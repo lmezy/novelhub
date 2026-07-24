@@ -1,9 +1,10 @@
 from fastapi import APIRouter
 
-from app.api.routes import books, chapters, progress, sources, sync
+from app.api.routes import auth, books, chapters, progress, sources, sync
 
 
 router = APIRouter(prefix="/api")
+router.include_router(auth.router)
 router.include_router(books.router)
 router.include_router(chapters.router)
 router.include_router(progress.router)

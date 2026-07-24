@@ -11,15 +11,20 @@ type Book = {
 const books = ref<Book[]>([])
 const loading = ref(true)
 const error = ref("")
+const apiStatus = ref("checking")
 
 onMounted(async () => {
   try {
+    const healthResponse = await fetch("/api/test")
+    apiStatus.value = healthResponse.ok ? "ok" : "failed"
+
     const response = await fetch("/api/books")
     if (!response.ok) {
       throw new Error(`API returned ${response.status}`)
     }
     books.value = await response.json()
   } catch (err) {
+    apiStatus.value = "failed"
     error.value = err instanceof Error ? err.message : "Unknown error"
   } finally {
     loading.value = false
@@ -34,6 +39,9 @@ onMounted(async () => {
       <h1>NovelHub</h1>
       <p class="subtitle">
         一个面向 NAS 长期运行的个人小说数字图书馆。
+      </p>
+      <p class="status" :class="apiStatus">
+        API: {{ apiStatus }}
       </p>
     </section>
 
@@ -88,6 +96,23 @@ h1 {
 .subtitle {
   font-size: 20px;
   color: #526071;
+}
+
+.status {
+  display: inline-flex;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: #fff;
+  color: #526071;
+  font-size: 14px;
+}
+
+.status.ok {
+  color: #067647;
+}
+
+.status.failed {
+  color: #b42318;
 }
 
 .panel {

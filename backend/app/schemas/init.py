@@ -1,3 +1,4 @@
+from .auth import *
 from .book import *
 from .chapter import *
 from .progress import *

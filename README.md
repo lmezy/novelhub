@@ -99,6 +99,7 @@ Stage 1:
 - Plugin framework：已提供 `local_markdown` 示例插件
 - Storage abstraction：正文按 `storage/books/author/book/*.md` 独立保存
 - API：`/api/books`、`/api/sources`、`/api/sync/book`、`/api/chapters/{id}`
+- Auth：`/api/auth/register`、`/api/auth/login`、`/api/auth/me`
 
 
 ## Local Markdown Import
