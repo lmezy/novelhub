@@ -22,6 +22,10 @@ onMounted(async () => {
     if (!response.ok) {
       throw new Error(`API returned ${response.status}`)
     }
+    const contentType = response.headers.get("content-type") || ""
+    if (!contentType.includes("application/json")) {
+      throw new Error("API did not return JSON. Check proxy routing.")
+    }
     books.value = await response.json()
   } catch (err) {
     apiStatus.value = "failed"
