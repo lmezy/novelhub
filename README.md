@@ -68,6 +68,10 @@ Frontend:
 
 http://localhost:5173
 
+Nginx gateway:
+
+http://localhost:8088
+
 
 
 ## Storage
