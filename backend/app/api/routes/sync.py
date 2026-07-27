@@ -6,7 +6,7 @@ from app.schemas.sync import BookshelfSyncRequest, BookshelfSyncResult, SyncRequ
 from app.services.sync import SyncService
 
 
-router = APIRouter(prefix="/sync", tags=["sync"])
+router = APIRouter(prefix="/sync", tags=["sync"], dependencies=[Depends(require_admin)])
 
 
 @router.post("/book", response_model=SyncResult)
@@ -23,3 +23,5 @@ async def sync_bookshelf(payload: BookshelfSyncRequest, db: AsyncSession = Depen
         return await SyncService(db).sync_bookshelf(payload.source_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+from app.models import User
+from app.services.auth import require_admin

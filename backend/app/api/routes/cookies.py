@@ -1,14 +1,19 @@
-﻿from uuid import uuid4
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.models import Cookie
+from app.models import Cookie, User
 from app.repositories.cookie import CookieRepository
 from app.schemas.cookie import CookieCreate, CookieOut, CookieUpdate
+from app.services.auth import require_admin
 
-router = APIRouter(prefix="/cookies", tags=["cookies"])
+router = APIRouter(
+    prefix="/cookies",
+    tags=["cookies"],
+    dependencies=[Depends(require_admin)],
+)
 
 
 @router.get("", response_model=list[CookieOut])

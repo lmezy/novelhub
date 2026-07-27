@@ -1,4 +1,4 @@
-﻿from uuid import uuid4
+from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -6,7 +6,8 @@ from loguru import logger
 
 from app.crawler.registry import get_plugin
 from app.core.events import emit, EventType
-from app.models import Author, Book, Chapter, Cookie, Source
+from app.models import Author, Book, BookTag, Chapter, Cookie, Source, Tag
+from app.repositories.tag import TagRepository
 from app.services.storage import BookStorage
 from app.services.search import search_service
 
@@ -178,3 +179,29 @@ class SyncService:
                 results.append({"url": shelf_book.url, "status": "failed", "error": str(exc)})
 
         return {"source_id": source_id, "total": len(shelf_books), "results": results}
+        # Save tags
+        if remote_book.tags:
+            await self._save_tags(book.id, remote_book.tags)
+
+    async def _save_tags(self, book_id: str, tag_names: list[str]) -> None:
+        """Create or get tags and associate them with the book."""
+        tag_repo = TagRepository(self.db)
+        # Remove old tag associations
+        old_tags = await self.db.scalars(
+            select(BookTag).where(BookTag.book_id == book_id)
+        )
+        for bt in old_tags:
+            await self.db.delete(bt)
+
+        for name in tag_names:
+            name = name.strip().lower()
+            if not name:
+                continue
+            tag = await tag_repo.get_by_name(name)
+            if tag is None:
+                tag = Tag(id=str(uuid4()), name=name)
+                self.db.add(tag)
+                await self.db.flush()
+            bt = BookTag(book_id=book_id, tag_id=tag.id)
+            self.db.add(bt)
+        await self.db.flush()

@@ -22,7 +22,7 @@ async def list_tags(
     return await repo.list(offset=offset, limit=limit)
 
 
-@router.post("", response_model=TagOut, status_code=201)
+@router.post("", response_model=TagOut, status_code=201, dependencies=[Depends(require_admin)])
 async def create_tag(payload: TagCreate, db: AsyncSession = Depends(get_db)):
     repo = TagRepository(db)
     existing = await repo.get_by_name(payload.name)
@@ -32,10 +32,12 @@ async def create_tag(payload: TagCreate, db: AsyncSession = Depends(get_db)):
     return await repo.add(tag)
 
 
-@router.delete("/{tag_id}", status_code=204)
+@router.delete("/{tag_id}", status_code=204, dependencies=[Depends(require_admin)])
 async def delete_tag(tag_id: str, db: AsyncSession = Depends(get_db)):
     repo = TagRepository(db)
     tag = await repo.get(tag_id)
     if tag is None:
         raise HTTPException(status_code=404, detail="Tag not found")
     await repo.delete(tag)
+from app.models import User
+from app.services.auth import require_admin

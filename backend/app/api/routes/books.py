@@ -2,6 +2,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -14,7 +15,9 @@ router = APIRouter(prefix="/books", tags=["books"])
 
 @router.get("", response_model=list[BookOut])
 async def list_books(db: AsyncSession = Depends(get_db)):
-    result = await db.scalars(select(Book).order_by(Book.updated_at.desc()))
+    result = await db.scalars(
+        select(Book).options(selectinload(Book.tags)).order_by(Book.updated_at.desc())
+    )
     return list(result)
 
 

@@ -16,7 +16,7 @@ async def list_sources(db: AsyncSession = Depends(get_db)):
     return list(result)
 
 
-@router.post("", response_model=SourceOut, status_code=201)
+@router.post("", response_model=SourceOut, status_code=201, dependencies=[Depends(require_admin)])
 async def create_source(payload: SourceCreate, db: AsyncSession = Depends(get_db)):
     if await db.get(Source, payload.id):
         raise HTTPException(status_code=409, detail="Source already exists")
@@ -25,3 +25,5 @@ async def create_source(payload: SourceCreate, db: AsyncSession = Depends(get_db
     await db.commit()
     await db.refresh(source)
     return source
+from app.models import User
+from app.services.auth import require_admin

@@ -215,3 +215,46 @@ onMounted(async () => {
     </main>
   </div>
 </template>
+const bookshelfSourceId = ref("")
+const bookshelfResult = ref<any>(null)
+const bookshelfError = ref("")
+const bookshelfLoading = ref(false)
+
+async function triggerBookshelfSync() {
+  bookshelfError.value = ""
+  bookshelfResult.value = null
+  bookshelfLoading.value = true
+  try {
+    bookshelfResult.value = await api.post("/sync/bookshelf", {
+      source_id: bookshelfSourceId.value,
+    })
+  } catch (e) {
+    bookshelfError.value = e instanceof Error ? e.message : "Sync failed"
+  } finally {
+    bookshelfLoading.value = false
+  }
+}
+
+        <div class="p-5 rounded-lg border border-border bg-surface mt-4">
+          <h2 class="text-sm font-semibold mb-4">Bookshelf Sync</h2>
+          <p class="text-xs text-muted mb-3">
+            Sync all books from a user's bookshelf. Requires a saved cookie for the source.
+          </p>
+          <div class="flex gap-3 mb-3">
+            <input v-model="bookshelfSourceId" placeholder="Source ID" class="flex-1 px-3 py-2 rounded border border-border text-sm bg-paper" />
+          </div>
+          <p v-if="bookshelfError" class="text-sm text-red-600 mb-2">{{ bookshelfError }}</p>
+          <button @click="triggerBookshelfSync" :disabled="bookshelfLoading" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">
+            {{ bookshelfLoading ? 'Syncing...' : 'Sync Bookshelf' }}
+          </button>
+          <div v-if="bookshelfResult" class="mt-4 p-3 rounded bg-green-50 text-sm">
+            <p>Source: {{ bookshelfResult.source_id }}</p>
+            <p>Total books on shelf: {{ bookshelfResult.total }}</p>
+            <div v-for="(r, i) in bookshelfResult.results" :key="i" class="mt-2 text-xs">
+              <span :class="r.status === 'ok' ? 'text-green-700' : 'text-red-600'">
+                {{ r.status === 'ok' ? 'OK' : 'Failed' }}: {{ r.book_id || r.url }}
+              </span>
+              <span v-if="r.error" class="text-red-500 ml-1">{{ r.error }}</span>
+            </div>
+          </div>
+        </div>

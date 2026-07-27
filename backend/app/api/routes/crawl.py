@@ -6,7 +6,7 @@ from app.repositories.crawl_task import CrawlTaskRepository
 from app.repositories.crawl_log import CrawlLogRepository
 from app.schemas.crawl import CrawlLogOut, CrawlTaskOut
 
-router = APIRouter(prefix="/crawl", tags=["crawl"])
+router = APIRouter(prefix="/crawl", tags=["crawl"], dependencies=[Depends(require_admin)])
 
 
 @router.get("/tasks", response_model=list[CrawlTaskOut])
@@ -37,3 +37,5 @@ async def list_task_logs(
 ):
     repo = CrawlLogRepository(db)
     return await repo.list_by_task(task_id, offset=offset, limit=limit)
+from app.models import User
+from app.services.auth import require_admin

@@ -48,3 +48,6 @@ class AliceSWConfig:
 
 
 default_config = AliceSWConfig()
+        # Tags
+        "book_tags": "a.tag-item, span.tag, .book-tag, .category-tag",
+        "book_tag_list": "div.book-tags, .tag-list, .categories",

@@ -31,3 +31,4 @@ class BookOut(BaseModel):
 
     class Config:
         from_attributes = True
+    tag_names: list[str] = []

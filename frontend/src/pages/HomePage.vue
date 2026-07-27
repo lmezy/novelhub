@@ -61,3 +61,10 @@ onMounted(() => {
     </main>
   </div>
 </template>
+            <div v-if="book.tag_names?.length" class="flex flex-wrap gap-1 mb-3">
+              <span
+                v-for="tag in book.tag_names"
+                :key="tag"
+                class="text-xs px-2 py-0.5 rounded bg-gray-100 text-muted"
+              >{{ tag }}</span>
+            </div>

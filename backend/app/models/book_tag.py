@@ -1,4 +1,5 @@
 from sqlalchemy import Column, ForeignKey, String
+from sqlalchemy.orm import relationship
 
 from .base import Base
 
@@ -8,3 +9,4 @@ class BookTag(Base):
 
     book_id = Column(String, ForeignKey("books.id"), primary_key=True)
     tag_id = Column(String, ForeignKey("tags.id"), primary_key=True)
+    tag = relationship("Tag", lazy="joined")

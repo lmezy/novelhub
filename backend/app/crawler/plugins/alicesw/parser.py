@@ -81,6 +81,7 @@ class AliceSWParser:
             description=description,
             status=status,
             chapters=chapters,
+            tags=tags,
         )
 
     def parse_chapter_content(self, html: str) -> tuple[str, str]:
@@ -140,3 +141,19 @@ class AliceSWParser:
         if href.startswith("/"):
             return self.config.base_url + href
         return self.config.base_url + "/" + href
+        # Extract tags
+        tags = self._extract_tags(soup)
+
+    def _extract_tags(self, soup: BeautifulSoup) -> list[str]:
+        """Extract category/genre tags from the book page."""
+        tag_names: list[str] = []
+        tag_container = soup.select_one(self.sel["book_tag_list"])
+        if tag_container:
+            tag_els = tag_container.select(self.sel["book_tags"])
+        else:
+            tag_els = soup.select(self.sel["book_tags"])
+        for el in tag_els:
+            name = el.get_text(strip=True)
+            if name and name not in tag_names:
+                tag_names.append(name)
+        return tag_names
