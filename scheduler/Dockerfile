@@ -2,8 +2,9 @@
 
 WORKDIR /app
 
-COPY scheduler/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY backend/requirements.txt ./backend_req.txt
+COPY scheduler/requirements.txt ./scheduler_req.txt
+RUN pip install --no-cache-dir -r backend_req.txt -r scheduler_req.txt
 
 COPY backend/ ./backend/
 COPY scheduler/app/ ./scheduler_app/
