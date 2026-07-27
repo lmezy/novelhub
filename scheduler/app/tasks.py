@@ -1,7 +1,7 @@
 ﻿import asyncio
 from celery.utils.log import get_task_logger
 
-from app.celery_app import celery_app
+from celery_app import celery_app
 
 logger = get_task_logger(__name__)
 
@@ -10,8 +10,6 @@ logger = get_task_logger(__name__)
 def sync_all_sources() -> dict:
     from app.core.database import SessionLocal
     from app.repositories.source import SourceRepository
-    from app.models.source import Source
-    from sqlalchemy import select
 
     async def _run():
         async with SessionLocal() as db:
@@ -22,7 +20,6 @@ def sync_all_sources() -> dict:
             results = []
             for source in sources:
                 logger.info("Triggering crawl for source=%s", source.id)
-                from app.tasks import crawl_source
                 crawl_source.delay(source.id)
                 results.append({"source_id": source.id, "status": "queued"})
 
@@ -36,7 +33,7 @@ def crawl_source(self, source_id: str) -> dict:
     import asyncio
 
     async def _run():
-        from crawler.app.crawler_service import run_crawl_for_source
+        from crawler_service import run_crawl_for_source
         await run_crawl_for_source(source_id)
         return {"source_id": source_id, "status": "completed"}
 

@@ -1,10 +1,9 @@
 ﻿import asyncio
-import sys
 import signal
 
 from loguru import logger
 
-from app.crawler_service import run_crawl_for_source
+from crawler_service import run_crawl_for_source
 
 
 running = True
