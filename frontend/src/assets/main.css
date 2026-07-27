@@ -1,0 +1,24 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-paper text-ink antialiased;
+  }
+
+  .dark body,
+  body.dark {
+    @apply bg-gray-950 text-gray-100;
+  }
+}
+
+@layer components {
+  .reader-content {
+    @apply font-serif text-lg leading-relaxed max-w-3xl mx-auto;
+  }
+
+  .reader-content p {
+    @apply mb-4;
+  }
+}

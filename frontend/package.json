@@ -12,7 +12,8 @@
 
 "build":"vite build",
 
-"preview":"vite preview --host 0.0.0.0"
+    "preview":"vite preview --host 0.0.0.0",
+    "typecheck":"vue-tsc --noEmit"
 
 },
 
@@ -30,7 +31,9 @@
 
 "vite":"latest",
 
-"typescript":"latest",
+    "typescript":"latest",
+    "tailwindcss":"^3.4",
+    "autoprefixer":"^10.4",
 
 "@vitejs/plugin-vue":"latest"
 
