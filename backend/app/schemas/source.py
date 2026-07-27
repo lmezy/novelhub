@@ -1,10 +1,10 @@
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 
 
 class SourceCreate(BaseModel):
     id: str
     name: str
-    url: HttpUrl | None = None
+    url: str | None = None
     plugin_name: str
     enabled: bool = True
 
