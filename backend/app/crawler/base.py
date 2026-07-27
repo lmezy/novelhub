@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Optional, Protocol
 
 
 @dataclass(frozen=True)
@@ -20,6 +20,15 @@ class RemoteBook:
     chapters: list[RemoteChapter]
 
 
+@dataclass(frozen=True)
+class RemoteShelfBook:
+    source_book_id: str
+    title: str
+    author: str
+    url: str
+    latest_chapter_title: str | None = None
+
+
 class NovelSourcePlugin(Protocol):
     name: str
 
@@ -27,4 +36,13 @@ class NovelSourcePlugin(Protocol):
         ...
 
     async def fetch_chapter_content(self, chapter: RemoteChapter) -> str:
+        ...
+
+    async def fetch_bookshelf(self, cookie: str) -> list[RemoteShelfBook]:
+        ...
+
+    async def update_book(self, url: str) -> RemoteBook | None:
+        ...
+
+    def set_cookie(self, cookie: str) -> None:
         ...

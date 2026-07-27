@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from app.crawler.base import RemoteBook, RemoteChapter
+from app.crawler.base import RemoteBook, RemoteChapter, RemoteShelfBook
 
 
 class LocalMarkdownPlugin:
@@ -42,3 +42,12 @@ class LocalMarkdownPlugin:
         if first_line and first_line[0].startswith("#"):
             return first_line[0].lstrip("#").strip()
         return path.stem
+
+    async def fetch_bookshelf(self, cookie: str) -> list[RemoteShelfBook]:
+        raise NotImplementedError("LocalMarkdownPlugin does not support bookshelf")
+
+    async def update_book(self, url: str) -> RemoteBook | None:
+        raise NotImplementedError("LocalMarkdownPlugin does not support incremental update")
+
+    def set_cookie(self, cookie: str) -> None:
+        pass

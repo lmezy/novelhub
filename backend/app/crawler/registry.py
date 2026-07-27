@@ -1,9 +1,11 @@
 from app.crawler.base import NovelSourcePlugin
 from app.crawler.plugins.local_markdown import LocalMarkdownPlugin
+from app.crawler.plugins.alicesw import AliceSWPlugin
 
 
 plugins: dict[str, NovelSourcePlugin] = {
     LocalMarkdownPlugin.name: LocalMarkdownPlugin(),
+    AliceSWPlugin.name: AliceSWPlugin(),
 }
 
 

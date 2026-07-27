@@ -6,7 +6,7 @@ from loguru import logger
 
 from app.crawler.registry import get_plugin
 from app.core.events import emit, EventType
-from app.models import Author, Book, Chapter, Source
+from app.models import Author, Book, Chapter, Cookie, Source
 from app.services.storage import BookStorage
 from app.services.search import search_service
 
@@ -147,3 +147,34 @@ class SyncService:
         self.db.add(book)
         await self.db.flush()
         return book, True
+
+    async def sync_bookshelf(self, source_id: str) -> dict:
+        """Sync all books from a user's bookshelf."""
+        source = await self.db.get(Source, source_id)
+        if source is None or not source.enabled:
+            raise ValueError("Source not found or disabled")
+
+        cookie_record = await self.db.scalar(
+            select(Cookie).where(Cookie.source == source_id)
+        )
+        if cookie_record is None:
+            raise ValueError(f"No cookie found for source '{source_id}'")
+
+        plugin = get_plugin(source.plugin_name)
+        plugin.set_cookie(cookie_record.cookie_data)
+
+        shelf_books = await plugin.fetch_bookshelf(cookie_record.cookie_data)
+        logger.info("Found {} books on bookshelf for source={}", len(shelf_books), source_id)
+
+        results = []
+        for shelf_book in shelf_books:
+            try:
+                result = await self.sync_book(source_id, shelf_book.url)
+                results.append({"book_id": result["book_id"], "status": "ok"})
+            except Exception as exc:
+                logger.opt(exception=exc).warning(
+                    "Failed to sync shelf book {}", shelf_book.url
+                )
+                results.append({"url": shelf_book.url, "status": "failed", "error": str(exc)})
+
+        return {"source_id": source_id, "total": len(shelf_books), "results": results}

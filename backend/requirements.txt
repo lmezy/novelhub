@@ -16,3 +16,6 @@ email-validator
 python-multipart
 loguru
 meilisearch
+httpx
+lxml
+beautifulsoup4
