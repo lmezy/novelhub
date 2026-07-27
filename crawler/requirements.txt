@@ -1,8 +1,7 @@
-requests
-
+﻿requests
 beautifulsoup4
-
 playwright
-
 pydantic
-
+loguru
+sqlalchemy>=2.0
+asyncpg

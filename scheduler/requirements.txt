@@ -1,0 +1,6 @@
+﻿celery[redis]
+loguru
+sqlalchemy>=2.0
+asyncpg
+pydantic
+python-dotenv

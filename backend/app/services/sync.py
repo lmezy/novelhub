@@ -1,11 +1,14 @@
-from uuid import uuid4
+﻿from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from loguru import logger
 
 from app.crawler.registry import get_plugin
+from app.core.events import emit, EventType
 from app.models import Author, Book, Chapter, Source
 from app.services.storage import BookStorage
+from app.services.search import search_service
 
 
 class SyncService:
@@ -18,11 +21,14 @@ class SyncService:
         if source is None or not source.enabled:
             raise ValueError("Source not found or disabled")
 
+        emit(EventType.SYNC_STARTED, source_id=source_id, url=url)
+        logger.info("Starting sync for source={} url={}", source_id, url)
+
         plugin = get_plugin(source.plugin_name)
         remote_book = await plugin.fetch_book(url)
 
         author = await self._get_or_create_author(remote_book.author)
-        book = await self._get_or_create_book(source.id, author.id, remote_book)
+        book, is_new = await self._get_or_create_book(source.id, author.id, remote_book)
 
         self.storage.write_metadata(
             remote_book.author,
@@ -36,6 +42,21 @@ class SyncService:
                 "status": remote_book.status,
             },
         )
+
+        search_service.index_book({
+            "id": book.id,
+            "title": book.title,
+            "author": remote_book.author,
+            "description": book.description or "",
+            "status": book.status or "",
+            "source_id": book.source_id or "",
+            "author_id": book.author_id or "",
+        })
+
+        if is_new:
+            emit(EventType.BOOK_CREATED, book_id=book.id, title=book.title)
+        else:
+            emit(EventType.BOOK_UPDATED, book_id=book.id, title=book.title)
 
         created = 0
         skipped = 0
@@ -58,20 +79,32 @@ class SyncService:
                 remote_chapter.title,
                 content,
             )
-            self.db.add(
-                Chapter(
-                    id=str(uuid4()),
-                    book_id=book.id,
-                    chapter_number=remote_chapter.chapter_number,
-                    source_chapter_id=remote_chapter.source_chapter_id,
-                    title=remote_chapter.title,
-                    content_path=content_path,
-                    hash=content_hash,
-                )
+            chapter = Chapter(
+                id=str(uuid4()),
+                book_id=book.id,
+                chapter_number=remote_chapter.chapter_number,
+                source_chapter_id=remote_chapter.source_chapter_id,
+                title=remote_chapter.title,
+                content_path=content_path,
+                hash=content_hash,
             )
+            self.db.add(chapter)
+            await self.db.flush()
+
+            search_service.index_chapter({
+                "id": chapter.id,
+                "book_id": book.id,
+                "title": chapter.title or "",
+                "chapter_number": chapter.chapter_number,
+                "content": content[:5000],
+            })
+
+            emit(EventType.CHAPTER_CREATED, chapter_id=chapter.id, book_id=book.id)
             created += 1
 
         await self.db.commit()
+        emit(EventType.SYNC_COMPLETED, book_id=book.id, created=created, skipped=skipped)
+        logger.info("Sync complete book={} created={} skipped={}", book.id, created, skipped)
         return {
             "book_id": book.id,
             "created_chapters": created,
@@ -87,7 +120,7 @@ class SyncService:
         await self.db.flush()
         return author
 
-    async def _get_or_create_book(self, source_id: str, author_id: str, remote_book) -> Book:
+    async def _get_or_create_book(self, source_id: str, author_id: str, remote_book) -> tuple[Book, bool]:
         book = await self.db.scalar(
             select(Book).where(
                 Book.source_id == source_id,
@@ -100,7 +133,7 @@ class SyncService:
             book.description = remote_book.description
             book.status = remote_book.status
             await self.db.flush()
-            return book
+            return book, False
 
         book = Book(
             id=str(uuid4()),
@@ -113,4 +146,4 @@ class SyncService:
         )
         self.db.add(book)
         await self.db.flush()
-        return book
+        return book, True

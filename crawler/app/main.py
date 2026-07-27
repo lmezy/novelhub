@@ -1,19 +1,35 @@
-import time
+﻿import asyncio
+import sys
+import signal
+
+from loguru import logger
+
+from app.crawler_service import run_crawl_for_source
 
 
-def main():
-
-    while True:
-
-        print(
-        "Crawler running..."
-        )
-
-        time.sleep(60)
+running = True
 
 
+def shutdown(sig, frame):
+    global running
+    logger.info("Crawler stopping...")
+    running = False
 
-if __name__=="__main__":
 
-    main()
+signal.signal(signal.SIGTERM, shutdown)
+signal.signal(signal.SIGINT, shutdown)
 
+
+async def main():
+    logger.info("NovelHub Crawler started")
+    try:
+        while running:
+            logger.info("Crawler heartbeat")
+            await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        pass
+    logger.info("Crawler stopped")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
