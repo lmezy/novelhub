@@ -5,7 +5,7 @@ import os
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from app.core.config import settings
 
@@ -13,7 +13,7 @@ from app.core.config import settings
 def _derive_key() -> bytes:
     """Derive a 256-bit AES key from COOKIE_SECRET."""
     salt = b"novelhub_cookie_salt"
-    kdf = PBKDF2(
+    kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100000,
     )
     return kdf.derive(settings.COOKIE_SECRET.encode("utf-8"))
