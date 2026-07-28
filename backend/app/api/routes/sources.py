@@ -3,8 +3,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.models import Source
+from app.models import Source, User
 from app.schemas.source import SourceCreate, SourceOut
+from app.services.auth import require_admin
 
 
 router = APIRouter(prefix="/sources", tags=["sources"])
@@ -25,5 +26,3 @@ async def create_source(payload: SourceCreate, db: AsyncSession = Depends(get_db
     await db.commit()
     await db.refresh(source)
     return source
-from app.models import User
-from app.services.auth import require_admin

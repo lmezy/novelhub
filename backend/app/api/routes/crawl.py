@@ -1,10 +1,12 @@
-﻿from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.models import User
 from app.repositories.crawl_task import CrawlTaskRepository
 from app.repositories.crawl_log import CrawlLogRepository
 from app.schemas.crawl import CrawlLogOut, CrawlTaskOut
+from app.services.auth import require_admin
 
 router = APIRouter(prefix="/crawl", tags=["crawl"], dependencies=[Depends(require_admin)])
 
@@ -37,5 +39,3 @@ async def list_task_logs(
 ):
     repo = CrawlLogRepository(db)
     return await repo.list_by_task(task_id, offset=offset, limit=limit)
-from app.models import User
-from app.services.auth import require_admin

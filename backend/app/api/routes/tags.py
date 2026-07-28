@@ -1,13 +1,14 @@
-﻿from uuid import uuid4
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.models import Tag
-from app.schemas.tag import TagCreate, TagOut
+from app.models import Tag, User
 from app.repositories.tag import TagRepository
+from app.schemas.tag import TagCreate, TagOut
+from app.services.auth import require_admin
 
 router = APIRouter(prefix="/tags", tags=["tags"])
 
@@ -39,5 +40,3 @@ async def delete_tag(tag_id: str, db: AsyncSession = Depends(get_db)):
     if tag is None:
         raise HTTPException(status_code=404, detail="Tag not found")
     await repo.delete(tag)
-from app.models import User
-from app.services.auth import require_admin
