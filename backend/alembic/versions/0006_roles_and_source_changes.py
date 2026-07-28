@@ -1,6 +1,6 @@
 """add user roles and source_changes table
 
-Revision ID: 0006_user_roles_and_source_changes
+Revision ID: 0006_roles_and_source_changes
 Revises: 0005_source_config
 Create Date: 2026-07-28
 """
@@ -9,7 +9,7 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
 
-revision: str = '0006_user_roles_and_source_changes'
+revision: str = '0006_roles_and_source_changes'
 down_revision: Union[str, None] = '0005_source_config'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
