@@ -6,14 +6,14 @@ from app.core.database import get_db
 from app.models import Source, Book, Cookie, CrawlTask, CrawlLog
 from app.models.source_credential import SourceCredential
 from app.schemas.source import SourceCreate, SourceOut
-from app.services.auth import require_admin
+from app.services.auth import get_current_user, require_admin
 
 
 router = APIRouter(prefix="/sources", tags=["sources"])
 
 
 @router.get("", response_model=list[SourceOut])
-async def list_sources(db: AsyncSession = Depends(get_db)):
+async def list_sources(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     result = await db.scalars(select(Source).order_by(Source.name.asc()))
     return list(result)
 

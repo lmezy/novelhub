@@ -3,6 +3,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from uuid import uuid4
+
+from loguru import logger
+from sqlalchemy import select
+
+from app.core.database import SessionLocal
+from app.models import User
+from app.services.security import hash_password
+
 from app.api.router import router as api_router
 from app.core.config import settings
 from app.core.logging import setup_logging
@@ -33,6 +42,27 @@ app.add_exception_handler(
 )
 
 app.include_router(api_router)
+
+
+
+
+@app.on_event("startup")
+async def seed_default_super_admin():
+    async with SessionLocal() as db:
+        result = await db.scalar(select(User).where(User.role == "super_admin"))
+        if result is None:
+            user = User(
+                id=str(uuid4()),
+                username="admin",
+                email="admin@novelhub.local",
+                password_hash=hash_password("admin"),
+                role="super_admin",
+            )
+            db.add(user)
+            await db.commit()
+            logger.info("Default super admin created: admin / admin")
+        else:
+            logger.info("Super admin already exists, skipping seed.")
 
 
 @app.get("/")

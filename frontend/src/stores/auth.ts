@@ -6,7 +6,7 @@ export interface User {
   id: string
   username: string
   email: string | null
-  is_admin: boolean
+  role: string
 }
 
 export const useAuthStore = defineStore("auth", () => {
@@ -15,7 +15,8 @@ const isDark = ref(localStorage.getItem('novelhub_dark') === 'true')
   const token = ref<string | null>(localStorage.getItem("novelhub_token"))
 
   const isAuthenticated = computed(() => !!token.value)
-  const isAdmin = computed(() => user.value?.is_admin ?? false)
+  const isAdmin = computed(() => user.value?.role === "admin" || user.value?.role === "super_admin")
+const isSuperAdmin = computed(() => user.value?.role === "super_admin")
 
 function toggleDark() {
   isDark.value = !isDark.value
@@ -59,5 +60,5 @@ function toggleDark() {
     localStorage.removeItem("novelhub_token")
   }
 
- return { user, token, isDark, isAuthenticated, isAdmin, toggleDark, login, register, fetchMe, logout }
+ return { user, token, isDark, isAuthenticated, isAdmin, isSuperAdmin, toggleDark, login, register, fetchMe, logout }
 })

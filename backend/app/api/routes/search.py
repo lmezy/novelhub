@@ -1,4 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
+from app.models import User
+from app.services.auth import get_current_user
 from pydantic import BaseModel
 
 from app.services.search import search_service
@@ -15,7 +17,7 @@ router = APIRouter(prefix="/search", tags=["search"])
 
 
 @router.get("", response_model=SearchResult)
-async def search(
+async def search(user: User = Depends(get_current_user),
     q: str = Query(..., min_length=1, description="Search query"),
     scope: str = Query("books", pattern="^(books|chapters)$"),
     offset: int = 0,
@@ -33,13 +35,13 @@ async def search(
         limit=result.get("limit", limit),
     )
 @router.get("/index/stats")
-async def index_stats():
+async def index_stats(user: User = Depends(get_current_user)):
     """Get Meilisearch index statistics."""
     return search_service.get_index_stats()
 
 
 @router.post("/index/rebuild")
-async def rebuild_index():
+async def rebuild_index(user: User = Depends(get_current_user)):
     """Rebuild search indexes from database."""
     try:
         result = search_service.rebuild_index()

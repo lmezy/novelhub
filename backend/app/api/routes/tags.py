@@ -8,7 +8,7 @@ from app.core.database import get_db
 from app.models import Tag, User
 from app.repositories.tag import TagRepository
 from app.schemas.tag import TagCreate, TagOut
-from app.services.auth import require_admin
+from app.services.auth import get_current_user, require_admin
 
 router = APIRouter(prefix="/tags", tags=["tags"])
 
@@ -17,6 +17,7 @@ router = APIRouter(prefix="/tags", tags=["tags"])
 async def list_tags(
     offset: int = 0,
     limit: int = 50,
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     repo = TagRepository(db)

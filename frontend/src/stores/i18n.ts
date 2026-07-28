@@ -218,6 +218,8 @@ const messages: Record<Locale, Record<string, string>> = {
     admin_loading: "Loading...",
     admin_importing: "Importing...",
     admin_tab_creds: "Credentials",
+    admin_tab_users: "Users",
+    admin_tab_approvals: "Approvals",
     admin_add_cred: "Add Login Credential",
     admin_cred_hint: "Configure auto-login for a source. After saving credentials, click Auto-Login to obtain and save cookies automatically. Only works for sources with API-based login.",
     admin_save_cred: "Save Credential",

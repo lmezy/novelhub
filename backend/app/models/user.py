@@ -1,4 +1,4 @@
-from sqlalchemy import Column,String,Boolean,DateTime
+from sqlalchemy import Column,String,DateTime
 
 from sqlalchemy.sql import func
 
@@ -38,9 +38,10 @@ class User(Base):
     )
 
 
-    is_admin=Column(
-        Boolean,
-        default=False
+    role=Column(
+        String(16),
+        nullable=False,
+        default="user"
     )
 
 

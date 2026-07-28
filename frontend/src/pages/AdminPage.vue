@@ -21,7 +21,7 @@ interface CookieItem {
   expired_at: string | null
 }
 
-const tab = ref<"sources" | "cookies" | "sync" | "logs" | "tokens" | "index" | "status" | "yuedu" | "creds">("sources")
+const tab = ref<"sources" | "cookies" | "sync" | "logs" | "tokens" | "index" | "status" | "yuedu" | "creds" | "users" | "approvals">("sources")
 
 const sources = ref<Source[]>([])
 const sourceForm = ref({ id: "", name: "", url: "", plugin_name: "alicesw" })
@@ -299,6 +299,38 @@ async function loadLogs() {
   logs.value = await api.get<any[]>("/crawl/tasks")
 }
 
+const users = ref<any[]>([])
+const userError = ref("")
+
+const approvals = ref<any[]>([])
+const approvalError = ref("")
+const approvalReviewing = ref<Record<string, boolean>>({})
+
+async function loadUsers() {
+  userError.value = ""
+  try { users.value = await api.get<any[]>("/admin/users") } catch (e) { userError.value = e instanceof Error ? e.message : "Failed" }
+}
+
+async function deleteUser(id: string, username: string) {
+  if (!confirm("Delete user " + username + "?")) return
+  try { await api.delete("/admin/users/" + id); await loadUsers() } catch (e) { alert(e instanceof Error ? e.message : "Failed") }
+}
+
+async function changeUserRole(id: string, role: string) {
+  try { await api.put("/admin/users/" + id + "/role", { role }); await loadUsers() } catch (e) { alert(e instanceof Error ? e.message : "Failed") }
+}
+
+async function loadApprovals() {
+  approvalError.value = ""
+  try { approvals.value = await api.get<any[]>("/source-changes?status=pending") } catch (e) { approvalError.value = e instanceof Error ? e.message : "Failed" }
+}
+
+async function reviewChange(id: string, action: string) {
+  approvalReviewing.value[id] = true
+  try { await api.post("/source-changes/" + id + "/review", { action }); await loadApprovals(); await loadSources() } catch (e) { alert(e instanceof Error ? e.message : "Failed") }
+  finally { approvalReviewing.value[id] = false }
+}
+
 onMounted(async () => {
   await loadSources()
   await loadCreds()
@@ -306,6 +338,8 @@ onMounted(async () => {
   await loadTokens()
   await loadStatus()
   await loadIndexStats()
+  await loadUsers()
+  await loadApprovals()
 })
 </script>
 
@@ -318,7 +352,7 @@ onMounted(async () => {
 
       <div class="flex gap-1 mb-8 border-b border-border flex-wrap">
         <button
-          v-for="t in (['sources', 'cookies', 'sync', 'logs', 'tokens', 'index', 'status', 'yuedu', 'creds'] as const)"
+          v-for="t in (['sources', 'cookies', 'sync', 'logs', 'tokens', 'index', 'status', 'yuedu', 'creds', 'users', 'approvals'] as const)"
           :key="t"
           @click="tab = t"
           class="px-4 py-2 text-sm transition-colors -mb-px"
@@ -593,6 +627,62 @@ onMounted(async () => {
           </div>
           <p v-if="creds.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">{{ i18n.t('admin_no_creds') }}</p>
         </div>
-      </section>    </main>
+      </section>
+      <section v-if="tab === 'users'" class="space-y-6">
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="text-lg font-semibold">User Management</h2>
+          <button @click="loadUsers" class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm hover:bg-surface transition-colors">Refresh</button>
+        </div>
+        <p v-if="userError" class="text-sm text-red-600 mb-3">{{ userError }}</p>
+        <div class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900">
+          <div v-for="u in users" :key="u.id" class="px-4 py-3 flex items-center justify-between flex-wrap gap-2">
+            <div>
+              <span class="text-sm font-medium">{{ u.username }}</span>
+              <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ u.email || '' }}</span>
+              <span class="text-xs px-1.5 py-0.5 rounded-full ml-2" :class="u.role === 'super_admin' ? 'bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-300' : u.role === 'admin' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300' : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400'">{{ u.role }}</span>
+            </div>
+            <div class="flex items-center gap-2">
+              <select @change="(e: any) => changeUserRole(u.id, e.target.value)" class="text-xs px-2 py-1 rounded border border-border dark:border-gray-700 bg-paper dark:bg-gray-800">
+                <option value="" disabled selected>Change role</option>
+                <option value="user">User</option>
+                <option value="admin">Admin</option>
+                <option value="super_admin">Super Admin</option>
+              </select>
+              <button @click="deleteUser(u.id, u.username)" class="text-xs text-red-500 hover:text-red-700">Delete</button>
+            </div>
+          </div>
+          <p v-if="users.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">No users found.</p>
+        </div>
+      </section>
+
+      <section v-if="tab === 'approvals'" class="space-y-6">
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="text-lg font-semibold">Pending Approvals</h2>
+          <button @click="loadApprovals" class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm hover:bg-surface transition-colors">Refresh</button>
+        </div>
+        <p v-if="approvalError" class="text-sm text-red-600 mb-3">{{ approvalError }}</p>
+        <div class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900">
+          <div v-for="a in approvals" :key="a.id" class="px-4 py-3 flex items-center justify-between flex-wrap gap-2">
+            <div>
+              <span class="text-xs px-1.5 py-0.5 rounded-full mr-2" :class="a.action === 'create' ? 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300' : 'bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300'">{{ a.action }}</span>
+              <template v-if="a.action === 'create' && a.source_data">
+                <span class="text-sm font-medium">{{ a.source_data.name }}</span>
+                <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ a.source_data.id }} ({{ a.source_data.plugin_name }})</span>
+              </template>
+              <template v-else-if="a.source_id">
+                <span class="text-sm font-medium">Delete: {{ a.source_id }}</span>
+              </template>
+              <span class="text-xs text-muted dark:text-gray-400 ml-2">by user {{ a.user_id?.slice(0, 8) }}...</span>
+            </div>
+            <div class="flex items-center gap-2">
+              <button @click="reviewChange(a.id, 'approve')" :disabled="approvalReviewing[a.id]" class="px-3 py-1 rounded bg-green-600 text-white text-xs font-medium hover:bg-green-700 disabled:opacity-50">Approve</button>
+              <button @click="reviewChange(a.id, 'reject')" :disabled="approvalReviewing[a.id]" class="px-3 py-1 rounded bg-red-500 text-white text-xs font-medium hover:bg-red-600 disabled:opacity-50">Reject</button>
+            </div>
+          </div>
+          <p v-if="approvals.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">No pending approvals.</p>
+        </div>
+      </section>
+
+    </main>
   </div>
 </template>

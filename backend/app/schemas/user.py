@@ -28,7 +28,7 @@ class UserOut(BaseModel):
 
     email:str
 
-    is_admin:bool
+    role: str
 
 
     class Config:

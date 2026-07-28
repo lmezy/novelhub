@@ -5,6 +5,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.models import User
+from app.services.auth import get_current_user
 from app.services.ai import AIService
 
 
@@ -55,7 +57,7 @@ class TimelineResponse(BaseModel):
 
 
 @router.post("/chat", response_model=ChatResponse)
-async def ai_chat(payload: ChatRequest, db: AsyncSession = Depends(get_db)):
+async def ai_chat(payload: ChatRequest, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     """Ask a question about a book with context-aware AI."""
     try:
         result = await AIService(db).chat(
@@ -71,7 +73,7 @@ async def ai_chat(payload: ChatRequest, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/summary", response_model=SummaryResponse)
-async def ai_summary(payload: SummaryRequest, db: AsyncSession = Depends(get_db)):
+async def ai_summary(payload: SummaryRequest, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     """Generate a summary for a book or range of chapters."""
     try:
         result = await AIService(db).summarize(
@@ -87,7 +89,7 @@ async def ai_summary(payload: SummaryRequest, db: AsyncSession = Depends(get_db)
 
 
 @router.post("/person", response_model=CharacterResponse)
-async def ai_characters(payload: CharacterRequest, db: AsyncSession = Depends(get_db)):
+async def ai_characters(payload: CharacterRequest, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     """Analyze and list characters in a book."""
     try:
         result = await AIService(db).analyze_characters(book_id=payload.book_id)
@@ -99,7 +101,7 @@ async def ai_characters(payload: CharacterRequest, db: AsyncSession = Depends(ge
 
 
 @router.post("/timeline", response_model=TimelineResponse)
-async def ai_timeline(payload: TimelineRequest, db: AsyncSession = Depends(get_db)):
+async def ai_timeline(payload: TimelineRequest, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     """Extract a timeline of events from a book."""
     try:
         result = await AIService(db).extract_timeline(book_id=payload.book_id)

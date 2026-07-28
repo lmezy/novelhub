@@ -32,9 +32,20 @@ const router = createRouter({
       path: "/admin",
       name: "admin",
       component: () => import("../pages/AdminPage.vue"),
-      meta: { requiresAuth: true, requiresAdmin: true },
+      meta: { requiresAuth: true },
     },
   ],
+})
+
+router.beforeEach((to, _from, next) => {
+  const token = localStorage.getItem("novelhub_token")
+  if (to.name === "login" && token) {
+    next({ name: "home" })
+  } else if (to.name !== "login" && !token) {
+    next({ name: "login" })
+  } else {
+    next()
+  }
 })
 
 export default router

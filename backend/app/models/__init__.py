@@ -24,6 +24,7 @@ from .cookie import Cookie
 from .reading_progress import ReadingProgress
 
 from .book_version import BookVersion
+from .source_change import SourceChange
 
 
 
