@@ -58,5 +58,6 @@ __all__=[
 ]
 
 from .chapter_embedding import ChapterEmbedding  # noqa: F401
+from .source_credential import SourceCredential  # noqa: F401
 
 from .api_token import ApiToken  # noqa: F401

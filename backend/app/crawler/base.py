@@ -47,3 +47,7 @@ class NovelSourcePlugin(Protocol):
 
     def set_cookie(self, cookie: str) -> None:
         ...
+
+    async def auto_login(self, username: str, password: str) -> str | None:
+        """Attempt auto-login with credentials. Returns cookie string on success, None on failure."""
+        ...

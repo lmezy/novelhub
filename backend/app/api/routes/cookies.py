@@ -68,3 +68,47 @@ async def delete_cookie(cookie_id: str, db: AsyncSession = Depends(get_db)):
     if cookie is None:
         raise HTTPException(status_code=404, detail="Cookie not found")
     await repo.delete(cookie)
+
+
+@router.post("/test", status_code=200)
+async def test_cookie(payload: CookieCreate):
+    """Test if a cookie works by attempting to fetch the bookshelf.
+
+    Does NOT save the cookie. Returns book count if successful.
+    """
+    from app.crawler.registry import get_plugin
+
+    try:
+        plugin = get_plugin(payload.source)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Unknown source: {payload.source}")
+
+    if not hasattr(plugin, "fetch_bookshelf"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Source '{payload.source}' does not support bookshelf fetch",
+        )
+
+    plugin.set_cookie(payload.cookie_data)
+
+    try:
+        shelf = await plugin.fetch_bookshelf(payload.cookie_data)
+        return {
+            "status": "ok",
+            "message": f"Cookie is valid. Found {len(shelf)} books on bookshelf.",
+            "books_count": len(shelf),
+            "sample_books": [
+                {"title": b.title, "author": b.author} for b in shelf[:5]
+            ],
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cookie test failed: {str(exc)[:300]}",
+        ) from exc
+    finally:
+        if hasattr(plugin, "close"):
+            try:
+                await plugin.close()
+            except Exception:
+                pass

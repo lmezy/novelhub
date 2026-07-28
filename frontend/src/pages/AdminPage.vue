@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import { onMounted, ref } from "vue"
 import { api } from "../api/client"
 import { useI18nStore } from "../stores/i18n"
@@ -21,7 +21,7 @@ interface CookieItem {
   expired_at: string | null
 }
 
-const tab = ref<"sources" | "cookies" | "sync" | "logs" | "tokens" | "status">("sources")
+const tab = ref<"sources" | "cookies" | "sync" | "logs" | "tokens" | "index" | "status" | "yuedu" | "creds">("sources")
 
 const sources = ref<Source[]>([])
 const sourceForm = ref({ id: "", name: "", url: "", plugin_name: "alicesw" })
@@ -36,6 +36,7 @@ async function createSource() {
   try {
     await api.post("/sources", sourceForm.value)
     await loadSources()
+  await loadCreds()
     sourceForm.value = { id: "", name: "", url: "", plugin_name: "alicesw" }
   } catch (e) {
     sourceError.value = e instanceof Error ? e.message : "Failed"
@@ -45,6 +46,25 @@ async function createSource() {
 const cookies = ref<CookieItem[]>([])
 const cookieForm = ref({ source: "", cookie_data: "", expired_at: "" })
 const cookieError = ref("")
+const cookieTesting = ref(false)
+const cookieTestResult = ref<any>(null)
+const cookieTestError = ref("")
+
+async function testCookie() {
+  cookieTestError.value = ""
+  cookieTestResult.value = null
+  cookieTesting.value = true
+  try {
+    cookieTestResult.value = await api.post("/cookies/test", {
+      source: cookieForm.value.source,
+      cookie_data: cookieForm.value.cookie_data,
+    })
+  } catch (e) {
+    cookieTestError.value = e instanceof Error ? e.message : "Test failed"
+  } finally {
+    cookieTesting.value = false
+  }
+}
 
 async function loadCookies() {
   cookies.value = await api.get<CookieItem[]>("/cookies")
@@ -78,6 +98,91 @@ const bookshelfSourceId = ref("")
 const bookshelfResult = ref<any>(null)
 const bookshelfError = ref("")
 const bookshelfLoading = ref(false)
+
+const yueduUrl = ref("")
+const yueduJsonText = ref("")
+const yueduImporting = ref(false)
+
+const creds = ref<any[]>([])
+const credForm = ref({ source: "", username: "", password: "" })
+const credError = ref("")
+const credLoggingIn = ref<Record<string, boolean>>({})
+const credLoginResult = ref<Record<string, any>>({})
+const credLoginError = ref<Record<string, string>>({})
+
+async function loadCreds() {
+  try {
+    creds.value = await api.get<any[]>("/credentials")
+  } catch { creds.value = [] }
+}
+
+async function createCred() {
+  credError.value = ""
+  try {
+    await api.post("/credentials", credForm.value)
+    await loadCreds()
+    credForm.value = { source: "", username: "", password: "" }
+  } catch (e) {
+    credError.value = e instanceof Error ? e.message : "Failed"
+  }
+}
+
+async function deleteCred(id: string) {
+  await api.delete("/credentials/" + id)
+  await loadCreds()
+}
+
+async function autoLogin(id: string) {
+  credLoggingIn.value[id] = true
+  credLoginResult.value[id] = null
+  credLoginError.value[id] = ""
+  try {
+    credLoginResult.value[id] = await api.post("/credentials/" + id + "/auto-login")
+    await loadCookies()
+  } catch (e) {
+    credLoginError.value[id] = e instanceof Error ? e.message : "Login failed"
+  } finally {
+    credLoggingIn.value[id] = false
+  }
+}
+const yueduPreviewing = ref(false)
+const yueduResult = ref<any>(null)
+const yueduError = ref("")
+const yueduPreview = ref<any>(null)
+
+async function yueduImport() {
+  yueduError.value = ""
+  yueduResult.value = null
+  yueduImporting.value = true
+  try {
+    const body: any = {}
+    if (yueduUrl.value) body.url = yueduUrl.value
+    if (yueduJsonText.value) body.json_text = yueduJsonText.value
+    yueduResult.value = await api.post("/yuedu/import", body)
+    await loadSources()
+  await loadCreds()
+  } catch (e) {
+    yueduError.value = e instanceof Error ? e.message : "Import failed"
+  } finally {
+    yueduImporting.value = false
+  }
+}
+
+async function yueduPreviewAction() {
+  yueduError.value = ""
+  yueduPreview.value = null
+  yueduPreviewing.value = true
+  try {
+    const body: any = {}
+    if (yueduUrl.value) body.url = yueduUrl.value
+    if (yueduJsonText.value) body.json_text = yueduJsonText.value
+    yueduPreview.value = await api.post("/yuedu/preview", body)
+  } catch (e) {
+    yueduError.value = e instanceof Error ? e.message : "Preview failed"
+  } finally {
+    yueduPreviewing.value = false
+  }
+}
 
 async function triggerSync() {
   syncError.value = ""
@@ -145,6 +250,33 @@ async function revokeToken(id: string) {
   await loadTokens()
 }
 
+const indexStats = ref<any>(null)
+const indexRebuilding = ref(false)
+const indexError = ref("")
+
+async function loadIndexStats() {
+  indexError.value = ""
+  try {
+    indexStats.value = await api.get<any>("/search/index/stats")
+  } catch (e) {
+    indexError.value = e instanceof Error ? e.message : "Failed"
+    indexStats.value = null
+  }
+}
+
+async function rebuildIndex() {
+  indexRebuilding.value = true
+  indexError.value = ""
+  try {
+    await api.post("/search/index/rebuild")
+    await loadIndexStats()
+  } catch (e) {
+    indexError.value = e instanceof Error ? e.message : "Rebuild failed"
+  } finally {
+    indexRebuilding.value = false
+  }
+}
+
 const healthStatus = ref<any>(null)
 
 async function loadStatus() {
@@ -159,9 +291,11 @@ async function loadLogs() {
 
 onMounted(async () => {
   await loadSources()
+  await loadCreds()
   await loadCookies()
   await loadTokens()
   await loadStatus()
+  await loadIndexStats()
 })
 </script>
 
@@ -174,7 +308,7 @@ onMounted(async () => {
 
       <div class="flex gap-1 mb-8 border-b border-border flex-wrap">
         <button
-          v-for="t in (['sources', 'cookies', 'sync', 'logs', 'tokens', 'status'] as const)"
+          v-for="t in (['sources', 'cookies', 'sync', 'logs', 'tokens', 'index', 'status', 'yuedu', 'creds'] as const)"
           :key="t"
           @click="tab = t"
           class="px-4 py-2 text-sm transition-colors -mb-px"
@@ -210,6 +344,18 @@ onMounted(async () => {
       </section>
 
       <section v-if="tab === 'cookies'" class="space-y-6">
+        <div class="mb-4 p-4 rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950 text-sm">
+          <p class="font-medium mb-1">{{ i18n.t('admin_cookie_help_title') }}</p>
+          <ol class="list-decimal list-inside space-y-1 text-muted dark:text-gray-300">
+            <li>{{ i18n.t('admin_cookie_help_step1') }}</li>
+            <li>{{ i18n.t('admin_cookie_help_step2') }}</li>
+            <li>{{ i18n.t('admin_cookie_help_step3') }}</li>
+            <li>{{ i18n.t('admin_cookie_help_step4') }}</li>
+          </ol>
+          <p class="mt-2">
+            <a href="/docs/cookie-guide.md" target="_blank" class="text-accent hover:underline">{{ i18n.t('admin_cookie_help_link') }}</a>
+          </p>
+        </div>
         <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
           <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_add_cookie') }}</h2>
           <div class="space-y-3 mb-3">
@@ -218,14 +364,30 @@ onMounted(async () => {
             <textarea v-model="cookieForm.cookie_data" :placeholder="i18n.t('admin_placeholder_cookie')" rows="3" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 resize-y" />
           </div>
           <p v-if="cookieError" class="text-sm text-red-600 mb-2">{{ cookieError }}</p>
-          <button @click="createCookie" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90">{{ i18n.t('admin_save_cookie') }}</button>
+                    <div class="flex gap-3">
+            <button @click="createCookie" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90">{{ i18n.t('admin_save_cookie') }}</button>
+            <button @click="testCookie" :disabled="cookieTesting" class="px-4 py-2 rounded border border-accent text-accent text-sm font-medium hover:bg-accent/10 disabled:opacity-50">
+              {{ cookieTesting ? i18n.t('admin_testing') : i18n.t('admin_test_cookie') }}
+            </button>
+          </div>
+          <div v-if="cookieTestResult" class="mt-3 p-3 rounded bg-green-50 dark:bg-green-950 text-sm">
+            <p class="font-medium text-green-700 dark:text-green-400">{{ cookieTestResult.message }}</p>
+            <div v-if="cookieTestResult.sample_books" class="mt-2 space-y-1 text-xs text-muted dark:text-gray-400">
+              <p v-for="b in cookieTestResult.sample_books" :key="b.title">{{ b.title }} &mdash; {{ b.author }}</p>
+            </div>
+          </div>
+          <p v-if="cookieTestError" class="text-sm text-red-600 mt-2">{{ cookieTestError }}</p>
         </div>
 
         <div class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900">
           <div v-for="c in cookies" :key="c.id" class="px-4 py-3 flex items-center justify-between">
+            <div class="flex items-center gap-3">
+              <span class="text-sm font-medium">{{ c.source }}</span>
+              <span v-if="c.expired_at" class="text-xs px-1.5 py-0.5 rounded-full" :class="new Date(c.expired_at) < new Date() ? 'bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300' : new Date(c.expired_at) < new Date(Date.now() + 3*86400000) ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900 dark:text-yellow-300' : 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300'">
+                {{ new Date(c.expired_at) < new Date() ? i18n.t('admin_cookie_expired') : new Date(c.expired_at) < new Date(Date.now() + 3*86400000) ? i18n.t('admin_cookie_expiring') : i18n.t('admin_cookie_valid') }}
+              </span>
             <div>
               <span class="text-sm font-medium">{{ c.source }}</span>
-              <span v-if="c.expired_at" class="text-xs text-muted dark:text-gray-400 ml-2">{{ i18n.t('admin_expires') }}: {{ new Date(c.expired_at).toLocaleDateString() }}</span>
             </div>
             <button @click="deleteCookie(c.id)" class="text-xs text-red-500 hover:text-red-700">{{ i18n.t('admin_delete') }}</button>
           </div>
@@ -341,6 +503,86 @@ onMounted(async () => {
           <p v-if="tokens.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">{{ i18n.t('admin_no_tokens') }}</p>
         </div>
       </section>
-    </main>
+  
+      <section v-if="tab === 'yuedu'" class="space-y-6">
+        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
+          <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_yuedu_title') }}</h2>
+          <p class="text-xs text-muted dark:text-gray-400 mb-4">{{ i18n.t('admin_yuedu_hint') }}</p>
+          <div class="space-y-3 mb-3">
+            <input v-model="yueduUrl" :placeholder="i18n.t('admin_yuedu_url_placeholder')" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            <textarea v-model="yueduJsonText" :placeholder="i18n.t('admin_yuedu_json_placeholder')" rows="4" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 resize-y" />
+          </div>
+          <p v-if="yueduError" class="text-sm text-red-600 mb-2">{{ yueduError }}</p>
+          <div class="flex gap-3">
+            <button @click="yueduPreviewAction" :disabled="yueduPreviewing" class="px-4 py-2 rounded border border-accent text-accent text-sm font-medium hover:bg-accent/10 disabled:opacity-50">
+              {{ yueduPreviewing ? i18n.t('admin_loading') : i18n.t('admin_yuedu_preview') }}
+            </button>
+            <button @click="yueduImport" :disabled="yueduImporting" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">
+              {{ yueduImporting ? i18n.t('admin_importing') : i18n.t('admin_yuedu_import') }}
+            </button>
+          </div>
+          <div v-if="yueduPreview" class="mt-4 p-3 rounded bg-blue-50 dark:bg-blue-950 text-sm">
+            <p class="font-medium mb-1">{{ i18n.t('admin_yuedu_preview_count', { n: yueduPreview.count }) }}</p>
+            <div class="max-h-64 overflow-y-auto space-y-1 text-xs text-muted dark:text-gray-400">
+              <p v-for="(s, i) in yueduPreview.sources" :key="i">{{ s.name }} &mdash; {{ s.url }}</p>
+            </div>
+          </div>
+          <div v-if="yueduResult" class="mt-4 p-3 rounded bg-green-50 dark:bg-green-950 text-sm">
+            <p class="font-medium mb-2">{{ i18n.t('admin_yuedu_imported', { imported: yueduResult.imported, total: yueduResult.total }) }}</p>
+            <p v-if="yueduResult.skipped > 0" class="text-xs text-muted dark:text-gray-400 mb-2">{{ i18n.t('admin_yuedu_skipped', { n: yueduResult.skipped }) }}</p>
+            <div class="max-h-48 overflow-y-auto space-y-1 text-xs text-muted dark:text-gray-400">
+              <p v-for="(s, i) in yueduResult.sources.filter((s: any) => s.status === 'imported')" :key="i">
+                <span class="font-medium text-green-700 dark:text-green-400">{{ s.name }}</span>
+                <span v-if="s.bookshelf_url" class="ml-1">&#10003; {{ i18n.t('admin_yuedu_bookshelf_detected') }}: {{ s.bookshelf_url }}</span>
+                <span v-else class="ml-1 text-yellow-600 dark:text-yellow-400">{{ i18n.t('admin_yuedu_bookshelf_none') }}</span>
+              </p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+        <div class="mt-6 p-4 rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950 text-sm">
+          <p class="font-medium mb-1">{{ i18n.t('admin_yuedu_bookshelf_howto_title') }}</p>
+          <ol class="list-decimal list-inside space-y-1 text-muted dark:text-gray-300">
+            <li>{{ i18n.t('admin_yuedu_bookshelf_howto_step1') }}</li>
+            <li>{{ i18n.t('admin_yuedu_bookshelf_howto_step2') }}</li>
+            <li>{{ i18n.t('admin_yuedu_bookshelf_howto_step3') }}</li>
+          </ol>
+        </div>
+
+
+      <section v-if="tab === 'creds'" class="space-y-6">
+        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
+          <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_add_cred') }}</h2>
+          <p class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('admin_cred_hint') }}</p>
+          <div class="grid grid-cols-3 gap-3 mb-3">
+            <input v-model="credForm.source" :placeholder="i18n.t('admin_placeholder_source')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            <input v-model="credForm.username" :placeholder="i18n.t('admin_placeholder_username')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            <input v-model="credForm.password" type="password" :placeholder="i18n.t('admin_placeholder_password')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+          </div>
+          <p v-if="credError" class="text-sm text-red-600 mb-2">{{ credError }}</p>
+          <button @click="createCred" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90">{{ i18n.t('admin_save_cred') }}</button>
+        </div>
+
+        <div class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900">
+          <div v-for="c in creds" :key="c.id" class="px-4 py-3 flex items-center justify-between flex-wrap gap-2">
+            <div>
+              <span class="text-sm font-medium">{{ c.source }}</span>
+              <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ c.username }}</span>
+            </div>
+            <div class="flex items-center gap-3">
+              <button @click="autoLogin(c.id)" :disabled="credLoggingIn[c.id]" class="px-3 py-1.5 rounded border border-green-500 text-green-600 text-xs font-medium hover:bg-green-50 dark:hover:bg-green-950 disabled:opacity-50">
+                {{ credLoggingIn[c.id] ? i18n.t('admin_logging_in') : i18n.t('admin_auto_login') }}
+              </button>
+              <button @click="deleteCred(c.id)" class="text-xs text-red-500 hover:text-red-700">{{ i18n.t('admin_delete') }}</button>
+            </div>
+            <div v-if="credLoginResult[c.id]" class="w-full mt-1 p-2 rounded bg-green-50 dark:bg-green-950 text-xs text-green-700 dark:text-green-400">
+              {{ credLoginResult[c.id].message }}
+            </div>
+            <p v-if="credLoginError[c.id]" class="w-full text-xs text-red-600 mt-1">{{ credLoginError[c.id] }}</p>
+          </div>
+          <p v-if="creds.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">{{ i18n.t('admin_no_creds') }}</p>
+        </div>
+      </section>    </main>
   </div>
 </template>

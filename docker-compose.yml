@@ -9,7 +9,28 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       TZ: ${TZ}
-    volumes:
+    
+  # ---- Optional: monitoring stack ----
+  # prometheus:
+  #   image: prom/prometheus
+  #   container_name: novelhub-prometheus
+  #   restart: always
+  #   volumes:
+  #     - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+  #     - prometheus_data:/prometheus
+  #   ports:
+  #     - "9090:9090"
+  #
+  # grafana:
+  #   image: grafana/grafana
+  #   container_name: novelhub-grafana
+  #   restart: always
+  #   volumes:
+  #     - grafana_data:/var/lib/grafana
+  #   ports:
+  #     - "3000:3000"
+
+volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
@@ -42,7 +63,28 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
-    volumes:
+    
+  # ---- Optional: monitoring stack ----
+  # prometheus:
+  #   image: prom/prometheus
+  #   container_name: novelhub-prometheus
+  #   restart: always
+  #   volumes:
+  #     - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+  #     - prometheus_data:/prometheus
+  #   ports:
+  #     - "9090:9090"
+  #
+  # grafana:
+  #   image: grafana/grafana
+  #   container_name: novelhub-grafana
+  #   restart: always
+  #   volumes:
+  #     - grafana_data:/var/lib/grafana
+  #   ports:
+  #     - "3000:3000"
+
+volumes:
       - redis_data:/data
 
   meilisearch:
@@ -52,7 +94,28 @@ services:
     environment:
       MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
       TZ: ${TZ}
-    volumes:
+    
+  # ---- Optional: monitoring stack ----
+  # prometheus:
+  #   image: prom/prometheus
+  #   container_name: novelhub-prometheus
+  #   restart: always
+  #   volumes:
+  #     - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+  #     - prometheus_data:/prometheus
+  #   ports:
+  #     - "9090:9090"
+  #
+  # grafana:
+  #   image: grafana/grafana
+  #   container_name: novelhub-grafana
+  #   restart: always
+  #   volumes:
+  #     - grafana_data:/var/lib/grafana
+  #   ports:
+  #     - "3000:3000"
+
+volumes:
       - meili_data:/meili_data
 
   backend:
@@ -69,7 +132,28 @@ services:
         condition: service_healthy
       meilisearch:
         condition: service_started
-    volumes:
+    
+  # ---- Optional: monitoring stack ----
+  # prometheus:
+  #   image: prom/prometheus
+  #   container_name: novelhub-prometheus
+  #   restart: always
+  #   volumes:
+  #     - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+  #     - prometheus_data:/prometheus
+  #   ports:
+  #     - "9090:9090"
+  #
+  # grafana:
+  #   image: grafana/grafana
+  #   container_name: novelhub-grafana
+  #   restart: always
+  #   volumes:
+  #     - grafana_data:/var/lib/grafana
+  #   ports:
+  #     - "3000:3000"
+
+volumes:
       - ./storage:/app/storage
     deploy:
       resources:
@@ -93,7 +177,28 @@ services:
     restart: always
     env_file:
       - .env
-    volumes:
+    
+  # ---- Optional: monitoring stack ----
+  # prometheus:
+  #   image: prom/prometheus
+  #   container_name: novelhub-prometheus
+  #   restart: always
+  #   volumes:
+  #     - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+  #     - prometheus_data:/prometheus
+  #   ports:
+  #     - "9090:9090"
+  #
+  # grafana:
+  #   image: grafana/grafana
+  #   container_name: novelhub-grafana
+  #   restart: always
+  #   volumes:
+  #     - grafana_data:/var/lib/grafana
+  #   ports:
+  #     - "3000:3000"
+
+volumes:
       - ./storage:/app/storage
 
   scheduler:
@@ -119,13 +224,143 @@ services:
     restart: always
     ports:
       - "8088:80"
-    volumes:
+    
+  # ---- Optional: monitoring stack ----
+  # prometheus:
+  #   image: prom/prometheus
+  #   container_name: novelhub-prometheus
+  #   restart: always
+  #   volumes:
+  #     - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+  #     - prometheus_data:/prometheus
+  #   ports:
+  #     - "9090:9090"
+  #
+  # grafana:
+  #   image: grafana/grafana
+  #   container_name: novelhub-grafana
+  #   restart: always
+  #   volumes:
+  #     - grafana_data:/var/lib/grafana
+  #   ports:
+  #     - "3000:3000"
+
+volumes:
       - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
       - backend
       - frontend
 
+  backup:
+    image: postgres:17
+    container_name: novelhub-backup
+    restart: always
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+      TZ: ${TZ}
+    
+  # ---- Optional: monitoring stack ----
+  # prometheus:
+  #   image: prom/prometheus
+  #   container_name: novelhub-prometheus
+  #   restart: always
+  #   volumes:
+  #     - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+  #     - prometheus_data:/prometheus
+  #   ports:
+  #     - "9090:9090"
+  #
+  # grafana:
+  #   image: grafana/grafana
+  #   container_name: novelhub-grafana
+  #   restart: always
+  #   volumes:
+  #     - grafana_data:/var/lib/grafana
+  #   ports:
+  #     - "3000:3000"
+
+volumes:
+      - backup_data:/backup
+      - ./storage:/app/storage:ro
+    entrypoint: >
+      sh -c '
+      mkdir -p /backup/daily /backup/weekly;
+      while true; do
+        TS=$$(date +%Y%m%d_%H%M);
+        pg_dump -h postgres -U $${PGUSER} -d $${PGDATABASE} -Fc -f /backup/daily/db_$${TS}.dump;
+        tar -I zstd -cf /backup/daily/storage_$${TS}.tar.zst -C /app storage/ 2>/dev/null || true;
+        find /backup/daily -mtime +7 -delete;
+        if [ $$(date +%u) -eq 7 ]; then
+          cp /backup/daily/db_$${TS}.dump /backup/weekly/;
+          cp /backup/daily/storage_$${TS}.tar.zst /backup/weekly/ 2>/dev/null || true;
+          find /backup/weekly -mtime +60 -delete;
+        fi;
+        sleep 86400;
+      done
+      '
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  # ---- Optional: auto-update containers ----
+  # watchtower:
+  #   image: containrrr/watchtower
+  #   container_name: novelhub-watchtower
+  #   restart: always
+  #   
+  # ---- Optional: monitoring stack ----
+  # prometheus:
+  #   image: prom/prometheus
+  #   container_name: novelhub-prometheus
+  #   restart: always
+  #   volumes:
+  #     - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+  #     - prometheus_data:/prometheus
+  #   ports:
+  #     - "9090:9090"
+  #
+  # grafana:
+  #   image: grafana/grafana
+  #   container_name: novelhub-grafana
+  #   restart: always
+  #   volumes:
+  #     - grafana_data:/var/lib/grafana
+  #   ports:
+  #     - "3000:3000"
+
+volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #   command: --interval 86400 --cleanup
+
+
+  # ---- Optional: monitoring stack ----
+  # prometheus:
+  #   image: prom/prometheus
+  #   container_name: novelhub-prometheus
+  #   restart: always
+  #   volumes:
+  #     - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+  #     - prometheus_data:/prometheus
+  #   ports:
+  #     - "9090:9090"
+  #
+  # grafana:
+  #   image: grafana/grafana
+  #   container_name: novelhub-grafana
+  #   restart: always
+  #   volumes:
+  #     - grafana_data:/var/lib/grafana
+  #   ports:
+  #     - "3000:3000"
+
 volumes:
   postgres_data:
   redis_data:
   meili_data:
+  backup_data:

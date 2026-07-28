@@ -25,7 +25,8 @@ class SyncService:
         emit(EventType.SYNC_STARTED, source_id=source_id, url=url)
         logger.info("Starting sync for source={} url={}", source_id, url)
 
-        plugin = get_plugin(source.plugin_name)
+        config = source.config if source.plugin_name == 'yuedu' else None
+        plugin = get_plugin(source.plugin_name, config=config)
         remote_book = await plugin.fetch_book(url)
 
         author = await self._get_or_create_author(remote_book.author)
@@ -164,7 +165,8 @@ class SyncService:
         if cookie_record is None:
             raise ValueError(f"No cookie found for source '{source_id}'")
 
-        plugin = get_plugin(source.plugin_name)
+        config = source.config if source.plugin_name == 'yuedu' else None
+        plugin = get_plugin(source.plugin_name, config=config)
         plugin.set_cookie(cookie_record.cookie_data)
 
         shelf_books = await plugin.fetch_bookshelf(cookie_record.cookie_data)
@@ -215,7 +217,8 @@ class SyncService:
         source = await self.db.get(Source, book.source_id)
         if source is None:
             raise ValueError("Source not found")
-        plugin = get_plugin(source.plugin_name)
+        config = source.config if source.plugin_name == 'yuedu' else None
+        plugin = get_plugin(source.plugin_name, config=config)
         # Construct URL from config
         cfg = plugin.config if hasattr(plugin, 'config') else None
         if cfg and hasattr(cfg, 'book_url'):

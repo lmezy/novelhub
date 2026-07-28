@@ -9,6 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.models import Book, Chapter, User
 from app.services.auth import require_admin
+from app.services.epub import EpubService
+from app.services.sync import SyncService
 from app.schemas.book import BookCreate, BookOut
 
 

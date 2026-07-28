@@ -1,4 +1,4 @@
-"""Celery worker — processes crawl tasks from the shared Redis queue."""
+"""Celery worker -- processes crawl tasks from the dedicated crawl queue."""
 import subprocess
 import sys
 
@@ -9,6 +9,7 @@ def main() -> None:
             sys.executable, "-m", "celery",
             "-A", "celery_app",
             "worker",
+            "-Q", "crawl",
             "-l", "info",
         ],
         cwd="/app/scheduler_app",

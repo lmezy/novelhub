@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+﻿from pydantic import BaseModel
 
 
 class SourceCreate(BaseModel):
@@ -7,6 +7,7 @@ class SourceCreate(BaseModel):
     url: str | None = None
     plugin_name: str
     enabled: bool = True
+    config: dict | None = None
 
 
 class SourceOut(BaseModel):
@@ -15,6 +16,7 @@ class SourceOut(BaseModel):
     url: str | None = None
     plugin_name: str | None = None
     enabled: bool
+    config: dict | None = None
 
     class Config:
         from_attributes = True

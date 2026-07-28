@@ -1,4 +1,4 @@
-﻿from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from app.services.search import search_service
@@ -32,3 +32,17 @@ async def search(
         offset=result.get("offset", offset),
         limit=result.get("limit", limit),
     )
+@router.get("/index/stats")
+async def index_stats():
+    """Get Meilisearch index statistics."""
+    return search_service.get_index_stats()
+
+
+@router.post("/index/rebuild")
+async def rebuild_index():
+    """Rebuild search indexes from database."""
+    try:
+        result = search_service.rebuild_index()
+        return {"status": "ok", **result}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc

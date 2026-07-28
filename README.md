@@ -1,4 +1,4 @@
-ï»¿# NovelHub
+# NovelHub
 
 Personal Novel Digital Library &mdash; self-hosted on NAS (UGREEN DX4600 Pro)
 
@@ -71,7 +71,7 @@ Cookie login (login.py), HTTP crawler with rate limiting (crawler.py), HTML pars
 - **Mobile responsive** -- done (NavBar hamburger menu, responsive layout)
 - **API Token UI** -- done (Admin page Tokens tab for create/revoke)
 - **Plugin template** -- done (`crawler/plugins/plugin_template.py` with documented interface)
-- Multi-source plugins and mobile UI remain.
+- Playwright infrastructure -- done (shared PlaywrightCrawler base class for any JS-rendered site plugin)
 
 ## Local Markdown Import
 
@@ -88,6 +88,19 @@ curl -X POST http://localhost:8088/api/sync/book \
   -H "Content-Type: application/json" \
   -d ''{"source_id":"local","url":"file:///app/storage/imports/demo-book"}''
 ```
+
+
+## Cookie Setup
+
+Before syncing books from online sources, you need to provide login cookies.
+See the [Cookie»ñÈ¡Ö¸ÄÏ](docs/cookie-guide.md) for step-by-step instructions.
+
+Quick steps:
+1. Log into the novel site in your browser
+2. F12 -> Application -> Cookies -> copy all as `name=value; name2=value2`
+3. Paste into Admin -> Cookies -> Add Cookie
+4. Click "Test Cookie" to verify it works
+5. Save and trigger a sync
 
 ## Storage Layout
 
@@ -112,4 +125,5 @@ storage/
 | Tasks | Celery |
 | Frontend | Vue 3, TypeScript, Vite, Pinia |
 | Crawler | requests, BeautifulSoup4, Playwright |
+| Crawler (JS) | Playwright (Chromium headless) |
 | Deploy | Docker Compose, Nginx |

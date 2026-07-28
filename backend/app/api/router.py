@@ -1,6 +1,6 @@
-﻿from fastapi import APIRouter
+from fastapi import APIRouter
 
-from app.api.routes import ai, auth, backup, books, chapters, cookies, crawl, health, progress, rag, search, sources, sync, tags, tokens
+from app.api.routes import ai, auth, backup, books, chapters, cookies, crawl, credentials, health, progress, rag, search, sources, sync, tags, tokens, yuedu
 
 
 router = APIRouter(prefix="/api")
@@ -18,7 +18,9 @@ router.include_router(search.router)
 router.include_router(sources.router)
 router.include_router(sync.router)
 router.include_router(tags.router)
+router.include_router(credentials.router)
 router.include_router(tokens.router)
+router.include_router(yuedu.router)
 
 
 @router.get("/test")

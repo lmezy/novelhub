@@ -13,6 +13,9 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="Asia/Shanghai",
     enable_utc=True,
+    task_routes={
+        "tasks.crawl_source": {"queue": "crawl"},
+    },
     beat_schedule={
         "daily-sync-all-sources": {
             "task": "tasks.sync_all_sources",
@@ -26,6 +29,11 @@ celery_app.conf.update(
             "task": "tasks.weekly_backup",
             "schedule": 604800.0,
         },
+        "check-cookie-expiry": {
+            "task": "tasks.check_cookie_expiry",
+            "schedule": 43200.0,
+        },
     },
 )
-import tasks  # noqa: F401 â€?register tasks for discovery
+
+import tasks  # noqa: F401 -- register tasks for discovery

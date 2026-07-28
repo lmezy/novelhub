@@ -1,40 +1,37 @@
-from sqlalchemy import Column,String,Boolean
+﻿from sqlalchemy import Column, String, Boolean
+from sqlalchemy.dialects.postgresql import JSONB
 
 from .base import Base
 
 
-
 class Source(Base):
 
+    __tablename__ = "sources"
 
-    __tablename__="sources"
-
-
-
-    id=Column(
+    id = Column(
         String,
         primary_key=True
     )
 
-
-    name=Column(
+    name = Column(
         String(100),
         nullable=False
     )
 
-
-    url=Column(
+    url = Column(
         String(255)
     )
 
-
-    plugin_name=Column(
+    plugin_name = Column(
         String(100)
     )
 
-
-    enabled=Column(
+    enabled = Column(
         Boolean,
         default=True
     )
 
+    config = Column(
+        JSONB,
+        nullable=True
+    )
