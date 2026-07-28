@@ -51,9 +51,15 @@ async def delete_source(source_id: str, db: AsyncSession = Depends(get_db)):
     # Delete related credentials
     await db.execute(delete(SourceCredential).where(SourceCredential.source == source_id))
 
-    # Delete related crawl tasks and logs
+    # Delete related crawl logs (via task_id join), then crawl tasks
+    await db.execute(
+        delete(CrawlLog).where(
+            CrawlLog.task_id.in_(
+                select(CrawlTask.id).where(CrawlTask.source == source_id)
+            )
+        )
+    )
     await db.execute(delete(CrawlTask).where(CrawlTask.source == source_id))
-    await db.execute(delete(CrawlLog).where(CrawlLog.source == source_id))
 
     # Delete the source itself
     await db.delete(source)
