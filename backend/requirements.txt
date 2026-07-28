@@ -10,7 +10,7 @@ python-dotenv
 redis
 celery
 cryptography
-passlib[bcrypt]
+bcrypt
 python-jose[cryptography]
 email-validator
 python-multipart
