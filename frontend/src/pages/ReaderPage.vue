@@ -1,4 +1,4 @@
-<script setup lang="ts">
+ï»¿<script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue"
 import { useRoute, useRouter } from "vue-router"
 import { useBooksStore, type Chapter, type ChapterContent } from "../stores/books"
@@ -24,11 +24,11 @@ const showToc = ref(false)
 const showAI = ref(false)
 
 const cnFonts = [
-  { value: "default", label: "ÏµÍ³Ä¬ÈÏ" },
-  { value: "song", label: "ËÎÌå" },
-  { value: "kai", label: "¿¬Ìå" },
-  { value: "hei", label: "ºÚÌå" },
-  { value: "fang", label: "·ÂËÎ" },
+  { value: "default", label: "ç³»ç»Ÿé»˜è®¤" },
+  { value: "song", label: "å®‹ä½“" },
+  { value: "kai", label: "æ¥·ä½“" },
+  { value: "hei", label: "é»‘ä½“" },
+  { value: "fang", label: "ä»¿å®‹" },
 ]
 const enFonts = [
   { value: "default", label: "System" },
@@ -199,7 +199,7 @@ watch(
             class="absolute right-0 top-full mt-1 w-48 rounded-lg border shadow-lg p-3 z-50"
             :class="isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-border'"
           >
-            <div class="text-xs font-medium mb-2 text-muted dark:text-gray-400">ÖÐÎÄ</div>
+            <div class="text-xs font-medium mb-2 text-muted dark:text-gray-400">ä¸­æ–‡</div>
             <div class="flex flex-wrap gap-1 mb-3">
               <button
                 v-for="f in cnFonts"

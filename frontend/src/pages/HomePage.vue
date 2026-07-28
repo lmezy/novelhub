@@ -1,4 +1,4 @@
-<script setup lang="ts">
+ï»¿<script setup lang="ts">
 import { onMounted, ref } from "vue"
 import { useBooksStore, type Book } from "../stores/books"
 import { useAuthStore } from "../stores/auth"
@@ -10,12 +10,12 @@ const auth = useAuthStore()
 const recentReads = ref<Book[]>([])
 
 async function deleteBook(id: string, title: string) {
-  if (!confirm('È·¶¨É¾³ı¡¶' + title + '¡·£¿´Ë²Ù×÷²»¿É³·Ïú¡£')) return
+  if (!confirm('ç¡®å®šåˆ é™¤ã€Š' + title + 'ã€‹ï¼Ÿæ­¤æ“ä½œä¸å¯æ’¤é”€ã€‚')) return
   try {
     await api.delete('/books/' + id)
     await store.fetchBooks()
   } catch (e) {
-    alert(e instanceof Error ? e.message : "É¾³ıÊ§°Ü")
+    alert(e instanceof Error ? e.message : "åˆ é™¤å¤±è´¥")
   }
 }
 
@@ -40,9 +40,8 @@ onMounted(async () => {
     <NavBar />
 
     <main class="max-w-5xl mx-auto px-4 py-8">
-      <!-- Recent Reads -->
       <section v-if="recentReads.length > 0" class="mb-10">
-        <h2 class="text-lg font-semibold mb-3">¼ÌĞøÔÄ¶Á</h2>
+        <h2 class="text-lg font-semibold mb-3">ç»§ç»­é˜…è¯»</h2>
         <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
           <router-link
             v-for="b in recentReads.slice(0, 4)"
@@ -51,30 +50,29 @@ onMounted(async () => {
             class="p-3 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 hover:shadow-sm hover:border-accent/30 transition-all no-underline"
           >
             <p class="text-sm font-medium truncate">{{ b.title }}</p>
-            <p class="text-xs text-muted dark:text-gray-400 mt-1">{{ b.status || 'ÔÄ¶ÁÖĞ' }}</p>
+            <p class="text-xs text-muted dark:text-gray-400 mt-1">{{ b.status || 'é˜…è¯»ä¸­' }}</p>
           </router-link>
         </div>
       </section>
 
-      <!-- Library -->
       <section>
         <div class="flex items-center justify-between mb-6">
-          <h1 class="text-2xl font-bold tracking-tight">Êé¼Ü</h1>
-          <span class="text-sm text-muted dark:text-gray-400">{{ store.books.length }} ±¾</span>
+          <h1 class="text-2xl font-bold tracking-tight">ä¹¦æ¶</h1>
+          <span class="text-sm text-muted dark:text-gray-400">{{ store.books.length }} æœ¬</span>
         </div>
 
-        <p v-if="store.loading" class="text-muted dark:text-gray-400">¼ÓÔØÖĞ...</p>
+        <p v-if="store.loading" class="text-muted dark:text-gray-400">åŠ è½½ä¸­...</p>
         <p v-else-if="store.error" class="text-red-600">{{ store.error }}</p>
 
         <div v-else-if="store.books.length === 0" class="text-center py-16">
-          <p class="text-muted dark:text-gray-400 text-lg mb-2">Êé¼ÜÊÇ¿ÕµÄ</p>
+          <p class="text-muted dark:text-gray-400 text-lg mb-2">ä¹¦æ¶æ˜¯ç©ºçš„</p>
           <p class="text-sm text-muted dark:text-gray-400">
-            ´´½¨Ò»¸öÊéÔ´²¢´¥·¢Í¬²½À´µ¼ÈëµÚÒ»±¾Êé¡£
+            åˆ›å»ºä¸€ä¸ªä¹¦æºå¹¶è§¦å‘åŒæ­¥æ¥å¯¼å…¥ç¬¬ä¸€æœ¬ä¹¦ã€‚
           </p>
           <router-link
             to="/admin"
             class="inline-block mt-4 text-sm text-accent hover:underline"
-          >Ç°Íù¹ÜÀí</router-link>
+          >å‰å¾€ç®¡ç†</router-link>
         </div>
 
         <div v-else class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -88,7 +86,7 @@ onMounted(async () => {
               v-if="auth.isAdmin"
               @click.prevent.stop="deleteBook(book.id, book.title)"
               class="absolute top-2 right-2 text-xs text-red-400 hover:text-red-600 opacity-0 group-hover:opacity-100 transition-opacity"
-              title="É¾³ıÕâ±¾Êé"
+              title="åˆ é™¤è¿™æœ¬ä¹¦"
             >&times;</button>
             <h3 class="font-semibold text-ink mb-1 truncate">{{ book.title }}</h3>
             <p v-if="book.author_name" class="text-xs text-muted dark:text-gray-400 mb-1">{{ book.author_name }}</p>
@@ -100,13 +98,13 @@ onMounted(async () => {
               >{{ tag }}</span>
             </div>
             <p class="text-sm text-muted dark:text-gray-400 line-clamp-2 mb-3">
-              {{ book.description || "ÔİÎŞ¼ò½é" }}
+              {{ book.description || "æš‚æ— ç®€ä»‹" }}
             </p>
             <div class="flex items-center gap-2">
               <span
                 class="text-xs px-2 py-0.5 rounded-full"
                 :class="book.status === 'completed' ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'"
-              >{{ book.status === 'completed' ? 'ÒÑÍê½á' : book.status || 'Á¬ÔØÖĞ' }}</span>
+              >{{ book.status === 'completed' ? 'å·²å®Œç»“' : book.status || 'è¿è½½ä¸­' }}</span>
               <span class="text-xs text-muted dark:text-gray-400 ml-auto">
                 {{ new Date(book.updated_at).toLocaleDateString() }}
               </span>
