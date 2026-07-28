@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir \
     -r crawler_req.txt
 
 # Install Playwright system dependencies and Chromium browser
+ENV PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright/
 RUN playwright install-deps chromium && \
     playwright install chromium
 
