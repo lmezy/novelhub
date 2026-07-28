@@ -16,9 +16,40 @@ const chapters = ref<Chapter[]>([])
 const loading = ref(true)
 const error = ref("")
 const fontSize = ref(18)
+const cnFont = ref(localStorage.getItem("novelhub_cn_font") || "default")
+const enFont = ref(localStorage.getItem("novelhub_en_font") || "default")
+const showFontMenu = ref(false)
 const isDark = ref(localStorage.getItem("novelhub_dark") === "true")
 const showToc = ref(false)
 const showAI = ref(false)
+
+const cnFonts = [
+  { value: "default", label: "系统默认" },
+  { value: "song", label: "宋体" },
+  { value: "kai", label: "楷体" },
+  { value: "hei", label: "黑体" },
+  { value: "fang", label: "仿宋" },
+]
+const enFonts = [
+  { value: "default", label: "System" },
+  { value: "serif", label: "Serif" },
+  { value: "sans", label: "Sans" },
+  { value: "mono", label: "Mono" },
+]
+
+const cnFontStack: Record<string, string> = {
+  default: "",
+  song: '"SimSun", "Noto Serif CJK SC", "Source Han Serif SC", serif',
+  kai: '"KaiTi", "Noto Serif CJK SC", "STKaiti", serif',
+  hei: '"SimHei", "Noto Sans CJK SC", "Source Han Sans SC", "Microsoft YaHei", sans-serif',
+  fang: '"FangSong", "Noto Serif CJK SC", "STFangsong", serif',
+}
+const enFontStack: Record<string, string> = {
+  default: "",
+  serif: 'Georgia, "Times New Roman", "Noto Serif", serif',
+  sans: 'system-ui, -apple-system, "Segoe UI", "Noto Sans", sans-serif',
+  mono: '"Courier New", "Consolas", "JetBrains Mono", monospace',
+}
 
 const bookId = computed(() => route.params.bookId as string)
 const chapterId = computed(() => route.params.chapterId as string)
@@ -30,6 +61,16 @@ const prevChapter = computed(() =>
 const nextChapter = computed(() =>
   currentIndex.value < chapters.value.length - 1 ? chapters.value[currentIndex.value + 1] : null,
 )
+
+const readerFontStyle = computed(() => {
+  const cn = cnFontStack[cnFont.value] || ""
+  const en = enFontStack[enFont.value] || ""
+  const stack = [en, cn].filter(Boolean).join(", ")
+  return {
+    fontSize: fontSize.value + "px",
+    ...(stack ? { fontFamily: stack } : {}),
+  }
+})
 
 let scrollTimer: ReturnType<typeof setTimeout>
 
@@ -53,6 +94,15 @@ function toggleDark() {
   isDark.value = !isDark.value
   localStorage.setItem("novelhub_dark", String(isDark.value))
   document.documentElement.classList.toggle("dark", isDark.value)
+}
+
+function setCnFont(f: string) {
+  cnFont.value = f
+  localStorage.setItem("novelhub_cn_font", f)
+}
+function setEnFont(f: string) {
+  enFont.value = f
+  localStorage.setItem("novelhub_en_font", f)
 }
 
 async function saveProgress() {
@@ -129,21 +179,66 @@ watch(
       <div class="flex items-center gap-2">
         <button
           @click="fontSize = Math.max(14, fontSize - 2)"
-          class="w-7 h-7 flex items-center justify-center rounded hover:bg-black/10 transition-colors text-sm"
+          class="w-7 h-7 flex items-center justify-center rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors text-sm"
           title="Smaller font"
         >A-</button>
         <button
           @click="fontSize = Math.min(26, fontSize + 2)"
-          class="w-7 h-7 flex items-center justify-center rounded hover:bg-black/10 transition-colors text-sm"
+          class="w-7 h-7 flex items-center justify-center rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors text-sm"
           title="Larger font"
         >A+</button>
+        <div class="relative">
+          <button
+            @click="showFontMenu = !showFontMenu"
+            class="w-7 h-7 flex items-center justify-center rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors text-sm"
+            :class="(cnFont !== 'default' || enFont !== 'default') ? 'text-accent' : ''"
+            title="Font settings"
+          >F</button>
+          <div
+            v-if="showFontMenu"
+            class="absolute right-0 top-full mt-1 w-48 rounded-lg border shadow-lg p-3 z-50"
+            :class="isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-border'"
+          >
+            <div class="text-xs font-medium mb-2 text-muted dark:text-gray-400">中文</div>
+            <div class="flex flex-wrap gap-1 mb-3">
+              <button
+                v-for="f in cnFonts"
+                :key="f.value"
+                @click="setCnFont(f.value)"
+                class="text-xs px-2 py-1 rounded transition-colors"
+                :class="cnFont === f.value
+                  ? 'bg-accent text-white'
+                  : isDark ? 'bg-gray-700 hover:bg-gray-600' : 'bg-gray-100 hover:bg-gray-200'"
+              >{{ f.label }}</button>
+            </div>
+            <div class="text-xs font-medium mb-2 text-muted dark:text-gray-400">English</div>
+            <div class="flex flex-wrap gap-1">
+              <button
+                v-for="f in enFonts"
+                :key="f.value"
+                @click="setEnFont(f.value)"
+                class="text-xs px-2 py-1 rounded transition-colors"
+                :class="enFont === f.value
+                  ? 'bg-accent text-white'
+                  : isDark ? 'bg-gray-700 hover:bg-gray-600' : 'bg-gray-100 hover:bg-gray-200'"
+              >{{ f.label }}</button>
+            </div>
+          </div>
+        </div>
         <button
           @click="toggleDark"
-          class="w-7 h-7 flex items-center justify-center rounded hover:bg-black/10 transition-colors text-sm"
+          class="w-7 h-7 flex items-center justify-center rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors text-sm"
           :title="isDark ? 'Light mode' : 'Dark mode'"
         >{{ isDark ? '\u2600' : '\u263e' }}</button>
       </div>
     </header>
+
+    <!-- click-outside to close font menu -->
+    <div
+      v-if="showFontMenu"
+      class="fixed inset-0 z-30"
+      @click="showFontMenu = false"
+    />
 
     <main class="max-w-3xl mx-auto px-4 py-10">
       <p v-if="loading" class="text-center py-16">Loading...</p>
@@ -152,7 +247,7 @@ watch(
       <article
         v-else-if="chapter"
         class="reader-content prose"
-        :style="{ fontSize: fontSize + 'px' }"
+        :style="readerFontStyle"
       >
         <h1 class="text-2xl font-bold mb-8 text-center">
           {{ chapter.title || 'Chapter ' + chapter.chapter_number }}
@@ -211,7 +306,6 @@ watch(
       </div>
     </Teleport>
 
-    <!-- AI Chat Panel -->
     <Teleport to="body">
       <div
         v-if="showAI"
