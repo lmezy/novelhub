@@ -31,6 +31,16 @@ async function loadSources() {
   sources.value = await api.get<Source[]>("/sources")
 }
 
+
+async function deleteSource(id: string) {
+  if (!confirm(i18n.t('admin_delete_source_confirm', { id }))) return
+  try {
+    await api.delete("/sources/" + id)
+    await loadSources()
+  } catch (e) {
+    sourceError.value = e instanceof Error ? e.message : "Delete failed"
+  }
+}
 async function createSource() {
   sourceError.value = ""
   try {
@@ -337,7 +347,7 @@ onMounted(async () => {
               <span class="text-sm font-medium">{{ s.name }}</span>
               <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ s.id }} ({{ s.plugin_name }})</span>
             </div>
-            <span class="text-xs" :class="s.enabled ? 'text-green-600' : 'text-red-500'">{{ s.enabled ? i18n.t('admin_enabled') : i18n.t('admin_disabled') }}</span>
+            <div class="flex items-center gap-3"><span class="text-xs" :class="s.enabled ? 'text-green-600' : 'text-red-500'">{{ s.enabled ? i18n.t('admin_enabled') : i18n.t('admin_disabled') }}</span><button @click="deleteSource(s.id)" class="text-xs text-red-500 hover:text-red-700">{{ i18n.t('admin_delete') }}</button></div>
           </div>
           <p v-if="sources.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">{{ i18n.t('admin_no_sources') }}</p>
         </div>
