@@ -1,5 +1,6 @@
 ﻿"""Source credential management for auto-login fallback."""
 
+from datetime import datetime
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -31,7 +32,7 @@ class CredentialOut(BaseModel):
     source: str
     username: str
     enabled: bool
-    created_at: str | None = None
+    created_at: datetime | None = None
 
     class Config:
         from_attributes = True
