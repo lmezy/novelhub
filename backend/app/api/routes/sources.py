@@ -3,7 +3,7 @@ from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.models import Source, Book, Cookie, CrawlTask, CrawlLog
+from app.models import Source, Book, Cookie, CrawlTask, CrawlLog, User
 from app.models.source_credential import SourceCredential
 from app.schemas.source import SourceCreate, SourceOut
 from app.services.auth import get_current_user, require_admin
