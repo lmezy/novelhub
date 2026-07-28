@@ -15,17 +15,17 @@ celery_app.conf.update(
     enable_utc=True,
     beat_schedule={
         "daily-sync-all-sources": {
-            "task": "app.tasks.sync_all_sources",
+            "task": "tasks.sync_all_sources",
             "schedule": 86400.0,
         },
         "daily-incremental-backup": {
-            "task": "app.tasks.daily_backup",
+            "task": "tasks.daily_backup",
             "schedule": 86400.0,
         },
         "weekly-full-backup": {
-            "task": "app.tasks.weekly_backup",
+            "task": "tasks.weekly_backup",
             "schedule": 604800.0,
         },
     },
 )
-import app.tasks  # noqa: F401 â€” register tasks for discovery
+import tasks  # noqa: F401 â€?register tasks for discovery

@@ -6,7 +6,7 @@ from celery_app import celery_app
 logger = get_task_logger(__name__)
 
 
-@celery_app.task(name="app.tasks.sync_all_sources")
+@celery_app.task(name="tasks.sync_all_sources")
 def sync_all_sources() -> dict:
     from app.core.database import SessionLocal
     from app.repositories.source import SourceRepository
@@ -28,7 +28,7 @@ def sync_all_sources() -> dict:
     return asyncio.run(_run())
 
 
-@celery_app.task(name="app.tasks.crawl_source", bind=True, max_retries=3)
+@celery_app.task(name="tasks.crawl_source", bind=True, max_retries=3)
 def crawl_source(self, source_id: str) -> dict:
     import asyncio
 
@@ -44,7 +44,7 @@ def crawl_source(self, source_id: str) -> dict:
         raise self.retry(exc=exc, countdown=300)
 
 
-@celery_app.task(name="app.tasks.daily_backup")
+@celery_app.task(name="tasks.daily_backup")
 def daily_backup() -> dict:
     """Daily incremental backup -- runs every day."""
     import asyncio
@@ -62,7 +62,7 @@ def daily_backup() -> dict:
         return {"status": "failed", "error": str(exc)}
 
 
-@celery_app.task(name="app.tasks.weekly_backup")
+@celery_app.task(name="tasks.weekly_backup")
 def weekly_backup() -> dict:
     """Weekly full backup -- runs every Sunday."""
     import asyncio
