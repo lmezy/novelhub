@@ -1,34 +1,20 @@
-﻿import asyncio
-import signal
-
-from loguru import logger
-
-from crawler_service import run_crawl_for_source
+"""Celery worker — processes crawl tasks from the shared Redis queue."""
+import subprocess
+import sys
 
 
-running = True
-
-
-def shutdown(sig, frame):
-    global running
-    logger.info("Crawler stopping...")
-    running = False
-
-
-signal.signal(signal.SIGTERM, shutdown)
-signal.signal(signal.SIGINT, shutdown)
-
-
-async def main():
-    logger.info("NovelHub Crawler started")
-    try:
-        while running:
-            logger.info("Crawler heartbeat")
-            await asyncio.sleep(60)
-    except asyncio.CancelledError:
-        pass
-    logger.info("Crawler stopped")
+def main() -> None:
+    subprocess.run(
+        [
+            sys.executable, "-m", "celery",
+            "-A", "celery_app",
+            "worker",
+            "-l", "info",
+        ],
+        cwd="/app/scheduler_app",
+        check=False,
+    )
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

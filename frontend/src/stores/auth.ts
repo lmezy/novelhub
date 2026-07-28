@@ -11,10 +11,17 @@ export interface User {
 
 export const useAuthStore = defineStore("auth", () => {
   const user = ref<User | null>(null)
+const isDark = ref(localStorage.getItem('novelhub_dark') === 'true')
   const token = ref<string | null>(localStorage.getItem("novelhub_token"))
 
   const isAuthenticated = computed(() => !!token.value)
   const isAdmin = computed(() => user.value?.is_admin ?? false)
+
+function toggleDark() {
+  isDark.value = !isDark.value
+  localStorage.setItem('novelhub_dark', String(isDark.value))
+  document.documentElement.classList.toggle('dark', isDark.value)
+}
 
   async function login(username: string, password: string) {
     const res = await api.post<{ access_token: string; user: User }>("/auth/login", {

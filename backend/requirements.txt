@@ -19,3 +19,10 @@ meilisearch
 httpx
 lxml
 beautifulsoup4
+ebooklib
+numpy
+zstandard
+
+pytest
+pytest-asyncio
+httpx

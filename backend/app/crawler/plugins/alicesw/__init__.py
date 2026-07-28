@@ -5,6 +5,7 @@ from app.crawler.plugins.alicesw.config import AliceSWConfig
 from app.crawler.plugins.alicesw.crawler import AliceSWCrawler
 from app.crawler.plugins.alicesw.login import AliceSWLogin
 from app.crawler.plugins.alicesw.parser import AliceSWParser
+from app.crawler.plugins.alicesw.updater import AliceSWUpdater
 
 
 class AliceSWPlugin:
@@ -17,6 +18,7 @@ class AliceSWPlugin:
         self.login = AliceSWLogin(source_id=self.name)
         self.crawler = AliceSWCrawler(config=self.config)
         self.parser = AliceSWParser(config=self.config)
+        self.updater = AliceSWUpdater(config=self.config, crawler=self.crawler, parser=self.parser)
 
     async def fetch_book(self, url: str) -> RemoteBook:
         html = await self.crawler.get(url)
@@ -34,8 +36,10 @@ class AliceSWPlugin:
         return self.parser.parse_bookshelf(html)
 
     async def update_book(self, url: str) -> RemoteBook | None:
+        result = await self.updater.check_for_updates(url, set())
         return await self.fetch_book(url)
 
     def set_cookie(self, cookie: str) -> None:
         self.login.set_cookie(cookie)
         self.crawler.set_cookie(cookie)
+        self.updater.set_cookie(cookie)

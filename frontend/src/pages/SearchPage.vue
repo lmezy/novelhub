@@ -23,7 +23,7 @@ function doSearch() {
     try {
       const q = encodeURIComponent(query.value.trim())
       const res = await api.get<{ hits: any[]; total: number }>(
-        `/search?q=${q}&scope=${scope.value}&limit=30`,
+        "/search?q=" + q + "&scope=" + scope.value + "&limit=30",
       )
       results.value = res.hits
       total.value = res.total
@@ -42,7 +42,7 @@ watch(scope, () => {
 </script>
 
 <template>
-  <div class="min-h-screen bg-paper">
+  <div class="min-h-screen bg-paper dark:bg-gray-800 dark:bg-gray-950 dark:text-gray-100">
     <NavBar />
 
     <main class="max-w-3xl mx-auto px-4 py-8">
@@ -53,7 +53,7 @@ watch(scope, () => {
           v-model="query"
           type="search"
           placeholder="Search books, authors, content..."
-          class="flex-1 px-4 py-2.5 rounded-lg border border-border bg-surface text-ink placeholder:text-muted focus:outline-none focus:ring-2 focus:ring-accent/30 text-sm"
+          class="flex-1 px-4 py-2.5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-ink placeholder:text-muted dark:text-gray-400 focus:outline-none focus:ring-2 focus:ring-accent/30 text-sm"
           @keydown.enter="doSearch"
         />
         <button
@@ -68,31 +68,31 @@ watch(scope, () => {
           :key="s"
           @click="scope = s"
           class="text-xs px-3 py-1 rounded-full transition-colors"
-          :class="scope === s ? 'bg-accent text-white' : 'bg-gray-100 text-muted hover:bg-gray-200'"
+          :class="scope === s ? 'bg-accent text-white' : 'bg-gray-100 dark:bg-gray-700 text-muted dark:text-gray-400 hover:bg-gray-200'"
         >{{ s === 'books' ? 'Books' : 'Chapters' }}</button>
       </div>
 
-      <p v-if="searching" class="text-muted text-sm">Searching...</p>
+      <p v-if="searching" class="text-muted dark:text-gray-400 text-sm">Searching...</p>
 
       <template v-else-if="searched">
-        <p class="text-sm text-muted mb-4">{{ total }} results for "{{ query }}"</p>
+        <p class="text-sm text-muted dark:text-gray-400 mb-4">{{ total }} results for "{{ query }}"</p>
 
-        <p v-if="results.length === 0" class="text-muted">No results found.</p>
+        <p v-if="results.length === 0" class="text-muted dark:text-gray-400">No results found.</p>
 
-        <div class="divide-y divide-border border border-border rounded-lg bg-surface">
+        <div class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900">
           <div
             v-for="hit in results"
             :key="hit.id"
             class="px-4 py-3 hover:bg-accent/5 cursor-pointer transition-colors"
             @click="
               scope === 'books'
-                ? router.push(`/books/${hit.id}`)
-                : router.push(`/books/${hit.book_id}/chapters/${hit.id}`)
+                ? router.push('/books/' + hit.id)
+                : router.push('/books/' + hit.book_id + '/chapters/' + hit.id)
             "
           >
             <h3 class="text-sm font-medium mb-0.5">{{ hit.title }}</h3>
-            <p v-if="hit.author" class="text-xs text-muted">{{ hit.author }}</p>
-            <p v-if="hit.content" class="text-xs text-muted mt-1 line-clamp-2">
+            <p v-if="hit.author" class="text-xs text-muted dark:text-gray-400">{{ hit.author }}</p>
+            <p v-if="hit.content" class="text-xs text-muted dark:text-gray-400 mt-1 line-clamp-2">
               {{ hit.content.slice(0, 200) }}
             </p>
           </div>

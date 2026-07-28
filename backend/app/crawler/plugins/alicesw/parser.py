@@ -74,6 +74,9 @@ class AliceSWParser:
                 chapter_number=index,
             ))
 
+        # Extract tags
+        tags = self._extract_tags(soup)
+
         return RemoteBook(
             source_book_id=book_id,
             title=title,
@@ -141,8 +144,6 @@ class AliceSWParser:
         if href.startswith("/"):
             return self.config.base_url + href
         return self.config.base_url + "/" + href
-        # Extract tags
-        tags = self._extract_tags(soup)
 
     def _extract_tags(self, soup: BeautifulSoup) -> list[str]:
         """Extract category/genre tags from the book page."""

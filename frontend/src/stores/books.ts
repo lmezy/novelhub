@@ -60,3 +60,4 @@ export const useBooksStore = defineStore("books", () => {
   return { books, loading, error, fetchBooks, fetchBook, fetchChapters, fetchChapter }
 })
   tag_names: string[]
+  author_name: string | null

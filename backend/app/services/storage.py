@@ -39,7 +39,7 @@ class BookStorage:
         path = self.book_dir(author, title)
         path.mkdir(parents=True, exist_ok=True)
         file_path = path / f"{number:06d}.md"
-        markdown = f"# {chapter_title}\n\n{content.strip()}\n"
+        markdown = f"#{chapter_title}\n\n{content.strip()}\n"
         file_path.write_text(markdown, encoding="utf-8")
         content_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
         return str(file_path), content_hash

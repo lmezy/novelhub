@@ -15,6 +15,7 @@ docker compose up -d --build
 | Service | Port | Notes |
 |---------|------|-------|
 | Nginx gateway | 8088 | Unified entry |
+| AI (optional) | -- | Configure via AI_PROVIDER env |
 | Backend API | 8000 | FastAPI |
 | Frontend | 5173 | Vue 3 + Vite |
 | PostgreSQL | 5432 | Database |
@@ -41,14 +42,36 @@ Project scaffold, Docker Compose, .env, README.
 - **Error handling** &mdash; Global exception handlers
 - **Scheduler** &mdash; Celery + Redis Beat for daily sync
 
-### Stage 2 - AliceSW Plugin (pending)
-Cookie login, book listing, chapter sync, incremental update.
+### Stage 2 - AliceSW Plugin (done)
+Cookie login (login.py), HTTP crawler with rate limiting (crawler.py), HTML parsing for bookshelf/book/chapters (parser.py), incremental update detection (updater.py), site configuration (config.py). All five modules integrated via the plugin class.
 
-### Stage 3 - Web System (pending)
-Reader UI, search, user system.
+### Stage 3 - Web System (done)
+**Pages:** Home (library + recent reads), Book Detail (chapters, EPUB export, re-sync, admin delete), Reader (dark mode, font sizing, TOC sidebar, scroll-progress save, chapter nav), Search (books + chapters scope with Meilisearch), Login/Register, Admin (sources/cookies/sync/logs tabs with bookshelf sync).
 
-### Stage 4 - Advanced Features (pending)
-AI, RAG, EPUB export, multi-source, mobile.
+### Stage 4 - Advanced Features (in progress)
+- **EPUB export** -- done (GET /api/books/{id}/epub)
+- **Backup service** -- done (daily incremental + weekly full, tar.zst compression, restore support, /api/backup/*)
+- **AI assistant** -- done (POST /ai/chat, /ai/summary, /ai/person, /ai/timeline; multi-provider: OpenAI/Claude/Qwen/Ollama/Hermes)
+- **RAG (semantic search)** -- done (chapter chunking, embedding via AI provider, JSONB vector storage, cosine similarity search, /api/rag/*)
+- **AI Chat panel** -- done (reader page sidebar, auto-switches to RAG when indexed)
+- **Celery Beat tasks** -- done (daily sync, daily incremental backup, weekly full backup)
+- **NAS optimization** -- done (PostgreSQL tuned for UGREEN DX4600, resource limits, log rotation)
+- **Storage abstraction** -- done (local filesystem, S3/MinIO, WebDAV; switch via STORAGE_BACKEND env)
+- **Rate limiting** -- done (Redis-based middleware, 10/min/auth, 200/min/api)
+- **Mobile responsive** -- done (NavBar hamburger menu, responsive layout)
+- **API Token UI** -- done (Admin page Tokens tab for create/revoke)
+- **Qidian plugin** -- done (skeleton registered in crawler registry)
+- **Fanqie plugin** -- done (skeleton registered in crawler registry)
+- **System health** -- done (GET /api/health/detailed with PostgreSQL/Redis/Meilisearch/disk checks + Admin Status tab)
+- **Global dark mode** -- done (toggle in NavBar, persisted to localStorage, Tailwind darkMode class)
+- **Docker health checks** -- done (postgres pg_isready, redis-cli ping, backend curl /health)
+- **Security hardening** -- done (bcrypt passwords, AES-GCM cookie encryption, API token auth via X-API-Token header, admin-only routes)
+- **Plugin template** -- done (crawler/plugins/plugin_template.py with documented interface, plus qidian skeleton)
+- **Rate limiting** -- done (Redis-based middleware, 10/min/auth, 200/min/api)
+- **Mobile responsive** -- done (NavBar hamburger menu, responsive layout)
+- **API Token UI** -- done (Admin page Tokens tab for create/revoke)
+- **Plugin template** -- done (`crawler/plugins/plugin_template.py` with documented interface)
+- Multi-source plugins and mobile UI remain.
 
 ## Local Markdown Import
 

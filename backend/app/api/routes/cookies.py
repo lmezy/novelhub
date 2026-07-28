@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.models import Cookie, User
+from app.services.cookie_crypto import encrypt_cookie, decrypt_cookie
 from app.repositories.cookie import CookieRepository
 from app.schemas.cookie import CookieCreate, CookieOut, CookieUpdate
 from app.services.auth import require_admin
@@ -31,7 +32,7 @@ async def create_cookie(payload: CookieCreate, db: AsyncSession = Depends(get_db
     cookie = Cookie(
         id=str(uuid4()),
         source=payload.source,
-        cookie_data=payload.cookie_data,
+        cookie_data=encrypt_cookie(payload.cookie_data),
         expired_at=payload.expired_at,
     )
     return await repo.add(cookie)
@@ -53,7 +54,7 @@ async def update_cookie(cookie_id: str, payload: CookieUpdate, db: AsyncSession 
     if cookie is None:
         raise HTTPException(status_code=404, detail="Cookie not found")
     if payload.cookie_data is not None:
-        cookie.cookie_data = payload.cookie_data
+        cookie.cookie_data = encrypt_cookie(payload.cookie_data)
     if payload.expired_at is not None:
         cookie.expired_at = payload.expired_at
     await db.flush()

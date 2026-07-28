@@ -2,7 +2,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.models import User
 from app.schemas.sync import BookshelfSyncRequest, BookshelfSyncResult, SyncRequest, SyncResult
+from app.services.auth import require_admin
 from app.services.sync import SyncService
 
 
@@ -23,5 +25,3 @@ async def sync_bookshelf(payload: BookshelfSyncRequest, db: AsyncSession = Depen
         return await SyncService(db).sync_bookshelf(payload.source_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-from app.models import User
-from app.services.auth import require_admin

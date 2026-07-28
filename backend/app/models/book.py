@@ -25,3 +25,7 @@ class Book(Base):
     @property
     def tag_names(self) -> list[str]:
         return [bt.tag.name for bt in self.tags if bt.tag]
+    author = relationship("Author", lazy="joined")
+    @property
+    def author_name(self) -> str | None:
+        return self.author.name if self.author else None

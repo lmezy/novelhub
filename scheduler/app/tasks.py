@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 from celery.utils.log import get_task_logger
 
 from celery_app import celery_app
@@ -42,3 +42,39 @@ def crawl_source(self, source_id: str) -> dict:
     except Exception as exc:
         logger.exception("Crawl failed for source=%s, retry=%d", source_id, self.request.retries)
         raise self.retry(exc=exc, countdown=300)
+
+
+@celery_app.task(name="app.tasks.daily_backup")
+def daily_backup() -> dict:
+    """Daily incremental backup -- runs every day."""
+    import asyncio
+
+    async def _run():
+        from app.services.backup import BackupService
+        path = await BackupService().create_incremental_backup()
+        logger.info("Daily backup complete: %s", path)
+        return {"path": path, "status": "completed"}
+
+    try:
+        return asyncio.run(_run())
+    except Exception as exc:
+        logger.exception("Daily backup failed")
+        return {"status": "failed", "error": str(exc)}
+
+
+@celery_app.task(name="app.tasks.weekly_backup")
+def weekly_backup() -> dict:
+    """Weekly full backup -- runs every Sunday."""
+    import asyncio
+
+    async def _run():
+        from app.services.backup import BackupService
+        path = await BackupService().create_full_backup()
+        logger.info("Weekly full backup complete: %s", path)
+        return {"path": path, "status": "completed"}
+
+    try:
+        return asyncio.run(_run())
+    except Exception as exc:
+        logger.exception("Weekly backup failed")
+        return {"status": "failed", "error": str(exc)}

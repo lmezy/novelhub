@@ -1,25 +1,20 @@
-﻿import time
-import signal
+"""Celery beat + worker entrypoint — scheduled syncs and crawl task execution."""
+import subprocess
 import sys
 
-running = True
 
-
-def shutdown(sig, frame):
-    global running
-    running = False
-
-
-signal.signal(signal.SIGTERM, shutdown)
-signal.signal(signal.SIGINT, shutdown)
-
-
-def main():
-    print("NovelHub Scheduler started")
-    while running:
-        print("Scheduler heartbeat")
-        time.sleep(60)
-    print("Scheduler stopped")
+def main() -> None:
+    subprocess.run(
+        [
+            sys.executable, "-m", "celery",
+            "-A", "celery_app",
+            "worker",
+            "-B",
+            "-l", "info",
+        ],
+        cwd="/app/scheduler_app",
+        check=False,
+    )
 
 
 if __name__ == "__main__":

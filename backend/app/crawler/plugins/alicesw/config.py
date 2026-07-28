@@ -37,6 +37,10 @@ class AliceSWConfig:
         # Chapter content
         "chapter_content": "div.content, div#content, .chapter-content",
         "chapter_title_sel": "h1.chapter-title, .chapter-name",
+        # Tags
+        "book_tags": "a.tag-item, span.tag, .book-tag, .category-tag",
+        "book_tag_list": "div.book-tags, .tag-list, .categories",
+
     })
 
     # Rate limiting
@@ -48,6 +52,3 @@ class AliceSWConfig:
 
 
 default_config = AliceSWConfig()
-        # Tags
-        "book_tags": "a.tag-item, span.tag, .book-tag, .category-tag",
-        "book_tag_list": "div.book-tags, .tag-list, .categories",

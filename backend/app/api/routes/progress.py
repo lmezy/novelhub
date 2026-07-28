@@ -1,6 +1,6 @@
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,3 +29,16 @@ async def upsert_progress(payload: ReadingProgressUpsert, db: AsyncSession = Dep
     await db.commit()
     await db.refresh(progress)
     return progress
+@router.get("", response_model=list[ReadingProgressOut])
+async def list_progress(
+    user_id: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.scalars(
+        select(ReadingProgress)
+        .where(ReadingProgress.user_id == user_id)
+        .order_by(ReadingProgress.updated_at.desc())
+        .limit(20)
+    )
+    return list(result)
+

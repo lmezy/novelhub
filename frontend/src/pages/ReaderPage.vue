@@ -1,11 +1,15 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue"
+import { computed, onMounted, onUnmounted, ref, watch } from "vue"
 import { useRoute, useRouter } from "vue-router"
 import { useBooksStore, type Chapter, type ChapterContent } from "../stores/books"
+import { useAuthStore } from "../stores/auth"
+import { api } from "../api/client"
+import AIChat from "../components/AIChat.vue"
 
 const route = useRoute()
 const router = useRouter()
 const store = useBooksStore()
+const auth = useAuthStore()
 
 const chapter = ref<ChapterContent | null>(null)
 const chapters = ref<Chapter[]>([])
@@ -14,6 +18,7 @@ const error = ref("")
 const fontSize = ref(18)
 const isDark = ref(localStorage.getItem("novelhub_dark") === "true")
 const showToc = ref(false)
+const showAI = ref(false)
 
 const bookId = computed(() => route.params.bookId as string)
 const chapterId = computed(() => route.params.chapterId as string)
@@ -26,10 +31,40 @@ const nextChapter = computed(() =>
   currentIndex.value < chapters.value.length - 1 ? chapters.value[currentIndex.value + 1] : null,
 )
 
+let scrollTimer: ReturnType<typeof setTimeout>
+
+function onScroll() {
+  clearTimeout(scrollTimer)
+  scrollTimer = setTimeout(() => {
+    if (!auth.user) return
+    const scrollPercent = Math.round(
+      (window.scrollY / (document.documentElement.scrollHeight - window.innerHeight)) * 100
+    )
+    api.put("/progress", {
+      user_id: auth.user.id,
+      book_id: bookId.value,
+      chapter_id: chapterId.value,
+      position: scrollPercent,
+    }).catch(() => {})
+  }, 2000)
+}
+
 function toggleDark() {
   isDark.value = !isDark.value
   localStorage.setItem("novelhub_dark", String(isDark.value))
   document.documentElement.classList.toggle("dark", isDark.value)
+}
+
+async function saveProgress() {
+  if (!auth.user || !chapter.value) return
+  try {
+    await api.put("/progress", {
+      user_id: auth.user.id,
+      book_id: bookId.value,
+      chapter_id: chapterId.value,
+      position: currentIndex.value,
+    })
+  } catch { /* non-critical */ }
 }
 
 async function loadChapter(id: string) {
@@ -37,6 +72,7 @@ async function loadChapter(id: string) {
   error.value = ""
   try {
     chapter.value = await store.fetchChapter(id)
+    await saveProgress()
   } catch (e) {
     error.value = e instanceof Error ? e.message : "Failed to load chapter"
   } finally {
@@ -46,12 +82,16 @@ async function loadChapter(id: string) {
 
 onMounted(async () => {
   document.documentElement.classList.toggle("dark", isDark.value)
+  window.addEventListener("scroll", onScroll, { passive: true })
   try {
     chapters.value = await store.fetchChapters(bookId.value)
-  } catch {
-    // non-fatal
-  }
+  } catch { /* non-fatal */ }
   await loadChapter(chapterId.value)
+})
+
+onUnmounted(() => {
+  window.removeEventListener("scroll", onScroll)
+  clearTimeout(scrollTimer)
 })
 
 watch(
@@ -64,18 +104,26 @@ watch(
 
 <template>
   <div class="min-h-screen" :class="isDark ? 'bg-gray-950 text-gray-100' : 'bg-paper text-ink'">
-    <!-- Top bar -->
     <header
       class="sticky top-0 z-40 border-b h-12 flex items-center justify-between px-4"
       :class="isDark ? 'bg-gray-900/90 border-gray-800' : 'bg-surface/80 border-border'"
     >
       <div class="flex items-center gap-3">
         <button
-          @click="router.push(`/books/${bookId}`)"
+          @click="router.push('/books/' + bookId)"
           class="text-sm hover:opacity-70 transition-opacity"
-        >&larr; TOC</button>
+        >&larr; Book</button>
+        <button
+          @click="showToc = !showToc"
+          class="text-sm hover:opacity-70 transition-opacity"
+        >TOC</button>
+        <button
+          @click="showAI = !showAI"
+          class="text-sm hover:opacity-70 transition-opacity"
+          :class="showAI ? 'text-accent' : ''"
+        >AI</button>
         <span v-if="chapter" class="text-sm truncate max-w-[200px]">
-          {{ chapter.title || `Chapter ${chapter.chapter_number}` }}
+          {{ chapter.title || 'Chapter ' + chapter.chapter_number }}
         </span>
       </div>
       <div class="flex items-center gap-2">
@@ -93,11 +141,10 @@ watch(
           @click="toggleDark"
           class="w-7 h-7 flex items-center justify-center rounded hover:bg-black/10 transition-colors text-sm"
           :title="isDark ? 'Light mode' : 'Dark mode'"
-        >{{ isDark ? '☀' : '☾' }}</button>
+        >{{ isDark ? '\u2600' : '\u263e' }}</button>
       </div>
     </header>
 
-    <!-- Content -->
     <main class="max-w-3xl mx-auto px-4 py-10">
       <p v-if="loading" class="text-center py-16">Loading...</p>
       <p v-else-if="error" class="text-center py-16 text-red-500">{{ error }}</p>
@@ -108,12 +155,11 @@ watch(
         :style="{ fontSize: fontSize + 'px' }"
       >
         <h1 class="text-2xl font-bold mb-8 text-center">
-          {{ chapter.title || `Chapter ${chapter.chapter_number}` }}
+          {{ chapter.title || 'Chapter ' + chapter.chapter_number }}
         </h1>
         <div v-html="chapter.content.replace(/\n\n/g, '</p><p>').replace(/\n/g, '<br>')" />
       </article>
 
-      <!-- Navigation -->
       <nav
         v-if="chapter"
         class="flex items-center justify-between mt-12 pt-6 border-t"
@@ -121,21 +167,19 @@ watch(
       >
         <router-link
           v-if="prevChapter"
-          :to="`/books/${bookId}/chapters/${prevChapter.id}`"
+          :to="'/books/' + bookId + '/chapters/' + prevChapter.id"
           class="text-sm hover:opacity-70 transition-opacity no-underline"
-        >&larr; {{ prevChapter.title || `Ch. ${prevChapter.chapter_number}` }}</router-link>
+        >&larr; {{ prevChapter.title || 'Ch. ' + prevChapter.chapter_number }}</router-link>
         <span v-else class="text-sm text-muted">Start</span>
-
         <router-link
           v-if="nextChapter"
-          :to="`/books/${bookId}/chapters/${nextChapter.id}`"
+          :to="'/books/' + bookId + '/chapters/' + nextChapter.id"
           class="text-sm hover:opacity-70 transition-opacity no-underline"
-        >{{ nextChapter.title || `Ch. ${nextChapter.chapter_number}` }} &rarr;</router-link>
+        >{{ nextChapter.title || 'Ch. ' + nextChapter.chapter_number }} &rarr;</router-link>
         <span v-else class="text-sm text-muted">End</span>
       </nav>
     </main>
 
-    <!-- TOC sidebar overlay -->
     <Teleport to="body">
       <div
         v-if="showToc"
@@ -153,7 +197,7 @@ watch(
           <router-link
             v-for="ch in chapters"
             :key="ch.id"
-            :to="`/books/${bookId}/chapters/${ch.id}`"
+            :to="'/books/' + bookId + '/chapters/' + ch.id"
             @click="showToc = false"
             class="block py-1.5 text-sm no-underline truncate"
             :class="
@@ -161,9 +205,32 @@ watch(
                 ? 'text-accent font-medium'
                 : isDark ? 'text-gray-400 hover:text-gray-200' : 'text-muted hover:text-ink'
             "
-          >{{ ch.chapter_number }}. {{ ch.title || `Chapter ${ch.chapter_number}` }}</router-link>
+          >{{ ch.chapter_number }}. {{ ch.title || 'Chapter ' + ch.chapter_number }}</router-link>
         </div>
         <div class="flex-1" @click="showToc = false" />
+      </div>
+    </Teleport>
+
+    <!-- AI Chat Panel -->
+    <Teleport to="body">
+      <div
+        v-if="showAI"
+        class="fixed inset-0 z-50 flex justify-end"
+        @click.self="showAI = false"
+      >
+        <div
+          class="w-80 h-full shadow-xl flex flex-col"
+          :class="isDark ? 'bg-gray-900' : 'bg-surface'"
+        >
+          <div class="flex items-center justify-between px-4 py-2 border-b" :class="isDark ? 'border-gray-800' : 'border-border'">
+            <span class="text-sm font-medium">AI Chat</span>
+            <button @click="showAI = false" class="text-muted text-lg">&times;</button>
+          </div>
+          <div class="flex-1 overflow-hidden">
+            <AIChat :bookId="bookId" />
+          </div>
+        </div>
+        <div class="flex-1" @click="showAI = false" />
       </div>
     </Teleport>
   </div>

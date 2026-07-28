@@ -31,6 +31,10 @@ class SyncService:
         author = await self._get_or_create_author(remote_book.author)
         book, is_new = await self._get_or_create_book(source.id, author.id, remote_book)
 
+        # Save tags from remote book
+        if remote_book.tags:
+            await self._save_tags(book.id, remote_book.tags)
+
         self.storage.write_metadata(
             remote_book.author,
             remote_book.title,
@@ -47,7 +51,6 @@ class SyncService:
         search_service.index_book({
             "id": book.id,
             "title": book.title,
-            "author": remote_book.author,
             "description": book.description or "",
             "status": book.status or "",
             "source_id": book.source_id or "",
@@ -179,9 +182,6 @@ class SyncService:
                 results.append({"url": shelf_book.url, "status": "failed", "error": str(exc)})
 
         return {"source_id": source_id, "total": len(shelf_books), "results": results}
-        # Save tags
-        if remote_book.tags:
-            await self._save_tags(book.id, remote_book.tags)
 
     async def _save_tags(self, book_id: str, tag_names: list[str]) -> None:
         """Create or get tags and associate them with the book."""
@@ -205,3 +205,23 @@ class SyncService:
             bt = BookTag(book_id=book_id, tag_id=tag.id)
             self.db.add(bt)
         await self.db.flush()
+    async def resync_book(self, book_id: str) -> dict:
+        """Re-sync a book already in the library from its source."""
+        book = await self.db.get(Book, book_id)
+        if book is None:
+            raise ValueError("Book not found")
+        if not book.source_id or not book.source_book_id:
+            raise ValueError("Book has no source reference")
+        source = await self.db.get(Source, book.source_id)
+        if source is None:
+            raise ValueError("Source not found")
+        plugin = get_plugin(source.plugin_name)
+        # Construct URL from config
+        cfg = plugin.config if hasattr(plugin, 'config') else None
+        if cfg and hasattr(cfg, 'book_url'):
+            url = cfg.base_url + cfg.book_url.format(book_id=book.source_book_id)
+        else:
+            url = source.url or ""
+            if not url:
+                raise ValueError("Cannot determine book URL for re-sync")
+        return await self.sync_book(book.source_id, url)

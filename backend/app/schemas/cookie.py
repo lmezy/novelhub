@@ -22,3 +22,7 @@ class CookieOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class CookieMaskedOut(CookieOut):
+    cookie_data: str = "***encrypted***"

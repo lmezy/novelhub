@@ -6,12 +6,14 @@ from fastapi.responses import JSONResponse
 from app.api.router import router as api_router
 from app.core.config import settings
 from app.core.logging import setup_logging
+from app.core.rate_limit import RateLimitMiddleware
 from app.core.error_handlers import generic_exception_handler, value_error_handler
 
 setup_logging()
 
 app = FastAPI(title=settings.PROJECT_NAME, version=settings.VERSION)
 
+app.add_middleware(RateLimitMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

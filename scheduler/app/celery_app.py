@@ -1,4 +1,4 @@
-﻿from celery import Celery
+from celery import Celery
 from app.core.config import settings
 
 celery_app = Celery(
@@ -18,5 +18,14 @@ celery_app.conf.update(
             "task": "app.tasks.sync_all_sources",
             "schedule": 86400.0,
         },
+        "daily-incremental-backup": {
+            "task": "app.tasks.daily_backup",
+            "schedule": 86400.0,
+        },
+        "weekly-full-backup": {
+            "task": "app.tasks.weekly_backup",
+            "schedule": 604800.0,
+        },
     },
 )
+import app.tasks  # noqa: F401 — register tasks for discovery

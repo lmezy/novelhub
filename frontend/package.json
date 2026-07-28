@@ -19,23 +19,23 @@
 
 "dependencies":{
 
-"vue":"latest",
+"vue":"^3.5",
 
-"pinia":"latest",
+"pinia":"^2.2",
 
-"vue-router":"latest"
+"vue-router":"^4.4"
 
 },
 
 "devDependencies":{
 
-"vite":"latest",
+"vite":"^6.0",
 
-    "typescript":"latest",
+    "typescript":"^5.6",
     "tailwindcss":"^3.4",
     "autoprefixer":"^10.4",
 
-"@vitejs/plugin-vue":"latest"
+"@vitejs/plugin-vue":"^5.2"
 
 }
 
