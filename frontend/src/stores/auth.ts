@@ -59,6 +59,5 @@ function toggleDark() {
     localStorage.removeItem("novelhub_token")
   }
 
- return { user, token, isAuthenticated, isAdmin, login, register, fetchMe, logout }
-  return { user, token, isDark, isAuthenticated, isAdmin, toggleDark, login, register, fetchMe, logout }
+ return { user, token, isDark, isAuthenticated, isAdmin, toggleDark, login, register, fetchMe, logout }
 })
