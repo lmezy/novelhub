@@ -1,0 +1,16 @@
+**/node_modules
+**/.git
+**/__pycache__
+**/*.pyc
+**/.venv
+**/venv
+frontend
+nginx
+docs
+storage
+.codex
+.agents
+.gitignore
+*.md
+!Dockerfile*
+!requirements.txt
