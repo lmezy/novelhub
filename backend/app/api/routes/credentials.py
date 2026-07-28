@@ -82,16 +82,16 @@ async def trigger_auto_login(cred_id: str, db: AsyncSession = Depends(get_db)):
 
     from app.crawler.registry import get_plugin
 
-    # Get the source to pass config for yuedu plugin
+    # Get the source to look up its plugin name
     source = await db.get(Source, cred.source)
-    config = None
-    if source and source.plugin_name == "yuedu" and source.config:
-        config = source.config
+    if source is None:
+        raise HTTPException(status_code=404, detail=f"Source not found: {cred.source}")
+    config = source.config if source.plugin_name == "yuedu" and source.config else None
 
     try:
-        plugin = get_plugin(cred.source, config=config)
+        plugin = get_plugin(source.plugin_name, config=config)
     except ValueError:
-        raise HTTPException(status_code=400, detail=f"Unknown source: {cred.source}")
+        raise HTTPException(status_code=400, detail=f"Unknown plugin: {source.plugin_name}")
 
     password = decrypt_cookie(cred.password_encrypted)
     cookie_str = await plugin.auto_login(cred.username, password)
