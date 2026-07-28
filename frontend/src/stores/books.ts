@@ -13,6 +13,8 @@ export interface Book {
   status: string | null
   created_at: string
   updated_at: string
+  tag_names: string[]
+  author_name: string | null
 }
 
 export interface Chapter {
@@ -59,5 +61,3 @@ export const useBooksStore = defineStore("books", () => {
 
   return { books, loading, error, fetchBooks, fetchBook, fetchChapters, fetchChapter }
 })
-  tag_names: string[]
-  author_name: string | null
