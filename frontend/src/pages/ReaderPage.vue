@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue"
 import { useRoute, useRouter } from "vue-router"
 import { useBooksStore, type Chapter, type ChapterContent } from "../stores/books"
 import { useAuthStore } from "../stores/auth"
+import { useI18nStore } from "../stores/i18n"
 import { api } from "../api/client"
 import AIChat from "../components/AIChat.vue"
 
@@ -10,6 +11,7 @@ const route = useRoute()
 const router = useRouter()
 const store = useBooksStore()
 const auth = useAuthStore()
+const i18n = useI18nStore()
 
 const chapter = ref<ChapterContent | null>(null)
 const chapters = ref<Chapter[]>([])
@@ -24,11 +26,11 @@ const showToc = ref(false)
 const showAI = ref(false)
 
 const cnFonts = [
-  { value: "default", label: "系统默认" },
-  { value: "song", label: "宋体" },
-  { value: "kai", label: "楷体" },
-  { value: "hei", label: "黑体" },
-  { value: "fang", label: "仿宋" },
+  { value: "default", label: "\u7cfb\u7edf\u9ed8\u8ba4" },
+  { value: "song", label: "\u5b8b\u4f53" },
+  { value: "kai", label: "\u6977\u4f53" },
+  { value: "hei", label: "\u9ed1\u4f53" },
+  { value: "fang", label: "\u4eff\u5b8b" },
 ]
 const enFonts = [
   { value: "default", label: "System" },
@@ -162,16 +164,16 @@ watch(
         <button
           @click="router.push('/books/' + bookId)"
           class="text-sm hover:opacity-70 transition-opacity"
-        >&larr; Book</button>
+        >&larr; {{ i18n.t('reader_book') }}</button>
         <button
           @click="showToc = !showToc"
           class="text-sm hover:opacity-70 transition-opacity"
-        >TOC</button>
+        >{{ i18n.t('reader_toc') }}</button>
         <button
           @click="showAI = !showAI"
           class="text-sm hover:opacity-70 transition-opacity"
           :class="showAI ? 'text-accent' : ''"
-        >AI</button>
+        >{{ i18n.t('reader_ai') }}</button>
         <span v-if="chapter" class="text-sm truncate max-w-[200px]">
           {{ chapter.title || 'Chapter ' + chapter.chapter_number }}
         </span>
@@ -180,26 +182,26 @@ watch(
         <button
           @click="fontSize = Math.max(14, fontSize - 2)"
           class="w-7 h-7 flex items-center justify-center rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors text-sm"
-          title="Smaller font"
+          :title="i18n.t('reader_smaller_font')"
         >A-</button>
         <button
           @click="fontSize = Math.min(26, fontSize + 2)"
           class="w-7 h-7 flex items-center justify-center rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors text-sm"
-          title="Larger font"
+          :title="i18n.t('reader_larger_font')"
         >A+</button>
         <div class="relative">
           <button
             @click="showFontMenu = !showFontMenu"
             class="w-7 h-7 flex items-center justify-center rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors text-sm"
             :class="(cnFont !== 'default' || enFont !== 'default') ? 'text-accent' : ''"
-            title="Font settings"
+            :title="i18n.t('reader_font_settings')"
           >F</button>
           <div
             v-if="showFontMenu"
             class="absolute right-0 top-full mt-1 w-48 rounded-lg border shadow-lg p-3 z-50"
             :class="isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-border'"
           >
-            <div class="text-xs font-medium mb-2 text-muted dark:text-gray-400">中文</div>
+            <div class="text-xs font-medium mb-2 text-muted dark:text-gray-400">{{ i18n.t('reader_cn_font') }}</div>
             <div class="flex flex-wrap gap-1 mb-3">
               <button
                 v-for="f in cnFonts"
@@ -211,7 +213,7 @@ watch(
                   : isDark ? 'bg-gray-700 hover:bg-gray-600' : 'bg-gray-100 hover:bg-gray-200'"
               >{{ f.label }}</button>
             </div>
-            <div class="text-xs font-medium mb-2 text-muted dark:text-gray-400">English</div>
+            <div class="text-xs font-medium mb-2 text-muted dark:text-gray-400">{{ i18n.t('reader_en_font') }}</div>
             <div class="flex flex-wrap gap-1">
               <button
                 v-for="f in enFonts"
@@ -228,12 +230,11 @@ watch(
         <button
           @click="toggleDark"
           class="w-7 h-7 flex items-center justify-center rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors text-sm"
-          :title="isDark ? 'Light mode' : 'Dark mode'"
+          :title="isDark ? i18n.t('reader_light_mode') : i18n.t('reader_dark_mode')"
         >{{ isDark ? '\u2600' : '\u263e' }}</button>
       </div>
     </header>
 
-    <!-- click-outside to close font menu -->
     <div
       v-if="showFontMenu"
       class="fixed inset-0 z-30"
@@ -241,7 +242,7 @@ watch(
     />
 
     <main class="max-w-3xl mx-auto px-4 py-10">
-      <p v-if="loading" class="text-center py-16">Loading...</p>
+      <p v-if="loading" class="text-center py-16">{{ i18n.t('reader_loading') }}</p>
       <p v-else-if="error" class="text-center py-16 text-red-500">{{ error }}</p>
 
       <article
@@ -265,13 +266,13 @@ watch(
           :to="'/books/' + bookId + '/chapters/' + prevChapter.id"
           class="text-sm hover:opacity-70 transition-opacity no-underline"
         >&larr; {{ prevChapter.title || 'Ch. ' + prevChapter.chapter_number }}</router-link>
-        <span v-else class="text-sm text-muted">Start</span>
+        <span v-else class="text-sm text-muted">{{ i18n.t('reader_start') }}</span>
         <router-link
           v-if="nextChapter"
           :to="'/books/' + bookId + '/chapters/' + nextChapter.id"
           class="text-sm hover:opacity-70 transition-opacity no-underline"
         >{{ nextChapter.title || 'Ch. ' + nextChapter.chapter_number }} &rarr;</router-link>
-        <span v-else class="text-sm text-muted">End</span>
+        <span v-else class="text-sm text-muted">{{ i18n.t('reader_end') }}</span>
       </nav>
     </main>
 
@@ -286,7 +287,7 @@ watch(
           :class="isDark ? 'bg-gray-900' : 'bg-surface'"
         >
           <div class="flex items-center justify-between mb-4">
-            <h3 class="font-semibold text-sm">Table of Contents</h3>
+            <h3 class="font-semibold text-sm">{{ i18n.t('reader_toc_title') }}</h3>
             <button @click="showToc = false" class="text-muted text-lg">&times;</button>
           </div>
           <router-link
@@ -317,7 +318,7 @@ watch(
           :class="isDark ? 'bg-gray-900' : 'bg-surface'"
         >
           <div class="flex items-center justify-between px-4 py-2 border-b" :class="isDark ? 'border-gray-800' : 'border-border'">
-            <span class="text-sm font-medium">AI Chat</span>
+            <span class="text-sm font-medium">{{ i18n.t('reader_ai_title') }}</span>
             <button @click="showAI = false" class="text-muted text-lg">&times;</button>
           </div>
           <div class="flex-1 overflow-hidden">
