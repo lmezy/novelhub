@@ -70,7 +70,7 @@ class ManualLoginSession:
         nav_ok = False
         nav_error = ""
         for attempt in range(2):
-            timeout = 10000 if attempt == 0 else 8000
+            timeout = 30000 if attempt == 0 else 20000
             try:
                 await self._page.goto(
                     self.login_url,
