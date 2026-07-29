@@ -9,6 +9,7 @@ Supported login patterns:
 3. Simple form URL: just a login page URL (auto-login not possible, manual cookie needed)
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -21,10 +22,11 @@ logger = logging.getLogger(__name__)
 class YueduLoginParser:
     """Parse YueDu loginUrl JS and execute the login in Python."""
 
-    def __init__(self, source_config: dict[str, Any]):
+    def __init__(self, source_config: dict[str, Any], js_runtime=None):
         self.config = source_config
         self.base_url = source_config.get("bookSourceUrl", "")
         self.login_url_js = source_config.get("loginUrl", "")
+        self._js_runtime = js_runtime
 
     def can_auto_login(self) -> bool:
         """Check if the login mechanism is parseable for auto-login."""
@@ -62,12 +64,64 @@ class YueduLoginParser:
         if not self.login_url_js:
             return None
 
-        # Try parsing JS-based API login
+        # First try: regex-based parsing (fast path for simple patterns)
         login_info = self._parse_js_login()
         if login_info:
-            return await self._do_api_login(login_info, username, password)
+            cookie = await self._do_api_login(login_info, username, password)
+            if cookie:
+                return cookie
+
+        # Second try: use JS runtime to execute the login JS directly
+        cookie = await self._execute_js_login(username, password)
+        if cookie:
+            return cookie
 
         return None
+
+    async def _execute_js_login(self, username: str, password: str) -> str | None:
+        """Use Node.js JS runtime to execute the loginUrl JS with java.* stubs."""
+        if not self._js_runtime:
+            # Try to get or create the JsRuntime
+            try:
+                from app.crawler.plugins.yuedu.js_runtime import JsRuntime
+                runtime = JsRuntime.get_instance()
+                ok = await runtime.start()
+                if not ok:
+                    return None
+                self._js_runtime = runtime
+            except Exception:
+                return None
+
+        js_code = self._clean_login_js(self.login_url_js)
+        if not js_code:
+            return None
+
+        try:
+            cookie = await self._js_runtime.eval_login_js(
+                js_code, username, password, self.base_url
+            )
+            return cookie
+        except Exception as e:
+            logger.warning(f"JS runtime login failed: {e}")
+            return None
+
+    @staticmethod
+    def _clean_login_js(js: str) -> str:
+        """Clean up the login JS: strip @js: prefix, <js> tags, etc."""
+        js = js.strip()
+        if js.startswith("@js:"):
+            js = js[4:].strip()
+        if js.startswith("<js>") and js.endswith("</js>"):
+            js = js[4:-5].strip()
+        if js.startswith("<js") and js.endswith("</js>"):
+            # Handle <js> or <js ...> tags
+            end_tag = js.find(">")
+            if end_tag != -1:
+                js = js[end_tag + 1:]
+            if js.endswith("</js>"):
+                js = js[:-5]
+        js = js.strip()
+        return js
 
     # ---- JS Parsing ----
 

@@ -305,6 +305,172 @@ class JsRuntime:
                 logger.warning(f"JsRuntime context eval error: {e}")
                 return None
 
+    async def eval_login_js(
+        self, js_code: str, login_info: str, password: str,
+        base_url: str = ""
+    ) -> str | None:
+        """Execute a YueDu loginUrl JS with java.* API stubs.
+
+        Writes a Node.js script to a temp file (avoiding shell escaping
+        issues) that provides synchronous java.post/get/ajax stubs using
+        curl, executes the login JS, and returns cookie strings.
+        """
+        import tempfile
+        import os as _os
+
+        # Build the Node.js script
+        script = self._build_login_script(js_code, login_info, password, base_url)
+
+        # Write to temp file
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(suffix=".js", prefix="yuedu_login_")
+            _os.write(fd, script.encode("utf-8"))
+            _os.close(fd)
+
+            proc = await asyncio.create_subprocess_exec(
+                "node",
+                "--no-warnings",
+                tmp_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=60
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                logger.warning("Login JS execution timed out")
+                return None
+
+            if proc.returncode != 0:
+                err_msg = stderr.decode("utf-8", errors="replace")[:500]
+                logger.warning(f"Login JS execution failed: {err_msg}")
+                return None
+
+            output = stdout.decode("utf-8", errors="replace")
+            m = re.search(
+                r"__CODEX_RESULT_START__\n(.*?)\n__CODEX_RESULT_END__",
+                output, re.DOTALL
+            )
+            if m:
+                try:
+                    data = json.loads(m.group(1))
+                    cookie = data.get("cookieString", "")
+                    if not cookie and data.get("cookies"):
+                        cookie = "; ".join(data["cookies"])
+                    if not cookie and data.get("result"):
+                        result_val = data["result"]
+                        if isinstance(result_val, str) and "=" in result_val:
+                            cookie = result_val.strip()
+                    return cookie if cookie else None
+                except json.JSONDecodeError:
+                    pass
+
+            # Fallback: find cookie-like strings in output
+            cookie_match = re.search(r'([a-zA-Z_]+=[a-zA-Z0-9_\-]+)', output)
+            if cookie_match:
+                return cookie_match.group(1)
+
+            return None
+
+        except FileNotFoundError:
+            logger.warning("Node.js not available for login JS execution")
+            return None
+        except Exception as e:
+            logger.warning(f"Login JS execution error: {e}")
+            return None
+        finally:
+            if tmp_path and _os.path.exists(tmp_path):
+                try:
+                    _os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _build_login_script(
+        js_code: str, login_info: str, password: str, base_url: str
+    ) -> str:
+        """Build a Node.js script that executes the login JS with java stubs."""
+        safe_base_url = json.dumps(base_url)
+        safe_login = json.dumps(login_info)
+        safe_pass = json.dumps(password)
+        # JSON-encode the JS code for safe embedding
+        safe_js = json.dumps(js_code)
+
+        return f"""// Auto-generated YueDu login script
+const {{ execSync }} = require('child_process');
+const baseUrl = {safe_base_url};
+const loginInfo = {safe_login};
+const password = {safe_pass};
+const userJsCode = {safe_js};
+
+let _cookies = [];
+
+function java_setCookie(c) {{ if (c) _cookies.push(c); }}
+
+function _httpSync(url, method, body, extraHeaders) {{
+    try {{
+        let headers = Object.assign({{}}, extraHeaders || {{}});
+        let headerArgs = '';
+        for (let key in headers) {{
+            let val = headers[key].replace(/'/g, "'\\\\''");
+            headerArgs += " -H '" + key + ": " + val + "'";
+        }}
+        let bodyArg = '';
+        if (body) {{
+            let escapedBody = body.replace(/'/g, "'\\\\''");
+            bodyArg = " -d '" + escapedBody + "'";
+        }}
+        let cmd = 'curl -s -S -L --max-time 30 -X ' + method + headerArgs + bodyArg + ' "' + url + '"';
+        let output = execSync(cmd, {{ maxBuffer: 10 * 1024 * 1024, timeout: 35000 }});
+        return output.toString('utf-8');
+    }} catch(e) {{
+        return null;
+    }}
+}}
+
+function java_post(url, body, headers) {{
+    return _httpSync(url, 'POST', typeof body === 'string' ? body : JSON.stringify(body), headers);
+}}
+
+function java_get(url) {{
+    return _httpSync(url, 'GET', null, null);
+}}
+
+function java_ajax(options) {{
+    return _httpSync(options.url, options.method || 'GET', options.body || null, options.headers);
+}}
+
+var java = {{
+    post: java_post,
+    get: java_get,
+    ajax: java_ajax,
+    setCookie: java_setCookie,
+    getCookie: function() {{ return _cookies.join('; '); }}
+}};
+
+function Url() {{ return baseUrl; }}
+
+var result;
+var loginInfo_val = loginInfo;
+var password_val = password;
+
+eval(userJsCode);
+
+var output = {{
+    result: result,
+    cookies: _cookies,
+    cookieString: _cookies.join('; ')
+}};
+
+console.log('__CODEX_RESULT_START__');
+console.log(JSON.stringify(output));
+console.log('__CODEX_RESULT_END__');
+"""
+
     async def _read_result(self) -> Any:
         """Read and parse the result from the Node.js subprocess stdout."""
         lines: list[str] = []

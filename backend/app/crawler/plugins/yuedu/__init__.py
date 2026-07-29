@@ -511,13 +511,29 @@ class YueduPlugin:
         """Attempt auto-login using the source loginUrl mechanism.
 
         Supports JS-based API login (parses java.post/get/ajax calls).
+        Falls back to Node.js JS runtime for complex login JS patterns.
         For form-based login, returns None (manual cookie needed).
         """
         from app.crawler.plugins.yuedu.login import YueduLoginParser
-        parser = YueduLoginParser(self.config)
+        from app.crawler.plugins.yuedu.js_runtime import JsRuntime
+
+        # Get or create the JS runtime for login execution
+        js_runtime = None
+        try:
+            js_runtime = JsRuntime.get_instance()
+        except Exception:
+            pass
+
+        parser = YueduLoginParser(self.config, js_runtime=js_runtime)
 
         if parser.can_auto_login():
             return await parser.execute_login(username, password)
+
+        # Even if can_auto_login returns False, try JS runtime anyway
+        # (some sources use function-based patterns the regex can't detect)
+        cookie = await parser.execute_login(username, password)
+        if cookie:
+            return cookie
 
         login_page = parser.get_login_page_url()
         if login_page:
