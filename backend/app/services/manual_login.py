@@ -57,6 +57,8 @@ class ManualLoginSession:
         proxy_config = get_playwright_proxy()
         if proxy_config:
             logger.info(f"Using proxy: {proxy_config['server']}")
+        else:
+            logger.info("No proxy configured - direct connection")
 
         self._context = await self._browser.new_context(
             viewport={"width": 1280, "height": 800},

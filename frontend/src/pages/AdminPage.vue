@@ -629,29 +629,7 @@ onMounted(async () => {
             <div class="flex items-center gap-2 mb-1">
               <span class="text-xs font-medium uppercase text-muted dark:text-gray-400">{{ key }}</span>
               <span class="w-2 h-2 rounded-full" :class="val === 'ok' ? 'bg-green-500' : typeof val === 'object' ? 'bg-blue-500' : 'bg-red-500'"></span>
-      <section v-if="tab === 'proxy'" class="space-y-6">
-        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 max-w-lg">
-          <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_proxy_title') }}</h2>
-          <p class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('admin_proxy_hint') }}</p>
-          <div class="flex items-center justify-between mb-4">
-            <span class="text-sm">{{ i18n.t('admin_proxy_enable') }}</span>
-            <button @click="proxyEnabled = !proxyEnabled" :class="proxyEnabled ? 'bg-green-500' : 'bg-gray-300 dark:bg-gray-600'" class="relative w-11 h-6 rounded-full transition-colors duration-200">
-              <span :class="proxyEnabled ? 'translate-x-5' : 'translate-x-0.5'" class="absolute top-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform duration-200"></span>
-            </button>
-          </div>
-          <div class="mb-3">
-            <label class="block text-xs text-muted dark:text-gray-400 mb-1">HTTPS Proxy</label>
-            <input v-model="proxyHttps" placeholder="http://127.0.0.1:7890" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-          </div>
-          <div class="mb-4">
-            <label class="block text-xs text-muted dark:text-gray-400 mb-1">HTTP Proxy</label>
-            <input v-model="proxyHttp" placeholder="http://127.0.0.1:7890" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-          </div>
-          <button @click="saveProxyConfig" :disabled="proxySaving" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">
-            {{ proxySaving ? i18n.t('admin_saving') : i18n.t('admin_save') }}
-          </button>
-        </div>
-      </section>
+      
 
             </div>
             <template v-if="typeof val === 'object'">
@@ -835,5 +813,29 @@ onMounted(async () => {
       </section>
 
     </main>
+
+<section v-if="tab === 'proxy'" class="space-y-6">
+        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 max-w-lg">
+          <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_proxy_title') }}</h2>
+          <p class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('admin_proxy_hint') }}</p>
+          <div class="flex items-center justify-between mb-4">
+            <span class="text-sm">{{ i18n.t('admin_proxy_enable') }}</span>
+            <button @click="proxyEnabled = !proxyEnabled" :class="proxyEnabled ? 'bg-green-500' : 'bg-gray-300 dark:bg-gray-600'" class="relative w-11 h-6 rounded-full transition-colors duration-200">
+              <span :class="proxyEnabled ? 'translate-x-5' : 'translate-x-0.5'" class="absolute top-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform duration-200"></span>
+            </button>
+          </div>
+          <div class="mb-3">
+            <label class="block text-xs text-muted dark:text-gray-400 mb-1">HTTPS Proxy</label>
+            <input v-model="proxyHttps" placeholder="http://127.0.0.1:7890" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+          </div>
+          <div class="mb-4">
+            <label class="block text-xs text-muted dark:text-gray-400 mb-1">HTTP Proxy</label>
+            <input v-model="proxyHttp" placeholder="http://127.0.0.1:7890" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+          </div>
+          <button @click="saveProxyConfig" :disabled="proxySaving" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">
+            {{ proxySaving ? i18n.t('admin_saving') : i18n.t('admin_save') }}
+          </button>
+        </div>
+      </section>
   </div>
 </template>

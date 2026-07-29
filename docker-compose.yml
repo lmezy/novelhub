@@ -37,6 +37,8 @@
     image: redis:7-alpine
     container_name: novelhub-redis
     restart: always
+    ports:
+      - "6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -49,6 +51,8 @@
     image: getmeili/meilisearch:v1.10
     container_name: novelhub-search
     restart: always
+    ports:
+      - "7700:7700"
     environment:
       MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
       TZ: ${TZ}
