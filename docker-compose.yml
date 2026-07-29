@@ -60,6 +60,7 @@
       context: ./backend
     container_name: novelhub-backend
     restart: always
+    network_mode: host
     env_file:
       - .env
     depends_on:
@@ -76,8 +77,8 @@
         limits:
           cpus: "2.0"
           memory: 1G
-    ports:
-      - "8000:8000"
+    # ports not used with network_mode: host
+    # healthcheck uses host network (localhost:8000)
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
       interval: 30s
