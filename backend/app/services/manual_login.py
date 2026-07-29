@@ -77,15 +77,13 @@ class ManualLoginSession:
                 logger.warning(f"Navigation attempt {attempt + 1} failed: {nav_error}")
 
         if not nav_ok:
-            # Generate an error screenshot so the user can see what happened
-            error_html = f"""<html><body style="font-family:sans-serif;padding:40px;text-align:center">
-<h2 style="color:#c00">无法连接到网站</h2>
-<p>目标: {self.login_url}</p>
-<p style="color:#666">错误: {nav_error}</p>
-<p style="color:#999;font-size:12px">Docker 容器可能无法访问此网站。<br>请检查网络配置或使用手动 Cookie 方式登录。</p>
-</body></html>"""
-            await self._page.set_content(error_html)
-            result["error"] = f"Cannot reach {self.login_url}: {nav_error}"
+            # Chrome shows its own error page (e.g. ERR_CONNECTION_REFUSED)
+            # which is already informative. Just capture it and report the error.
+            result["error"] = (
+                f"Cannot reach {self.login_url}\n{nav_error}\n\n"
+                "The site may be blocking Docker IPs or is unreachable.\n"
+                "Try adding a manual Cookie instead."
+            )
         else:
             # Pre-fill credentials if form found
             try:
