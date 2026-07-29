@@ -118,6 +118,8 @@
     image: nginx:latest
     container_name: novelhub-nginx
     restart: always
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8088:80"
     volumes:
