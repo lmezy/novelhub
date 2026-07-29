@@ -26,3 +26,4 @@ zstandard
 pytest
 pytest-asyncio
 httpx
+playwright==1.52.0
