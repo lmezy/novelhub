@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -7,6 +8,7 @@ from app.models import User, Source, SourceChange
 from app.schemas.user import UserOut
 from app.schemas.admin import UserRoleUpdate
 from app.services.auth import get_current_user, require_admin, require_super_admin
+from app.services.proxy_config import get_proxy_config, ProxyConfig, set_proxy_config
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -57,3 +59,34 @@ async def update_user_role(
     await db.commit()
     await db.refresh(target)
     return target
+
+
+class ProxyConfigRequest(BaseModel):
+    enabled: bool = False
+    https_proxy: str = ""
+    http_proxy: str = ""
+
+
+@router.get("/proxy")
+async def admin_get_proxy(current_user: User = Depends(require_admin)):
+    cfg = get_proxy_config()
+    return ProxyConfigRequest(
+        enabled=cfg.enabled,
+        https_proxy=cfg.https_proxy or "",
+        http_proxy=cfg.http_proxy or "",
+    )
+
+
+@router.put("/proxy")
+async def admin_update_proxy(
+    payload: ProxyConfigRequest,
+    current_user: User = Depends(require_admin),
+):
+    cfg = ProxyConfig(
+        enabled=payload.enabled,
+        https_proxy=payload.https_proxy,
+        http_proxy=payload.http_proxy,
+    )
+    set_proxy_config(cfg)
+    return payload
+

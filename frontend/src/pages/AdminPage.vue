@@ -47,6 +47,7 @@ async function createSource() {
     await api.post("/sources", sourceForm.value)
     await loadSources()
   await loadCreds()
+  loadProxyConfig()
     sourceForm.value = { id: "", name: "", url: "", plugin_name: "alicesw" }
   } catch (e) {
     sourceError.value = e instanceof Error ? e.message : "Failed"
@@ -126,6 +127,12 @@ const manualLoginSourceName = ref("")
 const manualLoginLoading = ref(false)
 const manualLoginInput = ref("")
 const manualLoginError = ref("")
+
+// Proxy config
+const proxyEnabled = ref(false)
+const proxyHttps = ref("")
+const proxyHttp = ref("")
+const proxySaving = ref(false)
 const credLoginResult = ref<Record<string, any>>({})
 const credLoginError = ref<Record<string, string>>({})
 
@@ -162,6 +169,33 @@ async function autoLogin(id: string) {
     credLoginError.value[id] = e instanceof Error ? e.message : "Login failed"
   } finally {
     credLoggingIn.value[id] = false
+  }
+}
+
+async function loadProxyConfig() {
+  try {
+    const res = await api.get("/admin/proxy") as any
+    proxyEnabled.value = res.enabled
+    proxyHttps.value = res.https_proxy || ""
+    proxyHttp.value = res.http_proxy || ""
+  } catch {}
+}
+
+async function saveProxyConfig() {
+  proxySaving.value = true
+  try {
+    const res = await api.put("/admin/proxy", {
+      enabled: proxyEnabled.value,
+      https_proxy: proxyHttps.value,
+      http_proxy: proxyHttp.value,
+    }) as any
+    proxyEnabled.value = res.enabled
+    proxyHttps.value = res.https_proxy || ""
+    proxyHttp.value = res.http_proxy || ""
+  } catch (e) {
+    alert(e instanceof Error ? e.message : "Failed to save proxy config")
+  } finally {
+    proxySaving.value = false
   }
 }
 
@@ -445,7 +479,7 @@ onMounted(async () => {
 
       <div class="flex gap-1 mb-8 border-b border-border flex-wrap">
         <button
-          v-for="t in (['sources', 'cookies', 'sync', 'logs', 'tokens', 'index', 'status', 'yuedu', 'creds', 'users', 'approvals'] as const)"
+          v-for="t in (['sources', 'cookies', 'sync', 'logs', 'tokens', 'index', 'status', 'yuedu', 'creds', 'users', 'approvals', 'proxy'] as const)"
           :key="t"
           @click="tab = t"
           class="px-4 py-2 text-sm transition-colors -mb-px"

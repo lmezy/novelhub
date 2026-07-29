@@ -52,9 +52,16 @@ class ManualLoginSession:
             headless=True,
             args=["--no-sandbox", "--disable-setuid-sandbox"],
         )
+        # Use hot-swappable proxy config (from admin UI or env vars)
+        from app.services.proxy_config import get_playwright_proxy
+        proxy_config = get_playwright_proxy()
+        if proxy_config:
+            logger.info(f"Using proxy: {proxy_config['server']}")
+
         self._context = await self._browser.new_context(
             viewport={"width": 1280, "height": 800},
             locale="zh-CN",
+            **(proxy_config and {"proxy": proxy_config} or {}),
         )
         self._page = await self._context.new_page()
 
