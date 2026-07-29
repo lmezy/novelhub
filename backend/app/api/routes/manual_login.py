@@ -89,8 +89,11 @@ async def start_manual_login(cred_id: str, db: AsyncSession = Depends(get_db)):
         password=password,
     )
 
-    screenshot = await session.start()
-    if screenshot is None:
+    start_result = await session.start()
+    screenshot = start_result.get("screenshot", "")
+    error = start_result.get("error")
+
+    if not screenshot:
         ManualLoginManager.remove_session(session.session_id)
         raise HTTPException(status_code=500, detail="Failed to start browser session")
 
@@ -99,6 +102,7 @@ async def start_manual_login(cred_id: str, db: AsyncSession = Depends(get_db)):
         "screenshot": screenshot,
         "login_url": login_url,
         "source_name": session.source_name,
+        "error": error,
     }
 
 

@@ -33,13 +33,19 @@ class ManualLoginSession:
     _pw: Any = None
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    async def start(self) -> str | None:
-        """Launch browser, navigate to login page, return base64 screenshot."""
+    async def start(self) -> dict:
+        """Launch browser, navigate to login page.
+        Returns {"screenshot": str, "error": str | None}.
+        Uses short timeout so the UI doesn't hang on unreachable sites.
+        """
+        result = {"screenshot": "", "error": None}
+
         try:
             from playwright.async_api import async_playwright
         except ImportError:
             logger.error("playwright not installed")
-            return None
+            result["error"] = "Playwright not installed in Docker image"
+            return result
 
         self._pw = await async_playwright().start()
         self._browser = await self._pw.chromium.launch(
@@ -52,22 +58,43 @@ class ManualLoginSession:
         )
         self._page = await self._context.new_page()
 
-        try:
-            await self._page.goto(self.login_url, wait_until="networkidle", timeout=30000)
-        except Exception as e:
-            logger.warning(f"Navigation issue: {e}")
+        # Navigate with short timeout (10s) so Docker network issues
+        # don't hang the UI for 30+ seconds
+        nav_ok = False
+        nav_error = ""
+        for attempt in range(2):
+            timeout = 10000 if attempt == 0 else 8000
             try:
-                await self._page.goto(self.login_url, wait_until="domcontentloaded", timeout=15000)
+                await self._page.goto(
+                    self.login_url,
+                    wait_until="domcontentloaded",
+                    timeout=timeout,
+                )
+                nav_ok = True
+                break
+            except Exception as e:
+                nav_error = str(e)[:200]
+                logger.warning(f"Navigation attempt {attempt + 1} failed: {nav_error}")
+
+        if not nav_ok:
+            # Generate an error screenshot so the user can see what happened
+            error_html = f"""<html><body style="font-family:sans-serif;padding:40px;text-align:center">
+<h2 style="color:#c00">无法连接到网站</h2>
+<p>目标: {self.login_url}</p>
+<p style="color:#666">错误: {nav_error}</p>
+<p style="color:#999;font-size:12px">Docker 容器可能无法访问此网站。<br>请检查网络配置或使用手动 Cookie 方式登录。</p>
+</body></html>"""
+            await self._page.set_content(error_html)
+            result["error"] = f"Cannot reach {self.login_url}: {nav_error}"
+        else:
+            # Pre-fill credentials if form found
+            try:
+                await self._try_fill_credentials()
             except Exception:
                 pass
 
-        # Pre-fill credentials if form found
-        try:
-            await self._try_fill_credentials()
-        except Exception:
-            pass
-
-        return await self.screenshot()
+        result["screenshot"] = await self.screenshot()
+        return result
 
     async def _try_fill_credentials(self) -> None:
         for sel in [

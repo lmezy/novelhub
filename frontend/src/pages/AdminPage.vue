@@ -174,6 +174,9 @@ async function startManualLogin(credId: string) {
     manualLoginScreenshot.value = res.screenshot
     manualLoginSourceName.value = res.source_name
     manualLoginActive.value = true
+    if (res.error) {
+      manualLoginError.value = res.error
+    }
   } catch (e) {
     manualLoginError.value = e instanceof Error ? e.message : "Failed to start manual login"
   } finally {
