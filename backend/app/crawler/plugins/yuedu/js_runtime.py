@@ -393,24 +393,36 @@ class JsRuntime:
     def _build_login_script(
         js_code: str, login_info: str, password: str, base_url: str
     ) -> str:
-        """Build a Node.js script that executes the login JS with java stubs."""
+        """Build a Node.js script that replicates Legado's login() behavior.
+
+        Legado wraps loginUrl JS as:
+            $loginJs
+            if(typeof login=='function'){login.apply(this);}
+
+        The JS runtime provides:
+        - java: post, get, ajax, setCookie, getLoginInfo, put, get
+        - source: same as java
+        - baseUrl: source's base URL
+        - cookie: cookie store (setCookie reads from here)
+        - cache: simple key-value store (put/get)
+        - Url(): returns baseUrl
+        """
         safe_base_url = json.dumps(base_url)
-        safe_login = json.dumps(login_info)
-        safe_pass = json.dumps(password)
-        # JSON-encode the JS code for safe embedding
         safe_js = json.dumps(js_code)
 
-        return f"""// Auto-generated YueDu login script
+        return f"""// YueDu login script (faithful to Legado BaseSource.login())
 const {{ execSync }} = require('child_process');
 const baseUrl = {safe_base_url};
-const loginInfo = {safe_login};
-const password = {safe_pass};
-const userJsCode = {safe_js};
 
+// ------- Cache (java.put / java.get / java.getLoginInfo) -------
+let _cache = {{}};
+// Store the user's credentials in the cache
+_cache["_loginInfo"] = JSON.stringify({{"username": {json.dumps(login_info)}, "password": {json.dumps(password)}}});
+
+// ------- Cookie store -------
 let _cookies = [];
 
-function java_setCookie(c) {{ if (c) _cookies.push(c); }}
-
+// ------- HTTP helper -------
 function _httpSync(url, method, body, extraHeaders) {{
     try {{
         let headers = Object.assign({{}}, extraHeaders || {{}});
@@ -432,38 +444,72 @@ function _httpSync(url, method, body, extraHeaders) {{
     }}
 }}
 
-function java_post(url, body, headers) {{
-    return _httpSync(url, 'POST', typeof body === 'string' ? body : JSON.stringify(body), headers);
-}}
-
-function java_get(url) {{
-    return _httpSync(url, 'GET', null, null);
-}}
-
-function java_ajax(options) {{
-    return _httpSync(options.url, options.method || 'GET', options.body || null, options.headers);
-}}
-
+// ------- java object (faithful to Legado bindings) -------
 var java = {{
-    post: java_post,
-    get: java_get,
-    ajax: java_ajax,
-    setCookie: java_setCookie,
-    getCookie: function() {{ return _cookies.join('; '); }}
+    post: function(url, body, headers) {{
+        return _httpSync(url, 'POST', typeof body === 'string' ? body : JSON.stringify(body), headers);
+    }},
+    get: function(url) {{
+        return _httpSync(url, 'GET', null, null);
+    }},
+    ajax: function(options) {{
+        return _httpSync(options.url, options.method || 'GET', options.body || null, options.headers);
+    }},
+    setCookie: function(c) {{
+        if (c) _cookies.push(c);
+    }},
+    getLoginInfo: function() {{
+        let raw = _cache["_loginInfo"];
+        if (!raw) return null;
+        try {{ return JSON.parse(raw); }} catch(e) {{ return raw; }}
+    }},
+    getLoginInfoMap: function() {{
+        return java.getLoginInfo();
+    }},
+    put: function(key, value) {{
+        _cache[key] = String(value);
+        return value;
+    }},
+    get: function(key) {{
+        return _cache[key] || "";
+    }}
+}};
+
+// 'source' is the same as 'java' in Legado
+var source = java;
+
+// 'cookie' store (Legado uses CookieStore)
+var cookie = {{
+    getCookie: function() {{ return _cookies.join('; '); }},
+    setCookie: function(c) {{ if (c) _cookies.push(c); }}
+}};
+
+// 'cache' object
+var cache = {{
+    put: function(key, value) {{ _cache[key] = String(value); return value; }},
+    get: function(key) {{ return _cache[key] || ""; }}
 }};
 
 function Url() {{ return baseUrl; }}
 
-var result;
-var loginInfo_val = loginInfo;
-var password_val = password;
+// ------- Execute the login JS (Legado-style) -------
+var userJsCode = {safe_js};
 
+// Wrap as Legado does: run user JS, then call login() if defined
 eval(userJsCode);
+if (typeof login === 'function') {{
+    try {{
+        login.apply(this);
+    }} catch(e) {{
+        // login() might not exist or might fail - that's OK
+    }}
+}}
 
+// ------- Output -------
 var output = {{
-    result: result,
     cookies: _cookies,
-    cookieString: _cookies.join('; ')
+    cookieString: _cookies.join('; '),
+    cache: _cache
 }};
 
 console.log('__CODEX_RESULT_START__');
