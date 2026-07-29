@@ -46,8 +46,6 @@ async function createSource() {
   try {
     await api.post("/sources", sourceForm.value)
     await loadSources()
-  await loadCreds()
-  loadProxyConfig()
     sourceForm.value = { id: "", name: "", url: "", plugin_name: "alicesw" }
   } catch (e) {
     sourceError.value = e instanceof Error ? e.message : "Failed"
@@ -467,6 +465,7 @@ onMounted(async () => {
   await loadIndexStats()
   await loadUsers()
   await loadApprovals()
+  loadProxyConfig()
 })
 </script>
 

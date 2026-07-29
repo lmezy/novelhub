@@ -63,6 +63,12 @@
     network_mode: host
     env_file:
       - .env
+    # Override service hostnames because network_mode: host
+    # means we access other containers via localhost
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://novelhub:CHANGE_ME@localhost:5432/novelhub
+      - REDIS_HOST=localhost
+      - MEILI_HOST=http://localhost:7700
     depends_on:
       postgres:
         condition: service_healthy
