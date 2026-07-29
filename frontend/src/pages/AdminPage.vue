@@ -117,6 +117,15 @@ const creds = ref<any[]>([])
 const credForm = ref({ source: "", username: "", password: "" })
 const credError = ref("")
 const credLoggingIn = ref<Record<string, boolean>>({})
+
+// Manual login state
+const manualLoginActive = ref(false)
+const manualLoginSessionId = ref("")
+const manualLoginScreenshot = ref("")
+const manualLoginSourceName = ref("")
+const manualLoginLoading = ref(false)
+const manualLoginInput = ref("")
+const manualLoginError = ref("")
 const credLoginResult = ref<Record<string, any>>({})
 const credLoginError = ref<Record<string, string>>({})
 
@@ -155,6 +164,87 @@ async function autoLogin(id: string) {
     credLoggingIn.value[id] = false
   }
 }
+
+async function startManualLogin(credId: string) {
+  manualLoginLoading.value = true
+  manualLoginError.value = ""
+  try {
+    const res = await api.post("/credentials/" + credId + "/manual-login/start") as any
+    manualLoginSessionId.value = res.session_id
+    manualLoginScreenshot.value = res.screenshot
+    manualLoginSourceName.value = res.source_name
+    manualLoginActive.value = true
+  } catch (e) {
+    manualLoginError.value = e instanceof Error ? e.message : "Failed to start manual login"
+  } finally {
+    manualLoginLoading.value = false
+  }
+}
+
+function handleManualClick(e: MouseEvent) {
+  if (!manualLoginActive.value) return
+  const img = e.currentTarget as HTMLImageElement
+  const rect = img.getBoundingClientRect()
+  const scaleX = img.naturalWidth / rect.width
+  const scaleY = img.naturalHeight / rect.height
+  const x = Math.round((e.clientX - rect.left) * scaleX)
+  const y = Math.round((e.clientY - rect.top) * scaleY)
+  manualLoginLoading.value = true
+  api.post("/manual-login/" + manualLoginSessionId.value + "/click", { x, y }).then((res: any) => {
+    manualLoginScreenshot.value = res.screenshot
+  }).catch(e => {
+    manualLoginError.value = e instanceof Error ? e.message : "Click failed"
+  }).finally(() => {
+    manualLoginLoading.value = false
+  })
+}
+
+async function handleManualType() {
+  if (!manualLoginInput.value) return
+  manualLoginLoading.value = true
+  try {
+    const res = await api.post("/manual-login/" + manualLoginSessionId.value + "/type", { text: manualLoginInput.value }) as any
+    manualLoginScreenshot.value = res.screenshot
+    manualLoginInput.value = ""
+  } catch (e) {
+    manualLoginError.value = e instanceof Error ? e.message : "Type failed"
+  } finally {
+    manualLoginLoading.value = false
+  }
+}
+
+async function handleManualKey(key: string) {
+  manualLoginLoading.value = true
+  try {
+    const res = await api.post("/manual-login/" + manualLoginSessionId.value + "/key", { key }) as any
+    manualLoginScreenshot.value = res.screenshot
+  } catch (e) {
+    manualLoginError.value = e instanceof Error ? e.message : "Key press failed"
+  } finally {
+    manualLoginLoading.value = false
+  }
+}
+
+async function finishManualLogin() {
+  manualLoginLoading.value = true
+  try {
+    await api.post("/manual-login/" + manualLoginSessionId.value + "/finish")
+    manualLoginActive.value = false
+    await loadCookies()
+  } catch (e) {
+    manualLoginError.value = e instanceof Error ? e.message : "Failed to save cookies"
+  } finally {
+    manualLoginLoading.value = false
+  }
+}
+
+async function cancelManualLogin() {
+  try {
+    await api.post("/manual-login/" + manualLoginSessionId.value + "/cancel")
+  } catch {}
+  manualLoginActive.value = false
+}
+
 const yueduPreviewing = ref(false)
 const yueduResult = ref<any>(null)
 const yueduError = ref("")
@@ -615,6 +705,9 @@ onMounted(async () => {
             <div class="flex items-center gap-3">
               <button @click="autoLogin(c.id)" :disabled="credLoggingIn[c.id]" class="px-3 py-1.5 rounded border border-green-500 text-green-600 text-xs font-medium hover:bg-green-50 dark:hover:bg-green-950 disabled:opacity-50">
                 {{ credLoggingIn[c.id] ? i18n.t('admin_logging_in') : i18n.t('admin_auto_login') }}
+              </button>
+              <button @click="startManualLogin(c.id)" :disabled="manualLoginLoading" class="px-3 py-1.5 rounded border border-blue-500 text-blue-600 text-xs font-medium hover:bg-blue-50 dark:hover:bg-blue-950 disabled:opacity-50">
+                {{ i18n.t('admin_manual_login') }}
               </button>
               <button @click="deleteCred(c.id)" class="text-xs text-red-500 hover:text-red-700">{{ i18n.t('admin_delete') }}</button>
             </div>

@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.routes import admin, ai, auth, backup, books, chapters, cookies, crawl, credentials, health, progress, rag, search, source_changes, sources, sync, tags, tokens, yuedu
+from app.api.routes import admin, ai, auth, backup, books, chapters, cookies, crawl, credentials, health, manual_login, progress, rag, search, source_changes, sources, sync, tags, tokens, yuedu
 
 
 router = APIRouter(prefix="/api")
@@ -24,6 +24,7 @@ router.include_router(credentials.router)
 router.include_router(tokens.router)
 router.include_router(yuedu.router)
 
+router.include_router(manual_login.router)
 
 @router.get("/test")
 async def test():
