@@ -26,4 +26,3 @@ zstandard
 pytest
 pytest-asyncio
 httpx
-playwright
