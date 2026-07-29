@@ -64,15 +64,9 @@
       context: ./backend
     container_name: novelhub-backend
     restart: always
-    network_mode: host
     env_file:
       - .env
-    # Override service hostnames because network_mode: host
-    # means we access other containers via localhost
-    environment:
-      - DATABASE_URL=postgresql+asyncpg://novelhub:CHANGE_ME@localhost:5432/novelhub
-      - REDIS_HOST=localhost
-      - MEILI_HOST=http://localhost:7700
+
     depends_on:
       postgres:
         condition: service_healthy
@@ -87,8 +81,8 @@
         limits:
           cpus: "2.0"
           memory: 1G
-    # ports not used with network_mode: host
-    # healthcheck uses host network (localhost:8000)
+    ports:
+      - "8000:8000"
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
       interval: 30s
@@ -128,8 +122,6 @@
     image: nginx:latest
     container_name: novelhub-nginx
     restart: always
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     ports:
       - "8088:80"
     volumes:
