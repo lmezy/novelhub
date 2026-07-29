@@ -510,14 +510,16 @@ class YueduPlugin:
     async def auto_login(self, username: str, password: str) -> str | None:
         """Attempt auto-login using the source loginUrl mechanism.
 
-        Supports JS-based API login (parses java.post/get/ajax calls).
-        Falls back to Node.js JS runtime for complex login JS patterns.
-        For form-based login, returns None (manual cookie needed).
+        Tries three approaches in order:
+        1. Regex-based API login (fast path for simple java.post patterns)
+        2. Node.js JS runtime (executes login JS with java.* stubs)
+        3. Playwright form login (opens login page, fills form, submits)
+
+        Falls back to None only if all three approaches fail.
         """
         from app.crawler.plugins.yuedu.login import YueduLoginParser
         from app.crawler.plugins.yuedu.js_runtime import JsRuntime
 
-        # Get or create the JS runtime for login execution
         js_runtime = None
         try:
             js_runtime = JsRuntime.get_instance()
@@ -526,20 +528,12 @@ class YueduPlugin:
 
         parser = YueduLoginParser(self.config, js_runtime=js_runtime)
 
-        if parser.can_auto_login():
-            return await parser.execute_login(username, password)
-
-        # Even if can_auto_login returns False, try JS runtime anyway
-        # (some sources use function-based patterns the regex can't detect)
+        # execute_login now has all three fallbacks built in
         cookie = await parser.execute_login(username, password)
         if cookie:
             return cookie
 
-        login_page = parser.get_login_page_url()
-        if login_page:
-            logger.info(f"Manual login page: {login_page}")
-
-        logger.warning(f"No parseable login mechanism for {self.display_name}")
+        logger.warning(f"All login methods failed for {self.display_name}")
         return None
 
     # ---- Helpers ----

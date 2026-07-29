@@ -61,18 +61,24 @@ class YueduLoginParser:
 
     async def execute_login(self, username: str, password: str) -> str | None:
         """Execute the login and return cookie string on success."""
-        if not self.login_url_js:
-            return None
+        # If loginUrl is set and contains JS, try API/JS-runtime paths
+        if self.login_url_js and self.login_url_js.strip():
+            # First try: regex-based parsing (fast path for simple API patterns)
+            login_info = self._parse_js_login()
+            if login_info:
+                cookie = await self._do_api_login(login_info, username, password)
+                if cookie:
+                    return cookie
 
-        # First try: regex-based parsing (fast path for simple patterns)
-        login_info = self._parse_js_login()
-        if login_info:
-            cookie = await self._do_api_login(login_info, username, password)
+            # Second try: use JS runtime to execute the login JS directly
+            cookie = await self._execute_js_login(username, password)
             if cookie:
                 return cookie
 
-        # Second try: use JS runtime to execute the login JS directly
-        cookie = await self._execute_js_login(username, password)
+        # Third try: Playwright form-based auto-login
+        # Works for both sources with loginUrl (plain URL) and sources
+        # without loginUrl (uses bookSourceUrl as default)
+        cookie = await self._execute_playwright_login(username, password)
         if cookie:
             return cookie
 
@@ -104,6 +110,278 @@ class YueduLoginParser:
         except Exception as e:
             logger.warning(f"JS runtime login failed: {e}")
             return None
+
+    async def _execute_playwright_login(
+        self, username: str, password: str
+    ) -> str | None:
+        """Use Playwright to open the login page, fill the form, submit,
+        and capture cookies -- replicating Legado's WebView-based login."""
+        login_url = self._resolve_login_url()
+        if not login_url:
+            return None
+
+        # Build a list of candidate login URLs to try
+        candidates = [login_url]
+        if self.base_url and login_url == self.base_url:
+            # Also try common login paths in parallel with the base URL
+            from urllib.parse import urljoin
+            for path in [
+                "/login", "/login.html", "/login.php",
+                "/user/login", "/member/login", "/signin",
+            ]:
+                candidates.append(urljoin(self.base_url, path))
+
+        # Only use Playwright for plain URLs, not JS code
+        if self._is_js_code(login_url):
+            return None
+
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            logger.warning("playwright not installed; cannot do form-based login")
+            return None
+
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox"],
+            )
+            try:
+                context = await browser.new_context(
+                    viewport={"width": 1280, "height": 720},
+                    locale="zh-CN",
+                )
+                page = await context.new_page()
+
+                # Try each candidate URL until we find a login form
+                cookie_str = None
+                for url in candidates:
+                    if cookie_str:
+                        break
+                    logger.info(f"Playwright form login: trying {url}")
+
+                    try:
+                        await page.goto(url, wait_until="networkidle", timeout=15000)
+                    except Exception:
+                        continue
+
+                    # Auto-fill the login form
+                    filled = await self._fill_login_form(page, username, password)
+                    if not filled:
+                        continue
+
+                    # Submit the form
+                    submitted = await self._submit_login_form(page)
+                    if not submitted:
+                        continue
+
+                    # Wait for login result
+                    await self._wait_for_login_result(page)
+
+                    # Capture cookies
+                    cookies = await context.cookies()
+                    cookie_str = "; ".join(
+                        f"{c['name']}={c['value']}" for c in cookies
+                        if c.get("name") and c.get("value")
+                    )
+                    if cookie_str:
+                        logger.info(
+                            f"Playwright login succeeded on {url} for "
+                            f"{self.config.get('bookSourceName', 'unknown')}: "
+                            f"{len(cookies)} cookies"
+                        )
+                        break
+
+                await context.close()
+                return cookie_str
+            finally:
+                await browser.close()
+
+    def _resolve_login_url(self) -> str | None:
+        """Resolve the loginUrl to an absolute HTTP URL.
+
+        If loginUrl is empty/missing, defaults to common login paths
+        on the source's base URL (matching Legado's WebView behavior).
+        """
+        from urllib.parse import urljoin
+
+        raw = (self.login_url_js or "").strip()
+
+        # If loginUrl is set, try to resolve it
+        if raw:
+            cleaned = self._clean_login_js(raw)
+            if cleaned.startswith("http://") or cleaned.startswith("https://"):
+                return cleaned
+            if "{{" in cleaned and "}}" in cleaned:
+                cleaned = cleaned.replace("{{baseUrl}}", self.base_url)
+                cleaned = cleaned.replace("{{Url()}}", self.base_url)
+                cleaned = re.sub(r"\{\{[^}]+\}\}", "", cleaned)
+                if cleaned.startswith("http"):
+                    return cleaned
+            if cleaned.startswith("/"):
+                return urljoin(self.base_url, cleaned)
+            if self.base_url and not self._is_js_code(cleaned):
+                return urljoin(self.base_url, cleaned)
+
+        # No loginUrl or couldn't resolve: try common login paths on base URL
+        if self.base_url:
+            for path in [
+                "/login", "/login.html", "/login.php",
+                "/user/login", "/member/login", "/signin",
+                "/user", "/member",
+            ]:
+                candidate = urljoin(self.base_url, path)
+                logger.debug(f"Trying login path: {candidate}")
+                # We'll try each in _execute_playwright_login
+            # Default: use the base URL itself (user may find login link there)
+            return self.base_url
+
+        return None
+
+    @staticmethod
+    def _is_js_code(text: str) -> bool:
+        """Check if text looks like JavaScript code (not a plain URL)."""
+        text = text.strip()
+        if not text:
+            return False
+        # Contains JS keywords
+        js_keywords = [
+            "function", "java.post", "java.get", "java.ajax",
+            "JSON.parse", "JSON.stringify", "return ", "var ",
+            "let ", "const ", "loginInfo", "@js:", "<js>",
+        ]
+        for kw in js_keywords:
+            if kw in text:
+                return True
+        # Starts with URL scheme
+        if text.startswith("http://") or text.startswith("https://"):
+            return False
+        # If it has no spaces and looks like a path/URL
+        if " " not in text and ("/" in text or "=" in text):
+            return False
+        return True
+
+    async def _fill_login_form(self, page, username: str, password: str) -> bool:
+        """Try to find and fill username/password fields on the login page."""
+        # Common username field selectors (ordered by likelihood)
+        username_selectors = [
+            "input[name='username']",
+            "input[name='user']",
+            "input[name='account']",
+            "input[name='email']",
+            "input[name='loginName']",
+            "input[name='name']",
+            "input[type='text'][name*='user' i]",
+            "input[type='text'][name*='account' i]",
+            "input[type='text'][name*='login' i]",
+            "input[type='email']",
+            "input[type='text']:first-of-type",
+        ]
+        # Common password field selectors
+        password_selectors = [
+            "input[name='password']",
+            "input[name='pass']",
+            "input[name='pwd']",
+            "input[name='passwd']",
+            "input[type='password']",
+        ]
+
+        username_el = None
+        for sel in username_selectors:
+            try:
+                username_el = await page.query_selector(sel)
+                if username_el:
+                    break
+            except Exception:
+                continue
+
+        password_el = None
+        for sel in password_selectors:
+            try:
+                password_el = await page.query_selector(sel)
+                if password_el:
+                    break
+            except Exception:
+                continue
+
+        if not username_el or not password_el:
+            return False
+
+        # Clear and fill
+        await username_el.click()
+        await username_el.fill("")
+        await username_el.type(username, delay=50)
+
+        await password_el.click()
+        await password_el.fill("")
+        await password_el.type(password, delay=50)
+
+        logger.info(f"Filled login form: username field found")
+        return True
+
+    async def _submit_login_form(self, page) -> bool:
+        """Try to submit the login form by clicking common submit buttons."""
+        submit_selectors = [
+            "button[type='submit']",
+            "input[type='submit']",
+            "button:has-text('登录')",
+            "button:has-text('Login')",
+            "button:has-text('登 录')",
+            "button:has-text('登陆')",
+            "a:has-text('登录')",
+            "a:has-text('Login')",
+            "button.btn-primary",
+            "button.login-btn",
+            "form button",
+            "form input[type='submit']",
+        ]
+
+        for sel in submit_selectors:
+            try:
+                btn = await page.query_selector(sel)
+                if btn:
+                    await btn.click()
+                    logger.info(f"Clicked submit button: {sel}")
+                    return True
+            except Exception:
+                continue
+
+        # Fallback: press Enter on the password field
+        try:
+            pwd = await page.query_selector("input[type='password']")
+            if pwd:
+                await pwd.press("Enter")
+                logger.info("Pressed Enter on password field")
+                return True
+        except Exception:
+            pass
+
+        return False
+
+    async def _wait_for_login_result(self, page) -> None:
+        """Wait for login to complete (URL change, cookie set, or element change)."""
+        try:
+            # Wait for navigation or network idle
+            await page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+
+        # Brief extra wait for cookie setting
+        try:
+            await page.wait_for_timeout(3000)
+        except Exception:
+            pass
+
+        # Try to detect login failure indicators
+        try:
+            page_text = await page.content()
+            if any(
+                kw in page_text
+                for kw in ["密码错误", "用户名错误", "登录失败", "账号或密码", "login failed"]
+            ):
+                logger.warning("Login failure detected on page")
+        except Exception:
+            pass
 
     @staticmethod
     def _clean_login_js(js: str) -> str:
