@@ -77,11 +77,10 @@ async def test_cookie(payload: CookieCreate):
     Does NOT save the cookie. Returns book count if successful.
     """
     from app.crawler.registry import get_plugin
-
     try:
         plugin = get_plugin(payload.source)
-    except ValueError:
-        raise HTTPException(status_code=400, detail=f"Unknown source: {payload.source}")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     if not hasattr(plugin, "fetch_bookshelf"):
         raise HTTPException(
