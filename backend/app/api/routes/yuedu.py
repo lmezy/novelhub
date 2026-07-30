@@ -234,12 +234,11 @@ async def import_and_sync_all(payload: YueduImportSyncRequest, db: AsyncSession 
         # Discover books from explore/category pages
         if payload.discover:
             try:
-                plugin = get_plugin(source_id, config=None)
-                if hasattr(plugin, "discover_books"):
-                    source = await db.get(Source, source_id)
-                    if source:
-                        config = source.config if source.plugin_name == "yuedu" else None
-                        plugin = get_plugin(source.plugin_name, config=config)
+                source = await db.get(Source, source_id)
+                if source:
+                    config = source.config if source.plugin_name == "yuedu" else None
+                    plugin = get_plugin(source.plugin_name, config=config)
+                if source and hasattr(plugin, "discover_books"):
                     for page in range(1, payload.max_discover_pages + 1):
                         shelf_books = await plugin.discover_books(page=page)
                         for sb in shelf_books:

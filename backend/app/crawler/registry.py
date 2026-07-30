@@ -5,10 +5,10 @@ must be configured with a YueDu book source JSON before use.
 
 get_plugin() accepts both plugin names (e.g. "yuedu") and source IDs
 (e.g. "yuedu_31a56dc1e2a9"). When given a source ID, it looks up the
-Source record to determine the plugin_name and config.
+Source record via a synchronous DB session to determine the plugin_name
+and config.
 """
 
-import asyncio
 from typing import Any
 
 from app.crawler.base import NovelSourcePlugin
@@ -36,7 +36,7 @@ def get_plugin(name: str, config: dict[str, Any] | None = None) -> NovelSourcePl
     """Get a plugin instance by plugin name or source ID.
 
     When given a source ID (not a known plugin name), looks up the Source
-    record to determine the actual plugin_name and fetches its config.
+    record via a synchronous DB session to determine the plugin_name and config.
     """
     if name in plugins:
         return _instantiate(name, config)
@@ -59,25 +59,24 @@ def _instantiate(plugin_name: str, config: dict[str, Any] | None = None) -> Nove
 
 
 def _get_plugin_by_source_id(source_id: str) -> NovelSourcePlugin:
-    """Look up a Source record and return the configured plugin."""
-    from app.core.database import SessionLocal
-    from app.models import Source
-    from sqlalchemy import select
+    """Look up a Source record via a synchronous DB session.
 
-    async def _lookup() -> NovelSourcePlugin:
-        async with SessionLocal() as db:
-            source = await db.get(Source, source_id)
+    Uses a sync session to avoid asyncpg event-loop conflicts when
+    called from within an active async database session.
+    """
+    from app.core.config import settings
+    from sqlalchemy import create_engine, select
+    from sqlalchemy.orm import Session
+    from app.models import Source
+
+    sync_url = settings.DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+    engine = create_engine(sync_url, pool_pre_ping=True)
+    try:
+        with Session(engine) as db:
+            source = db.get(Source, source_id)
             if source is None:
                 raise ValueError(f"Source not found: {source_id}")
             config = source.config if source.plugin_name == "yuedu" else None
             return _instantiate(source.plugin_name, config)
-
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(_lookup())
-    else:
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            future = pool.submit(lambda: asyncio.run(_lookup()))
-            return future.result()
+    finally:
+        engine.dispose()
