@@ -700,51 +700,51 @@ onMounted(async () => {
   
       <section v-if="tab === 'yuedu'" class="space-y-6">
         <div class="p-5 rounded-lg border-2 border-accent/30 dark:border-accent/50 bg-surface dark:bg-gray-900">
-          <h2 class="text-base font-bold mb-1">Import & Sync</h2>
-          <p class="text-xs text-muted dark:text-gray-400 mb-5">Paste a yuedu source URL, optionally add a Cookie, and import + sync everything in one click</p>
+          <h2 class="text-base font-bold mb-1">{{ i18n.t('admin_yuedu_title') }}</h2>
+          <p class="text-xs text-muted dark:text-gray-400 mb-5">{{ i18n.t('admin_yuedu_hint') }}</p>
 
           <div class="space-y-4">
             <div>
-              <label class="block text-xs font-medium mb-1.5">Source URL</label>
-              <input v-model="yueduUrl" placeholder="https://www.yckceo.com/yuedu/shuyuan/index.html" class="w-full px-3 py-2.5 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 focus:ring-2 focus:ring-accent/30 focus:border-accent" />
+              <label class="block text-xs font-medium mb-1.5">{{ i18n.t('admin_yuedu_source_url_label') }}</label>
+              <input v-model="yueduUrl" :placeholder="i18n.t('admin_yuedu_url_placeholder')" class="w-full px-3 py-2.5 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 focus:ring-2 focus:ring-accent/30 focus:border-accent" />
             </div>
             <div>
-              <label class="block text-xs font-medium mb-1.5">Cookie (optional)</label>
-              <textarea v-model="yueduCookie" placeholder="Paste cookie string from browser..." rows="3" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 resize-y font-mono text-xs" />
+              <label class="block text-xs font-medium mb-1.5">{{ i18n.t('admin_yuedu_cookie_label') }}</label>
+              <textarea v-model="yueduCookie" :placeholder="i18n.t('admin_yuedu_cookie_placeholder')" rows="3" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 resize-y font-mono text-xs" />
             </div>
             <div class="flex items-center gap-2">
               <input type="checkbox" id="yuedu-discover" v-model="yueduDiscover" class="rounded" />
-              <label for="yuedu-discover" class="text-xs text-muted dark:text-gray-400">Also discover novels from category pages</label>
+              <label for="yuedu-discover" class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_yuedu_discover_label') }}</label>
             </div>
 
             <p v-if="yueduSyncError" class="text-sm text-red-600">{{ yueduSyncError }}</p>
 
             <button @click="yueduImportAndSync" :disabled="yueduSyncImporting"
               class="w-full py-3 rounded-lg bg-accent text-white font-semibold hover:opacity-90 disabled:opacity-50 transition-all text-sm">
-              {{ yueduSyncImporting ? 'Importing & syncing...' : 'Import & Sync All' }}
+              {{ yueduSyncImporting ? i18n.t('admin_yuedu_importing_sync') : i18n.t('admin_yuedu_import_sync_btn') }}
             </button>
 
             <div v-if="yueduSyncResult" class="mt-4 space-y-3">
               <div class="grid grid-cols-4 gap-3 text-center">
                 <div class="p-3 rounded bg-green-50 dark:bg-green-950">
                   <div class="text-xl font-bold text-green-700 dark:text-green-400">{{ yueduSyncResult.sources_imported }}</div>
-                  <div class="text-xs text-muted dark:text-gray-400">Sources imported</div>
+                  <div class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_yuedu_sources_imported') }}</div>
                 </div>
                 <div class="p-3 rounded bg-blue-50 dark:bg-blue-950">
                   <div class="text-xl font-bold text-blue-700 dark:text-blue-400">{{ yueduSyncResult.books_synced }}</div>
-                  <div class="text-xs text-muted dark:text-gray-400">Bookshelf synced</div>
+                  <div class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_yuedu_bookshelf_synced') }}</div>
                 </div>
                 <div class="p-3 rounded bg-purple-50 dark:bg-purple-950">
                   <div class="text-xl font-bold text-purple-700 dark:text-purple-400">{{ yueduSyncResult.chapters_downloaded }}</div>
-                  <div class="text-xs text-muted dark:text-gray-400">Chapters downloaded</div>
+                  <div class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_yuedu_chapters_downloaded') }}</div>
                 </div>
                 <div class="p-3 rounded bg-amber-50 dark:bg-amber-950">
                   <div class="text-xl font-bold text-amber-700 dark:text-amber-400">{{ yueduSyncResult.books_discovered }}</div>
-                  <div class="text-xs text-muted dark:text-gray-400">Novels discovered</div>
+                  <div class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_yuedu_novels_discovered') }}</div>
                 </div>
               </div>
               <div v-if="yueduSyncResult.errors && yueduSyncResult.errors.length" class="p-3 rounded bg-red-50 dark:bg-red-950 text-sm">
-                <p class="font-medium text-red-700 dark:text-red-400 mb-1">{{ yueduSyncResult.errors.length }} errors</p>
+                <p class="font-medium text-red-700 dark:text-red-400 mb-1">{{ i18n.t('admin_yuedu_errors', { n: yueduSyncResult.errors.length }) }}</p>
                 <div class="max-h-32 overflow-y-auto space-y-1 text-xs text-red-600 dark:text-red-300">
                   <p v-for="(e, i) in yueduSyncResult.errors" :key="i">{{ e.source }}: {{ e.error }}</p>
                 </div>
@@ -752,26 +752,26 @@ onMounted(async () => {
             </div>
 
             <details class="mt-3">
-              <summary class="text-xs text-muted dark:text-gray-400 cursor-pointer hover:text-ink">Advanced (preview / manual import)</summary>
+              <summary class="text-xs text-muted dark:text-gray-400 cursor-pointer hover:text-ink">{{ i18n.t('admin_yuedu_advanced') }}</summary>
               <div class="mt-3 space-y-3">
-                <textarea v-model="yueduJsonText" placeholder="Or paste source JSON directly..." rows="3" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 resize-y" />
+                <textarea v-model="yueduJsonText" :placeholder="i18n.t('admin_yuedu_advanced_json_placeholder')" rows="3" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 resize-y" />
                 <p v-if="yueduError" class="text-sm text-red-600">{{ yueduError }}</p>
                 <div class="flex gap-3">
                   <button @click="yueduPreviewAction" :disabled="yueduPreviewing" class="px-3 py-1.5 rounded border border-border dark:border-gray-700 text-xs hover:bg-gray-50 dark:hover:bg-gray-800 disabled:opacity-50">
-                    {{ yueduPreviewing ? '...' : 'Preview' }}
+                    {{ yueduPreviewing ? '...' : i18n.t('admin_yuedu_btn_preview') }}
                   </button>
                   <button @click="yueduImport" :disabled="yueduImporting" class="px-3 py-1.5 rounded border border-accent text-accent text-xs hover:bg-accent/10 disabled:opacity-50">
-                    {{ yueduImporting ? '...' : 'Import only' }}
+                    {{ yueduImporting ? '...' : i18n.t('admin_yuedu_btn_import_only') }}
                   </button>
                 </div>
                 <div v-if="yueduPreview" class="p-2 rounded bg-blue-50 dark:bg-blue-950 text-xs">
-                  <p class="font-medium mb-1">Preview: {{ yueduPreview.count }} sources</p>
+                  <p class="font-medium mb-1">{{ i18n.t('admin_yuedu_preview_count', { n: yueduPreview.count }) }}</p>
                   <div class="max-h-32 overflow-y-auto">
                     <p v-for="(s, i) in yueduPreview.sources" :key="i">{{ s.name }}</p>
                   </div>
                 </div>
                 <div v-if="yueduResult" class="p-2 rounded bg-green-50 dark:bg-green-950 text-xs">
-                  <p class="font-medium mb-1">Imported {{ yueduResult.imported }}/{{ yueduResult.total }}</p>
+                  <p class="font-medium mb-1">{{ i18n.t('admin_yuedu_imported_count', { imported: yueduResult.imported, total: yueduResult.total }) }}</p>
                 </div>
               </div>
             </details>
