@@ -300,11 +300,13 @@ async function yueduImport() {
     if (yueduJsonText.value) body.json_text = yueduJsonText.value
     yueduResult.value = await api.post("/yuedu/import", body)
     await loadSources()
-  await loadCreds()
+    await loadCreds()
   } catch (e) {
     yueduError.value = e instanceof Error ? e.message : "Import failed"
   } finally {
-  yueduImporting.value = false
+    yueduImporting.value = false
+  }
+}
 
 async function yueduImportAndSync() {
   yueduSyncError.value = ""
@@ -322,8 +324,6 @@ async function yueduImportAndSync() {
     yueduSyncError.value = e instanceof Error ? e.message : "Import & Sync failed"
   } finally {
     yueduSyncImporting.value = false
-  }
-}
   }
 }
 
