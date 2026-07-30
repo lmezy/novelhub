@@ -43,3 +43,35 @@ class AliceSWPlugin:
         self.login.set_cookie(cookie)
         self.crawler.set_cookie(cookie)
         self.updater.set_cookie(cookie)
+
+    async def discover_books(self, url: str | None = None, page: int = 1) -> list[RemoteShelfBook]:
+        """Not implemented for AliceSW. Use yuedu plugin for catalog discovery."""
+        return []
+
+    async def auto_login(self, username: str, password: str) -> str | None:
+        """Attempt form-based login to AliceSW and return cookie string on success."""
+        import httpx
+        from bs4 import BeautifulSoup
+        from loguru import logger
+
+        login_url = f"{self.config.base_url}/login"
+        try:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                resp = await client.get(login_url)
+                soup = BeautifulSoup(resp.text, "lxml")
+                csrf = soup.select_one('input[name="_token"], input[name="csrf_token"], meta[name="csrf-token"]')
+                token = csrf.get("content") or csrf.get("value", "") if csrf else ""
+                form_data = {"username": username, "password": password}
+                if token:
+                    form_data["_token"] = token
+                login_resp = await client.post(login_url, data=form_data)
+                cookies = login_resp.headers.get_all("set-cookie")
+                if cookies:
+                    cookie_str = "; ".join(c.split(";")[0] for c in cookies)
+                    if len(cookie_str) > 20:
+                        self.set_cookie(cookie_str)
+                        logger.info("AliceSW auto-login successful for {}", username)
+                        return cookie_str
+        except Exception as exc:
+            logger.warning("AliceSW auto-login failed: {}", exc)
+        return None

@@ -51,3 +51,11 @@ class NovelSourcePlugin(Protocol):
     async def auto_login(self, username: str, password: str) -> str | None:
         """Attempt auto-login with credentials. Returns cookie string on success, None on failure."""
         ...
+
+    async def discover_books(self, url: str | None = None, page: int = 1) -> list[RemoteShelfBook]:
+        """Discover books from a catalog/explore/ranking page.
+
+        Each plugin implements site-specific parsing. The yuedu plugin
+        uses exploreUrl rules from the source JSON.
+        """
+        ...

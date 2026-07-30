@@ -1,39 +1,51 @@
-from celery import Celery
-from app.core.config import settings
+"""Celery application for NovelHub scheduled crawl tasks.
 
-celery_app = Celery(
+Shared by both the scheduler (beat) and crawler (worker) containers.
+"""
+
+import os
+
+from celery import Celery
+from celery.schedules import crontab
+
+REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+REDIS_PORT = os.getenv("REDIS_PORT", "6379")
+
+app = Celery(
     "novelhub",
-    broker=f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/0",
-    backend=f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/0",
+    broker=f"redis://{REDIS_HOST}:{REDIS_PORT}/0",
 )
 
-celery_app.conf.update(
+app.conf.update(
     task_serializer="json",
     accept_content=["json"],
     result_serializer="json",
     timezone="Asia/Shanghai",
     enable_utc=True,
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
+    task_default_retry_delay=300,  # 5 minutes
+    task_max_retries=3,
+    task_default_queue="crawl",
+    task_queues={
+        "crawl": {"exchange": "crawl", "routing_key": "crawl"},
+    },
     task_routes={
-        "tasks.crawl_source": {"queue": "crawl"},
+        "tasks.daily_sync_all": {"queue": "crawl"},
+        "tasks.sync_single_source": {"queue": "crawl"},
+        "tasks.resync_all_books": {"queue": "crawl"},
     },
     beat_schedule={
         "daily-sync-all-sources": {
-            "task": "tasks.sync_all_sources",
-            "schedule": 86400.0,
+            "task": "tasks.daily_sync_all",
+            "schedule": crontab(hour=3, minute=0),
         },
-        "daily-incremental-backup": {
-            "task": "tasks.daily_backup",
-            "schedule": 86400.0,
-        },
-        "weekly-full-backup": {
-            "task": "tasks.weekly_backup",
-            "schedule": 604800.0,
-        },
-        "check-cookie-expiry": {
-            "task": "tasks.check_cookie_expiry",
-            "schedule": 43200.0,
+        "cookie-health-check": {
+            "task": "tasks.check_cookie_health",
+            "schedule": crontab(hour=2, minute=0),
         },
     },
 )
 
-import tasks  # noqa: F401 -- register tasks for discovery
+# Register tasks by importing the module after app is created
+import tasks  # noqa: E402, F401

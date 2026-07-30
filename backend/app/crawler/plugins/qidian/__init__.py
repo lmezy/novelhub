@@ -83,3 +83,32 @@ class QidianPlugin:
         if self.crawler:
             await self.crawler.close()
             self.crawler = None
+
+    async def discover_books(self, url: str | None = None, page: int = 1) -> list[RemoteShelfBook]:
+        """Not implemented for Qidian. Use yuedu plugin for catalog discovery."""
+        return []
+
+    async def auto_login(self, username: str, password: str) -> str | None:
+        """Attempt Playwright-based login to Qidian."""
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            return None
+        try:
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
+                page = await browser.new_page()
+                await page.goto(f"{self.config.base_url}/login", wait_until="networkidle", timeout=30000)
+                await page.fill('input[name="username"], input[type="text"]', username)
+                await page.fill('input[name="password"], input[type="password"]', password)
+                await page.click('button[type="submit"], input[type="submit"]')
+                await page.wait_for_timeout(3000)
+                cookies = await page.context.cookies()
+                await browser.close()
+                if cookies:
+                    cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+                    self.set_cookie(cookie_str)
+                    return cookie_str
+        except Exception:
+            pass
+        return None

@@ -65,7 +65,10 @@ class SyncService:
 
         created = 0
         skipped = 0
+        total = len(remote_book.chapters)
+        batch = 0
         for remote_chapter in remote_book.chapters:
+            batch += 1
             existing = await self.db.scalar(
                 select(Chapter).where(
                     Chapter.book_id == book.id,
@@ -107,9 +110,22 @@ class SyncService:
             emit(EventType.CHAPTER_CREATED, chapter_id=chapter.id, book_id=book.id)
             created += 1
 
+            # Commit every 20 chapters so partial progress is saved on failure
+            if batch % 20 == 0:
+                await self.db.commit()
+                logger.debug("Checkpoint: {}/{} chapters synced for book {}", created, total, book.id)
+
         await self.db.commit()
         emit(EventType.SYNC_COMPLETED, book_id=book.id, created=created, skipped=skipped)
         logger.info("Sync complete book={} created={} skipped={}", book.id, created, skipped)
+
+        # Auto-categorize after sync (if new book or new tags)
+        try:
+            from app.services.auto_categorize import AutoCategorizationService
+            await AutoCategorizationService.categorize_book(self.db, book.id)
+        except Exception:
+            pass
+
         return {
             "book_id": book.id,
             "created_chapters": created,
@@ -228,3 +244,71 @@ class SyncService:
             if not url:
                 raise ValueError("Cannot determine book URL for re-sync")
         return await self.sync_book(book.source_id, url)
+
+    async def discover_and_sync(
+        self,
+        source_id: str,
+        url: str | None = None,
+        page: int = 1,
+        sync: bool = True,
+    ) -> dict:
+        """Discover books from a source's explore/catalog page and optionally sync them.
+
+        Uses the plugin's discover_books method if available. Falls back
+        to returning an empty list for plugins that don't implement it.
+        """
+        source = await self.db.get(Source, source_id)
+        if source is None or not source.enabled:
+            raise ValueError("Source not found or disabled")
+
+        config = source.config if source.plugin_name == "yuedu" else None
+        plugin = get_plugin(source.plugin_name, config=config)
+
+        if not hasattr(plugin, "discover_books"):
+            return {
+                "source_id": source_id,
+                "books_found": 0,
+                "books_synced": 0,
+                "details": [],
+            }
+
+        shelf_books = await plugin.discover_books(url=url, page=page)
+        books_found = len(shelf_books)
+        books_synced = 0
+        details = []
+
+        if sync:
+            for sb in shelf_books:
+                try:
+                    result = await self.sync_book(source_id, sb.url)
+                    details.append({
+                        "title": sb.title,
+                        "author": sb.author,
+                        "url": sb.url,
+                        "synced": True,
+                        "book_id": result.get("book_id"),
+                    })
+                    books_synced += 1
+                except Exception as exc:
+                    details.append({
+                        "title": sb.title,
+                        "author": sb.author,
+                        "url": sb.url,
+                        "synced": False,
+                        "error": str(exc),
+                    })
+        else:
+            for sb in shelf_books:
+                details.append({
+                    "title": sb.title,
+                    "author": sb.author,
+                    "url": sb.url,
+                    "synced": False,
+                })
+
+        return {
+            "source_id": source_id,
+            "books_found": books_found,
+            "books_synced": books_synced,
+            "details": details,
+        }

@@ -1,80 +1,184 @@
+"""Celery tasks for automated novel syncing.
+
+daily_sync_all      -- beat-scheduled: sync every enabled source
+sync_single_source  -- sync one source by ID
+resync_all_books    -- resync every book already in the library
+"""
+
 import asyncio
-from celery.utils.log import get_task_logger
+from uuid import uuid4
+from datetime import datetime, timezone
 
-from celery_app import celery_app
+from celery_app import app
+from loguru import logger
 
-logger = get_task_logger(__name__)
+
+@app.task(name="tasks.daily_sync_all")
+def daily_sync_all() -> dict:
+    """Daily beat task: sync all enabled sources."""
+    return asyncio.get_event_loop().run_until_complete(_daily_sync_all_async())
 
 
-@celery_app.task(name="tasks.sync_all_sources")
-def sync_all_sources() -> dict:
+@app.task(name="tasks.sync_single_source")
+def sync_single_source(source_id: str) -> dict:
+    """Sync a single source by its ID."""
+    return asyncio.get_event_loop().run_until_complete(
+        _sync_single_source_async(source_id)
+    )
+
+
+@app.task(name="tasks.resync_all_books")
+def resync_all_books() -> dict:
+    """Resync every book in the library (checks for new chapters)."""
+    return asyncio.get_event_loop().run_until_complete(_resync_all_books_async())
+
+
+@app.task(name="tasks.check_cookie_health")
+def check_cookie_health() -> dict:
+    """Periodic task: validate all cookies and auto-refresh expired ones."""
+    return asyncio.get_event_loop().run_until_complete(_check_cookie_health_async())
+
+
+async def _check_cookie_health_async() -> dict:
+    from app.services.cookie_health import CookieHealthService
+    return await CookieHealthService.check_all_cookies()
+
+
+async def _daily_sync_all_async() -> dict:
     from app.core.database import SessionLocal
-    from app.repositories.source import SourceRepository
+    from app.models import Book, CrawlLog, CrawlTask, Source
+    from app.services.sync import SyncService
+    from sqlalchemy import select
 
-    async def _run():
-        async with SessionLocal() as db:
-            repo = SourceRepository(db)
-            sources = await repo.list_enabled()
-            logger.info("Daily sync: found %d enabled sources", len(sources))
+    async with SessionLocal() as db:
+        sources = await db.scalars(
+            select(Source).where(Source.enabled == True)
+        )
+        source_list = list(sources)
+        task_obj = CrawlTask(
+            id=str(uuid4()),
+            source="*",
+            status="running",
+            started_at=datetime.now(timezone.utc),
+        )
+        db.add(task_obj)
+        await db.commit()
+        results = {
+            "task_id": task_obj.id,
+            "total_sources": len(source_list),
+            "synced": 0,
+            "failed": 0,
+            "details": [],
+        }
+        service = SyncService(db)
+        for src in source_list:
+            try:
+                try:
+                    shelf_result = await service.sync_bookshelf(src.id)
+                    results["details"].append({
+                        "source_id": src.id,
+                        "method": "bookshelf",
+                        "status": "ok",
+                        "books_on_shelf": shelf_result.get("total", 0),
+                    })
+                except ValueError:
+                    books = await db.scalars(
+                        select(Book).where(Book.source_id == src.id)
+                    )
+                    book_list = list(books)
+                    if not book_list:
+                        results["details"].append({
+                            "source_id": src.id,
+                            "method": "skip",
+                            "status": "ok",
+                            "reason": "no books and no cookie",
+                        })
+                        results["synced"] += 1
+                        continue
+                    for book in book_list:
+                        try:
+                            r = await service.resync_book(book.id)
+                            results["details"].append({
+                                "book_id": book.id,
+                                "method": "resync",
+                                "status": "ok",
+                                "chapters": r.get("created_chapters", 0),
+                            })
+                        except Exception as exc:
+                            results["details"].append({
+                                "book_id": book.id,
+                                "method": "resync",
+                                "status": "failed",
+                                "error": str(exc),
+                            })
+                results["synced"] += 1
+            except Exception as exc:
+                logger.opt(exception=exc).error(
+                    "Sync failed for source {}", src.id
+                )
+                results["failed"] += 1
+                results["details"].append({
+                    "source_id": src.id,
+                    "status": "failed",
+                    "error": str(exc),
+                })
+        task_obj.status = "completed" if results["failed"] == 0 else "completed_with_errors"
+        task_obj.finished_at = datetime.now(timezone.utc)
+        await db.commit()
+        logger.info("Daily sync: {} synced, {} failed", results["synced"], results["failed"])
+        return results
 
+
+async def _sync_single_source_async(source_id: str) -> dict:
+    from app.core.database import SessionLocal
+    from app.models import Book, Source
+    from app.services.sync import SyncService
+    from sqlalchemy import select
+
+    async with SessionLocal() as db:
+        source = await db.get(Source, source_id)
+        if source is None or not source.enabled:
+            return {"status": "skipped", "reason": "source not found or disabled"}
+        service = SyncService(db)
+        try:
+            return await service.sync_bookshelf(source_id)
+        except ValueError:
+            books = await db.scalars(
+                select(Book).where(Book.source_id == source_id)
+            )
             results = []
-            for source in sources:
-                logger.info("Triggering crawl for source=%s", source.id)
-                crawl_source.delay(source.id)
-                results.append({"source_id": source.id, "status": "queued"})
-
-            return {"sources_queued": len(results), "results": results}
-
-    return asyncio.run(_run())
-
-
-@celery_app.task(name="tasks.crawl_source", bind=True, max_retries=3)
-def crawl_source(self, source_id: str) -> dict:
-    import asyncio
-
-    async def _run():
-        from crawler_service import run_crawl_for_source
-        await run_crawl_for_source(source_id)
-        return {"source_id": source_id, "status": "completed"}
-
-    try:
-        return asyncio.run(_run())
-    except Exception as exc:
-        logger.exception("Crawl failed for source=%s, retry=%d", source_id, self.request.retries)
-        raise self.retry(exc=exc, countdown=300)
+            for book in books:
+                try:
+                    r = await service.resync_book(book.id)
+                    results.append({"book_id": book.id, **r})
+                except Exception as exc:
+                    results.append({"book_id": book.id, "error": str(exc)})
+            return {"status": "partial", "results": results}
 
 
-@celery_app.task(name="tasks.daily_backup")
-def daily_backup() -> dict:
-    """Daily incremental backup -- runs every day."""
-    import asyncio
+async def _resync_all_books_async() -> dict:
+    from app.core.database import SessionLocal
+    from app.models import Book
+    from app.services.sync import SyncService
+    from sqlalchemy import select
 
-    async def _run():
-        from app.services.backup import BackupService
-        path = await BackupService().create_incremental_backup()
-        logger.info("Daily backup complete: %s", path)
-        return {"path": path, "status": "completed"}
-
-    try:
-        return asyncio.run(_run())
-    except Exception as exc:
-        logger.exception("Daily backup failed")
-        return {"status": "failed", "error": str(exc)}
-
-
-@celery_app.task(name="tasks.weekly_backup")
-def weekly_backup() -> dict:
-    """Weekly full backup -- runs every Sunday."""
-    import asyncio
-
-    async def _run():
-        from app.services.backup import BackupService
-        path = await BackupService().create_full_backup()
-        logger.info("Weekly full backup complete: %s", path)
-        return {"path": path, "status": "completed"}
-
-    try:
-        return asyncio.run(_run())
-    except Exception as exc:
-        logger.exception("Weekly backup failed")
-        return {"status": "failed", "error": str(exc)}
+    async with SessionLocal() as db:
+        books = await db.scalars(select(Book))
+        book_list = list(books)
+        results = {"total_books": len(book_list), "ok": 0, "failed": 0, "details": []}
+        service = SyncService(db)
+        for book in book_list:
+            try:
+                r = await service.resync_book(book.id)
+                results["ok"] += 1
+                results["details"].append({
+                    "book_id": book.id,
+                    "chapters": r.get("created_chapters", 0),
+                })
+            except Exception as exc:
+                results["failed"] += 1
+                results["details"].append({
+                    "book_id": book.id,
+                    "error": str(exc),
+                })
+        return results

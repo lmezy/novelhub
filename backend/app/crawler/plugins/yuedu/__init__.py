@@ -493,6 +493,27 @@ class YueduPlugin:
         return self.engine.parse_search_results(html)
     # ---- Optional: update_book ----
 
+    async def discover_books(self, url: str | None = None, page: int = 1) -> list[RemoteShelfBook]:
+        """Discover books from a source's explore/catalog pages.
+
+        Wraps the existing fetch_explore method to return RemoteShelfBook
+        objects compatible with the NovelSourcePlugin protocol.
+        """
+        items = await self.fetch_explore(url=url, page=page)
+        books: list[RemoteShelfBook] = []
+        for item in items:
+            book_url = item.get("bookUrl", item.get("url", ""))
+            if not book_url:
+                continue
+            books.append(RemoteShelfBook(
+                source_book_id=book_url.rstrip("/").split("/")[-1] or book_url,
+                title=item.get("name", item.get("title", book_url)),
+                author=item.get("author", "Unknown"),
+                url=self._make_absolute(book_url, self.base_url),
+                latest_chapter_title=item.get("latestChapterTitle"),
+            ))
+        return books
+
     async def update_book(self, url: str) -> RemoteBook | None:
         """Re-fetch a book to check for new chapters."""
         try:

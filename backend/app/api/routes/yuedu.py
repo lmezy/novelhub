@@ -128,6 +128,138 @@ async def import_yuedu_sources(payload: YueduImportRequest, db: AsyncSession = D
     )
 
 
+class YueduImportSyncRequest(BaseModel):
+    url: str | None = None
+    json_text: str | None = None
+    cookie: str | None = None
+    discover: bool = True
+    max_discover_pages: int = 3
+
+
+class YueduImportSyncResult(BaseModel):
+    sources_total: int
+    sources_imported: int
+    sources_skipped: int
+    books_synced: int
+    chapters_downloaded: int
+    books_discovered: int
+    errors: list[dict[str, Any]]
+    details: list[dict[str, Any]]
+
+
+@router.post("/import-and-sync", response_model=YueduImportSyncResult, dependencies=[Depends(require_admin)])
+async def import_and_sync_all(payload: YueduImportSyncRequest, db: AsyncSession = Depends(get_db)):
+    """Import yuedu sources and immediately sync all discovered books.
+
+    This is the primary one-click workflow:
+    1. Import all book sources from the URL/JSON
+    2. If cookie provided, save it for each source
+    3. For each source, sync bookshelf (needs cookie)
+    4. For each source, discover books from explore/category pages
+    5. Return comprehensive results
+    """
+    from uuid import uuid4
+    from app.models import Cookie
+    from app.services.cookie_crypto import encrypt_cookie
+    from app.services.sync import SyncService
+    from app.crawler.registry import get_plugin
+
+    # Step 1: Import sources
+    import_result = await import_yuedu_sources(
+        YueduImportRequest(url=payload.url, json_text=payload.json_text),
+        db,
+    )
+
+    result = YueduImportSyncResult(
+        sources_total=import_result.total,
+        sources_imported=import_result.imported,
+        sources_skipped=import_result.skipped,
+        books_synced=0,
+        chapters_downloaded=0,
+        books_discovered=0,
+        errors=[],
+        details=[],
+    )
+
+    # Step 2: Save cookie if provided
+    if payload.cookie and payload.cookie.strip():
+        for src_info in import_result.sources:
+            if src_info["status"] != "imported":
+                continue
+            source_id = src_info["id"]
+            existing_cookie = await db.scalar(
+                select(Cookie).where(Cookie.source == source_id)
+            )
+            if existing_cookie is None:
+                cookie_obj = Cookie(
+                    id=str(uuid4()),
+                    source=source_id,
+                    cookie_data=encrypt_cookie(payload.cookie.strip()),
+                )
+                db.add(cookie_obj)
+        await db.commit()
+
+    # Step 3 & 4: Sync bookshelf + discover for each imported source
+    sync_service = SyncService(db)
+    for src_info in import_result.sources:
+        source_id = src_info["id"]
+        source_name = src_info.get("name", source_id)
+        detail = {"source_id": source_id, "name": source_name, "sync": {}, "discover": {}}
+
+        # Sync bookshelf
+        try:
+            # Check if there's a cookie for this source
+            cookie_record = await db.scalar(
+                select(Cookie).where(Cookie.source == source_id)
+            )
+            if cookie_record:
+                shelf_result = await sync_service.sync_bookshelf(source_id)
+                synced = sum(
+                    r.get("created_chapters", 0)
+                    for r in shelf_result.get("results", [])
+                    if isinstance(r, dict)
+                )
+                detail["sync"] = {
+                    "books_found": shelf_result.get("total", 0),
+                    "chapters_downloaded": synced,
+                }
+                result.books_synced += 1
+                result.chapters_downloaded += synced
+            else:
+                detail["sync"] = {"skipped": "no cookie"}
+        except Exception as exc:
+            detail["sync"] = {"error": str(exc)[:200]}
+            result.errors.append({"source": source_id, "stage": "sync", "error": str(exc)[:200]})
+
+        # Discover books from explore/category pages
+        if payload.discover:
+            try:
+                plugin = get_plugin(source_id, config=None)
+                if hasattr(plugin, "discover_books"):
+                    source = await db.get(Source, source_id)
+                    if source:
+                        config = source.config if source.plugin_name == "yuedu" else None
+                        plugin = get_plugin(source.plugin_name, config=config)
+                    for page in range(1, payload.max_discover_pages + 1):
+                        shelf_books = await plugin.discover_books(page=page)
+                        for sb in shelf_books:
+                            try:
+                                await sync_service.sync_book(source_id, sb.url)
+                                result.books_discovered += 1
+                                result.chapters_downloaded += 1
+                            except Exception:
+                                pass
+                        if len(shelf_books) == 0:
+                            break
+                detail["discover"] = {"pages_checked": payload.max_discover_pages}
+            except Exception as exc:
+                detail["discover"] = {"error": str(exc)[:200]}
+
+        result.details.append(detail)
+
+    return result
+
+
 @router.post("/preview", dependencies=[Depends(require_admin)])
 async def preview_yuedu_sources(payload: YueduImportRequest):
     """Preview what sources a URL or JSON text would import without saving."""

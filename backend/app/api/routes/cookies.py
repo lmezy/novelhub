@@ -112,3 +112,23 @@ async def test_cookie(payload: CookieCreate):
                 await plugin.close()
             except Exception:
                 pass
+
+
+@router.post("/{cookie_id}/refresh", status_code=200)
+async def refresh_cookie(cookie_id: str, db: AsyncSession = Depends(get_db)):
+    """Refresh an expired cookie using stored credentials (auto-login)."""
+    from app.services.cookie_health import CookieHealthService
+    try:
+        result = await CookieHealthService.refresh_single_cookie(cookie_id)
+        if result.get("success"):
+            return {"status": "ok", "message": result.get("message", "Cookie refreshed")}
+        raise HTTPException(status_code=400, detail=result.get("error", "Refresh failed"))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/health-check", status_code=200)
+async def check_all_cookies_health(db: AsyncSession = Depends(get_db)):
+    """Check all cookies and auto-refresh any that are expired/invalid."""
+    from app.services.cookie_health import CookieHealthService
+    return await CookieHealthService.check_all_cookies()

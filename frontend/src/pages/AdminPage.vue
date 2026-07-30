@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { onMounted, ref } from "vue"
 import { api } from "../api/client"
 import { useI18nStore } from "../stores/i18n"
@@ -21,7 +21,7 @@ interface CookieItem {
   expired_at: string | null
 }
 
-const tab = ref<"sources" | "cookies" | "sync" | "logs" | "tokens" | "index" | "status" | "yuedu" | "creds" | "users" | "approvals" | "proxy">("sources")
+const tab = ref<"sources" | "cookies" | "sync" | "logs" | "tokens" | "index" | "status" | "yuedu" | "creds" | "users" | "approvals" | "proxy">("yuedu"))
 
 const sources = ref<Source[]>([])
 const sourceForm = ref({ id: "", name: "", url: "", plugin_name: "alicesw" })
@@ -111,6 +111,11 @@ const bookshelfLoading = ref(false)
 const yueduUrl = ref("")
 const yueduJsonText = ref("")
 const yueduImporting = ref(false)
+const yueduSyncImporting = ref(false)
+const yueduCookie = ref("")
+const yueduDiscover = ref(true)
+const yueduSyncResult = ref<any>(null)
+const yueduSyncError = ref("")
 
 const creds = ref<any[]>([])
 const credForm = ref({ source: "", username: "", password: "" })
@@ -299,7 +304,26 @@ async function yueduImport() {
   } catch (e) {
     yueduError.value = e instanceof Error ? e.message : "Import failed"
   } finally {
-    yueduImporting.value = false
+  yueduImporting.value = false
+
+async function yueduImportAndSync() {
+  yueduSyncError.value = ""
+  yueduSyncResult.value = null
+  yueduSyncImporting.value = true
+  try {
+    const body: any = { discover: yueduDiscover.value }
+    if (yueduUrl.value) body.url = yueduUrl.value
+    if (yueduJsonText.value) body.json_text = yueduJsonText.value
+    if (yueduCookie.value.trim()) body.cookie = yueduCookie.value.trim()
+    yueduSyncResult.value = await api.post("/yuedu/import-and-sync", body)
+    await loadSources()
+    await loadCookies()
+  } catch (e) {
+    yueduSyncError.value = e instanceof Error ? e.message : "Import & Sync failed"
+  } finally {
+    yueduSyncImporting.value = false
+  }
+}
   }
 }
 
@@ -675,50 +699,84 @@ onMounted(async () => {
       </section>
   
       <section v-if="tab === 'yuedu'" class="space-y-6">
-        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
-          <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_yuedu_title') }}</h2>
-          <p class="text-xs text-muted dark:text-gray-400 mb-4">{{ i18n.t('admin_yuedu_hint') }}</p>
-          <div class="space-y-3 mb-3">
-            <input v-model="yueduUrl" :placeholder="i18n.t('admin_yuedu_url_placeholder')" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-            <textarea v-model="yueduJsonText" :placeholder="i18n.t('admin_yuedu_json_placeholder')" rows="4" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 resize-y" />
-          </div>
-          <p v-if="yueduError" class="text-sm text-red-600 mb-2">{{ yueduError }}</p>
-          <div class="flex gap-3">
-            <button @click="yueduPreviewAction" :disabled="yueduPreviewing" class="px-4 py-2 rounded border border-accent text-accent text-sm font-medium hover:bg-accent/10 disabled:opacity-50">
-              {{ yueduPreviewing ? i18n.t('admin_loading') : i18n.t('admin_yuedu_preview') }}
-            </button>
-            <button @click="yueduImport" :disabled="yueduImporting" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">
-              {{ yueduImporting ? i18n.t('admin_importing') : i18n.t('admin_yuedu_import') }}
-            </button>
-          </div>
-          <div v-if="yueduPreview" class="mt-4 p-3 rounded bg-blue-50 dark:bg-blue-950 text-sm">
-            <p class="font-medium mb-1">{{ i18n.t('admin_yuedu_preview_count', { n: yueduPreview.count }) }}</p>
-            <div class="max-h-64 overflow-y-auto space-y-1 text-xs text-muted dark:text-gray-400">
-              <p v-for="(s, i) in yueduPreview.sources" :key="i">{{ s.name }} &mdash; {{ s.url }}</p>
+        <div class="p-5 rounded-lg border-2 border-accent/30 dark:border-accent/50 bg-surface dark:bg-gray-900">
+          <h2 class="text-base font-bold mb-1">涓€閿鍏ュ苟鍚屾</h2>
+          <p class="text-xs text-muted dark:text-gray-400 mb-5">绮樿创闃呰涔︽簮閾炬帴锛屽彲閫夊～鍏?Cookie锛屼竴閿畬鎴愪功婧愬鍏ャ€佷功鏋跺悓姝ュ拰灏忚鍙戠幇</p>
+
+          <div class="space-y-4">
+            <div>
+              <label class="block text-xs font-medium mb-1.5">涔︽簮 URL</label>
+              <input v-model="yueduUrl" placeholder="https://www.yckceo.com/yuedu/shuyuan/index.html" class="w-full px-3 py-2.5 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 focus:ring-2 focus:ring-accent/30 focus:border-accent" />
             </div>
-          </div>
-          <div v-if="yueduResult" class="mt-4 p-3 rounded bg-green-50 dark:bg-green-950 text-sm">
-            <p class="font-medium mb-2">{{ i18n.t('admin_yuedu_imported', { imported: yueduResult.imported, total: yueduResult.total }) }}</p>
-            <p v-if="yueduResult.skipped > 0" class="text-xs text-muted dark:text-gray-400 mb-2">{{ i18n.t('admin_yuedu_skipped', { n: yueduResult.skipped }) }}</p>
-            <div class="max-h-48 overflow-y-auto space-y-1 text-xs text-muted dark:text-gray-400">
-              <p v-for="(s, i) in yueduResult.sources.filter((s: any) => s.status === 'imported')" :key="i">
-                <span class="font-medium text-green-700 dark:text-green-400">{{ s.name }}</span>
-                <span v-if="s.bookshelf_url" class="ml-1">&#10003; {{ i18n.t('admin_yuedu_bookshelf_detected') }}: {{ s.bookshelf_url }}</span>
-                <span v-else class="ml-1 text-yellow-600 dark:text-yellow-400">{{ i18n.t('admin_yuedu_bookshelf_none') }}</span>
-              </p>
+            <div>
+              <label class="block text-xs font-medium mb-1.5">Cookie (鍙€?</label>
+              <textarea v-model="yueduCookie" placeholder="绮樿创浠庢祻瑙堝櫒澶嶅埗鐨?Cookie 瀛楃涓?.." rows="3" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 resize-y font-mono text-xs" />
             </div>
+            <div class="flex items-center gap-2">
+              <input type="checkbox" id="yuedu-discover" v-model="yueduDiscover" class="rounded" />
+              <label for="yuedu-discover" class="text-xs text-muted dark:text-gray-400">鍚屾椂浠庡垎绫?鎺掕姒滈〉闈㈠彂鐜板皬璇?/label>
+            </div>
+
+            <p v-if="yueduSyncError" class="text-sm text-red-600">{{ yueduSyncError }}</p>
+
+            <button @click="yueduImportAndSync" :disabled="yueduSyncImporting"
+              class="w-full py-3 rounded-lg bg-accent text-white font-semibold hover:opacity-90 disabled:opacity-50 transition-all text-sm">
+              {{ yueduSyncImporting ? '姝ｅ湪瀵煎叆骞跺悓姝?..' : '瀵煎叆骞跺悓姝ュ叏閮? }}
+            </button>
+
+            <div v-if="yueduSyncResult" class="mt-4 space-y-3">
+              <div class="grid grid-cols-4 gap-3 text-center">
+                <div class="p-3 rounded bg-green-50 dark:bg-green-950">
+                  <div class="text-xl font-bold text-green-700 dark:text-green-400">{{ yueduSyncResult.sources_imported }}</div>
+                  <div class="text-xs text-muted dark:text-gray-400">涔︽簮宸插鍏?/div>
+                </div>
+                <div class="p-3 rounded bg-blue-50 dark:bg-blue-950">
+                  <div class="text-xl font-bold text-blue-700 dark:text-blue-400">{{ yueduSyncResult.books_synced }}</div>
+                  <div class="text-xs text-muted dark:text-gray-400">涔︽灦宸插悓姝?/div>
+                </div>
+                <div class="p-3 rounded bg-purple-50 dark:bg-purple-950">
+                  <div class="text-xl font-bold text-purple-700 dark:text-purple-400">{{ yueduSyncResult.chapters_downloaded }}</div>
+                  <div class="text-xs text-muted dark:text-gray-400">绔犺妭宸蹭笅杞?/div>
+                </div>
+                <div class="p-3 rounded bg-amber-50 dark:bg-amber-950">
+                  <div class="text-xl font-bold text-amber-700 dark:text-amber-400">{{ yueduSyncResult.books_discovered }}</div>
+                  <div class="text-xs text-muted dark:text-gray-400">灏忚宸插彂鐜?/div>
+                </div>
+              </div>
+              <div v-if="yueduSyncResult.errors?.length" class="p-3 rounded bg-red-50 dark:bg-red-950 text-sm">
+                <p class="font-medium text-red-700 dark:text-red-400 mb-1">{{ yueduSyncResult.errors.length }} 涓敊璇?/p>
+                <div class="max-h-32 overflow-y-auto space-y-1 text-xs text-red-600 dark:text-red-300">
+                  <p v-for="(e, i) in yueduSyncResult.errors" :key="i">{{ e.source }}: {{ e.error }}</p>
+                </div>
+              </div>
+            </div>
+
+            <details class="mt-3">
+              <summary class="text-xs text-muted dark:text-gray-400 cursor-pointer hover:text-ink">楂樼骇閫夐」 (棰勮/鎵嬪姩瀵煎叆)</summary>
+              <div class="mt-3 space-y-3">
+                <textarea v-model="yueduJsonText" placeholder="鎴栫洿鎺ョ矘璐翠功婧?JSON..." rows="3" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 resize-y" />
+                <p v-if="yueduError" class="text-sm text-red-600">{{ yueduError }}</p>
+                <div class="flex gap-3">
+                  <button @click="yueduPreviewAction" :disabled="yueduPreviewing" class="px-3 py-1.5 rounded border border-border dark:border-gray-700 text-xs hover:bg-gray-50 dark:hover:bg-gray-800 disabled:opacity-50">
+                    {{ yueduPreviewing ? '...' : '棰勮' }}
+                  </button>
+                  <button @click="yueduImport" :disabled="yueduImporting" class="px-3 py-1.5 rounded border border-accent text-accent text-xs hover:bg-accent/10 disabled:opacity-50">
+                    {{ yueduImporting ? '...' : '浠呭鍏? }}
+                  </button>
+                </div>
+                <div v-if="yueduPreview" class="p-2 rounded bg-blue-50 dark:bg-blue-950 text-xs">
+                  <p class="font-medium mb-1">棰勮: {{ yueduPreview.count }} 涓功婧?/p>
+                  <div class="max-h-32 overflow-y-auto">
+                    <p v-for="(s, i) in yueduPreview.sources" :key="i">{{ s.name }}</p>
+                  </div>
+                </div>
+                <div v-if="yueduResult" class="p-2 rounded bg-green-50 dark:bg-green-950 text-xs">
+                  <p class="font-medium mb-1">宸插鍏?{{ yueduResult.imported }}/{{ yueduResult.total }}</p>
+                </div>
+              </div>
           </div>
         </div>
       </section>
-
-        <div class="mt-6 p-4 rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950 text-sm">
-          <p class="font-medium mb-1">{{ i18n.t('admin_yuedu_bookshelf_howto_title') }}</p>
-          <ol class="list-decimal list-inside space-y-1 text-muted dark:text-gray-300">
-            <li>{{ i18n.t('admin_yuedu_bookshelf_howto_step1') }}</li>
-            <li>{{ i18n.t('admin_yuedu_bookshelf_howto_step2') }}</li>
-            <li>{{ i18n.t('admin_yuedu_bookshelf_howto_step3') }}</li>
-          </ol>
-        </div>
 
 
       <section v-if="tab === 'creds'" class="space-y-6">

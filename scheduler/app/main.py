@@ -1,4 +1,9 @@
-"""Celery beat + worker -- scheduled sync dispatch and backup tasks."""
+"""Celery beat scheduler -- dispatches periodic sync tasks.
+
+Run inside the scheduler container to trigger daily-sync-all-sources
+and any other beat-scheduled tasks.
+"""
+
 import subprocess
 import sys
 
@@ -8,9 +13,7 @@ def main() -> None:
         [
             sys.executable, "-m", "celery",
             "-A", "celery_app",
-            "worker",
-            "-B",
-            "-Q", "celery",
+            "beat",
             "-l", "info",
         ],
         cwd="/app/scheduler_app",
