@@ -1,4 +1,4 @@
-﻿"""Source credential management for auto-login fallback."""
+"""Source credential management for auto-login fallback."""
 
 from datetime import datetime
 from uuid import uuid4
@@ -104,12 +104,12 @@ async def trigger_auto_login(cred_id: str, db: AsyncSession = Depends(get_db)):
         select(Cookie).where(Cookie.source == cred.source)
     )
     if existing_cookie:
-        existing_cookie.cookie_data = cookie_str
+        existing_cookie.cookie_data = encrypt_cookie(cookie_str)
     else:
         new_cookie = Cookie(
             id=str(uuid4()),
             source=cred.source,
-            cookie_data=cookie_str,
+            cookie_data=encrypt_cookie(cookie_str),
         )
         db.add(new_cookie)
 

@@ -1,4 +1,4 @@
-﻿from datetime import datetime, timezone
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
@@ -10,7 +10,7 @@ from app.repositories.crawl_task import CrawlTaskRepository
 from app.repositories.crawl_log import CrawlLogRepository
 from app.schemas.crawl import CrawlLogOut, CrawlTaskOut
 from app.services.auth import require_admin
-from app.services.cookie_crypto import decrypt_cookie
+from app.services.cookie_crypto import safe_decrypt_cookie
 
 router = APIRouter(prefix="/crawl", tags=["crawl"], dependencies=[Depends(require_admin)])
 
@@ -72,7 +72,7 @@ async def retry_task(task_id: str, db: AsyncSession = Depends(get_db)):
             cookie = await db.scalar(select(Cookie).where(Cookie.source == task.source))
             if cookie:
                 plugin = get_plugin(task.source)
-                plugin.set_cookie(decrypt_cookie(cookie.cookie_data))
+                plugin.set_cookie(safe_decrypt_cookie(cookie.cookie_data))
             result = await svc.sync_bookshelf(task.source)
         task.status = "completed"
         task.finished_at = datetime.now(timezone.utc)

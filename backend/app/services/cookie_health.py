@@ -1,4 +1,4 @@
-﻿"""Cookie health check and auto-refresh service.
+"""Cookie health check and auto-refresh service.
 
 Periodically validates stored cookies and attempts automatic renewal
 via auto_login when credentials are available.
@@ -14,7 +14,7 @@ from app.core.database import SessionLocal
 from app.crawler.registry import get_plugin
 from app.models import Cookie
 from app.models.source_credential import SourceCredential
-from app.services.cookie_crypto import decrypt_cookie, encrypt_cookie
+from app.services.cookie_crypto import safe_decrypt_cookie, encrypt_cookie
 
 
 class CookieHealthService:
@@ -65,7 +65,7 @@ class CookieHealthService:
         """Test whether a cookie is still valid via bookshelf fetch."""
         try:
             plugin = get_plugin(cookie.source)
-            cookie_data = decrypt_cookie(cookie.cookie_data)
+            cookie_data = safe_decrypt_cookie(cookie.cookie_data)
             plugin.set_cookie(cookie_data)
             shelf = await plugin.fetch_bookshelf(cookie_data)
             return shelf is not None

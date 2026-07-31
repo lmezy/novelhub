@@ -1,4 +1,4 @@
-﻿"""YueDu book source import API.
+"""YueDu book source import API.
 
 Endpoints:
 - POST /api/yuedu/import   Import yuedu sources from URL or raw JSON
@@ -223,7 +223,7 @@ async def import_and_sync_all(payload: YueduImportSyncRequest, db: AsyncSession 
                     "books_found": shelf_result.get("total", 0),
                     "chapters_downloaded": synced,
                 }
-                result.books_synced += 1
+                result.books_synced += shelf_result.get("total", 0)
                 result.chapters_downloaded += synced
             else:
                 detail["sync"] = {"skipped": "no cookie"}

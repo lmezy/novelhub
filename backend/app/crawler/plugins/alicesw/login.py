@@ -7,6 +7,7 @@ from typing import Optional
 from loguru import logger
 
 from app.core.database import SessionLocal
+from app.services.cookie_crypto import safe_decrypt_cookie
 from app.repositories.cookie import CookieRepository
 
 
@@ -32,7 +33,7 @@ class AliceSWLogin:
                 logger.warning("Cookie for source={} is expired", self.source_id)
                 return None
 
-            self._cookie_string = cookie.cookie_data
+            self._cookie_string = safe_decrypt_cookie(cookie.cookie_data)
             self._parse_cookie()
             logger.info("Loaded cookie for source={}", self.source_id)
             return self._cookie_string

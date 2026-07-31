@@ -1,4 +1,4 @@
-﻿"""Manual browser login API endpoints.
+"""Manual browser login API endpoints.
 
 POST   /credentials/{id}/manual-login/start  - Start a browser session
 POST   /manual-login/{sid}/click             - Click at coordinates
@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.models import Source, Cookie
 from app.models.source_credential import SourceCredential
-from app.services.cookie_crypto import decrypt_cookie
+from app.services.cookie_crypto import decrypt_cookie, encrypt_cookie
 from app.services.manual_login import ManualLoginManager, ManualLoginSession
 from app.services.auth import require_admin
 
@@ -162,12 +162,12 @@ async def manual_login_finish(session_id: str, db: AsyncSession = Depends(get_db
     # Save to Cookie table
     existing = await db.scalar(select(Cookie).where(Cookie.source == session.source_id))
     if existing:
-        existing.cookie_data = cookie_str
+        existing.cookie_data = encrypt_cookie(cookie_str)
     else:
         new_cookie = Cookie(
             id=str(uuid4()),
             source=session.source_id,
-            cookie_data=cookie_str,
+            cookie_data=encrypt_cookie(cookie_str),
         )
         db.add(new_cookie)
     await db.commit()

@@ -9,6 +9,19 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from app.core.config import settings
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def safe_decrypt_cookie(value: str) -> str:
+    """Decrypt cookie data, falling back to plaintext for legacy unencrypted cookies."""
+    try:
+        return decrypt_cookie(value)
+    except Exception:
+        logger.debug("Cookie value appears to be plaintext (legacy), using as-is")
+        return value
+
 
 def _derive_key() -> bytes:
     """Derive a 256-bit AES key from COOKIE_SECRET."""

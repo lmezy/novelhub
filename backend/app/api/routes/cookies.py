@@ -1,5 +1,6 @@
 from uuid import uuid4
 
+import logging
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -9,6 +10,8 @@ from app.services.cookie_crypto import encrypt_cookie, decrypt_cookie
 from app.repositories.cookie import CookieRepository
 from app.schemas.cookie import CookieCreate, CookieOut, CookieUpdate
 from app.services.auth import require_admin
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/cookies",
@@ -25,17 +28,27 @@ async def list_cookies(db: AsyncSession = Depends(get_db)):
 
 @router.post("", response_model=CookieOut, status_code=201)
 async def create_cookie(payload: CookieCreate, db: AsyncSession = Depends(get_db)):
-    repo = CookieRepository(db)
-    existing = await repo.get_by_source(payload.source)
-    if existing:
-        raise HTTPException(status_code=409, detail="Cookie for this source already exists")
-    cookie = Cookie(
-        id=str(uuid4()),
-        source=payload.source,
-        cookie_data=encrypt_cookie(payload.cookie_data),
-        expired_at=payload.expired_at,
-    )
-    return await repo.add(cookie)
+    try:
+        repo = CookieRepository(db)
+        existing = await repo.get_by_source(payload.source)
+        if existing:
+            raise HTTPException(status_code=409, detail="Cookie for this source already exists")
+
+        encrypted = encrypt_cookie(payload.cookie_data)
+        cookie = Cookie(
+            id=str(uuid4()),
+            source=payload.source,
+            cookie_data=encrypted,
+            expired_at=payload.expired_at,
+        )
+        result = await repo.add(cookie)
+        logger.info("Cookie saved for source=%s id=%s", payload.source, cookie.id)
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to save cookie for source=%s", payload.source)
+        raise HTTPException(status_code=500, detail=f"Internal error while saving cookie: {str(exc)[:300]}")
 
 
 @router.get("/{cookie_id}", response_model=CookieOut)
