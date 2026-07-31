@@ -39,6 +39,19 @@ BOOKSHELF_PATH_CANDIDATES = [
     "/user/books",
     "/member/bookshelf",
     "/user",
+    "/user/bookcase",
+    "/user/shelf",
+    "/home/bookcase",
+    "/home/bookshelf",
+    "/space/bookshelf",
+    "/reader/bookshelf",
+    "/book/shelf",
+    "/books",
+    "/my",
+    "/ucenter/bookshelf",
+    "/ucenter",
+    "/center",
+    "/personal",
 ]
 
 # Common link text patterns that indicate a bookshelf link
@@ -58,6 +71,11 @@ SHELF_ITEM_SELECTORS = [
     "li[class*='shelf']", "div[class*='shelf']",
     # Very generic fallback: any li or div with an anchor inside
     "li:has(a[href])", "div.book-card",
+    # Additional patterns for Chinese novel sites
+    "div.panel-body li", "ul.list-group li",
+    "div.card li", "div.panel li",
+    "table.table tr", "ul.novel-list li",
+    "div[class*='shelf'] a[href]",
 ]
 
 # Anchor patterns within a shelf item
@@ -267,6 +285,19 @@ class YueduPlugin:
         except Exception:
             pass
 
+        # Try auto-detection by scanning the homepage for bookshelf links
+        try:
+            detected_url = await self.detect_bookshelf_url()
+            if detected_url:
+                html = await self._get(detected_url)
+                books = self._parse_bookshelf_html(html)
+                if books:
+                    self.config["bookshelf_url"] = detected_url
+                    logger.info(f"Auto-detected bookshelf URL in fetch: {detected_url}")
+                    return books
+        except Exception:
+            pass
+
         logger.warning(f"No bookshelf found for source {self.display_name}")
         return []
 
@@ -285,7 +316,17 @@ class YueduPlugin:
                 break
 
         if not items:
-            return []
+            # Last resort: any link that looks like a book title
+            for a_tag in soup.select("a[href]"):
+                href = (a_tag.get("href") or "").strip()
+                if not href or href in ("#", "/"):
+                    continue
+                txt = a_tag.get_text(strip=True)
+                if txt and len(txt) >= 2 and len(txt) <= 60:
+                    if any(seg in href.lower() for seg in ["/book/", "/novel/", "/read/", "/detail/", "/info/", "/article/", "/xiaoshuo/"]):
+                        items.append(a_tag.parent if a_tag.parent else a_tag)
+            if not items:
+                return []
 
         books: list[RemoteShelfBook] = []
         for item in items:

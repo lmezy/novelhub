@@ -184,8 +184,6 @@ async def import_and_sync_all(payload: YueduImportSyncRequest, db: AsyncSession 
     # Step 2: Save cookie if provided
     if payload.cookie and payload.cookie.strip():
         for src_info in import_result.sources:
-            if src_info["status"] != "imported":
-                continue
             source_id = src_info["id"]
             existing_cookie = await db.scalar(
                 select(Cookie).where(Cookie.source == source_id)
