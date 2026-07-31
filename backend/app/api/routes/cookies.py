@@ -84,14 +84,22 @@ async def delete_cookie(cookie_id: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/test", status_code=200)
-async def test_cookie(payload: CookieCreate):
+async def test_cookie(payload: CookieCreate, db: AsyncSession = Depends(get_db)):
     """Test if a cookie works by attempting to fetch the bookshelf.
 
     Does NOT save the cookie. Returns book count if successful.
     """
     from app.crawler.registry import get_plugin
+    from app.models import Source
+
+    # Look up source by ID to get its plugin_name and config
+    source = await db.get(Source, payload.source)
+    if source is None:
+        raise HTTPException(status_code=400, detail=f"Source not found: {payload.source}")
+
+    config = source.config if source.plugin_name == "yuedu" else None
     try:
-        plugin = get_plugin(payload.source)
+        plugin = get_plugin(source.plugin_name, config=config)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 

@@ -748,7 +748,17 @@ class YueduPlugin:
                 pass
 
 
-        async with httpx.AsyncClient(headers=headers, timeout=30, follow_redirects=True) as client:
+        # Proxy support: read from global proxy config
+        proxy_url = None
+        try:
+            from app.services.proxy_config import get_proxy_config
+            cfg = get_proxy_config()
+            if cfg.enabled:
+                proxy_url = cfg.https_proxy or cfg.http_proxy
+        except Exception:
+            pass
+
+        async with httpx.AsyncClient(headers=headers, timeout=30, follow_redirects=True, proxy=proxy_url) as client:
             resp = await client.get(url)
             resp.raise_for_status()
 
