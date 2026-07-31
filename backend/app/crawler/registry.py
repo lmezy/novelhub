@@ -1,8 +1,5 @@
 """Crawler plugin registry.
 
-Plugins are lazily instantiated. The yuedu plugin is special: each instance
-must be configured with a YueDu book source JSON before use.
-
 get_plugin() accepts both plugin names (e.g. "yuedu") and source IDs.
 """
 
@@ -33,23 +30,38 @@ plugins: dict[str, Any] = {
 }
 
 
+def _running_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
+
+
 def get_plugin(name: str, config: dict[str, Any] | None = None) -> NovelSourcePlugin:
     """Get a plugin instance by plugin name or source ID."""
     if name in plugins:
         return _instantiate(name, config)
-    try:
-        # Try asyncio.run first (works outside event loops, e.g. Celery tasks)
+
+    if not _running_loop():
+        # No running event loop (Celery task, etc.) — safe direct call
         return asyncio.run(_lookup_source_async(name))
-    except RuntimeError:
-        # Already inside an event loop (FastAPI handler) — use a thread
-        # with its own event loop. The thread uses a SEPARATE async session
-        # to avoid asyncpg connection conflicts.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(lambda: asyncio.run(_lookup_source_async(name))).result()
-    except Exception as exc:
-        logger.opt(exception=exc).warning("get_plugin failed for '{}'", name)
-        available = ", ".join(sorted(plugins))
-        raise ValueError(f"Unknown plugin or source '{name}'. Available: {available}")
+
+    # Running event loop (FastAPI) — use a dedicated thread with its own
+    # event loop and database session to avoid asyncpg connection conflicts
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_run_in_thread, name)
+        exc = future.exception()
+        if exc:
+            logger.opt(exception=exc).warning("get_plugin failed for '{}'", name)
+            available = ", ".join(sorted(plugins))
+            raise ValueError(f"Unknown plugin or source '{name}'. Available: {available}")
+        return future.result()
+
+
+def _run_in_thread(source_id: str) -> NovelSourcePlugin:
+    """Run the async lookup in a dedicated thread's event loop."""
+    return asyncio.run(_lookup_source_async(source_id))
 
 
 def _instantiate(plugin_name: str, config: dict[str, Any] | None = None) -> NovelSourcePlugin:
@@ -64,7 +76,7 @@ def _instantiate(plugin_name: str, config: dict[str, Any] | None = None) -> Nove
 
 
 async def _lookup_source_async(source_id: str) -> NovelSourcePlugin:
-    """Look up a Source record using its own async database session."""
+    """Look up a Source record using its own async session."""
     from app.core.database import SessionLocal
     from app.models import Source
     from sqlalchemy import select
