@@ -103,7 +103,7 @@ async def retry_task(task_id: str, db: AsyncSession = Depends(get_db)):
 
     task.status = "running"
     task.error = None
-    task.started_at = datetime.now(timezone.utc)
+    task.started_at = datetime.now(timezone.utc).replace(tzinfo=None)
     task.finished_at = None
     await db.commit()
 
@@ -119,18 +119,18 @@ async def retry_task(task_id: str, db: AsyncSession = Depends(get_db)):
             result = await svc.sync_bookshelf(task.source)
         task.status = "completed"
         task.result = result
-        task.finished_at = datetime.now(timezone.utc)
+        task.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
         await db.commit()
         return {"task_id": task_id, "status": "completed", "result": result}
     except ValueError as exc:
         task.status = "failed"
         task.error = str(exc)
-        task.finished_at = datetime.now(timezone.utc)
+        task.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
         await db.commit()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         task.status = "failed"
         task.error = str(exc)
-        task.finished_at = datetime.now(timezone.utc)
+        task.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
         await db.commit()
         raise HTTPException(status_code=500, detail=f"Retry failed: {str(exc)[:300]}") from exc

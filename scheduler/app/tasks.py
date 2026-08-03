@@ -13,6 +13,10 @@ from celery_app import app
 from loguru import logger
 
 
+def _naive_utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 @app.task(name="tasks.daily_sync_all")
 def daily_sync_all() -> dict:
     """Daily beat task: sync all enabled sources."""
@@ -63,7 +67,7 @@ async def _crawl_all_source_async(source_id: str, max_pages: int, task_id: str |
             task_obj = await db.get(CrawlTask, task_id)
             if task_obj:
                 task_obj.status = "running"
-                task_obj.started_at = datetime.now(timezone.utc)
+                task_obj.started_at = _naive_utcnow()
                 task_obj.error = None
                 await db.commit()
 
@@ -75,14 +79,14 @@ async def _crawl_all_source_async(source_id: str, max_pages: int, task_id: str |
             if task_obj:
                 task_obj.status = "completed"
                 task_obj.result = result
-                task_obj.finished_at = datetime.now(timezone.utc)
+                task_obj.finished_at = _naive_utcnow()
                 await db.commit()
             return result
         except Exception as exc:
             if task_obj:
                 task_obj.status = "failed"
                 task_obj.error = str(exc)
-                task_obj.finished_at = datetime.now(timezone.utc)
+                task_obj.finished_at = _naive_utcnow()
                 await db.commit()
             raise
 
@@ -102,7 +106,7 @@ async def _daily_sync_all_async() -> dict:
             id=str(uuid4()),
             source="*",
             status="running",
-            started_at=datetime.now(timezone.utc),
+            started_at=_naive_utcnow(),
         )
         db.add(task_obj)
         await db.commit()
@@ -166,7 +170,7 @@ async def _daily_sync_all_async() -> dict:
                     "error": str(exc),
                 })
         task_obj.status = "completed" if results["failed"] == 0 else "completed_with_errors"
-        task_obj.finished_at = datetime.now(timezone.utc)
+        task_obj.finished_at = _naive_utcnow()
         await db.commit()
         logger.info("Daily sync: {} synced, {} failed", results["synced"], results["failed"])
         return results

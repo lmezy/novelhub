@@ -10,6 +10,7 @@ def main() -> None:
             "-A", "celery_app",
             "worker",
             "-Q", "crawl",
+            "--concurrency", "1",
             "-l", "info",
         ],
         cwd="/app/scheduler_app",

@@ -13,6 +13,7 @@ Usage:
 import base64
 import json
 import logging
+import random
 import re
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -744,15 +745,19 @@ class YueduPlugin:
         if not url.startswith(("http://", "https://")):
             raise ValueError(f"Unsupported URL: {url}")
 
-        # Concurrent rate limiting
+        # Polite rate limiting: source rule wins, otherwise use a safe default.
         rate = self.config.get("concurrentRate", "")
+        delay_ms = 0
         if rate:
             try:
-                delay_ms = int(rate.strip()) if rate.strip().isdigit() else 0
-                if delay_ms > 0:
-                    await asyncio.sleep(delay_ms / 1000.0)
+                delay_ms = int(str(rate).strip()) if str(rate).strip().isdigit() else 0
             except (ValueError, TypeError):
-                pass
+                delay_ms = 0
+        if delay_ms <= 0:
+            from app.core.config import settings
+            delay_ms = settings.CRAWL_DELAY_MS
+        if delay_ms > 0:
+            await asyncio.sleep((delay_ms + random.uniform(200, 600)) / 1000.0)
 
         headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) Mobile Safari/537.36"}
 
@@ -804,27 +809,43 @@ class YueduPlugin:
         except Exception:
             pass
 
-        async with httpx.AsyncClient(headers=headers, timeout=30, follow_redirects=True, proxy=proxy_url) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
+        last_error: httpx.HTTPError | None = None
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(headers=headers, timeout=30, follow_redirects=True, proxy=proxy_url) as client:
+                    resp = await client.get(url)
+                    if resp.status_code in (429, 500, 502, 503, 504):
+                        retry_after = resp.headers.get("Retry-After", "")
+                        wait = float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else 2 ** attempt
+                        await asyncio.sleep(wait + random.uniform(0.5, 1.5))
+                        continue
+                    resp.raise_for_status()
 
-            # Cookie jar: collect Set-Cookie headers
-            if self.config.get("enabledCookieJar", False):
-                set_cookies = resp.headers.get_all("set-cookie")
-                if set_cookies:
-                    new_parts = []
-                    existing = dict(
-                        (p.split("=", 1)[0], p)
-                        for p in self._cookie.split("; ")
-                        if "=" in p
-                    )
-                    for sc in set_cookies:
-                        part = sc.split(";")[0].strip()
-                        if "=" in part:
-                            existing[part.split("=", 1)[0]] = part
-                    self._cookie = "; ".join(existing.values())
+                    # Cookie jar: collect Set-Cookie headers
+                    if self.config.get("enabledCookieJar", False):
+                        set_cookies = resp.headers.get_all("set-cookie")
+                        if set_cookies:
+                            new_parts = []
+                            existing = dict(
+                                (p.split("=", 1)[0], p)
+                                for p in self._cookie.split("; ")
+                                if "=" in p
+                            )
+                            for sc in set_cookies:
+                                part = sc.split(";")[0].strip()
+                                if "=" in part:
+                                    existing[part.split("=", 1)[0]] = part
+                            self._cookie = "; ".join(existing.values())
 
-            return resp.text
+                    return resp.text
+            except httpx.HTTPError as exc:
+                last_error = exc
+                if attempt < 2:
+                    await asyncio.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f"Request failed after retries: {url}")
     def get_search_check_keyword(self, default: str = "\u6211\u7684") -> str:
         """Get the check keyword for search validation.
 

@@ -10,14 +10,41 @@ const store = useBooksStore()
 const auth = useAuthStore()
 const i18n = useI18nStore()
 const recentReads = ref<Book[]>([])
+const selectedIds = ref<string[]>([])
+const batchDeleting = ref(false)
 
 async function deleteBook(id: string, title: string) {
   if (!confirm(i18n.t('home_delete_confirm', { title }))) return
   try {
     await api.delete('/books/' + id)
+    selectedIds.value = selectedIds.value.filter((x) => x !== id)
     await store.fetchBooks()
   } catch (e) {
     alert(e instanceof Error ? e.message : i18n.t('home_delete_failed'))
+  }
+}
+
+function toggleSelect(id: string) {
+  const idx = selectedIds.value.indexOf(id)
+  if (idx >= 0) {
+    selectedIds.value.splice(idx, 1)
+  } else {
+    selectedIds.value.push(id)
+  }
+}
+
+async function batchDelete() {
+  if (!selectedIds.value.length) return
+  if (!confirm(`确定删除选中的 ${selectedIds.value.length} 本书吗？此操作不可撤销。`)) return
+  batchDeleting.value = true
+  try {
+    await api.post('/books/batch-delete', { ids: selectedIds.value })
+    selectedIds.value = []
+    await store.fetchBooks()
+  } catch (e) {
+    alert(e instanceof Error ? e.message : '批量删除失败')
+  } finally {
+    batchDeleting.value = false
   }
 }
 
@@ -60,7 +87,15 @@ onMounted(async () => {
       <section>
         <div class="flex items-center justify-between mb-6">
           <h1 class="text-2xl font-bold tracking-tight">{{ i18n.t('home_library') }}</h1>
-          <span class="text-sm text-muted dark:text-gray-400">{{ i18n.t('home_books_count', { n: store.books.length }) }}</span>
+          <div class="flex items-center gap-3">
+            <span class="text-sm text-muted dark:text-gray-400">{{ i18n.t('home_books_count', { n: store.books.length }) }}</span>
+            <button
+              v-if="auth.isAdmin && selectedIds.length"
+              @click="batchDelete"
+              :disabled="batchDeleting"
+              class="text-xs px-3 py-1.5 rounded bg-red-500 text-white hover:bg-red-600 disabled:opacity-50"
+            >批量删除 ({{ selectedIds.length }})</button>
+          </div>
         </div>
 
         <p v-if="store.loading" class="text-muted dark:text-gray-400">{{ i18n.t('home_loading') }}</p>
@@ -84,6 +119,14 @@ onMounted(async () => {
             :to="'/books/' + book.id"
             class="relative group block p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 hover:shadow-md hover:border-accent/30 transition-all duration-200 no-underline"
           >
+            <input
+              v-if="auth.isAdmin"
+              type="checkbox"
+              :checked="selectedIds.includes(book.id)"
+              @click.prevent.stop="toggleSelect(book.id)"
+              class="absolute top-2 left-2 w-4 h-4 rounded border-border"
+              :title="i18n.t('home_delete_title')"
+            />
             <button
               v-if="auth.isAdmin"
               @click.prevent.stop="deleteBook(book.id, book.title)"

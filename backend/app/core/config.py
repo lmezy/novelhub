@@ -47,6 +47,9 @@ class Settings(BaseSettings):
 
 
 
+    CRAWL_DELAY_MS:int=1200
+
+
     class Config:
 
         env_file=".env"
