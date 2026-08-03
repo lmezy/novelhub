@@ -18,6 +18,18 @@ class SyncService:
         self.db = db
         self.storage = storage or BookStorage()
 
+    @staticmethod
+    def _safe_text(value, fallback: str) -> str:
+        text = str(value).strip() if value else ""
+        return text or fallback
+
+    def _safe_title(self, remote_book) -> str:
+        return self._safe_text(remote_book.title, remote_book.source_book_id or "Unknown")
+
+    @staticmethod
+    def _safe_author(name: str | None) -> str:
+        return SyncService._safe_text(name, "Unknown")
+
     async def sync_book(self, source_id: str, url: str) -> dict:
         source = await self.db.get(Source, source_id)
         if source is None or not source.enabled:
@@ -30,7 +42,10 @@ class SyncService:
         plugin = get_plugin(source.plugin_name, config=config)
         remote_book = await plugin.fetch_book(url)
 
-        author = await self._get_or_create_author(remote_book.author)
+        book_title = self._safe_title(remote_book)
+        author_name = self._safe_author(remote_book.author)
+
+        author = await self._get_or_create_author(author_name)
         book, is_new = await self._get_or_create_book(source.id, author.id, remote_book)
 
         # Save tags from remote book
@@ -38,13 +53,13 @@ class SyncService:
             await self._save_tags(book.id, remote_book.tags)
 
         self.storage.write_metadata(
-            remote_book.author,
-            remote_book.title,
+            author_name,
+            book_title,
             {
                 "source_id": source.id,
                 "source_book_id": remote_book.source_book_id,
-                "title": remote_book.title,
-                "author": remote_book.author,
+                "title": book_title,
+                "author": author_name,
                 "description": remote_book.description,
                 "status": remote_book.status,
             },
@@ -82,8 +97,8 @@ class SyncService:
 
             content = await plugin.fetch_chapter_content(remote_chapter)
             content_path, content_hash = self.storage.write_chapter(
-                remote_book.author,
-                remote_book.title,
+                author_name,
+                book_title,
                 remote_chapter.chapter_number,
                 remote_chapter.title,
                 content,
@@ -125,7 +140,7 @@ class SyncService:
             from app.services.auto_categorize import AutoCategorizationService
             await AutoCategorizationService.categorize_book(self.db, book.id)
         except Exception:
-            pass
+            await self.db.rollback()
 
         return {
             "book_id": book.id,
@@ -152,7 +167,7 @@ class SyncService:
             )
         )
         if book:
-            book.title = remote_book.title
+            book.title = self._safe_title(remote_book)
             book.author_id = author_id
             book.description = remote_book.description
             book.status = remote_book.status
@@ -164,7 +179,7 @@ class SyncService:
             source_id=source_id,
             author_id=author_id,
             source_book_id=remote_book.source_book_id,
-            title=remote_book.title,
+            title=self._safe_title(remote_book),
             description=remote_book.description,
             status=remote_book.status,
         )
@@ -201,6 +216,7 @@ class SyncService:
                 logger.opt(exception=exc).warning(
                     "Failed to sync shelf book {}", shelf_book.url
                 )
+                await self.db.rollback()
                 results.append({"url": shelf_book.url, "status": "failed", "error": str(exc), "created_chapters": 0, "skipped_chapters": 0})
 
         return {"source_id": source_id, "total": len(shelf_books), "results": results}
@@ -294,6 +310,7 @@ class SyncService:
                     })
                     books_synced += 1
                 except Exception as exc:
+                    await self.db.rollback()
                     details.append({
                         "title": sb.title,
                         "author": sb.author,

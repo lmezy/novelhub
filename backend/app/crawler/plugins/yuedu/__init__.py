@@ -181,8 +181,8 @@ class YueduPlugin:
                 chapter_number=chapter_num,
             ))
 
-        book_title = info.get("name", "Unknown")
-        author = info.get("author", "Unknown")
+        book_title = str(info.get("name") or "").strip() or "Unknown"
+        author = str(info.get("author") or "").strip() or "Unknown"
         description = info.get("intro", "")
         status = info.get("status", "")
 
@@ -580,8 +580,8 @@ class YueduPlugin:
                 continue
             books.append(RemoteShelfBook(
                 source_book_id=book_url.rstrip("/").split("/")[-1] or book_url,
-                title=item.get("name", item.get("title", book_url)),
-                author=item.get("author", "Unknown"),
+                title=str(item.get("name") or item.get("title") or book_url).strip() or "Unknown",
+                author=str(item.get("author") or "").strip() or "Unknown",
                 url=self._make_absolute(book_url, self.base_url),
                 latest_chapter_title=item.get("latestChapterTitle"),
             ))

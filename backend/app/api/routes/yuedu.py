@@ -226,6 +226,7 @@ async def import_and_sync_all(payload: YueduImportSyncRequest, db: AsyncSession 
             else:
                 detail["sync"] = {"skipped": "no cookie"}
         except Exception as exc:
+            await db.rollback()
             detail["sync"] = {"error": str(exc)[:200]}
             result.errors.append({"source": source_id, "stage": "sync", "error": str(exc)[:200]})
 
@@ -245,11 +246,12 @@ async def import_and_sync_all(payload: YueduImportSyncRequest, db: AsyncSession 
                                 result.books_discovered += 1
                                 result.chapters_downloaded += 1
                             except Exception:
-                                pass
+                                await db.rollback()
                         if len(shelf_books) == 0:
                             break
                 detail["discover"] = {"pages_checked": payload.max_discover_pages}
             except Exception as exc:
+                await db.rollback()
                 detail["discover"] = {"error": str(exc)[:200]}
 
         result.details.append(detail)
