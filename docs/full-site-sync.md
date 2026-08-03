@@ -74,3 +74,7 @@ curl -X POST http://localhost:8088/api/books/batch-delete \
 ### 批量删除报 relation "book_categories" does not exist
 
 这是旧数据库缺少分类表迁移导致的。运行 `docker compose restart backend` 或手动执行 `cd backend && alembic upgrade head` 即可补建 `categories` 与 `book_categories` 表。
+
+### 后端反复重启，日志报 StringDataRightTruncation
+
+`alembic_version.version_num` 列只有 32 字符，迁移 ID 不能超过该长度。当前分类迁移已改为 `0009_categories`，更新后端代码后重新启动 backend 即可。

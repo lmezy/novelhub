@@ -1,6 +1,6 @@
 """add categories and book_categories tables
 
-Revision ID: 0009_categories_and_book_categories
+Revision ID: 0009_categories
 Revises: 0008_crawl_task_progress
 Create Date: 2026-08-03
 """
@@ -11,7 +11,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision: str = "0009_categories_and_book_categories"
+revision: str = "0009_categories"
 down_revision: Union[str, None] = "0008_crawl_task_progress"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
