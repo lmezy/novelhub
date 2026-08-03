@@ -3,7 +3,13 @@ FROM python:3.13-slim
 WORKDIR /app
 
 # Install Chromium system dependencies for Playwright
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Use a China mirror for Debian packages so builds don't stall on deb.debian.org
+RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' \
+        /etc/apt/sources.list \
+        /etc/apt/sources.list.d/debian.sources \
+    2>/dev/null || true \
+    && export DEBIAN_FRONTEND=noninteractive \
+    && apt-get update && apt-get install -y --no-install-recommends \
     libnss3 libnspr4 libatk-bridge2.0-0t64 libatk1.0-0t64 \
     libcups2t64 libdrm2 libdbus-1-3 libxkbcommon0 \
     libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
