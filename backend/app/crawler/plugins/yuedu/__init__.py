@@ -375,7 +375,18 @@ class YueduPlugin:
                         break
 
             full_url = self._make_absolute(href, self.base_url)
+
+            # Skip non-book URLs: search, tag, category, author, user pages
+            skip_patterns = ["/search/", "/tag/", "/tags/", "/category/", "/categories/",
+                           "/author/", "/user/", "/users/", "/login", "/register",
+                           "/signup", "/about", "/help", "/faq", "/contact"]
+            if any(p in full_url.lower() for p in skip_patterns):
+                continue
+
             book_id = full_url.split("/")[-1] if "/" in full_url else full_url
+            # Skip if book_id is empty or just a number (likely a category ID)
+            if not book_id or book_id.isdigit():
+                continue
 
             books.append(RemoteShelfBook(
                 source_book_id=book_id,
@@ -516,6 +527,7 @@ class YueduPlugin:
 
         Ported from WebBook.exploreBookAwait. Uses ruleExplore
         (or falls back to ruleSearch) for parsing.
+        If no explore URL is configured, tries common ranking pages.
         """
         if not self.engine:
             raise RuntimeError("YueduPlugin not configured")
@@ -525,6 +537,26 @@ class YueduPlugin:
         else:
             explore_url = self.engine.build_explore_url(page=page)
         if not explore_url:
+            # Fallback: try common ranking/category pages
+            fallback_paths = [
+                "/rank.html", "/top.html", "/ranking.html",
+                "/sort.html", "/allvisit.html", "/top/allvisit_{}.html",
+                "/ph.html", "/category.html", "/fenlei.html",
+                "/list.html", "/quanben.html", "/wanben.html",
+            ]
+            import re
+            for path in fallback_paths:
+                try:
+                    # Replace {} with page number
+                    path_with_page = path.format(page) if "{}" in path else path
+                    candidate = urljoin(self.base_url, path_with_page)
+                    html = await self._get(candidate)
+                    items = self.engine.parse_search_results(html)
+                    if items:
+                        logger.info(f"Discovered books via fallback: {candidate}")
+                        return items
+                except Exception:
+                    continue
             logger.warning(f"No explore URL for {self.display_name}")
             return []
         html = await self._get(explore_url)

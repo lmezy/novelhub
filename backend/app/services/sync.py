@@ -134,10 +134,12 @@ class SyncService:
         }
 
     async def _get_or_create_author(self, name: str) -> Author:
-        author = await self.db.scalar(select(Author).where(Author.name == name))
+        # Fallback for empty/missing author names from book sources
+        safe_name = name.strip() if name and name.strip() else "Unknown"
+        author = await self.db.scalar(select(Author).where(Author.name == safe_name))
         if author:
             return author
-        author = Author(id=str(uuid4()), name=name)
+        author = Author(id=str(uuid4()), name=safe_name)
         self.db.add(author)
         await self.db.flush()
         return author
