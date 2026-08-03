@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from "vue"
+import { computed, onMounted, onUnmounted, ref } from "vue"
 import { api } from "../api/client"
 import { useI18nStore } from "../stores/i18n"
 import NavBar from "../components/NavBar.vue"
@@ -113,6 +113,12 @@ const crawlTask = ref<any>(null)
 const crawlTaskError = ref("")
 const crawlTaskLoading = ref(false)
 let crawlTaskTimer: number | null = null
+
+const crawlTaskProgress = computed(() => {
+  const max = crawlTask.value?.max_pages || 1
+  const pages = crawlTask.value?.progress?.pages_checked || 0
+  return Math.min(100, Math.round((pages / max) * 100))
+})
 
 const yueduUrl = ref("")
 const yueduJsonText = ref("")
@@ -688,6 +694,14 @@ onUnmounted(() => {
           <div v-if="crawlTask" class="mt-4 p-3 rounded bg-green-50 text-sm">
             <p>任务: {{ crawlTask.id }}</p>
             <p>状态: {{ crawlTask.status }}</p>
+            <div v-if="!['completed', 'failed', 'completed_with_errors'].includes(crawlTask.status)" class="mt-3">
+              <div class="h-2 rounded bg-gray-200 dark:bg-gray-700 overflow-hidden">
+                <div class="h-full bg-accent transition-all" :style="{ width: crawlTaskProgress + '%' }"></div>
+              </div>
+              <p class="text-xs text-muted dark:text-gray-400 mt-1">
+                已检查 {{ crawlTask.progress?.pages_checked || 0 }} 页，发现 {{ crawlTask.progress?.books_found || 0 }} 本
+              </p>
+            </div>
             <p v-if="crawlTask.result">发现 {{ crawlTask.result.books_found }} 本，成功 {{ crawlTask.result.books_synced }} 本，失败 {{ crawlTask.result.books_failed }} 本，新增章节 {{ crawlTask.result.chapters_created }}</p>
             <p v-if="crawlTask.error" class="text-red-600 mt-1">{{ crawlTask.error }}</p>
           </div>
@@ -818,11 +832,16 @@ onUnmounted(() => {
               </div>
             </div>
 
+            <p v-if="yueduError" class="text-sm text-red-600 mt-3">{{ yueduError }}</p>
+            <div v-if="yueduResult" class="mt-3 p-3 rounded bg-green-50 dark:bg-green-950 text-sm">
+              <p class="font-medium">{{ i18n.t('admin_yuedu_imported_count', { imported: yueduResult.imported, total: yueduResult.total }) }}</p>
+              <p class="text-xs text-muted dark:text-gray-400">跳过 {{ yueduResult.skipped }} 个已存在书源</p>
+            </div>
+
             <details class="mt-3">
               <summary class="text-xs text-muted dark:text-gray-400 cursor-pointer hover:text-ink">{{ i18n.t('admin_yuedu_advanced') }}</summary>
               <div class="mt-3 space-y-3">
                 <textarea v-model="yueduJsonText" :placeholder="i18n.t('admin_yuedu_advanced_json_placeholder')" rows="3" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 resize-y" />
-                <p v-if="yueduError" class="text-sm text-red-600">{{ yueduError }}</p>
                 <div class="flex gap-3">
                   <button @click="yueduPreviewAction" :disabled="yueduPreviewing" class="px-3 py-1.5 rounded border border-border dark:border-gray-700 text-xs hover:bg-gray-50 dark:hover:bg-gray-800 disabled:opacity-50">
                     {{ yueduPreviewing ? '...' : i18n.t('admin_yuedu_btn_preview') }}
@@ -836,9 +855,6 @@ onUnmounted(() => {
                   <div class="max-h-32 overflow-y-auto">
                     <p v-for="(s, i) in yueduPreview.sources" :key="i">{{ s.name }}</p>
                   </div>
-                </div>
-                <div v-if="yueduResult" class="p-2 rounded bg-green-50 dark:bg-green-950 text-xs">
-                  <p class="font-medium mb-1">{{ i18n.t('admin_yuedu_imported_count', { imported: yueduResult.imported, total: yueduResult.total }) }}</p>
                 </div>
               </div>
             </details>

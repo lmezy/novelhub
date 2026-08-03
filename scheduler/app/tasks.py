@@ -71,14 +71,33 @@ async def _crawl_all_source_async(source_id: str, max_pages: int, task_id: str |
                 task_obj.error = None
                 await db.commit()
 
+        async def _update_progress(page: int, found: int, synced: int, failed: int) -> None:
+            if task_obj is None:
+                return
+            task_obj.progress = {
+                "pages_checked": page,
+                "books_found": found,
+                "books_synced": synced,
+                "books_failed": failed,
+            }
+            await db.commit()
+
         try:
             result = await SyncService(db).discover_and_sync_all(
                 source_id,
                 max_pages=max_pages,
+                progress_cb=_update_progress,
             )
             if task_obj:
                 task_obj.status = "completed"
                 task_obj.result = result
+                task_obj.progress = {
+                    "pages_checked": result.get("pages_checked", 0),
+                    "books_found": result.get("books_found", 0),
+                    "books_synced": result.get("books_synced", 0),
+                    "books_failed": result.get("books_failed", 0),
+                    "done": True,
+                }
                 task_obj.finished_at = _naive_utcnow()
                 await db.commit()
             return result

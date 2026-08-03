@@ -543,8 +543,29 @@ class YueduPlugin:
         if url:
             explore_url = self._make_absolute(url, self.base_url)
             explore_url = self.engine._substitute(explore_url, page=str(page))
-        else:
-            explore_url = self.engine.build_explore_url(page=page)
+            return await self._fetch_explore_url(explore_url)
+
+        kinds = self.get_explore_kinds()
+        if kinds:
+            results = []
+            for kind in kinds:
+                kind_url = kind.get("url", "").strip()
+                if not kind_url:
+                    continue
+                kind_url = self.engine._substitute(kind_url, page=str(page))
+                if not kind_url.startswith(("http://", "https://")):
+                    kind_url = self._make_absolute(kind_url, self.base_url)
+                if not kind_url.startswith(("http://", "https://")):
+                    continue
+                try:
+                    results.extend(await self._fetch_explore_url(kind_url))
+                except Exception as exc:
+                    logger.warning(
+                        f"Explore kind failed: {kind.get('title', kind_url)} ({exc})"
+                    )
+            return results
+
+        explore_url = self.engine.build_explore_url(page=page)
         if not explore_url:
             # Fallback: try common ranking/category pages
             fallback_paths = [
@@ -568,6 +589,9 @@ class YueduPlugin:
                     continue
             logger.warning(f"No explore URL for {self.display_name}")
             return []
+        return await self._fetch_explore_url(explore_url)
+
+    async def _fetch_explore_url(self, explore_url: str) -> list[dict[str, Any]]:
         html = await self._get(explore_url)
         explore_rules = self.config.get("ruleExplore", {})
         if explore_rules.get("bookList", ""):

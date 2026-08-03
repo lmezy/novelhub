@@ -31,6 +31,17 @@ Admin 的 `Sync` 页也提供“全站同步”按钮，启动后会自动轮询
 - 每次延迟额外叠加 200-600ms 随机抖动；
 - 遇到 429/5xx 会自动重试并退避；
 - crawler worker 固定并发数为 1，同一时间只跑一个爬取任务。
+- Admin 里配置的代理会写入共享 storage，backend 和 crawler worker 都能读取。
+
+## 任务进度
+
+`crawl_tasks.progress` 会按页更新：
+
+```json
+{"pages_checked": 12, "books_found": 480, "books_synced": 320, "books_failed": 2}
+```
+
+Admin 的“全站同步”卡片会显示进度条和已检查页数。
 
 ## 迁移
 

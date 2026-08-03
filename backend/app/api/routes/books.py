@@ -49,7 +49,7 @@ async def batch_delete_books(
 
     books = (
         await db.scalars(select(Book).where(Book.id.in_(payload.ids)))
-    ).all()
+    ).unique().all()
     if not books:
         raise HTTPException(status_code=404, detail="No books found")
 

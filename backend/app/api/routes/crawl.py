@@ -92,6 +92,7 @@ async def retry_task(task_id: str, db: AsyncSession = Depends(get_db)):
         task.status = "pending"
         task.error = None
         task.result = None
+        task.progress = None
         task.started_at = None
         task.finished_at = None
         await db.commit()

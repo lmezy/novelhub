@@ -25,12 +25,9 @@ async function deleteBook(id: string, title: string) {
 }
 
 function toggleSelect(id: string) {
-  const idx = selectedIds.value.indexOf(id)
-  if (idx >= 0) {
-    selectedIds.value.splice(idx, 1)
-  } else {
-    selectedIds.value.push(id)
-  }
+  selectedIds.value = selectedIds.value.includes(id)
+    ? selectedIds.value.filter((x) => x !== id)
+    : [...selectedIds.value, id]
 }
 
 async function batchDelete() {
@@ -123,7 +120,7 @@ onMounted(async () => {
               v-if="auth.isAdmin"
               type="checkbox"
               :checked="selectedIds.includes(book.id)"
-              @click.prevent.stop="toggleSelect(book.id)"
+              @click.stop="toggleSelect(book.id)"
               class="absolute top-2 left-2 w-4 h-4 rounded border-border"
               :title="i18n.t('home_delete_title')"
             />

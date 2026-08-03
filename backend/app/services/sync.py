@@ -1,4 +1,5 @@
 from uuid import uuid4
+from collections.abc import Awaitable, Callable
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -371,6 +372,7 @@ class SyncService:
         url: str | None = None,
         max_pages: int = 200,
         sync: bool = True,
+        progress_cb: Callable[[int, int, int, int], Awaitable[None]] | None = None,
     ) -> dict:
         """Discover every book across catalog pages and optionally sync them."""
         source = await self.db.get(Source, source_id)
@@ -424,8 +426,8 @@ class SyncService:
             if not new_books:
                 break
 
-            books_found += len(new_books)
             for sb in new_books:
+                books_found += 1
                 if not sync:
                     details.append({
                         "title": sb.title,
@@ -433,6 +435,8 @@ class SyncService:
                         "url": sb.url,
                         "synced": False,
                     })
+                    if progress_cb is not None:
+                        await progress_cb(pages_checked, books_found, books_synced, books_failed)
                     continue
                 try:
                     result = await self.sync_book(source_id, sb.url)
@@ -458,6 +462,9 @@ class SyncService:
                         "synced": False,
                         "error": str(exc),
                     })
+
+                if progress_cb is not None:
+                    await progress_cb(pages_checked, books_found, books_synced, books_failed)
 
         return {
             "source_id": source_id,

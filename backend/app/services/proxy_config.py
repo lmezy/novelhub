@@ -6,8 +6,10 @@ Also reads HTTPS_PROXY env var as initial default.
 """
 
 import os
+import json
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass
@@ -30,8 +32,28 @@ _config = ProxyConfig(
 )
 
 
+def _config_path() -> Path:
+    from app.core.config import settings
+    return Path(settings.STORAGE_PATH).parent / "proxy_config.json"
+
+
+def _read_file_config() -> ProxyConfig | None:
+    try:
+        data = json.loads(_config_path().read_text(encoding="utf-8"))
+        return ProxyConfig(
+            enabled=bool(data.get("enabled", False)),
+            https_proxy=str(data.get("https_proxy", "") or ""),
+            http_proxy=str(data.get("http_proxy", "") or ""),
+        )
+    except Exception:
+        return None
+
+
 def get_proxy_config() -> ProxyConfig:
     with _lock:
+        file_cfg = _read_file_config()
+        if file_cfg is not None:
+            return file_cfg
         return ProxyConfig(
             enabled=_config.enabled,
             https_proxy=_config.https_proxy,
@@ -44,6 +66,21 @@ def set_proxy_config(cfg: ProxyConfig) -> None:
         _config.enabled = cfg.enabled
         _config.https_proxy = cfg.https_proxy
         _config.http_proxy = cfg.http_proxy
+        try:
+            path = _config_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps({
+                    "enabled": cfg.enabled,
+                    "https_proxy": cfg.https_proxy,
+                    "http_proxy": cfg.http_proxy,
+                }, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            os.replace(tmp, path)
+        except Exception:
+            pass
 
 
 def get_playwright_proxy() -> dict | None:

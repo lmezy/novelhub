@@ -67,6 +67,11 @@ class CrawlTask(Base):
     )
 
 
+    progress = Column(
+        JSONB
+    )
+
+
     created_at = Column(
         DateTime,
         server_default=func.now()
