@@ -48,7 +48,12 @@ class SearchService:
         except meilisearch.errors.MeilisearchApiError:
             pass
 
-
+    def delete_chapter_from_index(self, chapter_id: str) -> None:
+        try:
+            self.client.index(self.INDEX_CHAPTERS).delete_document(chapter_id)
+            logger.debug("Deleted chapter {} from search index", chapter_id)
+        except Exception:
+            pass
 
     def get_index_stats(self) -> dict:
         """Return document counts for both indexes."""

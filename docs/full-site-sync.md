@@ -64,3 +64,13 @@ curl -X POST http://localhost:8088/api/books/batch-delete \
 ```
 
 管理员的 Home 页面也支持勾选多本书后批量删除。
+
+## 常见问题
+
+### 同步/导入显示 0 本书，日志报 All connection attempts failed
+
+如果 Admin -> Proxy 启用了代理，但代理地址填的是宿主机 `127.0.0.1`，Docker 容器内无法访问该地址。请把代理改为容器可访问的地址（宿主机网关或 `host.docker.internal`），或关闭代理。NovelHub 现在会在代理连不上时自动尝试直连。
+
+### 批量删除报 relation "book_categories" does not exist
+
+这是旧数据库缺少分类表迁移导致的。运行 `docker compose restart backend` 或手动执行 `cd backend && alembic upgrade head` 即可补建 `categories` 与 `book_categories` 表。

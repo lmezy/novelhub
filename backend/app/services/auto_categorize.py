@@ -50,6 +50,7 @@ class AutoCategorizationService:
     @staticmethod
     async def categorize_book(db: AsyncSession, book_id: str) -> list[str]:
         """Auto-categorize a single book based on its tags. Returns assigned category names."""
+        await AutoCategorizationService.ensure_default_categories(db)
         book = await db.get(Book, book_id)
         if book is None:
             return []

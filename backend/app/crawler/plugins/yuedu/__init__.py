@@ -833,39 +833,71 @@ class YueduPlugin:
         except Exception:
             pass
 
-        last_error: httpx.HTTPError | None = None
-        for attempt in range(3):
-            try:
-                async with httpx.AsyncClient(headers=headers, timeout=30, follow_redirects=True, proxy=proxy_url) as client:
-                    resp = await client.get(url)
-                    if resp.status_code in (429, 500, 502, 503, 504):
-                        retry_after = resp.headers.get("Retry-After", "")
-                        wait = float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else 2 ** attempt
-                        await asyncio.sleep(wait + random.uniform(0.5, 1.5))
-                        continue
-                    resp.raise_for_status()
-
-                    # Cookie jar: collect Set-Cookie headers
-                    if self.config.get("enabledCookieJar", False):
-                        set_cookies = resp.headers.get_all("set-cookie")
-                        if set_cookies:
-                            new_parts = []
-                            existing = dict(
-                                (p.split("=", 1)[0], p)
-                                for p in self._cookie.split("; ")
-                                if "=" in p
+        async def _request(proxy: str | None) -> str:
+            last_error: httpx.HTTPError | None = None
+            for attempt in range(3):
+                try:
+                    async with httpx.AsyncClient(
+                        headers=headers,
+                        timeout=30,
+                        follow_redirects=True,
+                        proxy=proxy,
+                        trust_env=False,
+                    ) as client:
+                        resp = await client.get(url)
+                        if resp.status_code in (429, 500, 502, 503, 504):
+                            retry_after = resp.headers.get("Retry-After", "")
+                            wait = (
+                                float(retry_after)
+                                if retry_after and retry_after.replace(".", "", 1).isdigit()
+                                else 2 ** attempt
                             )
-                            for sc in set_cookies:
-                                part = sc.split(";")[0].strip()
-                                if "=" in part:
-                                    existing[part.split("=", 1)[0]] = part
-                            self._cookie = "; ".join(existing.values())
+                            await asyncio.sleep(wait + random.uniform(0.5, 1.5))
+                            continue
+                        resp.raise_for_status()
 
-                    return resp.text
-            except httpx.HTTPError as exc:
+                        # Cookie jar: collect Set-Cookie headers
+                        if self.config.get("enabledCookieJar", False):
+                            set_cookies = resp.headers.get_list("set-cookie")
+                            if set_cookies:
+                                existing = dict(
+                                    (p.split("=", 1)[0], p)
+                                    for p in self._cookie.split("; ")
+                                    if "=" in p
+                                )
+                                for sc in set_cookies:
+                                    part = sc.split(";")[0].strip()
+                                    if "=" in part:
+                                        existing[part.split("=", 1)[0]] = part
+                                self._cookie = "; ".join(existing.values())
+
+                        return resp.text
+                except httpx.HTTPError as exc:
+                    last_error = exc
+                    if attempt < 2:
+                        await asyncio.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
+
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError(f"Request failed after retries: {url}")
+
+        proxies: list[str | None] = [None]
+        if proxy_url:
+            proxies.insert(0, proxy_url)
+
+        last_error: httpx.HTTPError | None = None
+        for proxy in proxies:
+            try:
+                return await _request(proxy)
+            except httpx.RequestError as exc:
                 last_error = exc
-                if attempt < 2:
-                    await asyncio.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
+                if proxy is None:
+                    raise
+                logger.warning(
+                    "Configured proxy %s unreachable (%s); retrying direct",
+                    proxy_url,
+                    exc,
+                )
 
         if last_error is not None:
             raise last_error

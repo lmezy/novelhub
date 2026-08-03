@@ -3,22 +3,14 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
-from sqlalchemy import delete, select
+from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.models import (
-    Book,
-    BookCategory,
-    BookTag,
-    BookVersion,
-    Chapter,
-    ChapterEmbedding,
-    ReadingProgress,
-    User,
-)
+from app.models import Book, User
 from app.services.auth import get_current_user, require_admin
+from app.services.book_cleanup import delete_books
 from app.services.epub import EpubService
 from app.services.sync import SyncService
 from app.schemas.book import BookCreate, BookOut
@@ -54,18 +46,7 @@ async def batch_delete_books(
         raise HTTPException(status_code=404, detail="No books found")
 
     book_ids = [book.id for book in books]
-    await db.execute(delete(BookVersion).where(BookVersion.chapter_id.in_(
-        select(Chapter.id).where(Chapter.book_id.in_(book_ids))
-    )))
-    await db.execute(delete(ChapterEmbedding).where(ChapterEmbedding.book_id.in_(book_ids)))
-    await db.execute(delete(Chapter).where(Chapter.book_id.in_(book_ids)))
-    await db.execute(delete(BookTag).where(BookTag.book_id.in_(book_ids)))
-    await db.execute(delete(BookCategory).where(BookCategory.book_id.in_(book_ids)))
-    await db.execute(delete(ReadingProgress).where(ReadingProgress.book_id.in_(book_ids)))
-
-    for book in books:
-        await db.delete(book)
-    await db.commit()
+    await delete_books(db, book_ids)
     return {"deleted": len(book_ids)}
 
 
@@ -89,14 +70,7 @@ async def delete_book(book_id: str, db: AsyncSession = Depends(get_db)):
     book = await db.get(Book, book_id)
     if book is None:
         raise HTTPException(status_code=404, detail="Book not found")
-    # Delete associated chapters
-    chapters = await db.scalars(
-        select(Chapter).where(Chapter.book_id == book_id)
-    )
-    for ch in chapters:
-        await db.delete(ch)
-    await db.delete(book)
-    await db.commit()
+    await delete_books(db, [book.id])
 @router.get("/{book_id}/epub")
 async def download_epub(book_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     book = await db.get(Book, book_id)

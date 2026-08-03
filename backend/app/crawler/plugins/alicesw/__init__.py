@@ -56,7 +56,11 @@ class AliceSWPlugin:
 
         login_url = f"{self.config.base_url}/login"
         try:
-            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            async with httpx.AsyncClient(
+                timeout=30,
+                follow_redirects=True,
+                trust_env=False,
+            ) as client:
                 resp = await client.get(login_url)
                 soup = BeautifulSoup(resp.text, "lxml")
                 csrf = soup.select_one('input[name="_token"], input[name="csrf_token"], meta[name="csrf-token"]')

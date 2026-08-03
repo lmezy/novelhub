@@ -816,6 +816,23 @@ class YueduRuleEngine:
             except ValueError:
                 return pages[0]
         result = re.sub(r"<([^>]+)>", _page_replacer, result)
+        def _page_expr_replacer(m: re.Match) -> str:
+            expr = m.group(0)
+            match = re.fullmatch(r"\{\{\s*page\s*([+-])\s*(\d+)\s*\}\}", expr)
+            if not match:
+                return m.group(0)
+            try:
+                page_num = int(kwargs.get("page", "1"))
+                amount = int(match.group(2))
+                value = page_num + amount if match.group(1) == "+" else page_num - amount
+                return str(max(1, value))
+            except ValueError:
+                return m.group(0)
+        result = re.sub(
+            r"\{\{\s*page\s*([+-])\s*(\d+)\s*\}\}",
+            _page_expr_replacer,
+            result,
+        )
         def _var_replacer(m: re.Match) -> str:
             var = m.group(1)
             if var in self._variables:

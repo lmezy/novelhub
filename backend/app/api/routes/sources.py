@@ -7,6 +7,7 @@ from app.models import Source, Book, Cookie, CrawlTask, CrawlLog, User
 from app.models.source_credential import SourceCredential
 from app.schemas.source import SourceCreate, SourceOut
 from app.services.auth import get_current_user, require_admin
+from app.services.book_cleanup import delete_books
 
 
 router = APIRouter(prefix="/sources", tags=["sources"])
@@ -36,14 +37,12 @@ async def delete_source(source_id: str, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Source not found")
 
     # Count related books
-    book_count = await db.scalar(
-        select(Book).where(Book.source_id == source_id)
+    book_ids = list(
+        await db.scalars(select(Book.id).where(Book.source_id == source_id))
     )
-    deleted_books = 0
-    if book_count:
-        # Delete related books and their chapters will cascade
-        await db.execute(delete(Book).where(Book.source_id == source_id))
-        deleted_books = 1  # simplified count
+    deleted_books = len(book_ids)
+    if book_ids:
+        await delete_books(db, book_ids, commit=False)
 
     # Delete related cookies
     await db.execute(delete(Cookie).where(Cookie.source == source_id))

@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
+from loguru import logger
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,10 +24,38 @@ from app.services.proxy_config import get_proxy_config
 router = APIRouter(prefix="/yuedu", tags=["yuedu"])
 
 
-def _build_async_client(timeout: float = 30.0) -> httpx.AsyncClient:
+async def _fetch_response(url: str, timeout: float = 30.0) -> httpx.Response:
     cfg = get_proxy_config()
     proxy_url = (cfg.https_proxy or cfg.http_proxy) if cfg.enabled else None
-    return httpx.AsyncClient(timeout=timeout, follow_redirects=True, proxy=proxy_url)
+    proxies: list[str | None] = [None]
+    if proxy_url:
+        proxies.insert(0, proxy_url)
+
+    last_error: httpx.HTTPError | None = None
+    for proxy in proxies:
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=True,
+                proxy=proxy,
+                trust_env=False,
+            ) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                return resp
+        except httpx.RequestError as exc:
+            last_error = exc
+            if proxy is None:
+                raise
+            logger.warning(
+                "Configured proxy {} unreachable ({}); retrying direct",
+                proxy_url,
+                exc,
+            )
+
+    if last_error is not None:
+        raise last_error
+    raise httpx.ConnectError(f"Request failed for {url}")
 
 
 class YueduImportRequest(BaseModel):
@@ -55,11 +84,9 @@ async def import_yuedu_sources(payload: YueduImportRequest, db: AsyncSession = D
 
     elif payload.url:
         try:
-            async with _build_async_client() as client:
-                resp = await client.get(payload.url)
-                resp.raise_for_status()
-                parsed = resp.json()
-                sources_json = _extract_sources(parsed)
+            resp = await _fetch_response(payload.url)
+            parsed = resp.json()
+            sources_json = _extract_sources(parsed)
         except httpx.HTTPError as e:
             raise HTTPException(status_code=502, detail=f"Failed to fetch URL: {e}")
         except json.JSONDecodeError as e:
@@ -251,11 +278,9 @@ async def preview_yuedu_sources(payload: YueduImportRequest):
 
     elif payload.url:
         try:
-            async with _build_async_client() as client:
-                resp = await client.get(payload.url)
-                resp.raise_for_status()
-                parsed = resp.json()
-                sources_json = _extract_sources(parsed)
+            resp = await _fetch_response(payload.url)
+            parsed = resp.json()
+            sources_json = _extract_sources(parsed)
         except httpx.HTTPError as e:
             raise HTTPException(status_code=502, detail=f"Failed to fetch URL: {e}")
         except json.JSONDecodeError as e:

@@ -38,6 +38,7 @@ class AliceSWCrawler:
                 headers=headers,
                 timeout=30.0,
                 follow_redirects=True,
+                trust_env=False,
             )
         return self._client
 
