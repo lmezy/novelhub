@@ -39,9 +39,52 @@ def check_cookie_health() -> dict:
     return asyncio.get_event_loop().run_until_complete(_check_cookie_health_async())
 
 
+@app.task(name="tasks.crawl_all_source")
+def crawl_all_source(source_id: str, max_pages: int = 200, task_id: str | None = None) -> dict:
+    """Crawl every discoverable book from a source in the background."""
+    return asyncio.get_event_loop().run_until_complete(
+        _crawl_all_source_async(source_id, max_pages, task_id)
+    )
+
+
 async def _check_cookie_health_async() -> dict:
     from app.services.cookie_health import CookieHealthService
     return await CookieHealthService.check_all_cookies()
+
+
+async def _crawl_all_source_async(source_id: str, max_pages: int, task_id: str | None) -> dict:
+    from app.core.database import SessionLocal
+    from app.models import CrawlTask
+    from app.services.sync import SyncService
+
+    async with SessionLocal() as db:
+        task_obj = None
+        if task_id:
+            task_obj = await db.get(CrawlTask, task_id)
+            if task_obj:
+                task_obj.status = "running"
+                task_obj.started_at = datetime.now(timezone.utc)
+                task_obj.error = None
+                await db.commit()
+
+        try:
+            result = await SyncService(db).discover_and_sync_all(
+                source_id,
+                max_pages=max_pages,
+            )
+            if task_obj:
+                task_obj.status = "completed"
+                task_obj.result = result
+                task_obj.finished_at = datetime.now(timezone.utc)
+                await db.commit()
+            return result
+        except Exception as exc:
+            if task_obj:
+                task_obj.status = "failed"
+                task_obj.error = str(exc)
+                task_obj.finished_at = datetime.now(timezone.utc)
+                await db.commit()
+            raise
 
 
 async def _daily_sync_all_async() -> dict:

@@ -7,7 +7,6 @@ Endpoints:
 
 import json
 import hashlib
-import logging
 from typing import Any
 
 import httpx
@@ -15,15 +14,19 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.database import get_db
 from app.models import Source
 from app.services.auth import require_admin
-
-logger = logging.getLogger(__name__)
+from app.services.proxy_config import get_proxy_config
 
 router = APIRouter(prefix="/yuedu", tags=["yuedu"])
+
+
+def _build_async_client(timeout: float = 30.0) -> httpx.AsyncClient:
+    cfg = get_proxy_config()
+    proxy_url = (cfg.https_proxy or cfg.http_proxy) if cfg.enabled else None
+    return httpx.AsyncClient(timeout=timeout, follow_redirects=True, proxy=proxy_url)
 
 
 class YueduImportRequest(BaseModel):
@@ -52,7 +55,7 @@ async def import_yuedu_sources(payload: YueduImportRequest, db: AsyncSession = D
 
     elif payload.url:
         try:
-            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            async with _build_async_client() as client:
                 resp = await client.get(payload.url)
                 resp.raise_for_status()
                 parsed = resp.json()
@@ -98,27 +101,7 @@ async def import_yuedu_sources(payload: YueduImportRequest, db: AsyncSession = D
 
     await db.commit()
 
-    # Auto-detect bookshelf URLs for imported sources
-    for src_info in results:
-        if src_info["status"] != "imported":
-            continue
-        try:
-            source = await db.get(Source, src_info["id"])
-            if source and source.config:
-                from app.crawler.plugins.yuedu import YueduPlugin
-                plugin = YueduPlugin(source.config)
-                if source.config.get("bookshelf_url"):
-                    src_info["bookshelf_url"] = source.config["bookshelf_url"]
-                    continue
-                detected = await plugin.detect_bookshelf_url()
-                if detected:
-                    source.config["bookshelf_url"] = detected
-                    flag_modified(source, "config")
-                    src_info["bookshelf_url"] = detected
-                    await db.commit()
-                    logger.info(f"Auto-detected bookshelf URL for {source.name}: {detected}")
-        except Exception as e:
-            logger.warning(f"Bookshelf auto-detect failed for {src_info['id']}: {e}")
+    # Bookshelf URLs are detected lazily during sync, so import stays fast.
 
     return YueduImportResult(
         total=total,
@@ -162,7 +145,6 @@ async def import_and_sync_all(payload: YueduImportSyncRequest, db: AsyncSession 
     from app.models import Cookie
     from app.services.cookie_crypto import encrypt_cookie
     from app.services.sync import SyncService
-    from app.crawler.registry import get_plugin
 
     # Step 1: Import sources
     import_result = await import_yuedu_sources(
@@ -233,23 +215,19 @@ async def import_and_sync_all(payload: YueduImportSyncRequest, db: AsyncSession 
         # Discover books from explore/category pages
         if payload.discover:
             try:
-                source = await db.get(Source, source_id)
-                if source:
-                    config = source.config if source.plugin_name == "yuedu" else None
-                    plugin = get_plugin(source.plugin_name, config=config)
-                if source and hasattr(plugin, "discover_books"):
-                    for page in range(1, payload.max_discover_pages + 1):
-                        shelf_books = await plugin.discover_books(page=page)
-                        for sb in shelf_books:
-                            try:
-                                await sync_service.sync_book(source_id, sb.url)
-                                result.books_discovered += 1
-                                result.chapters_downloaded += 1
-                            except Exception:
-                                await db.rollback()
-                        if len(shelf_books) == 0:
-                            break
-                detail["discover"] = {"pages_checked": payload.max_discover_pages}
+                discover_result = await sync_service.discover_and_sync_all(
+                    source_id,
+                    max_pages=payload.max_discover_pages,
+                )
+                result.books_discovered += discover_result["books_found"]
+                result.chapters_downloaded += discover_result["chapters_created"]
+                detail["discover"] = {
+                    "pages_checked": discover_result["pages_checked"],
+                    "books_found": discover_result["books_found"],
+                    "books_synced": discover_result["books_synced"],
+                    "books_failed": discover_result["books_failed"],
+                    "chapters_created": discover_result["chapters_created"],
+                }
             except Exception as exc:
                 await db.rollback()
                 detail["discover"] = {"error": str(exc)[:200]}
@@ -273,7 +251,7 @@ async def preview_yuedu_sources(payload: YueduImportRequest):
 
     elif payload.url:
         try:
-            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            async with _build_async_client() as client:
                 resp = await client.get(payload.url)
                 resp.raise_for_status()
                 parsed = resp.json()

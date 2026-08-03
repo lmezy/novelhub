@@ -375,12 +375,20 @@ class YueduPlugin:
                         break
 
             full_url = self._make_absolute(href, self.base_url)
+            if not full_url.startswith(("http://", "https://")):
+                continue
 
             # Skip non-book URLs: search, tag, category, author, user pages
             skip_patterns = ["/search/", "/tag/", "/tags/", "/category/", "/categories/",
                            "/author/", "/user/", "/users/", "/login", "/register",
                            "/signup", "/about", "/help", "/faq", "/contact"]
             if any(p in full_url.lower() for p in skip_patterns):
+                continue
+            nav_paths = ["/rank", "/top", "/sort", "/allvisit", "/lastupdate",
+                         "/update", "/new", "/finish", "/quanben", "/wanben",
+                         "/bookcase", "/bookshelf", "/history", "/index", "/list", "/page"]
+            path = urlparse(full_url).path.lower()
+            if any(p in path for p in nav_paths):
                 continue
 
             book_id = full_url.split("/")[-1] if "/" in full_url else full_url
@@ -578,11 +586,14 @@ class YueduPlugin:
             book_url = item.get("bookUrl", item.get("url", ""))
             if not book_url:
                 continue
+            full_url = self._make_absolute(book_url, self.base_url)
+            if not full_url.startswith(("http://", "https://")):
+                continue
             books.append(RemoteShelfBook(
-                source_book_id=book_url.rstrip("/").split("/")[-1] or book_url,
+                source_book_id=full_url.rstrip("/").split("/")[-1] or full_url,
                 title=str(item.get("name") or item.get("title") or book_url).strip() or "Unknown",
                 author=str(item.get("author") or "").strip() or "Unknown",
-                url=self._make_absolute(book_url, self.base_url),
+                url=full_url,
                 latest_chapter_title=item.get("latestChapterTitle"),
             ))
         return books
@@ -729,6 +740,9 @@ class YueduPlugin:
         import asyncio
         import json
         import httpx
+
+        if not url.startswith(("http://", "https://")):
+            raise ValueError(f"Unsupported URL: {url}")
 
         # Concurrent rate limiting
         rate = self.config.get("concurrentRate", "")

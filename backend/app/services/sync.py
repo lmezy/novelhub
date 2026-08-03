@@ -30,7 +30,14 @@ class SyncService:
     def _safe_author(name: str | None) -> str:
         return SyncService._safe_text(name, "Unknown")
 
+    @staticmethod
+    def _is_http_url(url: str) -> bool:
+        return url.startswith(("http://", "https://"))
+
     async def sync_book(self, source_id: str, url: str) -> dict:
+        if not self._is_http_url(url):
+            raise ValueError(f"Unsupported book URL: {url}")
+
         source = await self.db.get(Source, source_id)
         if source is None or not source.enabled:
             raise ValueError("Source not found or disabled")
@@ -209,6 +216,15 @@ class SyncService:
 
         results = []
         for shelf_book in shelf_books:
+            if not self._is_http_url(shelf_book.url):
+                results.append({
+                    "url": shelf_book.url,
+                    "status": "skipped",
+                    "error": "Unsupported URL",
+                    "created_chapters": 0,
+                    "skipped_chapters": 0,
+                })
+                continue
             try:
                 result = await self.sync_book(source_id, shelf_book.url)
                 results.append({"book_id": result["book_id"], "status": "ok", "created_chapters": result.get("created_chapters", 0), "skipped_chapters": result.get("skipped_chapters", 0)})
@@ -284,6 +300,12 @@ class SyncService:
         config = source.config if source.plugin_name == "yuedu" else None
         plugin = get_plugin(source.plugin_name, config=config)
 
+        cookie_record = await self.db.scalar(
+            select(Cookie).where(Cookie.source == source_id)
+        )
+        if cookie_record:
+            plugin.set_cookie(safe_decrypt_cookie(cookie_record.cookie_data))
+
         if not hasattr(plugin, "discover_books"):
             return {
                 "source_id": source_id,
@@ -299,6 +321,15 @@ class SyncService:
 
         if sync:
             for sb in shelf_books:
+                if not self._is_http_url(sb.url):
+                    details.append({
+                        "title": sb.title,
+                        "author": sb.author,
+                        "url": sb.url,
+                        "synced": False,
+                        "error": "Unsupported URL",
+                    })
+                    continue
                 try:
                     result = await self.sync_book(source_id, sb.url)
                     details.append({
@@ -331,5 +362,110 @@ class SyncService:
             "source_id": source_id,
             "books_found": books_found,
             "books_synced": books_synced,
+            "details": details,
+        }
+
+    async def discover_and_sync_all(
+        self,
+        source_id: str,
+        url: str | None = None,
+        max_pages: int = 200,
+        sync: bool = True,
+    ) -> dict:
+        """Discover every book across catalog pages and optionally sync them."""
+        source = await self.db.get(Source, source_id)
+        if source is None or not source.enabled:
+            raise ValueError("Source not found or disabled")
+
+        config = source.config if source.plugin_name == "yuedu" else None
+        plugin = get_plugin(source.plugin_name, config=config)
+
+        cookie_record = await self.db.scalar(
+            select(Cookie).where(Cookie.source == source_id)
+        )
+        if cookie_record:
+            plugin.set_cookie(safe_decrypt_cookie(cookie_record.cookie_data))
+
+        if not hasattr(plugin, "discover_books"):
+            return {
+                "source_id": source_id,
+                "pages_checked": 0,
+                "books_found": 0,
+                "books_synced": 0,
+                "books_failed": 0,
+                "chapters_created": 0,
+                "chapters_skipped": 0,
+                "details": [],
+            }
+
+        seen: set[str] = set()
+        details: list[dict] = []
+        books_found = 0
+        books_synced = 0
+        books_failed = 0
+        chapters_created = 0
+        chapters_skipped = 0
+        pages_checked = 0
+
+        for page in range(1, max_pages + 1):
+            page_books = await plugin.discover_books(url=url, page=page)
+            if not page_books:
+                break
+            pages_checked = page
+
+            new_books = []
+            for sb in page_books:
+                key = sb.url.split("#", 1)[0].rstrip("/")
+                if not key or key in seen or not self._is_http_url(key):
+                    continue
+                seen.add(key)
+                new_books.append(sb)
+
+            if not new_books:
+                break
+
+            books_found += len(new_books)
+            for sb in new_books:
+                if not sync:
+                    details.append({
+                        "title": sb.title,
+                        "author": sb.author,
+                        "url": sb.url,
+                        "synced": False,
+                    })
+                    continue
+                try:
+                    result = await self.sync_book(source_id, sb.url)
+                    details.append({
+                        "title": sb.title,
+                        "author": sb.author,
+                        "url": sb.url,
+                        "synced": True,
+                        "book_id": result.get("book_id"),
+                        "created_chapters": result.get("created_chapters", 0),
+                        "skipped_chapters": result.get("skipped_chapters", 0),
+                    })
+                    books_synced += 1
+                    chapters_created += result.get("created_chapters", 0)
+                    chapters_skipped += result.get("skipped_chapters", 0)
+                except Exception as exc:
+                    await self.db.rollback()
+                    books_failed += 1
+                    details.append({
+                        "title": sb.title,
+                        "author": sb.author,
+                        "url": sb.url,
+                        "synced": False,
+                        "error": str(exc),
+                    })
+
+        return {
+            "source_id": source_id,
+            "pages_checked": pages_checked,
+            "books_found": books_found,
+            "books_synced": books_synced,
+            "books_failed": books_failed,
+            "chapters_created": chapters_created,
+            "chapters_skipped": chapters_skipped,
             "details": details,
         }

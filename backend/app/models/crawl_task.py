@@ -2,8 +2,10 @@ from sqlalchemy import (
     Column,
     String,
     DateTime,
+    Integer,
     Text
 )
+from sqlalchemy.dialects.postgresql import JSONB
 
 from sqlalchemy.sql import func
 
@@ -27,6 +29,18 @@ class CrawlTask(Base):
     )
 
 
+    mode = Column(
+        String(32),
+        default="bookshelf"
+    )
+
+
+    max_pages = Column(
+        Integer,
+        default=200
+    )
+
+
     status = Column(
         String(32),
         default="pending"
@@ -45,6 +59,11 @@ class CrawlTask(Base):
 
     error = Column(
         Text
+    )
+
+
+    result = Column(
+        JSONB
     )
 
 

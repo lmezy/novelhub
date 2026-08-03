@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue"
+import { onMounted, onUnmounted, ref } from "vue"
 import { api } from "../api/client"
 import { useI18nStore } from "../stores/i18n"
 import NavBar from "../components/NavBar.vue"
@@ -107,6 +107,12 @@ const bookshelfSourceId = ref("")
 const bookshelfResult = ref<any>(null)
 const bookshelfError = ref("")
 const bookshelfLoading = ref(false)
+
+const crawlAllSourceId = ref("")
+const crawlTask = ref<any>(null)
+const crawlTaskError = ref("")
+const crawlTaskLoading = ref(false)
+let crawlTaskTimer: number | null = null
 
 const yueduUrl = ref("")
 const yueduJsonText = ref("")
@@ -374,6 +380,43 @@ async function triggerBookshelfSync() {
   }
 }
 
+async function startCrawlAll() {
+  crawlTaskError.value = ""
+  crawlTask.value = null
+  if (!crawlAllSourceId.value) {
+    crawlTaskError.value = "请输入书源 ID"
+    return
+  }
+  crawlTaskLoading.value = true
+  try {
+    crawlTask.value = await api.post("/crawl/tasks", {
+      source: crawlAllSourceId.value,
+      max_pages: 500,
+    })
+    pollCrawlTask()
+  } catch (e) {
+    crawlTaskError.value = e instanceof Error ? e.message : "启动失败"
+  } finally {
+    crawlTaskLoading.value = false
+  }
+}
+
+async function pollCrawlTask() {
+  if (!crawlTask.value?.id) return
+  const finished = ["completed", "failed", "completed_with_errors"]
+  try {
+    crawlTask.value = await api.get("/crawl/tasks/" + crawlTask.value.id)
+    if (finished.includes(crawlTask.value.status)) {
+      crawlTaskTimer = null
+    } else {
+      crawlTaskTimer = window.setTimeout(pollCrawlTask, 2000)
+    }
+  } catch (e) {
+    crawlTaskError.value = e instanceof Error ? e.message : "查询任务失败"
+    crawlTaskTimer = null
+  }
+}
+
 const logs = ref<any[]>([])
 
 const tokens = ref<any[]>([])
@@ -490,6 +533,12 @@ onMounted(async () => {
   await loadUsers()
   await loadApprovals()
   loadProxyConfig()
+})
+
+onUnmounted(() => {
+  if (crawlTaskTimer !== null) {
+    window.clearTimeout(crawlTaskTimer)
+  }
 })
 </script>
 
@@ -623,6 +672,24 @@ onMounted(async () => {
               </span>
               <span v-if="r.error" class="text-red-500 ml-1">{{ r.error }}</span>
             </div>
+          </div>
+        </div>
+
+        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 mt-4">
+          <h2 class="text-sm font-semibold mb-4">全站同步</h2>
+          <p class="text-xs text-muted dark:text-gray-400 mb-3">遍历书源的发现/分类分页，抓取全部小说并增量更新。</p>
+          <div class="flex gap-3 mb-3">
+            <input v-model="crawlAllSourceId" :placeholder="i18n.t('admin_placeholder_source')" class="flex-1 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+          </div>
+          <p v-if="crawlTaskError" class="text-sm text-red-600 mb-2">{{ crawlTaskError }}</p>
+          <button @click="startCrawlAll" :disabled="crawlTaskLoading" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">
+            {{ crawlTaskLoading ? '启动中...' : '开始全站同步' }}
+          </button>
+          <div v-if="crawlTask" class="mt-4 p-3 rounded bg-green-50 text-sm">
+            <p>任务: {{ crawlTask.id }}</p>
+            <p>状态: {{ crawlTask.status }}</p>
+            <p v-if="crawlTask.result">发现 {{ crawlTask.result.books_found }} 本，成功 {{ crawlTask.result.books_synced }} 本，失败 {{ crawlTask.result.books_failed }} 本，新增章节 {{ crawlTask.result.chapters_created }}</p>
+            <p v-if="crawlTask.error" class="text-red-600 mt-1">{{ crawlTask.error }}</p>
           </div>
         </div>
       </section>

@@ -34,6 +34,7 @@ app.conf.update(
         "tasks.daily_sync_all": {"queue": "crawl"},
         "tasks.sync_single_source": {"queue": "crawl"},
         "tasks.resync_all_books": {"queue": "crawl"},
+        "tasks.crawl_all_source": {"queue": "crawl"},
     },
     beat_schedule={
         "daily-sync-all-sources": {
