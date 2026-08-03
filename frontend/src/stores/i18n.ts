@@ -6,6 +6,8 @@ type Locale = "zh" | "en"
 const messages: Record<Locale, Record<string, string>> = {
   zh: {
     nav_search: "搜索",
+    nav_books: "书籍",
+    nav_shelf: "书架",
     nav_admin: "管理",
     nav_login: "登录",
     nav_logout: "退出",
@@ -32,6 +34,7 @@ const messages: Record<Locale, Record<string, string>> = {
     admin_tab_status: "状态",
     admin_tab_index: "索引",
     admin_tab_yuedu: "书源导入",
+    admin_tab_add: "本地/手动",
     admin_tab_creds: "账号密码",
     admin_tab_users: "用户管理",
     admin_tab_approvals: "待审批",
@@ -134,6 +137,8 @@ const messages: Record<Locale, Record<string, string>> = {
   },
   en: {
     nav_search: "Search",
+    nav_books: "Books",
+    nav_shelf: "Bookshelf",
     nav_admin: "Admin",
     nav_login: "Login",
     nav_logout: "Logout",
@@ -160,6 +165,7 @@ const messages: Record<Locale, Record<string, string>> = {
     admin_tab_status: "Status",
     admin_tab_index: "Index",
     admin_tab_yuedu: "YueDu Import",
+    admin_tab_add: "Local / Manual",
     admin_tab_creds: "Credentials",
     admin_tab_users: "Users",
     admin_tab_approvals: "Approvals",

@@ -11,6 +11,7 @@ export interface Book {
   description: string | null
   cover: string | null
   status: string | null
+  is_favorite?: boolean
   created_at: string
   updated_at: string
   tag_names: string[]
@@ -59,5 +60,20 @@ export const useBooksStore = defineStore("books", () => {
     return api.get<ChapterContent>(`/chapters/${chapterId}`)
   }
 
-  return { books, loading, error, fetchBooks, fetchBook, fetchChapters, fetchChapter }
+  async function fetchFavorites(): Promise<Book[]> {
+    return api.get<Book[]>("/books/favorites")
+  }
+
+  async function toggleFavorite(book: Book): Promise<boolean> {
+    const next = !book.is_favorite
+    if (next) {
+      await api.post(`/books/${book.id}/favorite`)
+    } else {
+      await api.delete(`/books/${book.id}/favorite`)
+    }
+    book.is_favorite = next
+    return next
+  }
+
+  return { books, loading, error, fetchBooks, fetchBook, fetchChapters, fetchChapter, fetchFavorites, toggleFavorite }
 })

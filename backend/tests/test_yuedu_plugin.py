@@ -41,6 +41,87 @@ def test_substitute_page_expressions():
     ) == "https://example.com/sort/3.html"
 
 
+def test_parse_book_generic_fills_metadata_and_chapters():
+    plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
+    html = """
+    <html><body>
+      <h1>书名</h1>
+      <p class="author">作者</p>
+      <p class="intro">简介内容</p>
+      <div class="listmain">
+        <a href="/novel/123/1.html">第一章</a>
+        <a href="/novel/123/2.html">第二章</a>
+      </div>
+    </body></html>
+    """
+
+    parsed = plugin._parse_book_generic(
+        html,
+        "https://example.com/novel/123.html",
+    )
+
+    assert parsed["title"] == "书名"
+    assert parsed["author"] == "作者"
+    assert parsed["description"] == "简介内容"
+    assert len(parsed["chapters"]) == 2
+    assert parsed["chapters"][0].url == "https://example.com/novel/123/1.html"
+
+
+def test_build_book_url_uses_configured_detail_prefix():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "bookUrlPattern": "https://example.com/novel/.*",
+    })
+
+    assert plugin.build_book_url("37466.html") == "https://example.com/novel/37466.html"
+
+
+@pytest.mark.asyncio
+async def test_fetch_book_uses_generic_fallback():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "ruleBookInfo": {},
+        "ruleToc": {},
+    })
+    html = """
+    <html><body>
+      <h1>书名</h1>
+      <div class="listmain">
+        <a href="/novel/123/1.html">第一章</a>
+        <a href="/novel/123/2.html">第二章</a>
+      </div>
+    </body></html>
+    """
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        book = await plugin.fetch_book("https://example.com/novel/123.html")
+
+    assert book.title == "书名"
+    assert len(book.chapters) == 2
+
+
+@pytest.mark.asyncio
+async def test_fetch_explore_uses_generic_fallback_when_rules_empty():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "ruleSearch": {},
+        "ruleExplore": {},
+    })
+    html = """
+    <html><body>
+      <ul>
+        <li class="book-item"><a href="/novel/123.html" class="book-title">书一</a></li>
+        <li class="book-item"><a href="/novel/456.html" class="book-title">书二</a></li>
+      </ul>
+    </body></html>
+    """
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        items = await plugin._fetch_explore_url("https://example.com/lists/1.html")
+
+    assert len(items) == 2
+    assert items[0]["name"] == "书一"
+    assert items[0]["bookUrl"] == "https://example.com/novel/123.html"
+
+
 @pytest.mark.asyncio
 async def test_get_falls_back_to_direct_when_proxy_unreachable():
     plugin = YueduPlugin({

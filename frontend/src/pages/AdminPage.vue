@@ -2,9 +2,11 @@
 import { computed, onMounted, onUnmounted, ref } from "vue"
 import { api } from "../api/client"
 import { useI18nStore } from "../stores/i18n"
+import { useCrawlStore } from "../stores/crawl"
 import NavBar from "../components/NavBar.vue"
 
 const i18n = useI18nStore()
+const crawlStore = useCrawlStore()
 
 interface Source {
   id: string
@@ -21,7 +23,7 @@ interface CookieItem {
   expired_at: string | null
 }
 
-const tab = ref<"sources" | "cookies" | "sync" | "logs" | "tokens" | "index" | "status" | "yuedu" | "creds" | "users" | "approvals" | "proxy">("yuedu")
+const tab = ref<"sources" | "cookies" | "sync" | "logs" | "tokens" | "index" | "status" | "yuedu" | "add" | "creds" | "users" | "approvals" | "proxy">("yuedu")
 
 const sources = ref<Source[]>([])
 const sourceForm = ref({ id: "", name: "", url: "", plugin_name: "alicesw" })
@@ -109,14 +111,13 @@ const bookshelfError = ref("")
 const bookshelfLoading = ref(false)
 
 const crawlAllSourceId = ref("")
-const crawlTask = ref<any>(null)
 const crawlTaskError = ref("")
 const crawlTaskLoading = ref(false)
-let crawlTaskTimer: number | null = null
 
 const crawlTaskProgress = computed(() => {
-  const max = crawlTask.value?.max_pages || 1
-  const pages = crawlTask.value?.progress?.pages_checked || 0
+  const task = crawlStore.activeTask
+  const max = task?.max_pages || 1
+  const pages = task?.progress?.pages_checked || 0
   return Math.min(100, Math.round((pages / max) * 100))
 })
 
@@ -128,6 +129,21 @@ const yueduCookie = ref("")
 const yueduDiscover = ref(true)
 const yueduSyncResult = ref<any>(null)
 const yueduSyncError = ref("")
+
+const localPath = ref("")
+const localImporting = ref(false)
+const localResult = ref<any>(null)
+const localError = ref("")
+
+const manualTitle = ref("")
+const manualAuthor = ref("")
+const manualStatus = ref("ongoing")
+const manualDescription = ref("")
+const manualTags = ref("")
+const manualChaptersText = ref("")
+const manualImporting = ref(false)
+const manualResult = ref<any>(null)
+const manualError = ref("")
 
 const creds = ref<any[]>([])
 const credForm = ref({ source: "", username: "", password: "" })
@@ -355,6 +371,98 @@ async function yueduPreviewAction() {
   }
 }
 
+async function importLocal() {
+  localError.value = ""
+  localResult.value = null
+  if (!localPath.value.trim()) {
+    localError.value = "请输入服务器上的书籍目录路径"
+    return
+  }
+  localImporting.value = true
+  try {
+    localResult.value = await api.post<any>("/sync/local", {
+      path: localPath.value.trim(),
+    })
+    await loadSources()
+  } catch (e) {
+    localError.value = e instanceof Error ? e.message : "本地导入失败"
+  } finally {
+    localImporting.value = false
+  }
+}
+
+function onManualFile(e: Event) {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  file.text().then((text) => {
+    manualChaptersText.value = text
+  })
+}
+
+function parseManualChapters() {
+  const text = manualChaptersText.value.trim()
+  if (!text) return []
+  const chapters: { title: string; content: string }[] = []
+  let title = "第一章"
+  let lines: string[] = []
+
+  const push = () => {
+    const content = lines.join("\n").trim()
+    if (content || chapters.length === 0) {
+      chapters.push({ title, content })
+    }
+  }
+
+  for (const line of text.split(/\r?\n/)) {
+    const match = line.match(/^##\s+(.+)/)
+    if (match) {
+      push()
+      title = match[1].trim()
+      lines = []
+    } else {
+      lines.push(line)
+    }
+  }
+  push()
+  return chapters
+}
+
+async function submitManualBook() {
+  manualError.value = ""
+  manualResult.value = null
+  if (!manualTitle.value.trim()) {
+    manualError.value = "请输入书名"
+    return
+  }
+  const chapters = parseManualChapters()
+  if (!chapters.length) {
+    manualError.value = "请输入至少一章内容"
+    return
+  }
+  manualImporting.value = true
+  try {
+    manualResult.value = await api.post<any>("/books/manual", {
+      title: manualTitle.value.trim(),
+      author: manualAuthor.value.trim() || "未知作者",
+      status: manualStatus.value,
+      description: manualDescription.value.trim() || null,
+      tags: manualTags.value.split(/[,，\s]+/).filter(Boolean),
+      chapters,
+    })
+    manualTitle.value = ""
+    manualAuthor.value = ""
+    manualDescription.value = ""
+    manualTags.value = ""
+    manualChaptersText.value = ""
+    manualStatus.value = "ongoing"
+  } catch (e) {
+    manualError.value = e instanceof Error ? e.message : "手动上传失败"
+  } finally {
+    manualImporting.value = false
+  }
+}
+
 async function triggerSync() {
   syncError.value = ""
   syncResult.value = null
@@ -388,18 +496,17 @@ async function triggerBookshelfSync() {
 
 async function startCrawlAll() {
   crawlTaskError.value = ""
-  crawlTask.value = null
   if (!crawlAllSourceId.value) {
     crawlTaskError.value = "请输入书源 ID"
     return
   }
   crawlTaskLoading.value = true
   try {
-    crawlTask.value = await api.post("/crawl/tasks", {
+    const task = await api.post<any>("/crawl/tasks", {
       source: crawlAllSourceId.value,
       max_pages: 500,
     })
-    pollCrawlTask()
+    await crawlStore.setTask(task)
   } catch (e) {
     crawlTaskError.value = e instanceof Error ? e.message : "启动失败"
   } finally {
@@ -407,19 +514,28 @@ async function startCrawlAll() {
   }
 }
 
-async function pollCrawlTask() {
-  if (!crawlTask.value?.id) return
-  const finished = ["completed", "failed", "completed_with_errors"]
+async function pauseCrawlTask() {
   try {
-    crawlTask.value = await api.get("/crawl/tasks/" + crawlTask.value.id)
-    if (finished.includes(crawlTask.value.status)) {
-      crawlTaskTimer = null
-    } else {
-      crawlTaskTimer = window.setTimeout(pollCrawlTask, 2000)
-    }
+    await crawlStore.pauseTask()
   } catch (e) {
-    crawlTaskError.value = e instanceof Error ? e.message : "查询任务失败"
-    crawlTaskTimer = null
+    crawlTaskError.value = e instanceof Error ? e.message : "暂停任务失败"
+  }
+}
+
+async function resumeCrawlTask() {
+  try {
+    await crawlStore.resumeTask()
+  } catch (e) {
+    crawlTaskError.value = e instanceof Error ? e.message : "恢复任务失败"
+  }
+}
+
+async function cancelCrawlTask() {
+  if (!confirm("确定取消当前同步任务吗？")) return
+  try {
+    await crawlStore.cancelTask()
+  } catch (e) {
+    crawlTaskError.value = e instanceof Error ? e.message : "取消任务失败"
   }
 }
 
@@ -495,6 +611,10 @@ async function loadStatus() {
 
 async function loadLogs() {
   logs.value = await api.get<any[]>("/crawl/tasks")
+  const active = logs.value.find((t) => ["pending", "running", "paused"].includes(t.status))
+  if (active && (!crawlStore.activeTask || crawlStore.activeTask.id !== active.id)) {
+    await crawlStore.setTask(active)
+  }
 }
 
 const users = ref<any[]>([])
@@ -538,13 +658,15 @@ onMounted(async () => {
   await loadIndexStats()
   await loadUsers()
   await loadApprovals()
+  await loadLogs()
+  if (crawlStore.activeTask?.id && !["completed", "failed", "cancelled", "completed_with_errors"].includes(crawlStore.activeTask.status)) {
+    crawlStore.startPolling(crawlStore.activeTask.id)
+  }
   loadProxyConfig()
 })
 
 onUnmounted(() => {
-  if (crawlTaskTimer !== null) {
-    window.clearTimeout(crawlTaskTimer)
-  }
+  // Polling lives in the global crawl store so the task survives route changes.
 })
 </script>
 
@@ -557,7 +679,7 @@ onUnmounted(() => {
 
       <div class="flex gap-1 mb-8 border-b border-border flex-wrap">
         <button
-          v-for="t in (['sources', 'cookies', 'sync', 'logs', 'tokens', 'index', 'status', 'yuedu', 'creds', 'users', 'approvals', 'proxy'] as const)"
+          v-for="t in (['sources', 'cookies', 'sync', 'logs', 'tokens', 'index', 'status', 'yuedu', 'add', 'creds', 'users', 'approvals', 'proxy'] as const)"
           :key="t"
           @click="tab = t"
           class="px-4 py-2 text-sm transition-colors -mb-px"
@@ -691,19 +813,36 @@ onUnmounted(() => {
           <button @click="startCrawlAll" :disabled="crawlTaskLoading" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">
             {{ crawlTaskLoading ? '启动中...' : '开始全站同步' }}
           </button>
-          <div v-if="crawlTask" class="mt-4 p-3 rounded bg-green-50 text-sm">
-            <p>任务: {{ crawlTask.id }}</p>
-            <p>状态: {{ crawlTask.status }}</p>
-            <div v-if="!['completed', 'failed', 'completed_with_errors'].includes(crawlTask.status)" class="mt-3">
+          <div v-if="crawlStore.activeTask" class="mt-4 p-3 rounded bg-green-50 text-sm">
+            <p>任务: {{ crawlStore.activeTask.id }}</p>
+            <p>状态: {{ crawlStore.activeTask.status }}</p>
+            <div class="flex gap-2 mt-2">
+              <button
+                v-if="crawlStore.activeTask.status === 'running'"
+                @click="pauseCrawlTask"
+                class="px-3 py-1 text-xs border border-border rounded hover:bg-white/60"
+              >暂停</button>
+              <button
+                v-if="crawlStore.activeTask.status === 'paused'"
+                @click="resumeCrawlTask"
+                class="px-3 py-1 text-xs border border-green-600 text-green-700 rounded hover:bg-green-50"
+              >继续</button>
+              <button
+                v-if="!['completed', 'failed', 'cancelled', 'completed_with_errors'].includes(crawlStore.activeTask.status)"
+                @click="cancelCrawlTask"
+                class="px-3 py-1 text-xs border border-red-500 text-red-600 rounded hover:bg-red-50"
+              >取消</button>
+            </div>
+            <div v-if="!['completed', 'failed', 'cancelled', 'completed_with_errors'].includes(crawlStore.activeTask.status)" class="mt-3">
               <div class="h-2 rounded bg-gray-200 dark:bg-gray-700 overflow-hidden">
                 <div class="h-full bg-accent transition-all" :style="{ width: crawlTaskProgress + '%' }"></div>
               </div>
               <p class="text-xs text-muted dark:text-gray-400 mt-1">
-                已检查 {{ crawlTask.progress?.pages_checked || 0 }} 页，发现 {{ crawlTask.progress?.books_found || 0 }} 本
+                已检查 {{ crawlStore.activeTask.progress?.pages_checked || 0 }} 页，发现 {{ crawlStore.activeTask.progress?.books_found || 0 }} 本
               </p>
             </div>
-            <p v-if="crawlTask.result">发现 {{ crawlTask.result.books_found }} 本，成功 {{ crawlTask.result.books_synced }} 本，失败 {{ crawlTask.result.books_failed }} 本，新增章节 {{ crawlTask.result.chapters_created }}</p>
-            <p v-if="crawlTask.error" class="text-red-600 mt-1">{{ crawlTask.error }}</p>
+            <p v-if="crawlStore.activeTask.result">发现 {{ crawlStore.activeTask.result.books_found }} 本，成功 {{ crawlStore.activeTask.result.books_synced }} 本，失败 {{ crawlStore.activeTask.result.books_failed }} 本，新增章节 {{ crawlStore.activeTask.result.chapters_created }}</p>
+            <p v-if="crawlStore.activeTask.error" class="text-red-600 mt-1">{{ crawlStore.activeTask.error }}</p>
           </div>
         </div>
       </section>
@@ -862,6 +1001,76 @@ onUnmounted(() => {
         </div>
       </section>
 
+      <section v-if="tab === 'add'" class="space-y-6">
+        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 max-w-3xl">
+          <h2 class="text-sm font-semibold mb-4">本地 Markdown 导入</h2>
+          <p class="text-xs text-muted dark:text-gray-400 mb-3">输入服务器上已经准备好的书籍目录，目录内需要有章节 Markdown 文件，可附带 metadata.json。</p>
+          <input
+            v-model="localPath"
+            placeholder="/app/storage/imports/书名"
+            class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
+          />
+          <p v-if="localError" class="text-sm text-red-600 mt-2">{{ localError }}</p>
+          <button
+            @click="importLocal"
+            :disabled="localImporting"
+            class="mt-3 px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50"
+          >{{ localImporting ? '导入中...' : '导入本地书籍' }}</button>
+          <div v-if="localResult" class="mt-3 p-3 rounded bg-green-50 dark:bg-green-950 text-sm">
+            <p>Book ID: {{ localResult.book_id }}</p>
+            <p>新增章节: {{ localResult.created_chapters }}</p>
+          </div>
+        </div>
+
+        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 max-w-3xl">
+          <h2 class="text-sm font-semibold mb-4">手动上传</h2>
+          <p class="text-xs text-muted dark:text-gray-400 mb-3">填写书名和作者，章节用 <code>## 章节标题</code> 分隔，也可以直接选择 .txt / .md 文件读取。</p>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+            <input v-model="manualTitle" placeholder="书名" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            <input v-model="manualAuthor" placeholder="作者" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+          </div>
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+            <select v-model="manualStatus" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800">
+              <option value="ongoing">连载中</option>
+              <option value="completed">已完结</option>
+            </select>
+            <input v-model="manualTags" placeholder="标签，逗号分隔" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+          </div>
+          <textarea
+            v-model="manualDescription"
+            rows="3"
+            placeholder="简介"
+            class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 resize-y mb-3"
+          ></textarea>
+          <textarea
+            v-model="manualChaptersText"
+            rows="10"
+            placeholder="## 第一章&#10;正文内容..."
+            class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 resize-y font-mono mb-3"
+          ></textarea>
+
+          <div class="flex items-center gap-3 mb-3">
+            <label class="inline-flex px-3 py-2 rounded border border-border dark:border-gray-700 text-sm cursor-pointer hover:bg-accent/5">
+              选择 .txt / .md
+              <input type="file" accept=".txt,.md,text/plain,text/markdown" class="hidden" @change="onManualFile" />
+            </label>
+            <span class="text-xs text-muted dark:text-gray-400">章节标题用 <code>## </code> 开头</span>
+          </div>
+
+          <p v-if="manualError" class="text-sm text-red-600 mb-2">{{ manualError }}</p>
+          <button
+            @click="submitManualBook"
+            :disabled="manualImporting"
+            class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50"
+          >{{ manualImporting ? '保存中...' : '保存书籍' }}</button>
+          <div v-if="manualResult" class="mt-3 p-3 rounded bg-green-50 dark:bg-green-950 text-sm">
+            <p>Book ID: {{ manualResult.book_id }}</p>
+            <p>新增章节: {{ manualResult.created_chapters }}</p>
+          </div>
+        </div>
+      </section>
+
       <section v-if="tab === 'creds'" class="space-y-6">
         <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
           <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_add_cred') }}</h2>
@@ -953,9 +1162,7 @@ onUnmounted(() => {
         </div>
       </section>
 
-    </main>
-
-<section v-if="tab === 'proxy'" class="space-y-6">
+      <section v-if="tab === 'proxy'" class="space-y-6">
         <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 max-w-lg">
           <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_proxy_title') }}</h2>
           <p class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('admin_proxy_hint') }}</p>
@@ -978,5 +1185,6 @@ onUnmounted(() => {
           </button>
         </div>
       </section>
+    </main>
   </div>
 </template>

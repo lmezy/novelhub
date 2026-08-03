@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import (
     Book,
     BookCategory,
+    BookFavorite,
     BookTag,
     BookVersion,
     Chapter,
@@ -45,6 +46,7 @@ async def delete_books(
     await db.execute(delete(Chapter).where(Chapter.book_id.in_(book_ids)))
     await db.execute(delete(BookTag).where(BookTag.book_id.in_(book_ids)))
     await db.execute(delete(BookCategory).where(BookCategory.book_id.in_(book_ids)))
+    await db.execute(delete(BookFavorite).where(BookFavorite.book_id.in_(book_ids)))
     await db.execute(
         delete(ReadingProgress).where(ReadingProgress.book_id.in_(book_ids))
     )

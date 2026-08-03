@@ -41,6 +41,8 @@ function closeMenu() {
       </div>
 
       <div class="hidden sm:flex items-center gap-4">
+        <router-link to="/" class="text-sm text-muted hover:text-ink no-underline transition-colors">{{ i18n.t('nav_shelf') }}</router-link>
+        <router-link to="/books" class="text-sm text-muted hover:text-ink no-underline transition-colors">{{ i18n.t('nav_books') }}</router-link>
         <router-link to="/search" class="text-sm text-muted hover:text-ink no-underline transition-colors">{{ i18n.t('nav_search') }}</router-link>
         <template v-if="auth.user">
           <router-link v-if="auth.user" to="/admin" class="text-sm text-muted hover:text-ink no-underline transition-colors">{{ i18n.t('nav_admin') }}</router-link>
@@ -60,6 +62,8 @@ function closeMenu() {
     </div>
 
     <div v-if="menuOpen" class="sm:hidden border-t border-border bg-surface px-4 py-3 space-y-2">
+      <router-link to="/" @click="closeMenu" class="block text-sm text-muted hover:text-ink no-underline py-1">{{ i18n.t('nav_shelf') }}</router-link>
+      <router-link to="/books" @click="closeMenu" class="block text-sm text-muted hover:text-ink no-underline py-1">{{ i18n.t('nav_books') }}</router-link>
       <router-link to="/search" @click="closeMenu" class="block text-sm text-muted hover:text-ink no-underline py-1">{{ i18n.t('nav_search') }}</router-link>
       <template v-if="auth.user">
         <router-link v-if="auth.user" to="/admin" @click="closeMenu" class="block text-sm text-muted hover:text-ink no-underline py-1">{{ i18n.t('nav_admin') }}</router-link>

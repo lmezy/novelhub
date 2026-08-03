@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from pydantic import BaseModel
 
 
@@ -19,6 +21,20 @@ class BookCreate(BaseModel):
     status: str | None = "unknown"
 
 
+class ManualChapterIn(BaseModel):
+    title: str = ""
+    content: str = ""
+
+
+class ManualBookCreate(BaseModel):
+    title: str
+    author: str = "未知作者"
+    description: str | None = None
+    status: str = "ongoing"
+    tags: list[str] = []
+    chapters: list[ManualChapterIn]
+
+
 class BookOut(BaseModel):
     id: str
     title: str
@@ -28,6 +44,9 @@ class BookOut(BaseModel):
     cover: str | None = None
     description: str | None = None
     status: str | None = None
+    is_favorite: bool = False
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
     class Config:
         from_attributes = True

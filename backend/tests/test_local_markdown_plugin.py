@@ -1,0 +1,34 @@
+import json
+
+import pytest
+
+from app.crawler.plugins.local_markdown import LocalMarkdownPlugin
+
+
+@pytest.mark.asyncio
+async def test_local_markdown_accepts_file_url(tmp_path):
+    book_dir = tmp_path / "book"
+    book_dir.mkdir()
+    (book_dir / "metadata.json").write_text(
+        json.dumps({
+            "title": "测试书",
+            "author": "作者",
+            "description": "简介",
+            "status": "completed",
+            "tags": ["都市"],
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (book_dir / "000001.md").write_text(
+        "# 第一章\n\n正文内容\n",
+        encoding="utf-8",
+    )
+
+    plugin = LocalMarkdownPlugin()
+    url = f"file://{book_dir.as_posix()}"
+    book = await plugin.fetch_book(url)
+
+    assert book.title == "测试书"
+    assert book.author == "作者"
+    assert len(book.chapters) == 1
+    assert book.chapters[0].title == "第一章"

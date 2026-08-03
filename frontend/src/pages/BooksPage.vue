@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import { onMounted, ref } from "vue"
 import { useBooksStore, type Book } from "../stores/books"
 import { useAuthStore } from "../stores/auth"
@@ -9,30 +9,17 @@ import NavBar from "../components/NavBar.vue"
 const store = useBooksStore()
 const auth = useAuthStore()
 const i18n = useI18nStore()
-const recentReads = ref<Book[]>([])
-const favoriteBooks = ref<Book[]>([])
-const favoriteLoading = ref(false)
-const favoriteError = ref("")
 const selectedIds = ref<string[]>([])
 const batchDeleting = ref(false)
 
-async function loadFavorites() {
-  favoriteLoading.value = true
-  favoriteError.value = ""
-  try {
-    favoriteBooks.value = await store.fetchFavorites()
-  } catch (e) {
-    favoriteError.value = e instanceof Error ? e.message : "加载书架失败"
-  } finally {
-    favoriteLoading.value = false
-  }
+function toggleSelect(id: string) {
+  selectedIds.value = selectedIds.value.includes(id)
+    ? selectedIds.value.filter((x) => x !== id)
+    : [...selectedIds.value, id]
 }
 
 async function toggleFavorite(book: Book) {
-  const isFavorite = await store.toggleFavorite(book)
-  if (!isFavorite) {
-    favoriteBooks.value = favoriteBooks.value.filter((b) => b.id !== book.id)
-  }
+  await store.toggleFavorite(book)
 }
 
 async function deleteBook(id: string, title: string) {
@@ -40,16 +27,10 @@ async function deleteBook(id: string, title: string) {
   try {
     await api.delete('/books/' + id)
     selectedIds.value = selectedIds.value.filter((x) => x !== id)
-    await loadFavorites()
+    await store.fetchBooks()
   } catch (e) {
     alert(e instanceof Error ? e.message : i18n.t('home_delete_failed'))
   }
-}
-
-function toggleSelect(id: string) {
-  selectedIds.value = selectedIds.value.includes(id)
-    ? selectedIds.value.filter((x) => x !== id)
-    : [...selectedIds.value, id]
 }
 
 async function batchDelete() {
@@ -59,7 +40,7 @@ async function batchDelete() {
   try {
     await api.post('/books/batch-delete', { ids: selectedIds.value })
     selectedIds.value = []
-    await loadFavorites()
+    await store.fetchBooks()
   } catch (e) {
     alert(e instanceof Error ? e.message : '批量删除失败')
   } finally {
@@ -68,18 +49,7 @@ async function batchDelete() {
 }
 
 onMounted(async () => {
-  await loadFavorites()
-  if (auth.user) {
-    try {
-      const progress = await api.get<any[]>('/progress?user_id=' + auth.user.id)
-      if (progress.length > 0) {
-        const results = await Promise.all(
-          progress.map((p: any) => store.fetchBook(p.book_id).catch(() => null))
-        )
-        recentReads.value = results.filter(Boolean) as Book[]
-      }
-    } catch { /* non-critical */ }
-  }
+  await store.fetchBooks()
 })
 </script>
 
@@ -88,26 +58,14 @@ onMounted(async () => {
     <NavBar />
 
     <main class="max-w-5xl mx-auto px-4 py-8">
-      <section v-if="recentReads.length > 0" class="mb-10">
-        <h2 class="text-lg font-semibold mb-3">{{ i18n.t('home_continue') }}</h2>
-        <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
-          <router-link
-            v-for="b in recentReads.slice(0, 4)"
-            :key="b.id"
-            :to="'/books/' + b.id"
-            class="p-3 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 hover:shadow-sm hover:border-accent/30 transition-all no-underline"
-          >
-            <p class="text-sm font-medium truncate">{{ b.title }}</p>
-            <p class="text-xs text-muted dark:text-gray-400 mt-1">{{ b.status || i18n.t('home_reading') }}</p>
-          </router-link>
-        </div>
-      </section>
-
       <section>
         <div class="flex items-center justify-between mb-6">
-          <h1 class="text-2xl font-bold tracking-tight">{{ i18n.t('home_library') }}</h1>
+          <div>
+            <h1 class="text-2xl font-bold">全部书籍</h1>
+            <p class="text-sm text-muted dark:text-gray-400 mt-1">仓库中已经保存的所有小说</p>
+          </div>
           <div class="flex items-center gap-3">
-            <span class="text-sm text-muted dark:text-gray-400">{{ i18n.t('home_books_count', { n: favoriteBooks.length }) }}</span>
+            <span class="text-sm text-muted dark:text-gray-400">{{ i18n.t('home_books_count', { n: store.books.length }) }}</span>
             <button
               v-if="auth.isAdmin && selectedIds.length"
               @click="batchDelete"
@@ -117,23 +75,17 @@ onMounted(async () => {
           </div>
         </div>
 
-        <p v-if="favoriteLoading" class="text-muted dark:text-gray-400">{{ i18n.t('home_loading') }}</p>
-        <p v-else-if="favoriteError" class="text-red-600">{{ favoriteError }}</p>
+        <p v-if="store.loading" class="text-muted dark:text-gray-400">{{ i18n.t('home_loading') }}</p>
+        <p v-else-if="store.error" class="text-red-600">{{ store.error }}</p>
 
-        <div v-else-if="favoriteBooks.length === 0" class="text-center py-16">
-          <p class="text-muted dark:text-gray-400 text-lg mb-2">书架还是空的</p>
-          <p class="text-sm text-muted dark:text-gray-400">
-            去“全部书籍”里把想读的小说收藏到书架。
-          </p>
-          <router-link
-            to="/books"
-            class="inline-block mt-4 text-sm text-accent hover:underline"
-          >前往全部书籍</router-link>
+        <div v-else-if="store.books.length === 0" class="text-center py-16">
+          <p class="text-muted dark:text-gray-400 text-lg mb-2">仓库还没有书籍</p>
+          <router-link to="/admin" class="inline-block mt-4 text-sm text-accent hover:underline">前往管理页同步</router-link>
         </div>
 
         <div v-else class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
           <router-link
-            v-for="book in favoriteBooks"
+            v-for="book in store.books"
             :key="book.id"
             :to="'/books/' + book.id"
             class="relative group block p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 hover:shadow-md hover:border-accent/30 transition-all duration-200 no-underline"
@@ -144,20 +96,14 @@ onMounted(async () => {
               :checked="selectedIds.includes(book.id)"
               @click.stop="toggleSelect(book.id)"
               class="absolute top-2 left-2 w-4 h-4 rounded border-border"
-              :title="i18n.t('home_delete_title')"
             />
             <button
               @click.prevent.stop="toggleFavorite(book)"
-              class="absolute top-2 right-2 w-7 h-7 flex items-center justify-center rounded text-amber-500 text-base"
-              title="取消收藏"
-            >★</button>
-            <button
-              v-if="auth.isAdmin"
-              @click.prevent.stop="deleteBook(book.id, book.title)"
-              class="absolute top-2 right-10 text-xs text-red-400 hover:text-red-600 opacity-0 group-hover:opacity-100 transition-opacity"
-              :title="i18n.t('home_delete_title')"
-            >&times;</button>
-            <h3 class="font-semibold text-ink mb-1 truncate">{{ book.title }}</h3>
+              class="absolute top-2 right-2 w-7 h-7 flex items-center justify-center rounded text-base"
+              :class="book.is_favorite ? 'text-amber-500' : 'text-muted hover:text-amber-500'"
+              :title="book.is_favorite ? '取消收藏' : '收藏到书架'"
+            >{{ book.is_favorite ? '★' : '☆' }}</button>
+            <h3 class="font-semibold text-ink mb-1 truncate pr-6">{{ book.title }}</h3>
             <p v-if="book.author_name" class="text-xs text-muted dark:text-gray-400 mb-1">{{ book.author_name }}</p>
             <div v-if="book.tag_names?.length" class="flex flex-wrap gap-1 mb-2">
               <span

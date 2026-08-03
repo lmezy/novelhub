@@ -78,6 +78,46 @@ async def list_task_logs(
     return await repo.list_by_task(task_id, offset=offset, limit=limit)
 
 
+@router.post("/tasks/{task_id}/pause")
+async def pause_task(task_id: str, db: AsyncSession = Depends(get_db)):
+    repo = CrawlTaskRepository(db)
+    task = await repo.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Crawl task not found")
+    if task.status != "running":
+        raise HTTPException(status_code=400, detail=f"Cannot pause task in status: {task.status}")
+    task.status = "paused"
+    await db.commit()
+    return {"task_id": task.id, "status": task.status}
+
+
+@router.post("/tasks/{task_id}/resume")
+async def resume_task(task_id: str, db: AsyncSession = Depends(get_db)):
+    repo = CrawlTaskRepository(db)
+    task = await repo.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Crawl task not found")
+    if task.status != "paused":
+        raise HTTPException(status_code=400, detail=f"Cannot resume task in status: {task.status}")
+    task.status = "running"
+    await db.commit()
+    return {"task_id": task.id, "status": task.status}
+
+
+@router.post("/tasks/{task_id}/cancel")
+async def cancel_task(task_id: str, db: AsyncSession = Depends(get_db)):
+    repo = CrawlTaskRepository(db)
+    task = await repo.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Crawl task not found")
+    if task.status in ("completed", "failed", "cancelled", "completed_with_errors"):
+        raise HTTPException(status_code=400, detail=f"Cannot cancel task in status: {task.status}")
+    task.status = "cancelled"
+    task.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    await db.commit()
+    return {"task_id": task.id, "status": task.status}
+
+
 @router.post("/tasks/{task_id}/retry")
 async def retry_task(task_id: str, db: AsyncSession = Depends(get_db)):
     """Retry a failed crawl task with auto-resume (skips already-downloaded chapters)."""

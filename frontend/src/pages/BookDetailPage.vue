@@ -17,6 +17,12 @@ const loading = ref(true)
 const error = ref("")
 const savedChapterId = ref<string | null>(null)
 const syncing = ref(false)
+const favorite = ref(false)
+
+async function toggleFavorite() {
+  if (!book.value) return
+  favorite.value = await store.toggleFavorite(book.value)
+}
 
 async function deleteThisBook() {
   if (!book.value || !confirm('Delete "' + book.value.title + '"? This cannot be undone.')) return
@@ -45,6 +51,7 @@ async function resyncBook() {
 onMounted(async () => {
   try {
     book.value = await store.fetchBook(route.params.id as string)
+    favorite.value = book.value.is_favorite || false
     chapters.value = await store.fetchChapters(route.params.id as string)
     if (auth.user) {
       try {
@@ -102,6 +109,10 @@ onMounted(async () => {
             </span>
           </div>
           <div class="flex items-center gap-2 mt-4">
+            <button
+              @click="toggleFavorite"
+              class="px-3 py-1 text-xs border border-border dark:border-gray-700 rounded hover:bg-accent/5 transition-colors"
+            >{{ favorite ? '★ 已收藏' : '☆ 收藏' }}</button>
             <button
               v-if="auth.isAdmin"
               @click="deleteThisBook"

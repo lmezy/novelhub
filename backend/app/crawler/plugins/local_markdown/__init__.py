@@ -22,7 +22,7 @@ class LocalMarkdownPlugin:
     name = "local_markdown"
 
     async def fetch_book(self, url: str) -> RemoteBook:
-        book_dir = Path(url)
+        book_dir = Path(str(url).replace("file://", ""))
         if not book_dir.is_dir():
             raise ValueError(f"Not a directory: {url}")
 
@@ -32,7 +32,7 @@ class LocalMarkdownPlugin:
         else:
             meta = {}
 
-        author = book_dir.parent.name
+        author = meta.get("author", book_dir.parent.name)
         title = meta.get("title", book_dir.name)
 
         chapters: list[RemoteChapter] = []

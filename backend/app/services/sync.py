@@ -1,5 +1,6 @@
 from uuid import uuid4
 from collections.abc import Awaitable, Callable
+from urllib.parse import urljoin
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,12 +37,11 @@ class SyncService:
         return url.startswith(("http://", "https://"))
 
     async def sync_book(self, source_id: str, url: str) -> dict:
-        if not self._is_http_url(url):
-            raise ValueError(f"Unsupported book URL: {url}")
-
         source = await self.db.get(Source, source_id)
         if source is None or not source.enabled:
             raise ValueError("Source not found or disabled")
+        if source.plugin_name != "local_markdown" and not self._is_http_url(url):
+            raise ValueError(f"Unsupported book URL: {url}")
 
         emit(EventType.SYNC_STARTED, source_id=source_id, url=url)
         logger.info("Starting sync for source={} url={}", source_id, url)
@@ -49,6 +49,13 @@ class SyncService:
         config = source.config if source.plugin_name == 'yuedu' else None
         plugin = get_plugin(source.plugin_name, config=config)
         remote_book = await plugin.fetch_book(url)
+        if (
+            not remote_book.chapters
+            or str(remote_book.title or "").strip() in ("", "Unknown")
+        ):
+            raise ValueError(
+                f"Book page returned no usable metadata/chapters: {url}"
+            )
 
         book_title = self._safe_title(remote_book)
         author_name = self._safe_author(remote_book.author)
@@ -274,12 +281,15 @@ class SyncService:
         plugin = get_plugin(source.plugin_name, config=config)
         # Construct URL from config
         cfg = plugin.config if hasattr(plugin, 'config') else None
-        if cfg and hasattr(cfg, 'book_url'):
+        if hasattr(plugin, "build_book_url"):
+            url = plugin.build_book_url(book.source_book_id)
+        elif cfg and hasattr(cfg, 'book_url'):
             url = cfg.base_url + cfg.book_url.format(book_id=book.source_book_id)
         else:
             url = source.url or ""
             if not url:
                 raise ValueError("Cannot determine book URL for re-sync")
+            url = urljoin(url.rstrip("/") + "/", book.source_book_id)
         return await self.sync_book(book.source_id, url)
 
     async def discover_and_sync(
@@ -373,6 +383,7 @@ class SyncService:
         max_pages: int = 200,
         sync: bool = True,
         progress_cb: Callable[[int, int, int, int], Awaitable[None]] | None = None,
+        before_step: Callable[[], Awaitable[None]] | None = None,
     ) -> dict:
         """Discover every book across catalog pages and optionally sync them."""
         source = await self.db.get(Source, source_id)
@@ -410,6 +421,8 @@ class SyncService:
         pages_checked = 0
 
         for page in range(1, max_pages + 1):
+            if before_step is not None:
+                await before_step()
             page_books = await plugin.discover_books(url=url, page=page)
             if not page_books:
                 break
@@ -427,6 +440,8 @@ class SyncService:
                 break
 
             for sb in new_books:
+                if before_step is not None:
+                    await before_step()
                 books_found += 1
                 if not sync:
                     details.append({

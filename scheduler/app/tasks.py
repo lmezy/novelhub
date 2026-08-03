@@ -61,6 +61,9 @@ async def _crawl_all_source_async(source_id: str, max_pages: int, task_id: str |
     from app.models import CrawlTask
     from app.services.sync import SyncService
 
+    class TaskCancelled(Exception):
+        pass
+
     async with SessionLocal() as db:
         task_obj = None
         if task_id:
@@ -70,6 +73,17 @@ async def _crawl_all_source_async(source_id: str, max_pages: int, task_id: str |
                 task_obj.started_at = _naive_utcnow()
                 task_obj.error = None
                 await db.commit()
+
+        async def _wait_if_paused() -> None:
+            if task_obj is None:
+                return
+            while True:
+                await db.refresh(task_obj)
+                if task_obj.status == "cancelled":
+                    raise TaskCancelled("Task cancelled")
+                if task_obj.status != "paused":
+                    return
+                await asyncio.sleep(1)
 
         async def _update_progress(page: int, found: int, synced: int, failed: int) -> None:
             if task_obj is None:
@@ -87,6 +101,7 @@ async def _crawl_all_source_async(source_id: str, max_pages: int, task_id: str |
                 source_id,
                 max_pages=max_pages,
                 progress_cb=_update_progress,
+                before_step=_wait_if_paused,
             )
             if task_obj:
                 task_obj.status = "completed"
@@ -101,6 +116,13 @@ async def _crawl_all_source_async(source_id: str, max_pages: int, task_id: str |
                 task_obj.finished_at = _naive_utcnow()
                 await db.commit()
             return result
+        except TaskCancelled as exc:
+            if task_obj:
+                task_obj.status = "cancelled"
+                task_obj.error = str(exc)
+                task_obj.finished_at = _naive_utcnow()
+                await db.commit()
+            raise
         except Exception as exc:
             if task_obj:
                 task_obj.status = "failed"

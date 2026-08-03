@@ -93,6 +93,54 @@ SHELF_AUTHOR_SELECTORS = [
     "p.author", "span[class*='by']",
 ]
 
+GENERIC_BOOK_TITLE_SELECTORS = [
+    "h1",
+    ".book-name",
+    ".book_name",
+    ".novel-title",
+    ".bookTitle",
+    ".info h1",
+    ".bookinfo h1",
+    ".book_info h1",
+    "meta[property='og:title']",
+    "meta[name='og:title']",
+]
+
+GENERIC_BOOK_AUTHOR_SELECTORS = [
+    "meta[property='og:novel:author']",
+    "meta[name='author']",
+    ".book-author",
+    ".author",
+    ".writer",
+    ".info .author",
+    ".bookinfo .author",
+    ".book_info .author",
+]
+
+GENERIC_BOOK_DESC_SELECTORS = [
+    "meta[name='description']",
+    ".book-intro",
+    ".book_intro",
+    ".book-desc",
+    ".intro",
+    ".desc",
+    ".book-description",
+    "#intro",
+]
+
+GENERIC_CHAPTER_SELECTORS = [
+    "#list a",
+    ".listmain a",
+    ".chapterlist a",
+    "ul.chapter-list a",
+    ".chapter-list a",
+    "div.listmain a",
+    "li.chapter-item a",
+    "dd.chapter a",
+    ".book-catalog a",
+    "#catalog a",
+]
+
 
 class YueduPlugin:
     """A NovelSourcePlugin implementation driven by a YueDu book source JSON."""
@@ -122,6 +170,23 @@ class YueduPlugin:
         self.config = config
         self.engine = YueduRuleEngine(config)
         self.base_url = config.get("bookSourceUrl", "")
+
+    def build_book_url(self, book_id: str) -> str:
+        """Reconstruct a book detail URL from a stored source book id."""
+        if book_id.startswith(("http://", "https://")):
+            return book_id
+        if book_id.startswith("/"):
+            return urljoin(self.base_url, book_id)
+        if "/" in book_id:
+            return urljoin(self.base_url.rstrip("/") + "/", book_id)
+
+        prefix = "/novel/"
+        pattern = self.config.get("bookUrlPattern", "")
+        if pattern:
+            match = re.search(r"https?://[^/]+(/[^?#]*?)(?:\.html|\{[^}]+\}|[^/]+)$", pattern)
+            if match:
+                prefix = match.group(1).rsplit("/", 1)[0] + "/"
+        return f"{self.base_url.rstrip('/')}{prefix}{book_id}"
 
     # ---- Required: fetch_book ----
 
@@ -156,6 +221,16 @@ class YueduPlugin:
             if more_toc:
                 toc.extend(more_toc)
 
+        generic = self._parse_book_generic(html, url)
+        if not str(info.get("name") or "").strip():
+            info["name"] = generic["title"]
+        if not str(info.get("author") or "").strip():
+            info["author"] = generic["author"]
+        if not info.get("intro"):
+            info["intro"] = generic["description"]
+        if not info.get("status"):
+            info["status"] = generic["status"]
+
         chapters: list[RemoteChapter] = []
         chapter_num = 0
         for ch in toc:
@@ -182,6 +257,9 @@ class YueduPlugin:
                 chapter_number=chapter_num,
             ))
 
+        if not chapters:
+            chapters = generic["chapters"]
+
         book_title = str(info.get("name") or "").strip() or "Unknown"
         author = str(info.get("author") or "").strip() or "Unknown"
         description = info.get("intro", "")
@@ -196,6 +274,115 @@ class YueduPlugin:
             chapters=chapters,
             tags=info.get("kind", "").split(",") if info.get("kind") else [],
         )
+
+    def _parse_book_generic(
+        self,
+        html: str,
+        url: str,
+    ) -> dict[str, Any]:
+        """Parse a detail page using common novel-site patterns.
+
+        This is a fallback for YueDu sources whose configured rules no longer
+        match the live page. It extracts title/author/description and any
+        chapter links so a source can still sync without a rule rewrite.
+        """
+        soup = BeautifulSoup(html, "lxml")
+        title = ""
+        for selector in GENERIC_BOOK_TITLE_SELECTORS:
+            el = soup.select_one(selector)
+            if el is None:
+                continue
+            value = el.get("content") if el.name == "meta" else el.get_text(" ", strip=True)
+            if value:
+                title = str(value).strip()
+                break
+
+        if not title:
+            title_tag = soup.find("title")
+            if title_tag:
+                title = title_tag.get_text(" ", strip=True)
+                title = re.split(r"\s+[-_|]\s+", title, maxsplit=1)[0].strip()
+        title = re.sub(r"^《(.+)》$", r"\1", title).strip()
+
+        author = ""
+        for selector in GENERIC_BOOK_AUTHOR_SELECTORS:
+            el = soup.select_one(selector)
+            if el is None:
+                continue
+            value = el.get("content") if el.name == "meta" else el.get_text(" ", strip=True)
+            if value:
+                author = str(value).strip()
+                break
+
+        description = ""
+        for selector in GENERIC_BOOK_DESC_SELECTORS:
+            el = soup.select_one(selector)
+            if el is None:
+                continue
+            value = el.get("content") if el.name == "meta" else el.get_text(" ", strip=True)
+            if value:
+                description = str(value).strip()
+                break
+
+        status = ""
+        page_text = soup.get_text(" ", strip=True)
+        for marker in ("已完结", "完结", "连载中", "连载"):
+            if marker in page_text:
+                status = "completed" if marker in ("已完结", "完结") else "ongoing"
+                break
+
+        chapter_links: list[Tag] = []
+        for selector in GENERIC_CHAPTER_SELECTORS:
+            links = soup.select(selector)
+            if len(links) >= 2:
+                chapter_links = links
+                break
+
+        if not chapter_links:
+            book_segment = urlparse(url).path.rstrip("/").split("/")[-1].split(".")[0]
+            for a in soup.select("a[href]"):
+                href = (a.get("href") or "").strip()
+                if not href or href in ("#", "javascript:;", "javascript:void(0)"):
+                    continue
+                path = urlparse(self._make_absolute(href, url)).path.lower()
+                if (
+                    "/chapter/" in path
+                    or "/read/" in path
+                    or (book_segment and book_segment in path and "/novel/" in path)
+                    or (book_segment and book_segment in path and "/book/" in path)
+                ):
+                    chapter_links.append(a)
+
+        chapters: list[RemoteChapter] = []
+        seen_urls: set[str] = set()
+        chapter_number = 0
+        skip_titles = {"目录", "简介", "上一章", "下一章", "返回目录", "首页"}
+        for a in chapter_links:
+            text = a.get_text(" ", strip=True)
+            if not text or text in skip_titles or len(text) > 80:
+                continue
+            href = (a.get("href") or "").strip()
+            if not href or href in ("#", "javascript:;", "javascript:void(0)"):
+                continue
+            abs_url = self._make_absolute(href, url)
+            if abs_url in seen_urls:
+                continue
+            seen_urls.add(abs_url)
+            chapter_number += 1
+            chapters.append(RemoteChapter(
+                source_chapter_id=urlparse(abs_url).path,
+                title=text,
+                url=abs_url,
+                chapter_number=chapter_number,
+            ))
+
+        return {
+            "title": title,
+            "author": author,
+            "description": description,
+            "status": status,
+            "chapters": chapters,
+        }
 
     # ---- Required: fetch_chapter_content ----
 
@@ -393,8 +580,16 @@ class YueduPlugin:
                 continue
 
             book_id = full_url.split("/")[-1] if "/" in full_url else full_url
-            # Skip if book_id is empty or just a number (likely a category ID)
-            if not book_id or book_id.isdigit():
+            path = urlparse(full_url).path.lower()
+            # Skip empty IDs or bare numeric category IDs, but keep numeric
+            # book IDs under /novel/ or /book/ paths.
+            if not book_id or (
+                book_id.isdigit()
+                and not any(
+                    seg in path
+                    for seg in ("/novel/", "/book/", "/read/", "/detail/")
+                )
+            ):
                 continue
 
             books.append(RemoteShelfBook(
@@ -595,8 +790,24 @@ class YueduPlugin:
         html = await self._get(explore_url)
         explore_rules = self.config.get("ruleExplore", {})
         if explore_rules.get("bookList", ""):
-            return self.engine.parse_explore_results(html)
-        return self.engine.parse_search_results(html)
+            items = self.engine.parse_explore_results(html)
+        else:
+            items = self.engine.parse_search_results(html)
+        if items:
+            return items
+
+        # Generic fallback for list/category pages whose configured rules no
+        # longer match the live site.
+        shelf_books = self._parse_bookshelf_html(html)
+        return [
+            {
+                "bookUrl": book.url,
+                "name": book.title,
+                "author": book.author,
+                "latestChapterTitle": book.latest_chapter_title,
+            }
+            for book in shelf_books
+        ]
     # ---- Optional: update_book ----
 
     async def discover_books(self, url: str | None = None, page: int = 1) -> list[RemoteShelfBook]:

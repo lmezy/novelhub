@@ -9,9 +9,9 @@ class AliceSWConfig:
 
     # URL templates
     bookshelf_url: str = "/bookshelf"
-    book_url: str = "/book/{book_id}"
-    chapter_url: str = "/book/{book_id}/chapter/{chapter_id}"
-    chapter_list_url: str = "/book/{book_id}/chapters"
+    book_url: str = "/novel/{book_id}"
+    chapter_url: str = "/novel/{book_id}/{chapter_id}.html"
+    chapter_list_url: str = "/novel/{book_id}/"
 
     # CSS selectors — adjust these to match the actual site structure
     selectors: dict = field(default_factory=lambda: {
