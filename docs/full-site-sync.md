@@ -75,6 +75,10 @@ curl -X POST http://localhost:8088/api/books/batch-delete \
 
 这是旧数据库缺少分类表迁移导致的。运行 `docker compose restart backend` 或手动执行 `cd backend && alembic upgrade head` 即可补建 `categories` 与 `book_categories` 表。
 
+### 全站同步显示 0 本书但页面请求成功
+
+如果 YueDu 书源的 `ruleExplore` / `ruleSearch` 规则与网站当前 HTML 不匹配，旧版可能只返回没有 `bookUrl` 的空条目。现在会过滤空条目，并自动回退到通用列表页解析；相对链接也会按当前列表页拼接。重新部署 backend 后再发起一次全站同步即可。
+
 ### 后端反复重启，日志报 StringDataRightTruncation
 
 `alembic_version.version_num` 列只有 32 字符，迁移 ID 不能超过该长度。当前分类迁移已改为 `0009_categories`，更新后端代码后重新启动 backend 即可。

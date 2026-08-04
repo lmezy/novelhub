@@ -142,6 +142,53 @@ async def test_fetch_explore_uses_generic_fallback_when_rules_empty():
 
 
 @pytest.mark.asyncio
+async def test_fetch_explore_falls_back_when_rule_matches_container():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "ruleSearch": {},
+        "ruleExplore": {"bookList": "div.book-list"},
+        "concurrentRate": "0",
+    })
+    html = """
+    <html><body>
+      <div class="book-list">
+        <a href="/novel/123.html" class="book-title">Book One</a>
+        <a href="/novel/456.html" class="book-title">Book Two</a>
+      </div>
+    </body></html>
+    """
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        items = await plugin._fetch_explore_url("https://example.com/lists/65.html")
+
+    assert len(items) == 2
+    assert items[0]["bookUrl"] == "https://example.com/novel/123.html"
+    assert items[1]["bookUrl"] == "https://example.com/novel/456.html"
+
+
+@pytest.mark.asyncio
+async def test_fetch_explore_resolves_relative_book_urls_against_page():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "ruleSearch": {},
+        "ruleExplore": {},
+        "concurrentRate": "0",
+    })
+    html = """
+    <html><body>
+      <a href="../novel/123.html">Book One</a>
+      <a href="../novel/456.html">Book Two</a>
+    </body></html>
+    """
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        items = await plugin._fetch_explore_url("https://example.com/lists/65.html")
+
+    assert [item["bookUrl"] for item in items] == [
+        "https://example.com/novel/123.html",
+        "https://example.com/novel/456.html",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_get_falls_back_to_direct_when_proxy_unreachable():
     plugin = YueduPlugin({
         "bookSourceUrl": "https://example.com",

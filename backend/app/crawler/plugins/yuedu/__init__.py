@@ -491,9 +491,14 @@ class YueduPlugin:
 
     # ---- Generic bookshelf HTML parser ----
 
-    def _parse_bookshelf_html(self, html: str) -> list[RemoteShelfBook]:
-        """Parse a bookshelf page using common CSS patterns."""
+    def _parse_bookshelf_html(
+        self,
+        html: str,
+        base_url: str | None = None,
+    ) -> list[RemoteShelfBook]:
+        """Parse a bookshelf/list page using common CSS patterns."""
         soup = BeautifulSoup(html, "lxml")
+        resolve_base = base_url or self.base_url
         items: list[Tag] = []
 
         # Try each selector pattern
@@ -519,10 +524,13 @@ class YueduPlugin:
         books: list[RemoteShelfBook] = []
         for item in items:
             link_el = None
-            for sel in SHELF_LINK_SELECTORS:
-                link_el = item.select_one(sel)
-                if link_el and link_el.get("href"):
-                    break
+            if item.name == "a" and item.get("href"):
+                link_el = item
+            else:
+                for sel in SHELF_LINK_SELECTORS:
+                    link_el = item.select_one(sel)
+                    if link_el and link_el.get("href"):
+                        break
 
             if not link_el or not link_el.get("href"):
                 continue
@@ -562,7 +570,7 @@ class YueduPlugin:
                         latest = txt
                         break
 
-            full_url = self._make_absolute(href, self.base_url)
+            full_url = self._make_absolute(href, resolve_base)
             if not full_url.startswith(("http://", "https://")):
                 continue
 
@@ -576,7 +584,7 @@ class YueduPlugin:
                          "/update", "/new", "/finish", "/quanben", "/wanben",
                          "/bookcase", "/bookshelf", "/history", "/index", "/list", "/page"]
             path = urlparse(full_url).path.lower()
-            if any(p in path for p in nav_paths):
+            if any(self._is_nav_path(path, p) for p in nav_paths):
                 continue
 
             book_id = full_url.split("/")[-1] if "/" in full_url else full_url
@@ -600,69 +608,91 @@ class YueduPlugin:
                 latest_chapter_title=latest,
             ))
 
-        if not books:
-            # Direct anchor fallback: some list pages do not use the common
-            # shelf-item wrappers, so scan every book-looking link instead.
-            seen_urls: set[str] = set()
-            skip_titles = {"首页", "上一页", "下一页", "末页", "home", "next", "prev", "login", "注册"}
-            nav_paths = ["/rank", "/top", "/sort", "/allvisit", "/lastupdate",
-                         "/update", "/new", "/finish", "/quanben", "/wanben",
-                         "/bookcase", "/bookshelf", "/history", "/index", "/list", "/page"]
-            skip_patterns = ["/search/", "/tag/", "/tags/", "/category/", "/categories/",
-                             "/author/", "/user/", "/users/", "/login", "/register",
-                             "/signup", "/about", "/help", "/faq", "/contact"]
-            for a_tag in soup.select("a[href]"):
-                href = (a_tag.get("href") or "").strip()
-                if not href or href in ("#", "javascript:;", "javascript:void(0)"):
-                    continue
-                full_url = self._make_absolute(href, self.base_url)
-                if not full_url.startswith(("http://", "https://")):
-                    continue
-                path = urlparse(full_url).path.lower()
-                if not any(seg in path for seg in ("/novel/", "/book/", "/read/", "/detail/", "/xiaoshuo/")):
-                    continue
-                if any(p in path for p in nav_paths):
-                    continue
-                if any(p in full_url.lower() for p in skip_patterns):
-                    continue
-                if full_url in seen_urls:
-                    continue
-
-                title = a_tag.get_text(" ", strip=True)
-                if not title:
-                    title = a_tag.get("title") or a_tag.get("alt") or ""
-                if not title and a_tag.parent is not None:
-                    heading = a_tag.parent.select_one("h3, h2, h4, .book-name, .book-title")
-                    title = heading.get_text(" ", strip=True) if heading else ""
-                title = title.strip()
-                if not title or len(title) < 2 or title.lower() in skip_titles:
-                    continue
-
-                book_id = full_url.split("/")[-1]
-                if not book_id or (
-                    book_id.isdigit()
-                    and not any(seg in path for seg in ("/novel/", "/book/", "/read/", "/detail/"))
-                ):
-                    continue
-
-                author = "Unknown"
-                if a_tag.parent is not None:
-                    for sel in SHELF_AUTHOR_SELECTORS:
-                        author_el = a_tag.parent.select_one(sel)
-                        if author_el:
-                            author = author_el.get_text(" ", strip=True) or "Unknown"
-                            break
-
-                seen_urls.add(full_url)
-                books.append(RemoteShelfBook(
-                    source_book_id=book_id,
-                    title=title,
-                    author=author,
-                    url=full_url,
-                    latest_chapter_title=None,
-                ))
+        # Merge in every book-looking anchor.  This catches list pages whose
+        # wrapper markup is too generic for the item selectors above.
+        seen_urls = {book.url for book in books}
+        for book in self._parse_direct_anchor_books(soup, resolve_base):
+            if book.url not in seen_urls:
+                seen_urls.add(book.url)
+                books.append(book)
 
         return books
+
+    def _parse_direct_anchor_books(
+        self,
+        soup: BeautifulSoup,
+        base_url: str,
+    ) -> list[RemoteShelfBook]:
+        """Scan all anchors for book-like links without relying on wrappers."""
+        books: list[RemoteShelfBook] = []
+        seen_urls: set[str] = set()
+        skip_titles = {"首页", "上一页", "下一页", "末页", "home", "next", "prev", "login", "注册"}
+        nav_paths = ["/rank", "/top", "/sort", "/allvisit", "/lastupdate",
+                     "/update", "/new", "/finish", "/quanben", "/wanben",
+                     "/bookcase", "/bookshelf", "/history", "/index", "/list", "/page"]
+        skip_patterns = ["/search/", "/tag/", "/tags/", "/category/", "/categories/",
+                         "/author/", "/user/", "/users/", "/login", "/register",
+                         "/signup", "/about", "/help", "/faq", "/contact"]
+        for a_tag in soup.select("a[href]"):
+            href = (a_tag.get("href") or "").strip()
+            if not href or href in ("#", "javascript:;", "javascript:void(0)"):
+                continue
+            full_url = self._make_absolute(href, base_url)
+            if not full_url.startswith(("http://", "https://")):
+                continue
+            path = urlparse(full_url).path.lower()
+            if not any(seg in path for seg in ("/novel/", "/book/", "/read/", "/detail/", "/xiaoshuo/")):
+                continue
+            if any(self._is_nav_path(path, p) for p in nav_paths):
+                continue
+            if any(p in full_url.lower() for p in skip_patterns):
+                continue
+            if full_url in seen_urls:
+                continue
+
+            title = a_tag.get_text(" ", strip=True)
+            if not title:
+                title = a_tag.get("title") or a_tag.get("alt") or ""
+            if not title and a_tag.parent is not None:
+                heading = a_tag.parent.select_one("h3, h2, h4, .book-name, .book-title")
+                title = heading.get_text(" ", strip=True) if heading else ""
+            title = title.strip()
+            if not title or len(title) < 2 or title.lower() in skip_titles:
+                continue
+
+            book_id = full_url.split("/")[-1]
+            if not book_id or (
+                book_id.isdigit()
+                and not any(seg in path for seg in ("/novel/", "/book/", "/read/", "/detail/"))
+            ):
+                continue
+
+            author = "Unknown"
+            if a_tag.parent is not None:
+                for sel in SHELF_AUTHOR_SELECTORS:
+                    author_el = a_tag.parent.select_one(sel)
+                    if author_el:
+                        author = author_el.get_text(" ", strip=True) or "Unknown"
+                        break
+
+            seen_urls.add(full_url)
+            books.append(RemoteShelfBook(
+                source_book_id=book_id,
+                title=title,
+                author=author,
+                url=full_url,
+                latest_chapter_title=None,
+            ))
+
+        return books
+
+    @staticmethod
+    def _is_nav_path(path: str, nav: str) -> bool:
+        """Match a nav path as a segment, not as a substring."""
+        path = path.split("?", 1)[0].split("#", 1)[0]
+        if path.endswith(".html"):
+            path = path[:-5]
+        return path == nav or path.startswith(nav + "/")
 
     # ---- Bookshelf URL auto-detection ----
 
@@ -838,7 +868,7 @@ class YueduPlugin:
                     path_with_page = path.format(page) if "{}" in path else path
                     candidate = urljoin(self.base_url, path_with_page)
                     html = await self._get(candidate)
-                    items = self.engine.parse_search_results(html)
+                    items = self._explore_items_from_html(html, candidate)
                     if items:
                         logger.info(f"Discovered books via fallback: {candidate}")
                         return items
@@ -850,17 +880,32 @@ class YueduPlugin:
 
     async def _fetch_explore_url(self, explore_url: str) -> list[dict[str, Any]]:
         html = await self._get(explore_url)
+        return self._explore_items_from_html(html, explore_url)
+
+    def _explore_items_from_html(
+        self,
+        html: str,
+        page_url: str,
+    ) -> list[dict[str, Any]]:
+        """Parse an explore page and fall back to generic anchor scanning."""
         explore_rules = self.config.get("ruleExplore", {})
         if explore_rules.get("bookList", ""):
             items = self.engine.parse_explore_results(html)
         else:
             items = self.engine.parse_search_results(html)
-        if items:
-            return items
+        usable_items = [
+            item for item in items
+            if str(item.get("bookUrl") or item.get("url") or "").strip()
+        ]
+        if usable_items:
+            return [
+                self._normalize_explore_item(item, page_url)
+                for item in usable_items
+            ]
 
         # Generic fallback for list/category pages whose configured rules no
         # longer match the live site.
-        shelf_books = self._parse_bookshelf_html(html)
+        shelf_books = self._parse_bookshelf_html(html, base_url=page_url)
         return [
             {
                 "bookUrl": book.url,
@@ -870,6 +915,26 @@ class YueduPlugin:
             }
             for book in shelf_books
         ]
+
+    @staticmethod
+    def _explore_item_url(item: dict[str, Any]) -> str:
+        return str(item.get("bookUrl") or item.get("url") or "").strip()
+
+    def _normalize_explore_item(
+        self,
+        item: dict[str, Any],
+        page_url: str | None,
+    ) -> dict[str, Any]:
+        """Resolve relative book URLs against the page that contained them."""
+        normalized = dict(item)
+        book_url = self._explore_item_url(normalized)
+        if book_url:
+            normalized["bookUrl"] = self._make_absolute(
+                book_url,
+                page_url or self.base_url,
+            )
+        return normalized
+
     # ---- Optional: update_book ----
 
     async def discover_books(self, url: str | None = None, page: int = 1) -> list[RemoteShelfBook]:
@@ -879,12 +944,13 @@ class YueduPlugin:
         objects compatible with the NovelSourcePlugin protocol.
         """
         items = await self.fetch_explore(url=url, page=page)
+        link_base = self._make_absolute(url, self.base_url) if url else self.base_url
         books: list[RemoteShelfBook] = []
         for item in items:
-            book_url = item.get("bookUrl", item.get("url", ""))
+            book_url = self._explore_item_url(item)
             if not book_url:
                 continue
-            full_url = self._make_absolute(book_url, self.base_url)
+            full_url = self._make_absolute(book_url, link_base)
             if not full_url.startswith(("http://", "https://")):
                 continue
             books.append(RemoteShelfBook(
