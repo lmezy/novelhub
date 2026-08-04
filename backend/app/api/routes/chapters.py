@@ -27,5 +27,17 @@ async def get_chapter(chapter_id: str, user: User = Depends(get_current_user), d
     chapter = await db.get(Chapter, chapter_id)
     if chapter is None:
         raise HTTPException(status_code=404, detail="Chapter not found")
-    content = BookStorage().read_chapter(chapter.content_path)
-    return ChapterContentOut.model_validate(chapter).model_copy(update={"content": content})
+    try:
+        content = BookStorage().read_chapter(chapter.content_path)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Chapter content not found")
+    except OSError:
+        content = ""
+    return ChapterContentOut(
+        id=chapter.id,
+        title=chapter.title,
+        chapter_number=chapter.chapter_number,
+        source_chapter_id=chapter.source_chapter_id,
+        content_path=chapter.content_path,
+        content=content or "",
+    )

@@ -79,6 +79,10 @@ curl -X POST http://localhost:8088/api/books/batch-delete \
 
 如果 YueDu 书源的 `ruleExplore` / `ruleSearch` 规则与网站当前 HTML 不匹配，旧版可能只返回没有 `bookUrl` 的空条目。现在会过滤空条目，并自动回退到通用列表页解析；相对链接也会按当前列表页拼接。重新部署 backend 后再发起一次全站同步即可。
 
+### 同步到分类、章节显示小说名、正文报 content missing
+
+旧版 YueDu 规则引擎没有完整处理书源里常见的 `|` 规则分隔符、字面量回退和 `replaceRegex` 数组，导致规则解析失败后把分类链接、书页链接当成书籍和章节。现在会按 `bookUrlPattern` 过滤发现结果，过滤与书页 URL 相同的目录链接，并支持单 `|` 规则与 `replaceRegex` 数组。章节接口也会对缺失正文返回明确的 404 或空正文，不再报 Pydantic 校验错误。已经同步错的分类书籍需要先删除，再重新同步。
+
 ### 后端反复重启，日志报 StringDataRightTruncation
 
 `alembic_version.version_num` 列只有 32 字符，迁移 ID 不能超过该长度。当前分类迁移已改为 `0009_categories`，更新后端代码后重新启动 backend 即可。

@@ -60,6 +60,17 @@ def test_substitute_page_expressions():
     ) == "https://example.com/sort/3.html"
 
 
+def test_substitute_inner_rules_keeps_rules_without_templates():
+    plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
+    assert plugin.engine._substitute_inner_rules("a@text", "<html></html>") == "a@text"
+
+
+def test_css_rule_supports_single_pipe_or():
+    plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
+    html = '<html><body><div id="content"><p>Main text.</p></div></body></html>'
+    assert plugin.engine._eval_rule_str(html, "#content@text|article@text") == "Main text."
+
+
 def test_parse_book_generic_fills_metadata_and_chapters():
     plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
     html = """
@@ -186,6 +197,112 @@ async def test_fetch_explore_resolves_relative_book_urls_against_page():
         "https://example.com/novel/123.html",
         "https://example.com/novel/456.html",
     ]
+
+
+ALICE_SOURCE = {
+    "bookSourceUrl": "https://www.alicesw.com",
+    "bookUrlPattern": r"https?://www\.alicesw\.com/novel/\d+\.html",
+    "ruleExplore": {
+        "bookList": "table tr",
+        "name": "a@text",
+        "bookUrl": "a@href",
+    },
+    "ruleToc": {
+        "chapterList": ".list a",
+        "chapterName": "a@text",
+        "chapterUrl": "a@href",
+    },
+    "ruleContent": {
+        "content": "#content@text",
+        "replaceRegex": ["banner.*"],
+    },
+    "concurrentRate": "0",
+}
+
+
+@pytest.mark.asyncio
+async def test_fetch_explore_filters_category_links_when_pattern_configured():
+    plugin = YueduPlugin(ALICE_SOURCE)
+    html = """
+    <html><body><table>
+      <tr><td><a href="/lists/65.html">Category</a></td></tr>
+      <tr><td><a href="/novel/123.html">Book One</a></td></tr>
+      <tr><td><a href="/novel/456.html">Book Two</a></td></tr>
+    </table></body></html>
+    """
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        items = await plugin._fetch_explore_url("https://www.alicesw.com/lists/65.html")
+
+    assert [item["bookUrl"] for item in items] == [
+        "https://www.alicesw.com/novel/123.html",
+        "https://www.alicesw.com/novel/456.html",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_book_does_not_treat_book_page_as_chapter():
+    plugin = YueduPlugin(ALICE_SOURCE)
+    html = """
+    <html><body>
+      <h1>Book One</h1>
+      <div class="list">
+        <a href="/novel/123.html">Book One</a>
+        <a href="/novel/123/1.html">Chapter 1</a>
+        <a href="/novel/123/2.html">Chapter 2</a>
+        <a href="/lists/65.html">Category</a>
+      </div>
+    </body></html>
+    """
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        book = await plugin.fetch_book("https://www.alicesw.com/novel/123.html")
+
+    assert book.title == "Book One"
+    assert [(c.title, c.url) for c in book.chapters] == [
+        ("Chapter 1", "https://www.alicesw.com/novel/123/1.html"),
+        ("Chapter 2", "https://www.alicesw.com/novel/123/2.html"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_chapter_content_handles_replace_regex_list():
+    plugin = YueduPlugin(ALICE_SOURCE)
+    html = """
+    <html><body>
+      <div id="content">
+        Main text.
+        banner advertisement
+      </div>
+    </body></html>
+    """
+    chapter = SimpleNamespace(
+        url="https://www.alicesw.com/novel/123/1.html",
+    )
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        content = await plugin.fetch_chapter_content(chapter)
+
+    assert "Main text" in content
+    assert "banner" not in content
+
+
+@pytest.mark.asyncio
+async def test_fetch_chapter_content_generic_fallback():
+    plugin = YueduPlugin({
+        **ALICE_SOURCE,
+        "ruleContent": {"content": "#missing@text"},
+    })
+    html = """
+    <html><body>
+      <div id="content"><p>Main text.</p></div>
+    </body></html>
+    """
+    chapter = SimpleNamespace(
+        url="https://www.alicesw.com/novel/123/1.html",
+    )
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        content = await plugin.fetch_chapter_content(chapter)
+
+    assert "Main text" in content
+    assert "<" not in content
 
 
 @pytest.mark.asyncio

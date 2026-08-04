@@ -224,8 +224,8 @@ class _RuleAnalyzer:
             self._start_x = start_x
             self._pos = pos
 
-        if start_x == self._pos and start_x == 0:
-            return ""
+        if start_x == 0:
+            return q
 
         st_buf.append(q[self._start_x:])
         return "".join(st_buf)
@@ -233,7 +233,9 @@ class _RuleAnalyzer:
 class YueduRuleEngine:
     """Evaluates YueDu book source rules against HTML or JSON responses."""
 
-    SEPARATORS = ("&&", "||", "%%")
+    # Legado splits on &&/||/%%.  Many exported sources also use single `|`
+    # as a fallback separator, so accept it too.
+    SEPARATORS = ("&&", "||", "|", "%%")
     JS_PATTERN = re.compile(
         r"<js>[\s\S]*?</js>|@js:[^\n]*",
         re.IGNORECASE,
@@ -372,7 +374,7 @@ class YueduRuleEngine:
 
         content = self._eval_rule_str(raw, content_rule)
         if not content:
-            return raw
+            return ""
 
         replace_regex = rules.get("replaceRegex", "")
         if replace_regex:
@@ -513,10 +515,16 @@ class YueduRuleEngine:
             rl = rl.strip()
             if not rl:
                 continue
-            temp = self._eval_css_single(soup, rl)
+            if rl.startswith(("http://", "https://")):
+                temp = [rl]
+            else:
+                try:
+                    temp = self._eval_css_single(soup, rl)
+                except Exception:
+                    temp = None
             if temp:
                 results.append(temp)
-                if elem_type == "||":
+                if elem_type in ("||", "|"):
                     break
         if not results:
             return None
@@ -601,7 +609,7 @@ class YueduRuleEngine:
             resolved = str(val) if val is not None else ""
             if resolved:
                 results.append(resolved)
-                if elem_type == "||":
+                if elem_type in ("||", "|"):
                     break
         if not results:
             return None
@@ -630,7 +638,13 @@ class YueduRuleEngine:
             results = soup.select(rule)
             return "\n".join(r.get_text("\n", strip=True) for r in results) if results else None
 
-    def _apply_replace_regex(self, text: str, rule: str) -> str:
+    def _apply_replace_regex(self, text: str, rule: Any) -> str:
+        if isinstance(rule, list):
+            for item in rule:
+                text = self._apply_replace_regex(text, item)
+            return text
+        if not isinstance(rule, str):
+            return text
         parts = rule.split("##")
         if len(parts) >= 3:
             pattern = parts[1]
@@ -640,6 +654,17 @@ class YueduRuleEngine:
                 if replace_first:
                     return re.sub(pattern, replacement, text, count=1)
                 return re.sub(pattern, replacement, text)
+            except re.error:
+                return text
+        if len(parts) == 2:
+            pattern, replacement = parts
+            try:
+                return re.sub(pattern, replacement, text)
+            except re.error:
+                return text
+        if rule.strip():
+            try:
+                return re.sub(rule, "", text)
             except re.error:
                 return text
         return text
@@ -755,6 +780,9 @@ class YueduRuleEngine:
         return cleaned.strip(), put_map
 
     def _substitute_inner_rules(self, rule: str, raw: Any) -> str:
+        if "{{" not in rule or "}}" not in rule:
+            return rule
+
         def _resolve_template(inner: str) -> str | None:
             inner = inner.strip()
             if inner.startswith("@") or inner.startswith("$.") or inner.startswith("//"):

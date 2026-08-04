@@ -249,6 +249,15 @@ class YueduPlugin:
                 continue
             if ch_url and not ch_url.startswith("http"):
                 ch_url = self._make_absolute(ch_url, url)
+            if not self._is_chapter_url(ch_url, url):
+                continue
+            title = str(title or "").strip() or f"Chapter {chapter_num + 1}"
+            book_name = str(info.get("name") or "").strip()
+            if (
+                title in ("目录", "简介", "上一章", "下一章", "返回目录", "首页", "开始阅读")
+                or (book_name and title == book_name)
+            ):
+                continue
             chapter_num += 1
             chapters.append(RemoteChapter(
                 source_chapter_id=str(chapter_num),
@@ -367,6 +376,8 @@ class YueduPlugin:
             abs_url = self._make_absolute(href, url)
             if abs_url in seen_urls:
                 continue
+            if not self._is_chapter_url(abs_url, url):
+                continue
             seen_urls.add(abs_url)
             chapter_number += 1
             chapters.append(RemoteChapter(
@@ -400,8 +411,13 @@ class YueduPlugin:
             html = await self._get_with_web_js(chapter.url, web_js)
         else:
             html = await self._get(chapter.url)
-        content = self.engine.parse_content(html)
-        parts = [content] if content else [html]
+        try:
+            content = self.engine.parse_content(html)
+        except Exception:
+            content = ""
+        if not content:
+            content = self._parse_chapter_content_generic(html)
+        parts = [content] if content else []
 
         # Follow nextContentUrl for multi-page chapters
         max_pages = 20  # safety limit
@@ -424,7 +440,44 @@ class YueduPlugin:
             except Exception:
                 pass
 
-        return content or html
+        if not content:
+            content = self._parse_chapter_content_generic(html)
+        content = content.strip()
+        replace_rules = (self.config.get("ruleContent") or {}).get("replaceRegex", [])
+        if replace_rules:
+            content = self.engine._apply_replace_regex(content, replace_rules).strip()
+        return content or ""
+
+    def _parse_chapter_content_generic(self, html: str) -> str:
+        """Extract readable text when the configured content rule misses."""
+        soup = BeautifulSoup(html, "lxml")
+        content_selectors = (
+            "#content",
+            "#chapter-content",
+            "article",
+            "div.content",
+            ".chapter-content",
+            ".read-content",
+            ".reader-content",
+            ".article",
+        )
+        for selector in content_selectors:
+            el = soup.select_one(selector)
+            if el is None:
+                continue
+            for tag in el.find_all(["script", "style", "ins", "nav", "header", "footer"]):
+                tag.decompose()
+            paragraphs = [
+                p.get_text(strip=True)
+                for p in el.find_all(["p", "br"])
+                if p.get_text(strip=True)
+            ]
+            if paragraphs:
+                return "\n\n".join(paragraphs)
+            text = el.get_text("\n", strip=True)
+            if text:
+                return text
+        return ""
 
     # ---- Required: fetch_bookshelf ----
 
@@ -573,6 +626,8 @@ class YueduPlugin:
             full_url = self._make_absolute(href, resolve_base)
             if not full_url.startswith(("http://", "https://")):
                 continue
+            if not self._is_book_url(full_url, require_pattern=True):
+                continue
 
             # Skip non-book URLs: search, tag, category, author, user pages
             skip_patterns = ["/search/", "/tag/", "/tags/", "/category/", "/categories/",
@@ -640,9 +695,9 @@ class YueduPlugin:
             full_url = self._make_absolute(href, base_url)
             if not full_url.startswith(("http://", "https://")):
                 continue
-            path = urlparse(full_url).path.lower()
-            if not any(seg in path for seg in ("/novel/", "/book/", "/read/", "/detail/", "/xiaoshuo/")):
+            if not self._is_book_url(full_url, require_pattern=True):
                 continue
+            path = urlparse(full_url).path.lower()
             if any(self._is_nav_path(path, p) for p in nav_paths):
                 continue
             if any(p in full_url.lower() for p in skip_patterns):
@@ -693,6 +748,57 @@ class YueduPlugin:
         if path.endswith(".html"):
             path = path[:-5]
         return path == nav or path.startswith(nav + "/")
+
+    def _is_book_url(self, url: str, require_pattern: bool = False) -> bool:
+        """Check whether a URL points to a book detail page.
+
+        When the source defines `bookUrlPattern`, discovery uses it strictly
+        for the same host so category/chapter links are not mistaken for books.
+        """
+        pattern = self.config.get("bookUrlPattern", "")
+        if pattern and pattern.strip():
+            try:
+                if re.search(pattern, url):
+                    return True
+            except re.error:
+                pass
+            if require_pattern:
+                same_host = (
+                    urlparse(url).netloc.lower()
+                    == urlparse(self.base_url).netloc.lower()
+                )
+                if same_host:
+                    return False
+        path = urlparse(url).path.lower()
+        return any(
+            seg in path
+            for seg in ("/novel/", "/book/", "/read/", "/detail/", "/xiaoshuo/")
+        )
+
+    def _is_chapter_url(self, url: str, book_url: str) -> bool:
+        """Filter out book-page, category, and navigation links from a TOC."""
+        abs_url = self._make_absolute(url, book_url or self.base_url)
+        abs_book = self._make_absolute(book_url, self.base_url)
+        if abs_url.rstrip("/") == abs_book.rstrip("/"):
+            return False
+
+        path = urlparse(abs_url).path.lower()
+        skip_paths = (
+            "/lists/", "/category/", "/categories/", "/tag/", "/tags/",
+            "/author/", "/search/", "/bookcase/", "/bookshelf/", "/user/",
+            "/login", "/register", "/signup", "/about", "/help", "/faq",
+            "/contact", "/rank", "/top", "/sort", "/finish", "/wanben",
+            "/quanben", "/allvisit", "/lastupdate",
+        )
+        if any(seg in path for seg in skip_paths):
+            return False
+        if "/chapter/" in path or "/read/" in path:
+            return True
+
+        book_path = urlparse(abs_book).path.lower().rstrip("/")
+        book_id = book_path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        segments = [seg for seg in path.split("/") if seg]
+        return bool(book_id and book_id in segments)
 
     # ---- Bookshelf URL auto-detection ----
 
@@ -898,9 +1004,16 @@ class YueduPlugin:
             if str(item.get("bookUrl") or item.get("url") or "").strip()
         ]
         if usable_items:
-            return [
+            normalized_items = [
                 self._normalize_explore_item(item, page_url)
                 for item in usable_items
+            ]
+            return [
+                item for item in normalized_items
+                if self._is_book_url(
+                    self._explore_item_url(item),
+                    require_pattern=True,
+                )
             ]
 
         # Generic fallback for list/category pages whose configured rules no
@@ -952,6 +1065,8 @@ class YueduPlugin:
                 continue
             full_url = self._make_absolute(book_url, link_base)
             if not full_url.startswith(("http://", "https://")):
+                continue
+            if not self._is_book_url(full_url, require_pattern=True):
                 continue
             books.append(RemoteShelfBook(
                 source_book_id=full_url.rstrip("/").split("/")[-1] or full_url,
