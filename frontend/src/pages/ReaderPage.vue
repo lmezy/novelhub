@@ -24,6 +24,8 @@ const showFontMenu = ref(false)
 const isDark = ref(localStorage.getItem("novelhub_dark") === "true")
 const showToc = ref(false)
 const showAI = ref(false)
+const alternates = ref<any[]>([])
+const showSourceMenu = ref(false)
 
 const cnFonts = [
   { value: "default", label: "\u7cfb\u7edf\u9ed8\u8ba4" },
@@ -132,12 +134,38 @@ async function loadChapter(id: string) {
   }
 }
 
+async function loadAlternates() {
+  try {
+    const res = await api.get<any>("/books/" + bookId.value + "/sources")
+    alternates.value = res.sources || []
+  } catch { /* non-critical */ }
+}
+
+async function switchSource(alt: any) {
+  showSourceMenu.value = false
+  if (alt.is_current || !chapter.value) return
+  try {
+    const targetChapters = await store.fetchChapters(alt.id)
+    const sameNumber = targetChapters.find(
+      (c) => c.chapter_number === chapter.value?.chapter_number,
+    )
+    if (sameNumber) {
+      router.push("/books/" + alt.id + "/chapters/" + sameNumber.id)
+    } else {
+      router.push("/books/" + alt.id)
+    }
+  } catch {
+    router.push("/books/" + alt.id)
+  }
+}
+
 onMounted(async () => {
   document.documentElement.classList.toggle("dark", isDark.value)
   window.addEventListener("scroll", onScroll, { passive: true })
   try {
     chapters.value = await store.fetchChapters(bookId.value)
   } catch { /* non-fatal */ }
+  await loadAlternates()
   await loadChapter(chapterId.value)
 })
 
@@ -179,6 +207,32 @@ watch(
         </span>
       </div>
       <div class="flex items-center gap-2">
+        <div v-if="alternates.length > 1" class="relative">
+          <button
+            @click="showSourceMenu = !showSourceMenu"
+            class="w-7 h-7 flex items-center justify-center rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors text-sm"
+            :class="showSourceMenu ? 'text-accent' : ''"
+            :title="'Sources'"
+          >Src</button>
+          <div
+            v-if="showSourceMenu"
+            class="absolute right-0 top-full mt-1 w-60 rounded-lg border shadow-lg p-2 z-50"
+            :class="isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-border'"
+          >
+            <button
+              v-for="alt in alternates"
+              :key="alt.id"
+              @click="switchSource(alt)"
+              class="w-full text-left px-2 py-1.5 rounded text-xs transition-colors"
+              :class="alt.is_current
+                ? 'bg-accent text-white font-medium'
+                : isDark ? 'hover:bg-gray-700' : 'hover:bg-gray-100'"
+            >
+              {{ alt.source_name || alt.source_id || "Unknown" }}
+              <span v-if="alt.is_current" class="ml-1 opacity-70">(current)</span>
+            </button>
+          </div>
+        </div>
         <button
           @click="fontSize = Math.max(14, fontSize - 2)"
           class="w-7 h-7 flex items-center justify-center rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors text-sm"

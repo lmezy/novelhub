@@ -296,7 +296,7 @@ class YueduPlugin:
         status = info.get("status", "")
 
         return RemoteBook(
-            source_book_id=url.split("/")[-1] if "/" in url else url,
+            source_book_id=self._book_id_from_url(url),
             title=book_title,
             author=author,
             description=description if description else None,
@@ -659,12 +659,13 @@ class YueduPlugin:
             if any(self._is_nav_path(path, p) for p in nav_paths):
                 continue
 
-            book_id = full_url.split("/")[-1] if "/" in full_url else full_url
+            book_id = self._book_id_from_url(full_url)
             path = urlparse(full_url).path.lower()
+            last_segment = book_id.rsplit("/", 1)[-1] if "/" in book_id else book_id
             # Skip empty IDs or bare numeric category IDs, but keep numeric
             # book IDs under /novel/ or /book/ paths.
-            if not book_id or (
-                book_id.isdigit()
+            if not last_segment or (
+                last_segment.isdigit()
                 and not any(
                     seg in path
                     for seg in ("/novel/", "/book/", "/read/", "/detail/")
@@ -732,9 +733,10 @@ class YueduPlugin:
             if not title or len(title) < 2 or title.lower() in skip_titles:
                 continue
 
-            book_id = full_url.split("/")[-1]
-            if not book_id or (
-                book_id.isdigit()
+            book_id = self._book_id_from_url(full_url)
+            last_segment = book_id.rsplit("/", 1)[-1] if "/" in book_id else book_id
+            if not last_segment or (
+                last_segment.isdigit()
                 and not any(seg in path for seg in ("/novel/", "/book/", "/read/", "/detail/"))
             ):
                 continue
@@ -1087,7 +1089,7 @@ class YueduPlugin:
             if not self._is_book_url(full_url, require_pattern=True):
                 continue
             books.append(RemoteShelfBook(
-                source_book_id=full_url.rstrip("/").split("/")[-1] or full_url,
+                source_book_id=self._book_id_from_url(full_url),
                 title=str(item.get("name") or item.get("title") or book_url).strip() or "Unknown",
                 author=str(item.get("author") or "").strip() or "Unknown",
                 url=full_url,
@@ -1644,6 +1646,16 @@ class YueduPlugin:
             if ch_url and not ch_url.startswith(("http://", "https://")):
                 entry["chapterUrl"] = urljoin(base_url, ch_url)
         return entries
+
+    @staticmethod
+    def _book_id_from_url(url: str) -> str:
+        """Return a stable source book id from a book URL.
+
+        Legado uses the full book URL as the book key. Keep the full
+        normalized URL so build_book_url() can reconstruct it directly
+        without depending on the bookUrlPattern.
+        """
+        return url.rstrip("/") or url
 
     @staticmethod
     def _make_absolute(href: str, base: str) -> str:

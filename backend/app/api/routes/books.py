@@ -1,14 +1,15 @@
+import re
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.models import Book, BookFavorite, User
+from app.models import Book, BookFavorite, Chapter, Source, User
 from app.services.auth import get_current_user, require_admin
 from app.services.book_cleanup import delete_books
 from app.services.epub import EpubService
@@ -19,7 +20,13 @@ from app.services.visibility import (
     ensure_book_visible,
     visible_tags,
 )
-from app.schemas.book import BookCreate, BookOut, ManualBookCreate
+from app.schemas.book import (
+    BookCreate,
+    BookOut,
+    BookSourceAlternate,
+    BookSourceAlternatesOut,
+    ManualBookCreate,
+)
 from app.services.manual_import import ManualImportService
 
 
@@ -28,6 +35,14 @@ router = APIRouter(prefix="/books", tags=["books"])
 
 class BatchDeleteRequest(BaseModel):
     ids: list[str]
+
+
+def _normalize_book_title(title: str) -> str:
+    return re.sub(
+        r"[\s《》「」『』〈〉（）【】\[\]\"'“”‘’]+",
+        "",
+        title or "",
+    ).lower()
 
 
 def _serialize_book(book: Book, user: User, is_favorite: bool = False) -> BookOut:
@@ -195,6 +210,82 @@ async def get_book(book_id: str, user: User = Depends(get_current_user), db: Asy
     )
     book.is_favorite = favorite is not None
     return _serialize_book(book, user, book.is_favorite)
+
+
+@router.get("/{book_id}/sources", response_model=BookSourceAlternatesOut)
+async def list_book_sources(
+    book_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List other library books with the same title across sources."""
+    book = await db.get(Book, book_id)
+    if not ensure_book_visible(user, book):
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    query = select(Book).options(selectinload(Book.author)).where(Book.id != book_id)
+    if user.role not in ("admin", "super_admin"):
+        conditions = []
+        if can_view_all_ages(user):
+            conditions.append(Book.is_r18 == False)
+        if can_view_r18(user):
+            conditions.append(Book.is_r18 == True)
+        query = query.where(or_(*conditions)) if conditions else query.where(Book.id == "__none__")
+
+    normalized = _normalize_book_title(book.title)
+    candidates = [
+        b
+        for b in (await db.scalars(query)).all()
+        if _normalize_book_title(b.title) == normalized
+    ]
+    candidates.append(book)
+
+    if not candidates:
+        return BookSourceAlternatesOut(book_id=book_id, sources=[])
+
+    chapter_counts = dict(
+        (
+            await db.execute(
+                select(Chapter.book_id, func.count(Chapter.id))
+                .where(Chapter.book_id.in_([b.id for b in candidates]))
+                .group_by(Chapter.book_id)
+            )
+        ).all()
+    )
+
+    source_ids = {b.source_id for b in candidates if b.source_id}
+    source_names: dict[str, str] = {}
+    if source_ids:
+        source_rows = await db.execute(
+            select(Source.id, Source.name).where(Source.id.in_(source_ids))
+        )
+        source_names = dict(source_rows.all())
+
+    sources = [
+        BookSourceAlternate(
+            id=b.id,
+            source_id=b.source_id,
+            source_name=source_names.get(b.source_id),
+            source_book_id=b.source_book_id,
+            title=b.title,
+            author_name=b.author_name,
+            status=b.status,
+            chapter_count=chapter_counts.get(b.id, 0),
+            updated_at=b.updated_at,
+            is_current=b.id == book.id,
+        )
+        for b in candidates
+    ]
+    sources.sort(
+        key=lambda s: (
+            not s.is_current,
+            s.author_name != book.author_name,
+            s.source_name or "",
+        )
+    )
+    return BookSourceAlternatesOut(book_id=book_id, sources=sources)
+
+
 @router.delete("/{book_id}", status_code=204, dependencies=[Depends(require_admin)])
 async def delete_book(book_id: str, db: AsyncSession = Depends(get_db)):
     book = await db.get(Book, book_id)

@@ -18,6 +18,8 @@ const error = ref("")
 const savedChapterId = ref<string | null>(null)
 const syncing = ref(false)
 const favorite = ref(false)
+const alternates = ref<any[]>([])
+const showSources = ref(false)
 
 async function toggleFavorite() {
   if (!book.value) return
@@ -48,11 +50,23 @@ async function resyncBook() {
   }
 }
 
+async function loadAlternates() {
+  try {
+    const res = await api.get<any>("/books/" + route.params.id + "/sources")
+    alternates.value = res.sources || []
+  } catch { /* non-critical */ }
+}
+
+function switchSource(id: string) {
+  router.push("/books/" + id)
+}
+
 onMounted(async () => {
   try {
     book.value = await store.fetchBook(route.params.id as string)
     favorite.value = book.value.is_favorite || false
     chapters.value = await store.fetchChapters(route.params.id as string)
+    await loadAlternates()
     if (auth.user) {
       try {
         const progress = await api.get<any[]>('/progress?user_id=' + auth.user.id)
@@ -107,6 +121,34 @@ onMounted(async () => {
             <span class="text-xs text-muted dark:text-gray-400">
               Updated {{ new Date(book.updated_at).toLocaleDateString() }}
             </span>
+          </div>
+          <div v-if="alternates.length > 1" class="mt-4">
+            <button
+              @click="showSources = !showSources"
+              class="px-3 py-1 text-xs border border-border dark:border-gray-700 rounded hover:bg-accent/5 transition-colors"
+            >Sources ({{ alternates.length }})</button>
+            <div
+              v-if="showSources"
+              class="mt-2 divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900"
+            >
+              <button
+                v-for="alt in alternates"
+                :key="alt.id"
+                @click="switchSource(alt.id)"
+                class="w-full flex items-center justify-between px-3 py-2 text-left text-sm hover:bg-accent/5 transition-colors"
+                :class="alt.is_current ? 'text-accent font-medium' : ''"
+              >
+                <span>
+                  {{ alt.source_name || alt.source_id || "Unknown" }}
+                  <span class="text-xs text-muted dark:text-gray-400">
+                    ({{ alt.chapter_count }} chapters)
+                  </span>
+                </span>
+                <span class="text-xs text-muted dark:text-gray-400">
+                  {{ alt.is_current ? "current" : "switch" }}
+                </span>
+              </button>
+            </div>
           </div>
           <div class="flex items-center gap-2 mt-4">
             <button

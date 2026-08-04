@@ -3,6 +3,14 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from app.api.routes.books import _normalize_book_title
+
+
+def test_normalize_book_title():
+    assert _normalize_book_title("《剑来》") == "剑来"
+    assert _normalize_book_title(" 剑来 ") == "剑来"
+    assert _normalize_book_title("剑来（全文）") == "剑来全文"
+
 
 @pytest.mark.asyncio
 async def test_list_books(client):

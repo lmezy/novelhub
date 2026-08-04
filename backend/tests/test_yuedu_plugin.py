@@ -107,6 +107,50 @@ def test_build_book_url_uses_configured_detail_prefix():
     assert plugin.build_book_url("37466.html") == "https://example.com/novel/37466.html"
 
 
+def test_build_book_url_accepts_full_source_book_id():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "http://m.5859ycdh.com",
+        "bookUrlPattern": r"http://m\.5859ycdh\.com/wuba/\d+/?$",
+    })
+    assert plugin.build_book_url(
+        "http://m.5859ycdh.com/wuba/29416"
+    ) == "http://m.5859ycdh.com/wuba/29416"
+
+
+def test_book_id_from_url_handles_trailing_slash():
+    assert YueduPlugin._book_id_from_url(
+        "http://m.5859ycdh.com/wuba/29416/"
+    ) == "http://m.5859ycdh.com/wuba/29416"
+    assert YueduPlugin._book_id_from_url(
+        "http://m.5859ycdh.com/wuba/29416"
+    ) == "http://m.5859ycdh.com/wuba/29416"
+    assert YueduPlugin._book_id_from_url(
+        "https://example.com/novel/123.html"
+    ) == "https://example.com/novel/123.html"
+
+
+@pytest.mark.asyncio
+async def test_fetch_book_source_book_id_uses_full_normalized_url():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "ruleBookInfo": {},
+        "ruleToc": {},
+    })
+    html = """
+    <html><body>
+      <h1>Book One</h1>
+      <div class="listmain">
+        <a href="/novel/123/1.html">Chapter 1</a>
+        <a href="/novel/123/2.html">Chapter 2</a>
+      </div>
+    </body></html>
+    """
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        book = await plugin.fetch_book("https://example.com/wuba/29416/")
+
+    assert book.source_book_id == "https://example.com/wuba/29416"
+
+
 @pytest.mark.asyncio
 async def test_fetch_book_uses_generic_fallback():
     plugin = YueduPlugin({

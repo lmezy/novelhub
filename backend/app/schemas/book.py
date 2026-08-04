@@ -53,3 +53,21 @@ class BookOut(BaseModel):
         from_attributes = True
     tag_names: list[str] = []
     author_name: str | None = None
+
+
+class BookSourceAlternate(BaseModel):
+    id: str
+    source_id: str | None = None
+    source_name: str | None = None
+    source_book_id: str | None = None
+    title: str
+    author_name: str | None = None
+    status: str | None = None
+    chapter_count: int = 0
+    updated_at: datetime | None = None
+    is_current: bool = False
+
+
+class BookSourceAlternatesOut(BaseModel):
+    book_id: str
+    sources: list[BookSourceAlternate]

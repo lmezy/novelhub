@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.crawler.base import RemoteBook, RemoteShelfBook
-from app.models import Cookie, Source
+from app.models import Book, Cookie, Source
 from app.services.sync import SyncService
 
 
@@ -16,6 +16,30 @@ def _source(source_id: str = "src1") -> Source:
         enabled=True,
         config={},
     )
+
+
+def test_normalize_title_for_match():
+    assert SyncService._normalize_title_for_match("《剑来》") == "剑来"
+    assert SyncService._normalize_title_for_match("剑来（全文）") == "剑来全文"
+    assert SyncService._normalize_title_for_match(" 剑来 ") == "剑来"
+
+
+@pytest.mark.asyncio
+async def test_find_same_title_books_filters_normalized_title():
+    db = AsyncMock()
+    db.scalars.return_value = MagicMock()
+    db.scalars.return_value.all.return_value = [
+        Book(id="a", source_id="s1", title="《剑来》"),
+        Book(id="b", source_id="s2", title=" 剑来 "),
+        Book(id="c", source_id="s3", title="凡人修仙传"),
+    ]
+    service = SyncService(db)
+
+    result = await service._find_same_title_books(
+        Book(id="x", source_id="s0", title="剑来")
+    )
+
+    assert [b.id for b in result] == ["a", "b"]
 
 
 @pytest.mark.asyncio

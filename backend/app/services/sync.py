@@ -1,9 +1,11 @@
+import re
 from uuid import uuid4
 from collections.abc import Awaitable, Callable
 from urllib.parse import urljoin
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 from loguru import logger
 
 from app.crawler.registry import get_plugin
@@ -36,6 +38,31 @@ class SyncService:
     @staticmethod
     def _is_http_url(url: str) -> bool:
         return url.startswith(("http://", "https://"))
+
+    @staticmethod
+    def _normalize_title_for_match(title: str | None) -> str:
+        return re.sub(
+            r"[\s《》「」『』〈〉（）【】\[\]\"'“”‘’]+",
+            "",
+            title or "",
+        ).lower()
+
+    async def _find_same_title_books(self, book: Book) -> list[Book]:
+        """Find other source books with the same normalized title."""
+        normalized = self._normalize_title_for_match(book.title)
+        rows = await self.db.scalars(
+            select(Book)
+            .options(selectinload(Book.tags))
+            .where(
+                Book.id != book.id,
+                Book.source_id.is_not(None),
+            )
+        )
+        return [
+            b
+            for b in rows.all()
+            if self._normalize_title_for_match(b.title) == normalized
+        ]
 
     @staticmethod
     def _is_book_r18(source: Source, remote_book) -> bool:
@@ -78,9 +105,30 @@ class SyncService:
             source.id, author.id, remote_book, is_r18=is_r18
         )
 
-        # Save remote tags plus the admin-only classification tag.
+        # Save remote tags plus the admin-only classification tag. Tags from
+        # other sources that carry the same title are merged in as well.
         classification_tag = "r18" if is_r18 else "all-ages"
-        await self._save_tags(book.id, [*remote_book.tags, classification_tag])
+        same_title_books = await self._find_same_title_books(book)
+        source_tags: set[str] = set()
+        for candidate in [book, *same_title_books]:
+            for tag in candidate.tag_names:
+                tag = tag.strip().lower()
+                if tag and tag not in ("all-ages", "r18"):
+                    source_tags.add(tag)
+        for tag in remote_book.tags:
+            tag = str(tag).strip().lower()
+            if tag:
+                source_tags.add(tag)
+        await self._save_tags(
+            book.id,
+            sorted([*source_tags, classification_tag]),
+        )
+        for same_title_book in same_title_books:
+            other_classification = "r18" if same_title_book.is_r18 else "all-ages"
+            await self._save_tags(
+                same_title_book.id,
+                sorted([*source_tags, other_classification]),
+            )
 
         self.storage.write_metadata(
             author_name,
