@@ -1,6 +1,6 @@
 """Book deletion helpers shared by single, batch, and source cleanup paths."""
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
@@ -43,13 +43,18 @@ async def delete_books(
     await db.execute(
         delete(ChapterEmbedding).where(ChapterEmbedding.book_id.in_(book_ids))
     )
+    await db.execute(
+        delete(ReadingProgress).where(
+            or_(
+                ReadingProgress.book_id.in_(book_ids),
+                ReadingProgress.chapter_id.in_(chapter_ids),
+            )
+        )
+    )
     await db.execute(delete(Chapter).where(Chapter.book_id.in_(book_ids)))
     await db.execute(delete(BookTag).where(BookTag.book_id.in_(book_ids)))
     await db.execute(delete(BookCategory).where(BookCategory.book_id.in_(book_ids)))
     await db.execute(delete(BookFavorite).where(BookFavorite.book_id.in_(book_ids)))
-    await db.execute(
-        delete(ReadingProgress).where(ReadingProgress.book_id.in_(book_ids))
-    )
     await db.execute(delete(Book).where(Book.id.in_(book_ids)))
 
     if commit:
