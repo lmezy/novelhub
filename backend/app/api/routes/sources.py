@@ -1,5 +1,5 @@
 ﻿from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select, delete
+from sqlalchemy import delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -14,6 +14,7 @@ from app.schemas.source import (
 )
 from app.services.auth import get_current_user, require_admin
 from app.services.book_cleanup import delete_books
+from app.services.visibility import can_view_all_ages, can_view_r18
 
 
 router = APIRouter(prefix="/sources", tags=["sources"])
@@ -21,7 +22,15 @@ router = APIRouter(prefix="/sources", tags=["sources"])
 
 @router.get("", response_model=list[SourceOut])
 async def list_sources(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    result = await db.scalars(select(Source).order_by(Source.name.asc()))
+    query = select(Source).order_by(Source.name.asc())
+    if user.role not in ("admin", "super_admin"):
+        conditions = []
+        if can_view_all_ages(user):
+            conditions.append(Source.is_r18 == False)
+        if can_view_r18(user):
+            conditions.append(Source.is_r18 == True)
+        query = query.where(or_(*conditions)) if conditions else query.where(Source.id == "__none__")
+    result = await db.scalars(query)
     return list(result)
 
 
@@ -52,6 +61,11 @@ async def search_remote_books(
 
     source = await db.get(Source, source_id)
     if source is None or not source.enabled:
+        raise HTTPException(status_code=404, detail="Source not found or disabled")
+    if (
+        (source.is_r18 and not can_view_r18(user))
+        or (not source.is_r18 and not can_view_all_ages(user))
+    ):
         raise HTTPException(status_code=404, detail="Source not found or disabled")
 
     config = source.config if source.plugin_name == "yuedu" else None

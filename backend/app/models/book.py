@@ -1,4 +1,4 @@
-from sqlalchemy import Column, DateTime, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, String, Text, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -16,6 +16,7 @@ class Book(Base):
     author_id = Column(String, ForeignKey("authors.id"))
     source_book_id = Column(String(255))
     title = Column(String(255), nullable=False)
+    is_r18 = Column(Boolean, default=False, nullable=False)
     cover = Column(String(255))
     description = Column(Text)
     status = Column(String(32))

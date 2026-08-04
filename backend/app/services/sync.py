@@ -13,6 +13,7 @@ from app.repositories.tag import TagRepository
 from app.services.storage import BookStorage
 from app.services.search import search_service
 from app.services.cookie_crypto import safe_decrypt_cookie
+from app.services.r18 import detect_r18
 
 
 class SyncService:
@@ -35,6 +36,16 @@ class SyncService:
     @staticmethod
     def _is_http_url(url: str) -> bool:
         return url.startswith(("http://", "https://"))
+
+    @staticmethod
+    def _is_book_r18(source: Source, remote_book) -> bool:
+        return detect_r18(
+            source_is_r18=getattr(source, "is_r18", False),
+            title=remote_book.title,
+            author=remote_book.author,
+            description=remote_book.description,
+            tags=getattr(remote_book, "tags", []) or [],
+        )
 
     async def sync_book(self, source_id: str, url: str) -> dict:
         source = await self.db.get(Source, source_id)
@@ -60,13 +71,16 @@ class SyncService:
 
         book_title = self._safe_title(remote_book)
         author_name = self._safe_author(remote_book.author)
+        is_r18 = self._is_book_r18(source, remote_book)
 
         author = await self._get_or_create_author(author_name)
-        book, is_new = await self._get_or_create_book(source.id, author.id, remote_book)
+        book, is_new = await self._get_or_create_book(
+            source.id, author.id, remote_book, is_r18=is_r18
+        )
 
-        # Save tags from remote book
-        if remote_book.tags:
-            await self._save_tags(book.id, remote_book.tags)
+        # Save remote tags plus the admin-only classification tag.
+        classification_tag = "r18" if is_r18 else "all-ages"
+        await self._save_tags(book.id, [*remote_book.tags, classification_tag])
 
         self.storage.write_metadata(
             author_name,
@@ -78,6 +92,7 @@ class SyncService:
                 "author": author_name,
                 "description": remote_book.description,
                 "status": remote_book.status,
+                "is_r18": is_r18,
             },
         )
 
@@ -88,6 +103,7 @@ class SyncService:
             "status": book.status or "",
             "source_id": book.source_id or "",
             "author_id": book.author_id or "",
+            "is_r18": book.is_r18,
         })
 
         if is_new:
@@ -137,6 +153,7 @@ class SyncService:
                 "title": chapter.title or "",
                 "chapter_number": chapter.chapter_number,
                 "content": content[:5000],
+                "is_r18": book.is_r18,
             })
 
             emit(EventType.CHAPTER_CREATED, chapter_id=chapter.id, book_id=book.id)
@@ -175,7 +192,13 @@ class SyncService:
         await self.db.flush()
         return author
 
-    async def _get_or_create_book(self, source_id: str, author_id: str, remote_book) -> tuple[Book, bool]:
+    async def _get_or_create_book(
+        self,
+        source_id: str,
+        author_id: str,
+        remote_book,
+        is_r18: bool = False,
+    ) -> tuple[Book, bool]:
         book = await self.db.scalar(
             select(Book).where(
                 Book.source_id == source_id,
@@ -187,6 +210,7 @@ class SyncService:
             book.author_id = author_id
             book.description = remote_book.description
             book.status = remote_book.status
+            book.is_r18 = is_r18
             await self.db.flush()
             return book, False
 
@@ -198,6 +222,7 @@ class SyncService:
             title=self._safe_title(remote_book),
             description=remote_book.description,
             status=remote_book.status,
+            is_r18=is_r18,
         )
         self.db.add(book)
         await self.db.flush()

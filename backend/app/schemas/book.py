@@ -44,6 +44,7 @@ class BookOut(BaseModel):
     cover: str | None = None
     description: str | None = None
     status: str | None = None
+    is_r18: bool = False
     is_favorite: bool = False
     created_at: datetime | None = None
     updated_at: datetime | None = None

@@ -5,9 +5,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.models import User
-from app.services.auth import require_admin
+from app.models import Book, User
+from app.services.auth import get_current_user, require_admin
 from app.services.rag import RAGService
+from app.services.visibility import ensure_book_visible
 
 
 router = APIRouter(prefix="/rag", tags=["rag"])
@@ -41,8 +42,15 @@ async def index_book(book_id: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/search", response_model=list[RAGSearchResult])
-async def search_chunks(payload: RAGSearchRequest, db: AsyncSession = Depends(get_db)):
+async def search_chunks(
+    payload: RAGSearchRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """Semantic search within a book's indexed content."""
+    book = await db.get(Book, payload.book_id)
+    if not ensure_book_visible(user, book):
+        raise HTTPException(status_code=404, detail="Book not found")
     try:
         results = await RAGService(db).search(
             book_id=payload.book_id,

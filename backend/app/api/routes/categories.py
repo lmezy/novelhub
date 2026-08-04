@@ -2,10 +2,11 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
-from app.models import User
+from app.models import Book, User
 from app.repositories.category import CategoryRepository
 from app.schemas.category import BookCategoryAssign, CategoryCreate, CategoryOut
 from app.services.auth import get_current_user, require_admin
+from app.services.visibility import ensure_book_visible
 
 router = APIRouter(prefix="/categories", tags=["categories"])
 
@@ -34,12 +35,18 @@ async def delete_category(category_id: str, db: AsyncSession = Depends(get_db)):
 
 @router.get("/book/{book_id}", response_model=list[CategoryOut])
 async def get_book_categories(book_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    book = await db.get(Book, book_id)
+    if not ensure_book_visible(user, book):
+        raise HTTPException(status_code=404, detail="Book not found")
     repo = CategoryRepository(db)
     return await repo.get_book_categories(book_id)
 
 
 @router.put("/book/{book_id}", response_model=list[CategoryOut])
 async def set_book_categories(book_id: str, payload: BookCategoryAssign, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    book = await db.get(Book, book_id)
+    if not ensure_book_visible(user, book):
+        raise HTTPException(status_code=404, detail="Book not found")
     repo = CategoryRepository(db)
     await repo.set_book_categories(book_id, payload.category_ids)
     return await repo.get_book_categories(book_id)

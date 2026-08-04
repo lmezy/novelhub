@@ -3,7 +3,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,6 +13,12 @@ from app.services.auth import get_current_user, require_admin
 from app.services.book_cleanup import delete_books
 from app.services.epub import EpubService
 from app.services.sync import SyncService
+from app.services.visibility import (
+    can_view_r18,
+    can_view_all_ages,
+    ensure_book_visible,
+    visible_tags,
+)
 from app.schemas.book import BookCreate, BookOut, ManualBookCreate
 from app.services.manual_import import ManualImportService
 
@@ -24,11 +30,37 @@ class BatchDeleteRequest(BaseModel):
     ids: list[str]
 
 
+def _serialize_book(book: Book, user: User, is_favorite: bool = False) -> BookOut:
+    is_admin = user.role in ("admin", "super_admin")
+    return BookOut(
+        id=book.id,
+        title=book.title,
+        author_id=book.author_id,
+        source_id=book.source_id,
+        source_book_id=book.source_book_id,
+        cover=book.cover,
+        description=book.description,
+        status=book.status,
+        is_r18=book.is_r18 if is_admin else False,
+        is_favorite=is_favorite,
+        created_at=book.created_at,
+        updated_at=book.updated_at,
+        tag_names=visible_tags(user, book.tag_names),
+        author_name=book.author_name,
+    )
+
+
 @router.get("", response_model=list[BookOut])
 async def list_books(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    result = await db.scalars(
-        select(Book).options(selectinload(Book.tags)).order_by(Book.updated_at.desc())
-    )
+    query = select(Book).options(selectinload(Book.tags)).order_by(Book.updated_at.desc())
+    if user.role not in ("admin", "super_admin"):
+        conditions = []
+        if can_view_all_ages(user):
+            conditions.append(Book.is_r18 == False)
+        if can_view_r18(user):
+            conditions.append(Book.is_r18 == True)
+        query = query.where(or_(*conditions)) if conditions else query.where(Book.id == "__none__")
+    result = await db.scalars(query)
     books = list(result)
     favorite_ids = set(
         await db.scalars(
@@ -37,7 +69,7 @@ async def list_books(user: User = Depends(get_current_user), db: AsyncSession = 
     )
     for book in books:
         book.is_favorite = book.id in favorite_ids
-    return books
+    return [_serialize_book(book, user, book.is_favorite) for book in books]
 
 
 @router.post("/batch-delete", dependencies=[Depends(require_admin)])
@@ -91,17 +123,23 @@ async def list_favorite_books(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.scalars(
+    query = (
         select(Book)
         .join(BookFavorite, BookFavorite.book_id == Book.id)
         .where(BookFavorite.user_id == user.id)
         .options(selectinload(Book.tags))
         .order_by(BookFavorite.created_at.desc())
     )
+    if user.role not in ("admin", "super_admin"):
+        conditions = []
+        if can_view_all_ages(user):
+            conditions.append(Book.is_r18 == False)
+        if can_view_r18(user):
+            conditions.append(Book.is_r18 == True)
+        query = query.where(or_(*conditions)) if conditions else query.where(Book.id == "__none__")
+    result = await db.scalars(query)
     books = list(result)
-    for book in books:
-        book.is_favorite = True
-    return books
+    return [_serialize_book(book, user, True) for book in books]
 
 
 @router.post("/{book_id}/favorite")
@@ -111,7 +149,7 @@ async def favorite_book(
     db: AsyncSession = Depends(get_db),
 ):
     book = await db.get(Book, book_id)
-    if book is None:
+    if not ensure_book_visible(user, book):
         raise HTTPException(status_code=404, detail="Book not found")
     existing = await db.scalar(
         select(BookFavorite).where(
@@ -131,6 +169,9 @@ async def unfavorite_book(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    book = await db.get(Book, book_id)
+    if not ensure_book_visible(user, book):
+        raise HTTPException(status_code=404, detail="Book not found")
     await db.execute(
         delete(BookFavorite).where(
             BookFavorite.user_id == user.id,
@@ -144,7 +185,7 @@ async def unfavorite_book(
 @router.get("/{book_id}", response_model=BookOut)
 async def get_book(book_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     book = await db.get(Book, book_id)
-    if book is None:
+    if not ensure_book_visible(user, book):
         raise HTTPException(status_code=404, detail="Book not found")
     favorite = await db.scalar(
         select(BookFavorite).where(
@@ -153,7 +194,7 @@ async def get_book(book_id: str, user: User = Depends(get_current_user), db: Asy
         )
     )
     book.is_favorite = favorite is not None
-    return book
+    return _serialize_book(book, user, book.is_favorite)
 @router.delete("/{book_id}", status_code=204, dependencies=[Depends(require_admin)])
 async def delete_book(book_id: str, db: AsyncSession = Depends(get_db)):
     book = await db.get(Book, book_id)
@@ -163,7 +204,7 @@ async def delete_book(book_id: str, db: AsyncSession = Depends(get_db)):
 @router.get("/{book_id}/epub")
 async def download_epub(book_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     book = await db.get(Book, book_id)
-    if book is None:
+    if not ensure_book_visible(user, book):
         raise HTTPException(status_code=404, detail="Book not found")
     try:
         epub_bytes = await EpubService(db).generate(book_id)

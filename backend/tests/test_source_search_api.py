@@ -17,6 +17,7 @@ async def test_source_search_api_returns_in_library_status():
         enabled=True,
         plugin_name="yuedu",
         config={},
+        is_r18=False,
     )
     db = AsyncMock()
     db.get = AsyncMock(return_value=source)

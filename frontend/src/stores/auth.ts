@@ -7,6 +7,9 @@ export interface User {
   username: string
   email: string | null
   role: string
+  r18_enabled: boolean
+  non_r18_enabled: boolean
+  can_manage_visibility: boolean
 }
 
 export const useAuthStore = defineStore("auth", () => {
@@ -54,11 +57,18 @@ function toggleDark() {
     }
   }
 
+  async function updateVisibility(payload: {
+    r18_enabled?: boolean
+    non_r18_enabled?: boolean
+  }) {
+    user.value = await api.put<User>("/auth/me/visibility", payload)
+  }
+
   function logout() {
     token.value = null
     user.value = null
     localStorage.removeItem("novelhub_token")
   }
 
- return { user, token, isDark, isAuthenticated, isAdmin, isSuperAdmin, toggleDark, login, register, fetchMe, logout }
+ return { user, token, isDark, isAuthenticated, isAdmin, isSuperAdmin, toggleDark, login, register, fetchMe, updateVisibility, logout }
 })

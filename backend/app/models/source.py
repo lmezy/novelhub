@@ -31,6 +31,12 @@ class Source(Base):
         default=True
     )
 
+    is_r18 = Column(
+        Boolean,
+        default=False,
+        nullable=False
+    )
+
     config = Column(
         JSONB,
         nullable=True

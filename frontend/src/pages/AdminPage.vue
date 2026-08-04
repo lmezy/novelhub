@@ -16,6 +16,7 @@ interface Source {
   url: string | null
   plugin_name: string
   enabled: boolean
+  is_r18: boolean
 }
 
 interface CookieItem {
@@ -28,7 +29,7 @@ interface CookieItem {
 const tab = ref<"sources" | "cookies" | "sync" | "logs" | "tokens" | "index" | "status" | "yuedu" | "add" | "creds" | "users" | "approvals" | "proxy">("yuedu")
 
 const sources = ref<Source[]>([])
-const sourceForm = ref({ id: "", name: "", url: "", plugin_name: "alicesw" })
+const sourceForm = ref({ id: "", name: "", url: "", plugin_name: "alicesw", is_r18: false })
 const sourceError = ref("")
 
 async function loadSources() {
@@ -50,7 +51,7 @@ async function createSource() {
   try {
     await api.post("/sources", sourceForm.value)
     await loadSources()
-    sourceForm.value = { id: "", name: "", url: "", plugin_name: "alicesw" }
+    sourceForm.value = { id: "", name: "", url: "", plugin_name: "alicesw", is_r18: false }
   } catch (e) {
     sourceError.value = e instanceof Error ? e.message : "Failed"
   }
@@ -129,6 +130,7 @@ const yueduImporting = ref(false)
 const yueduSyncImporting = ref(false)
 const yueduCookie = ref("")
 const yueduDiscover = ref(true)
+const yueduIsR18 = ref(false)
 const yueduSyncResult = ref<any>(null)
 const yueduSyncError = ref("")
 
@@ -328,6 +330,7 @@ async function yueduImport() {
     const body: any = {}
     if (yueduUrl.value) body.url = yueduUrl.value
     if (yueduJsonText.value) body.json_text = yueduJsonText.value
+    body.is_r18 = yueduIsR18.value
     yueduResult.value = await api.post("/yuedu/import", body)
     await loadSources()
     await loadCreds()
@@ -343,7 +346,7 @@ async function yueduImportAndSync() {
   yueduSyncResult.value = null
   yueduSyncImporting.value = true
   try {
-    const body: any = { discover: yueduDiscover.value }
+    const body: any = { discover: yueduDiscover.value, is_r18: yueduIsR18.value }
     if (yueduUrl.value) body.url = yueduUrl.value
     if (yueduJsonText.value) body.json_text = yueduJsonText.value
     if (yueduCookie.value.trim()) body.cookie = yueduCookie.value.trim()
@@ -644,6 +647,20 @@ async function changeUserRole(id: string, role: string) {
   try { await api.put("/admin/users/" + id + "/role", { role }); await loadUsers() } catch (e) { alert(e instanceof Error ? e.message : "Failed") }
 }
 
+async function toggleUserVisibility(
+  u: any,
+  key: "r18_enabled" | "non_r18_enabled" | "can_manage_visibility",
+) {
+  try {
+    const body: any = {}
+    body[key] = !u[key]
+    await api.put("/admin/users/" + u.id + "/visibility", body)
+    await loadUsers()
+  } catch (e) {
+    alert(e instanceof Error ? e.message : "Failed")
+  }
+}
+
 async function loadApprovals() {
   approvalError.value = ""
   try { approvals.value = await api.get<any[]>("/source-changes?status=pending") } catch (e) { approvalError.value = e instanceof Error ? e.message : "Failed" }
@@ -704,6 +721,10 @@ onUnmounted(() => {
             <input v-model="sourceForm.url" :placeholder="i18n.t('admin_placeholder_url')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
             <input v-model="sourceForm.plugin_name" :placeholder="i18n.t('admin_placeholder_plugin')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
           </div>
+          <div class="flex items-center gap-2 mb-3">
+            <input type="checkbox" id="source-r18" v-model="sourceForm.is_r18" class="rounded" />
+            <label for="source-r18" class="text-xs text-muted dark:text-gray-400">R18 source</label>
+          </div>
           <p v-if="sourceError" class="text-sm text-red-600 mb-2">{{ sourceError }}</p>
           <button @click="createSource" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90">{{ i18n.t('admin_create_source') }}</button>
         </div>
@@ -713,6 +734,7 @@ onUnmounted(() => {
             <div>
               <span class="text-sm font-medium">{{ s.name }}</span>
               <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ s.id }} ({{ s.plugin_name }})</span>
+              <span v-if="s.is_r18" class="text-xs px-1.5 py-0.5 rounded ml-2 bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-300">R18</span>
             </div>
             <div class="flex items-center gap-3"><span class="text-xs" :class="s.enabled ? 'text-green-600' : 'text-red-500'">{{ s.enabled ? i18n.t('admin_enabled') : i18n.t('admin_disabled') }}</span><button @click="deleteSource(s.id)" class="text-xs text-red-500 hover:text-red-700">{{ i18n.t('admin_delete') }}</button></div>
           </div>
@@ -942,6 +964,10 @@ onUnmounted(() => {
               <input type="checkbox" id="yuedu-discover" v-model="yueduDiscover" class="rounded" />
               <label for="yuedu-discover" class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_yuedu_discover_label') }}</label>
             </div>
+            <div class="flex items-center gap-2">
+              <input type="checkbox" id="yuedu-r18" v-model="yueduIsR18" class="rounded" />
+              <label for="yuedu-r18" class="text-xs text-muted dark:text-gray-400">R18 source</label>
+            </div>
 
             <p v-if="yueduSyncError" class="text-sm text-red-600">{{ yueduSyncError }}</p>
 
@@ -1127,6 +1153,15 @@ onUnmounted(() => {
               <span class="text-xs px-1.5 py-0.5 rounded-full ml-2" :class="u.role === 'super_admin' ? 'bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-300' : u.role === 'admin' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300' : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400'">{{ u.role }}</span>
             </div>
             <div class="flex items-center gap-2">
+              <button @click="toggleUserVisibility(u, 'r18_enabled')" class="text-xs px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5" :class="u.r18_enabled ? 'text-purple-700 dark:text-purple-300 border-purple-500' : ''">
+                {{ u.r18_enabled ? 'R18 On' : 'R18 Off' }}
+              </button>
+              <button @click="toggleUserVisibility(u, 'non_r18_enabled')" class="text-xs px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5" :class="u.non_r18_enabled ? 'text-green-700 dark:text-green-300 border-green-500' : ''">
+                {{ u.non_r18_enabled ? 'All-Ages On' : 'All-Ages Off' }}
+              </button>
+              <button @click="toggleUserVisibility(u, 'can_manage_visibility')" class="text-xs px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5" :class="u.can_manage_visibility ? 'text-blue-700 dark:text-blue-300 border-blue-500' : ''">
+                {{ u.can_manage_visibility ? 'Controls On' : 'Controls Off' }}
+              </button>
               <select @change="(e: any) => changeUserRole(u.id, e.target.value)" class="text-xs px-2 py-1 rounded border border-border dark:border-gray-700 bg-paper dark:bg-gray-800">
                 <option value="" disabled selected>Change role</option>
                 <option value="user">User</option>

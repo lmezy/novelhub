@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from app.models import User
 from app.services.auth import get_current_user
+from app.services.visibility import can_view_all_ages, can_view_r18
 from pydantic import BaseModel
 
 from app.services.search import search_service
@@ -23,10 +24,24 @@ async def search(user: User = Depends(get_current_user),
     offset: int = 0,
     limit: int = 20,
 ):
+    allow_r18 = can_view_r18(user)
+    allow_all_ages = can_view_all_ages(user)
     if scope == "books":
-        result = search_service.search_books(q, offset=offset, limit=limit)
+        result = search_service.search_books(
+            q,
+            offset=offset,
+            limit=limit,
+            allow_r18=allow_r18,
+            allow_all_ages=allow_all_ages,
+        )
     else:
-        result = search_service.search_chapters(q, offset=offset, limit=limit)
+        result = search_service.search_chapters(
+            q,
+            offset=offset,
+            limit=limit,
+            allow_r18=allow_r18,
+            allow_all_ages=allow_all_ages,
+        )
 
     return SearchResult(
         hits=result["hits"],

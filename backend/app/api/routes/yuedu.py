@@ -62,6 +62,7 @@ async def _fetch_response(url: str, timeout: float = 30.0) -> httpx.Response:
 class YueduImportRequest(BaseModel):
     url: str | None = None
     json_text: str | None = None
+    is_r18: bool = False
 
 
 class YueduImportResult(BaseModel):
@@ -121,6 +122,7 @@ async def import_yuedu_sources(payload: YueduImportRequest, db: AsyncSession = D
             url=base_url,
             plugin_name="yuedu",
             enabled=True,
+            is_r18=payload.is_r18,
             config=src,
         )
         db.add(source)
@@ -142,6 +144,7 @@ async def import_yuedu_sources(payload: YueduImportRequest, db: AsyncSession = D
 class YueduImportSyncRequest(BaseModel):
     url: str | None = None
     json_text: str | None = None
+    is_r18: bool = False
     cookie: str | None = None
     discover: bool = True
     max_discover_pages: int = 3
@@ -174,7 +177,11 @@ async def import_yuedu_sources_as_tasks(
     from app.services.cookie_crypto import encrypt_cookie
 
     import_result = await import_yuedu_sources(
-        YueduImportRequest(url=payload.url, json_text=payload.json_text),
+        YueduImportRequest(
+            url=payload.url,
+            json_text=payload.json_text,
+            is_r18=payload.is_r18,
+        ),
         db,
     )
 
@@ -243,7 +250,11 @@ async def import_and_sync_all(payload: YueduImportSyncRequest, db: AsyncSession 
 
     # Step 1: Import sources
     import_result = await import_yuedu_sources(
-        YueduImportRequest(url=payload.url, json_text=payload.json_text),
+        YueduImportRequest(
+            url=payload.url,
+            json_text=payload.json_text,
+            is_r18=payload.is_r18,
+        ),
         db,
     )
 
@@ -363,6 +374,7 @@ async def preview_yuedu_sources(payload: YueduImportRequest):
             "name": src.get("bookSourceName", "Unknown"),
             "url": src.get("bookSourceUrl", ""),
             "group": src.get("bookSourceGroup", ""),
+            "is_r18": payload.is_r18,
             "type": _source_type_name(src.get("bookSourceType", 0)),
         })
 

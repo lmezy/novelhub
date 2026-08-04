@@ -6,7 +6,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.models import User, Source, SourceChange
 from app.schemas.user import UserOut
-from app.schemas.admin import UserRoleUpdate
+from app.schemas.admin import (
+    UserContentVisibilityUpdate,
+    UserRoleUpdate,
+    UserR18Update,
+)
 from app.services.auth import get_current_user, require_admin, require_super_admin
 from app.services.proxy_config import get_proxy_config, ProxyConfig, set_proxy_config
 
@@ -56,6 +60,45 @@ async def update_user_role(
     if target.id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot change your own role")
     target.role = payload.role
+    await db.commit()
+    await db.refresh(target)
+    return target
+
+
+@router.put("/users/{user_id}/r18", response_model=UserOut)
+async def update_user_r18(
+    user_id: str,
+    payload: UserR18Update,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin-only switch that enables a user to see R18 books."""
+    target = await db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    target.r18_enabled = payload.enabled
+    await db.commit()
+    await db.refresh(target)
+    return target
+
+
+@router.put("/users/{user_id}/visibility", response_model=UserOut)
+async def update_user_visibility(
+    user_id: str,
+    payload: UserContentVisibilityUpdate,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin-only switches for R18 and non-R18 content visibility."""
+    target = await db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if payload.r18_enabled is not None:
+        target.r18_enabled = payload.r18_enabled
+    if payload.non_r18_enabled is not None:
+        target.non_r18_enabled = payload.non_r18_enabled
+    if payload.can_manage_visibility is not None:
+        target.can_manage_visibility = payload.can_manage_visibility
     await db.commit()
     await db.refresh(target)
     return target

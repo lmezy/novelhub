@@ -16,7 +16,9 @@ class SearchService:
             self.client.get_index(name)
         except meilisearch.errors.MeilisearchApiError:
             self.client.create_index(name, {"primaryKey": primary_key})
-            self.client.index(name).update_filterable_attributes(["source_id", "book_id", "author_id"])
+        self.client.index(name).update_filterable_attributes(
+            ["source_id", "book_id", "author_id", "is_r18"]
+        )
 
     def index_book(self, book: dict) -> None:
         self._ensure_index(self.INDEX_BOOKS)
@@ -28,11 +30,45 @@ class SearchService:
         self.client.index(self.INDEX_CHAPTERS).add_documents([chapter])
         logger.debug("Indexed chapter {}", chapter.get("id"))
 
-    def search_books(self, query: str, *, offset: int = 0, limit: int = 20) -> dict:
-        return self.client.index(self.INDEX_BOOKS).search(query, {"offset": offset, "limit": limit})
+    @staticmethod
+    def _visibility_filter(allow_r18: bool, allow_all_ages: bool) -> str | None:
+        if allow_r18 and allow_all_ages:
+            return None
+        if allow_r18:
+            return "is_r18 = true"
+        if allow_all_ages:
+            return "is_r18 = false"
+        return "is_r18 = true AND is_r18 = false"
 
-    def search_chapters(self, query: str, *, offset: int = 0, limit: int = 20) -> dict:
-        return self.client.index(self.INDEX_CHAPTERS).search(query, {"offset": offset, "limit": limit})
+    def search_books(
+        self,
+        query: str,
+        *,
+        offset: int = 0,
+        limit: int = 20,
+        allow_r18: bool = True,
+        allow_all_ages: bool = True,
+    ) -> dict:
+        options = {"offset": offset, "limit": limit}
+        r18_filter = self._visibility_filter(allow_r18, allow_all_ages)
+        if r18_filter:
+            options["filter"] = r18_filter
+        return self.client.index(self.INDEX_BOOKS).search(query, options)
+
+    def search_chapters(
+        self,
+        query: str,
+        *,
+        offset: int = 0,
+        limit: int = 20,
+        allow_r18: bool = True,
+        allow_all_ages: bool = True,
+    ) -> dict:
+        options = {"offset": offset, "limit": limit}
+        r18_filter = self._visibility_filter(allow_r18, allow_all_ages)
+        if r18_filter:
+            options["filter"] = r18_filter
+        return self.client.index(self.INDEX_CHAPTERS).search(query, options)
 
     def delete_book(self, book_id: str) -> None:
         try:
@@ -105,6 +141,7 @@ class SearchService:
                         "status": b.status or "",
                         "source_id": b.source_id or "",
                         "author_id": b.author_id or "",
+                        "is_r18": b.is_r18,
                     })
                 result["books"] = len(book_list)
 
@@ -112,13 +149,22 @@ class SearchService:
                 chapters = await db.scalars(
                     select(Chapter).limit(5000)
                 )
+                chapter_list = list(chapters)
+                book_ids = {ch.book_id for ch in chapter_list if ch.book_id}
+                book_r18: dict[str, bool] = {}
+                if book_ids:
+                    book_rows = await db.execute(
+                        select(Book.id, Book.is_r18).where(Book.id.in_(book_ids))
+                    )
+                    book_r18 = {book_id: bool(is_r18) for book_id, is_r18 in book_rows}
                 batch = []
-                for ch in chapters:
+                for ch in chapter_list:
                     batch.append({
                         "id": ch.id,
                         "book_id": ch.book_id,
                         "title": ch.title or "",
                         "chapter_number": ch.chapter_number or 0,
+                        "is_r18": book_r18.get(ch.book_id, False),
                     })
                 if batch:
                     self.client.index(self.INDEX_CHAPTERS).add_documents(batch)

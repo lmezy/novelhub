@@ -9,6 +9,7 @@ from app.models import Tag, User
 from app.repositories.tag import TagRepository
 from app.schemas.tag import TagCreate, TagOut
 from app.services.auth import get_current_user, require_admin
+from app.services.visibility import R18_TAGS
 
 router = APIRouter(prefix="/tags", tags=["tags"])
 
@@ -21,7 +22,10 @@ async def list_tags(
     db: AsyncSession = Depends(get_db),
 ):
     repo = TagRepository(db)
-    return await repo.list(offset=offset, limit=limit)
+    tags = await repo.list(offset=offset, limit=limit)
+    if user.role not in ("admin", "super_admin"):
+        tags = [tag for tag in tags if tag.name not in R18_TAGS]
+    return tags
 
 
 @router.post("", response_model=TagOut, status_code=201, dependencies=[Depends(require_admin)])

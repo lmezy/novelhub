@@ -1,4 +1,4 @@
-from sqlalchemy import Column,String,DateTime
+from sqlalchemy import Boolean, Column, String, DateTime
 
 from sqlalchemy.sql import func
 
@@ -42,6 +42,24 @@ class User(Base):
         String(16),
         nullable=False,
         default="user"
+    )
+
+    r18_enabled=Column(
+        Boolean,
+        nullable=False,
+        default=False
+    )
+
+    non_r18_enabled=Column(
+        Boolean,
+        nullable=False,
+        default=True
+    )
+
+    can_manage_visibility=Column(
+        Boolean,
+        nullable=False,
+        default=False
     )
 
 

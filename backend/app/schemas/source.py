@@ -7,6 +7,7 @@ class SourceCreate(BaseModel):
     url: str | None = None
     plugin_name: str
     enabled: bool = True
+    is_r18: bool = False
     config: dict | None = None
 
 
@@ -16,6 +17,7 @@ class SourceOut(BaseModel):
     url: str | None = None
     plugin_name: str | None = None
     enabled: bool
+    is_r18: bool = False
     config: dict | None = None
 
     class Config:

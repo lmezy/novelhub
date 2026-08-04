@@ -67,6 +67,16 @@ async function batchDelete() {
   }
 }
 
+async function toggleSelfVisibility(key: "r18_enabled" | "non_r18_enabled") {
+  if (!auth.user) return
+  try {
+    await auth.updateVisibility({ [key]: !auth.user[key] })
+    await loadFavorites()
+  } catch (e) {
+    alert(e instanceof Error ? e.message : "Update failed")
+  }
+}
+
 onMounted(async () => {
   await loadFavorites()
   if (auth.user) {
@@ -107,6 +117,18 @@ onMounted(async () => {
         <div class="flex items-center justify-between mb-6">
           <h1 class="text-2xl font-bold tracking-tight">{{ i18n.t('home_library') }}</h1>
           <div class="flex items-center gap-3">
+            <template v-if="auth.user?.can_manage_visibility && !auth.isAdmin">
+              <button
+                @click="toggleSelfVisibility('r18_enabled')"
+                class="text-xs px-3 py-1.5 rounded border text-sm"
+                :class="auth.user.r18_enabled ? 'bg-purple-100 text-purple-700 border-purple-400 dark:bg-purple-900 dark:text-purple-300' : 'border-border dark:border-gray-700 text-muted dark:text-gray-400'"
+              >{{ auth.user.r18_enabled ? 'R18 On' : 'R18 Off' }}</button>
+              <button
+                @click="toggleSelfVisibility('non_r18_enabled')"
+                class="text-xs px-3 py-1.5 rounded border text-sm"
+                :class="auth.user.non_r18_enabled ? 'bg-green-100 text-green-700 border-green-400 dark:bg-green-900 dark:text-green-300' : 'border-border dark:border-gray-700 text-muted dark:text-gray-400'"
+              >{{ auth.user.non_r18_enabled ? 'All-Ages On' : 'All-Ages Off' }}</button>
+            </template>
             <span class="text-sm text-muted dark:text-gray-400">{{ i18n.t('home_books_count', { n: favoriteBooks.length }) }}</span>
             <button
               v-if="auth.isAdmin && selectedIds.length"

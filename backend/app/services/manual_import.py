@@ -7,6 +7,7 @@ from app.models import Author, Book, BookTag, Chapter, Tag
 from app.repositories.tag import TagRepository
 from app.services.search import search_service
 from app.services.storage import BookStorage
+from app.services.r18 import detect_r18
 
 
 class ManualImportService:
@@ -40,18 +41,25 @@ class ManualImportService:
             self.db.add(db_author)
             await self.db.flush()
 
+        is_r18 = detect_r18(
+            title=title,
+            author=author_name,
+            description=description,
+            tags=tags,
+        )
         book = Book(
             id=str(uuid4()),
             author_id=db_author.id,
             title=title,
             description=description or None,
             status=status or "ongoing",
+            is_r18=is_r18,
         )
         self.db.add(book)
         await self.db.flush()
 
-        if tags:
-            await self._save_tags(book.id, tags)
+        classification_tag = "r18" if is_r18 else "all-ages"
+        await self._save_tags(book.id, [*tags, classification_tag])
 
         self.storage.write_metadata(
             author_name,
@@ -63,6 +71,7 @@ class ManualImportService:
                 "author": author_name,
                 "description": description,
                 "status": status,
+                "is_r18": is_r18,
             },
         )
         search_service.index_book({
@@ -72,6 +81,7 @@ class ManualImportService:
             "status": book.status or "",
             "source_id": "",
             "author_id": book.author_id or "",
+            "is_r18": book.is_r18,
         })
 
         created = 0
@@ -102,6 +112,7 @@ class ManualImportService:
                 "title": chapter_title,
                 "chapter_number": index,
                 "content": content[:5000],
+                "is_r18": book.is_r18,
             })
             created += 1
 
