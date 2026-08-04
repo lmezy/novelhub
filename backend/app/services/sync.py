@@ -84,6 +84,15 @@ class SyncService:
             if self._normalize_title_for_match(b.title) == normalized
         ]
 
+    async def _book_tag_names(self, book_id: str) -> list[str]:
+        """Load tag names without triggering a sync lazy-load on ORM objects."""
+        rows = await self.db.execute(
+            select(Tag.name)
+            .join(BookTag, BookTag.tag_id == Tag.id)
+            .where(BookTag.book_id == book_id)
+        )
+        return [name for (name,) in rows.all()]
+
     @staticmethod
     def _is_book_r18(source: Source, remote_book) -> bool:
         return detect_r18(
@@ -131,7 +140,7 @@ class SyncService:
         same_title_books = await self._find_same_title_books(book)
         source_tags: set[str] = set()
         for candidate in [book, *same_title_books]:
-            for tag in candidate.tag_names:
+            for tag in await self._book_tag_names(candidate.id):
                 tag = tag.strip().lower()
                 if tag and tag not in ("all-ages", "r18"):
                     source_tags.add(tag)
