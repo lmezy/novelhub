@@ -34,6 +34,9 @@ class UserOut(BaseModel):
     non_r18_enabled: bool = True
     can_manage_visibility: bool = False
 
+    class Config:
+        from_attributes = True
+
 
 class UserSelfVisibilityUpdate(BaseModel):
     r18_enabled: bool | None = None

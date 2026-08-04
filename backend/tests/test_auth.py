@@ -1,6 +1,25 @@
 """Tests for auth endpoints."""
 
 import pytest
+from types import SimpleNamespace
+
+from app.schemas.auth import TokenOut
+from app.schemas.user import UserOut
+
+
+def test_token_out_accepts_user_attributes():
+    user = SimpleNamespace(
+        id="1",
+        username="admin",
+        email="admin@example.com",
+        role="super_admin",
+        r18_enabled=True,
+        non_r18_enabled=True,
+        can_manage_visibility=True,
+    )
+    out = TokenOut(access_token="token", user=user)
+    assert out.user.username == "admin"
+    assert UserOut.model_validate(user).role == "super_admin"
 
 
 @pytest.mark.asyncio
