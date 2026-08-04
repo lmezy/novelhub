@@ -327,6 +327,87 @@ async def test_fetch_chapter_content_generic_fallback():
     assert "<" not in content
 
 
+def test_next_content_url_resolves_relative_against_current_page():
+    engine = YueduRuleEngine({
+        "bookSourceUrl": "http://m.5859ycdh.com",
+        "ruleContent": {"nextContentUrl": "a.next@href"},
+    })
+    html = (
+        '<html><body>'
+        '<a class="next" href="16555538-2.html">下一页</a>'
+        '</body></html>'
+    )
+    assert engine.get_next_content_url(
+        html,
+        "http://m.5859ycdh.com/wubashu/29416/16555538.html",
+    ) == "http://m.5859ycdh.com/wubashu/29416/16555538-2.html"
+
+
+def test_next_toc_url_resolves_relative_against_current_page():
+    engine = YueduRuleEngine({
+        "bookSourceUrl": "http://m.5859ycdh.com",
+        "ruleToc": {"nextTocUrl": "a.next@href"},
+    })
+    html = (
+        '<html><body>'
+        '<a class="next" href="list_2.html">下一页</a>'
+        '</body></html>'
+    )
+    assert engine.get_next_toc_url(
+        html,
+        "http://m.5859ycdh.com/wuba/29416/list.html",
+    ) == "http://m.5859ycdh.com/wuba/29416/list_2.html"
+
+
+@pytest.mark.asyncio
+async def test_fetch_chapter_content_resolves_relative_next_pages():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "http://m.5859ycdh.com",
+        "ruleContent": {
+            "content": "#content@text",
+            "nextContentUrl": "a.next@href",
+        },
+        "concurrentRate": "0",
+    })
+    page1 = (
+        '<html><body><div id="content">Page one.</div>'
+        '<a class="next" href="16555538-2.html">下一页</a></body></html>'
+    )
+    page2 = (
+        '<html><body><div id="content">Page two.</div>'
+        '<a class="next" href="16555538-3.html">下一页</a></body></html>'
+    )
+    page3 = (
+        '<html><body><div id="content">Page three.</div></body></html>'
+    )
+    requested: list[str] = []
+
+    async def fake_get(url):
+        requested.append(url)
+        if url.endswith("16555538.html"):
+            return page1
+        if url.endswith("16555538-2.html"):
+            return page2
+        if url.endswith("16555538-3.html"):
+            return page3
+        raise AssertionError(f"unexpected url: {url}")
+
+    chapter = SimpleNamespace(
+        url="http://m.5859ycdh.com/wubashu/29416/16555538.html",
+    )
+    with patch.object(plugin, "_get", fake_get):
+        content = await plugin.fetch_chapter_content(chapter)
+
+    assert "Page one." in content
+    assert "Page two." in content
+    assert "Page three." in content
+    assert requested == [
+        "http://m.5859ycdh.com/wubashu/29416/16555538.html",
+        "http://m.5859ycdh.com/wubashu/29416/16555538-2.html",
+        "http://m.5859ycdh.com/wubashu/29416/16555538-3.html",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_get_falls_back_to_direct_when_proxy_unreachable():
     plugin = YueduPlugin({

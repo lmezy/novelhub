@@ -212,11 +212,16 @@ class YueduPlugin:
         # Follow nextTocUrl for paginated tables of contents
         max_toc_pages = 20
         current_toc_html = html
+        current_toc_url = url
         for _ in range(max_toc_pages):
-            next_toc_url = self.engine.get_next_toc_url(current_toc_html)
+            next_toc_url = self.engine.get_next_toc_url(
+                current_toc_html,
+                current_toc_url,
+            )
             if not next_toc_url:
                 break
             current_toc_html = await self._get(next_toc_url)
+            current_toc_url = next_toc_url
             more_toc = self.engine.parse_toc(current_toc_html)
             if more_toc:
                 toc.extend(more_toc)
@@ -416,11 +421,13 @@ class YueduPlugin:
         # Follow nextContentUrl for multi-page chapters
         max_pages = 20  # safety limit
         current_html = html
+        current_url = chapter.url
         for _ in range(max_pages):
-            next_url = self.engine.get_next_content_url(current_html)
+            next_url = self.engine.get_next_content_url(current_html, current_url)
             if not next_url:
                 break
             current_html = await self._get(next_url)
+            current_url = next_url
             next_part = self.engine.parse_content(current_html)
             if next_part and next_part != current_html:
                 parts.append(next_part)

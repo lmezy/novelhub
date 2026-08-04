@@ -298,19 +298,37 @@ class YueduRuleEngine:
     def parse_content(self, html_or_json: str) -> str:
         return self._extract_content(html_or_json, self.config.get("ruleContent", {}))
 
-    def get_next_content_url(self, html_or_json: str) -> str | None:
+    def get_next_content_url(
+        self,
+        html_or_json: str,
+        current_url: str | None = None,
+    ) -> str | None:
         rules = self.config.get("ruleContent", {})
         next_rule = rules.get("nextContentUrl", "")
         if not next_rule:
             return None
-        return self._eval_rule_str(html_or_json, next_rule, is_url=True)
+        return self._eval_rule_str(
+            html_or_json,
+            next_rule,
+            is_url=True,
+            base_url=current_url,
+        )
 
-    def get_next_toc_url(self, html_or_json: str) -> str | None:
+    def get_next_toc_url(
+        self,
+        html_or_json: str,
+        current_url: str | None = None,
+    ) -> str | None:
         rules = self.config.get("ruleToc", {})
         next_rule = rules.get("nextTocUrl", "")
         if not next_rule:
             return None
-        return self._eval_rule_str(html_or_json, next_rule, is_url=True)
+        return self._eval_rule_str(
+            html_or_json,
+            next_rule,
+            is_url=True,
+            base_url=current_url,
+        )
 
     # ---- Internal extraction ----
 
@@ -579,7 +597,13 @@ class YueduRuleEngine:
             return [elements[i] for i in ordered]
         return list(elements)
 
-    def _eval_rule_str(self, raw: str | Any, rule: str, is_url: bool = False) -> str:
+    def _eval_rule_str(
+        self,
+        raw: str | Any,
+        rule: str,
+        is_url: bool = False,
+        base_url: str | None = None,
+    ) -> str:
         result = self._eval_field(raw, rule)
         if result is None:
             return ""
@@ -587,7 +611,7 @@ class YueduRuleEngine:
             result = "\n".join(str(r) for r in result)
         result = str(result)
         if is_url and result.strip():
-            return urljoin(self.base_url, result)
+            return urljoin(base_url or self.base_url, result)
         return result
 
     def _eval_field(self, raw: Any, rule: str) -> Any:
