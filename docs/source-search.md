@@ -61,8 +61,12 @@ curl -X POST "http://localhost:8088/api/sync/book" \
 The search implementation follows Legado behavior:
 
 - `{{key}}` / `{{page}}` and legacy `searchKey` / `searchPage` placeholders.
+- Page arithmetic expressions such as `{{(page-1)*12}}`.
 - URL option suffix such as `,{"method":"POST","body":{...}}`.
 - POST JSON bodies, extra headers, cookies, retries, and proxy fallback.
+- Legado CSS shorthand selectors: `tag.xxx`, `class.xxx`, `id.xxx`,
+  `text.xxx`, `children.xxx`, `@` chains, `-`/`+` list prefixes, index
+  selectors (`option.0`, `option!0`, `option[-1]`), and `##` regex suffixes.
 - `bookUrlPattern` filtering so category/search/navigation links are not
   returned as novels.
 - Generic list parsing fallback when the configured `ruleSearch` misses the

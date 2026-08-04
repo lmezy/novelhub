@@ -398,20 +398,185 @@ class YueduRuleEngine:
         if not rule:
             return []
 
+        reverse = False
+        if rule.startswith("-"):
+            reverse = True
+            rule = rule[1:]
+        elif rule.startswith("+"):
+            rule = rule[1:]
+
         parsed = self._try_parse_json(raw)
         if parsed is not None:
             self._is_json_context = True
             try:
                 result = self._jsonpath(parsed, rule)
                 if isinstance(result, list):
-                    return result
+                    return list(reversed(result)) if reverse else result
                 return [result] if result is not None else []
             finally:
                 self._is_json_context = False
 
         self._is_json_context = False
-        soup = BeautifulSoup(raw, "lxml")
-        elements = soup.select(rule)
+        return self._get_elements(raw, rule)
+
+    def _get_elements(self, raw: Any, rule: str) -> list[Tag]:
+        """Port of Legado AnalyzeByJSoup getElements with @ chains and indexes."""
+        if not rule:
+            return []
+        reverse = False
+        if rule.startswith("-"):
+            reverse = True
+            rule = rule[1:]
+        elif rule.startswith("+"):
+            rule = rule[1:]
+        if rule.lower().startswith("@css:"):
+            rule = rule[5:].strip()
+
+        root = self._ensure_soup(raw)
+        if root is None:
+            return []
+
+        elements: list[Tag] = [root]
+        for segment in rule.split("@"):
+            segment = segment.strip()
+            if not segment:
+                continue
+            elements = self._select_elements_chain(elements, segment)
+        if reverse:
+            elements.reverse()
+        return elements
+
+    def _select_elements_chain(
+        self,
+        elements: list[Tag],
+        rule: str,
+    ) -> list[Tag]:
+        if rule.startswith("@@"):
+            rule = rule[2:]
+            selected: list[Tag] = []
+            for el in elements:
+                selected.extend(el.select(rule))
+            return selected
+
+        before, split, indexes = self._parse_legado_index(rule)
+        selected: list[Tag] = []
+        for el in elements:
+            if before:
+                base = self._legado_before_elements(el, before)
+            else:
+                base = [c for c in getattr(el, "children", []) if isinstance(c, Tag)]
+            if indexes:
+                selected.extend(self._apply_legado_indexes(base, indexes, split))
+            else:
+                selected.extend(base)
+        return selected
+
+    @staticmethod
+    def _parse_legado_index(rule: str) -> tuple[str, str, list[Any]]:
+        """Split a Legado element rule into selector, index mode, and indexes."""
+        rule = rule.strip()
+        if rule.endswith("]"):
+            start = rule.rfind("[")
+            if start != -1:
+                before = rule[:start].rstrip()
+                inner = rule[start + 1:-1].strip()
+                split = "!"
+                if inner.startswith("!"):
+                    inner = inner[1:]
+                else:
+                    split = "."
+                indexes: list[Any] = []
+                for part in inner.split(","):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    if ":" in part:
+                        segs = part.split(":")
+
+                        def _int(v: str) -> int | None:
+                            try:
+                                return int(v) if v.strip() else None
+                            except ValueError:
+                                return None
+
+                        start_i = _int(segs[0]) if len(segs) > 0 else None
+                        end_i = _int(segs[1]) if len(segs) > 1 else None
+                        step = _int(segs[2]) if len(segs) > 2 else None
+                        indexes.append((start_i, end_i, step or 1))
+                    else:
+                        try:
+                            indexes.append(int(part))
+                        except ValueError:
+                            pass
+                if not indexes:
+                    split = " "
+                return before, split, indexes
+
+        m = re.match(r"^(.*?)([.!:])(-?\d+)$", rule)
+        if m:
+            return m.group(1).rstrip(), m.group(2), [int(m.group(3))]
+        return rule, " ", []
+
+    @staticmethod
+    def _legado_before_elements(el: Tag, before: str) -> list[Tag]:
+        before = before.strip()
+        if before in ("children", "children."):
+            return [c for c in getattr(el, "children", []) if isinstance(c, Tag)]
+        parts = before.split(".", 1)
+        if len(parts) == 2:
+            kind, value = parts
+            if kind == "class":
+                return el.find_all(class_=value)
+            if kind == "tag":
+                return el.find_all(value)
+            if kind == "id":
+                return el.find_all(id=value)
+            if kind == "text":
+                return [
+                    node.parent for node in el.find_all(string=True)
+                    if node.parent is not None and value in str(node)
+                ]
+        return el.select(before)
+
+    @staticmethod
+    def _apply_legado_indexes(
+        elements: list[Tag],
+        indexes: list[Any],
+        split: str,
+    ) -> list[Tag]:
+        length = len(elements)
+        chosen: set[int] = set()
+        ordered: list[int] = []
+
+        for index in indexes:
+            if isinstance(index, int):
+                i = index if index >= 0 else index + length
+                if 0 <= i < length and i not in chosen:
+                    chosen.add(i)
+                    ordered.append(i)
+            elif isinstance(index, tuple):
+                start, end, step = index
+                start = 0 if start is None else (start if start >= 0 else start + length)
+                end = length - 1 if end is None else (end if end >= 0 else end + length)
+                step = step or 1
+                if step < 0:
+                    step = -step
+                start = max(0, min(length - 1, start))
+                end = max(0, min(length - 1, end))
+                rng = (
+                    range(start, end + 1, step)
+                    if start <= end
+                    else range(start, end - 1, -step)
+                )
+                for i in rng:
+                    if 0 <= i < length and i not in chosen:
+                        chosen.add(i)
+                        ordered.append(i)
+
+        if split == "!":
+            return [elements[i] for i in range(length) if i not in chosen]
+        if split == ".":
+            return [elements[i] for i in ordered]
         return list(elements)
 
     def _eval_rule_str(self, raw: str | Any, rule: str, is_url: bool = False) -> str:
@@ -509,7 +674,8 @@ class YueduRuleEngine:
         if soup is None:
             return None
         analyzer = _RuleAnalyzer(rule)
-        rules = analyzer.split_rule(*self.SEPARATORS)
+        separators = ("&&", "||", "%%") if "##" in rule else self.SEPARATORS
+        rules = analyzer.split_rule(*separators)
         elem_type = analyzer.elements_type
         results: list[list[str]] = []
         for rl in rules:
@@ -545,16 +711,26 @@ class YueduRuleEngine:
     def _eval_css_single(self, soup: BeautifulSoup | Tag, rule: str) -> list[str] | None:
         if not rule:
             return [soup.get_text("\n", strip=True)]
-        css_part, attr_suffix = self._split_css_attr(rule)
-        if css_part:
-            elements = soup.select(css_part)
-        else:
-            elements = [soup] if isinstance(soup, Tag) else []
+        parts = rule.split("@")
+        elements: list[Tag] = [soup]
+        attr_suffix = "text"
+        for i, part in enumerate(parts):
+            part = part.strip()
+            if not part:
+                continue
+            if i == len(parts) - 1:
+                attr_suffix = part
+            else:
+                elements = self._select_elements_chain(elements, part)
         if not elements:
             return None
+        raw_attr = attr_suffix
+        attr_suffix = attr_suffix.split("##")[0].strip()
         results: list[str] = []
         for el in elements:
             val = self._extract_css_value(el, attr_suffix)
+            if "##" in raw_attr:
+                val = self._apply_replace_regex(val, raw_attr)
             if val:
                 results.append(val)
         return results if results else None
@@ -599,7 +775,8 @@ class YueduRuleEngine:
         if not isinstance(raw, (dict, list)):
             return None
         analyzer = _RuleAnalyzer(rule, code_balance=True)
-        rules = analyzer.split_rule(*self.SEPARATORS)
+        separators = ("&&", "||", "%%") if "##" in rule else self.SEPARATORS
+        rules = analyzer.split_rule(*separators)
         elem_type = analyzer.elements_type
         results: list[str] = []
         for rl in rules:
@@ -658,9 +835,8 @@ class YueduRuleEngine:
             except re.error:
                 return text
         if len(parts) == 2:
-            pattern, replacement = parts
             try:
-                return re.sub(pattern, replacement, text)
+                return re.sub(parts[1], "", text)
             except re.error:
                 return text
         if rule.strip():
@@ -860,6 +1036,19 @@ class YueduRuleEngine:
         result = re.sub(
             r"\{\{\s*page\s*([+-])\s*(\d+)\s*\}\}",
             _page_expr_replacer,
+            result,
+        )
+        def _math_replacer(m: re.Match) -> str:
+            expr = m.group(1).strip().replace("page", kwargs.get("page", "1"))
+            if re.fullmatch(r"[0-9+\-*/().\s]+", expr):
+                try:
+                    return str(int(eval(expr, {"__builtins__": {}}, {})))
+                except Exception:
+                    pass
+            return m.group(0)
+        result = re.sub(
+            r"\{\{\s*([0-9+\-*/().\s]*page[0-9+\-*/().\s]*)\s*\}\}",
+            _math_replacer,
             result,
         )
         result = result.replace("{{searchPage}}", kwargs.get("page", "1"))

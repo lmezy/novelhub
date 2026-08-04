@@ -609,6 +609,19 @@ def try_eval_js_pattern(js_code: str, raw: Any) -> Any:
             if m and idx2 <= len(m.groups()):
                 return m.group(idx2)
 
+    # String(result).match(/pattern/) or result.match(/pattern/)
+    match_string = re.search(
+        r"(?:String\(result\)|result)\.match\(\s*/(.+?)/(\w*)\s*\)",
+        code,
+    )
+    if match_string:
+        pattern = match_string.group(1)
+        if isinstance(raw, str):
+            m = re.search(pattern, raw)
+            if m:
+                return m.group(0)
+            return None
+
     # result.split("sep")[n]
     split_match = re.search(
         r'result\.split\(\s*["\'](.+?)["\']\s*\)\s*\[(\d+)\]', code
