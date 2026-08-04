@@ -258,10 +258,11 @@ class YueduRuleEngine:
     def build_search_url(self, keyword: str, page: int = 1) -> str:
         template = self.config.get("searchUrl", "")
         if not template:
-            if self.base_url:
-                return self._substitute(self.base_url, key=keyword, page=str(page))
             raise ValueError("No searchUrl defined in source config")
-        return self._substitute(template, key=keyword, page=str(page))
+        url = self._substitute(template, key=keyword, page=str(page))
+        # Legacy Legado placeholders still appear in many exported sources.
+        url = url.replace("searchKey", keyword).replace("searchPage", str(page))
+        return url
 
     def build_explore_url(self, page: int = 1) -> str:
         template = self.config.get("exploreUrl", "")
@@ -861,6 +862,8 @@ class YueduRuleEngine:
             _page_expr_replacer,
             result,
         )
+        result = result.replace("{{searchPage}}", kwargs.get("page", "1"))
+        result = result.replace("{{searchKey}}", kwargs.get("key", ""))
         def _var_replacer(m: re.Match) -> str:
             var = m.group(1)
             if var in self._variables:

@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+import json
 
 from app.crawler.plugins.yuedu import YueduPlugin
 from app.crawler.plugins.yuedu.rule_engine import YueduRuleEngine
@@ -375,3 +376,92 @@ async def test_get_falls_back_to_direct_when_proxy_unreachable():
     assert html == "<html>ok</html>"
     assert proxy_calls[0] == "http://127.0.0.1:1"
     assert proxy_calls[-1] is None
+
+
+SEARCH_SOURCE = {
+    "bookSourceUrl": "https://example.com",
+    "bookUrlPattern": r"https?://example\.com/novel/\d+\.html",
+    "searchUrl": "https://example.com/search?q={{key}}",
+    "ruleSearch": {
+        "bookList": "div.result",
+        "name": "a@text",
+        "bookUrl": "a@href",
+        "author": ".author@text",
+        "lastChapter": ".latest@text",
+    },
+    "concurrentRate": "0",
+}
+
+
+@pytest.mark.asyncio
+async def test_search_books_filters_category_links_and_normalizes():
+    plugin = YueduPlugin(SEARCH_SOURCE)
+    html = """
+    <html><body>
+      <div class="result"><a href="/novel/123.html">Book One</a><span class="author">Author A</span><span class="latest">Chapter 1</span></div>
+      <div class="result"><a href="/lists/65.html">Category</a></div>
+      <div class="result"><a href="/novel/456.html">Book Two</a><span class="author">Author B</span></div>
+    </body></html>
+    """
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        items = await plugin.search_books("test", page=1)
+
+    assert [item["bookUrl"] for item in items] == [
+        "https://example.com/novel/123.html",
+        "https://example.com/novel/456.html",
+    ]
+    assert items[0]["author"] == "Author A"
+    assert items[0]["lastChapter"] == "Chapter 1"
+
+
+API_SEARCH_SOURCE = {
+    "bookSourceUrl": "https://api.example.com",
+    "bookUrlPattern": r"https?://api\.example\.com/books/\d+",
+    "searchUrl": 'https://api.example.com/search,{"method":"POST","body":{"q":"searchKey","page":{{searchPage}}}}',
+    "ruleSearch": {
+        "bookList": "$.data",
+        "name": "$.title",
+        "author": "$.author",
+        "bookUrl": "$.url",
+    },
+    "concurrentRate": "0",
+}
+
+
+@pytest.mark.asyncio
+async def test_search_books_posts_json_body_with_legacy_placeholders():
+    plugin = YueduPlugin(API_SEARCH_SOURCE)
+    response_json = json.dumps({
+        "data": [
+            {"title": "Book A", "author": "Author", "url": "/books/1"},
+            {"title": "Book B", "author": "Author", "url": "/books/2"},
+        ]
+    })
+    captured: dict[str, object] = {}
+
+    async def fake_post(url, body=None, headers=None):
+        captured["url"] = url
+        captured["body"] = body
+        captured["headers"] = headers
+        return response_json
+
+    with patch.object(plugin, "_post", fake_post):
+        items = await plugin.search_books("hello", page=2)
+
+    assert captured["url"] == "https://api.example.com/search"
+    assert "hello" in str(captured["body"])
+    assert '"page": 2' in str(captured["body"])
+    assert captured["headers"].get("Content-Type") == "application/json"
+    assert [item["bookUrl"] for item in items] == [
+        "https://api.example.com/books/1",
+        "https://api.example.com/books/2",
+    ]
+
+
+def test_search_books_requires_search_url():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "ruleSearch": {"bookList": "div.result"},
+    })
+    with pytest.raises(ValueError, match="searchUrl"):
+        plugin.engine.build_search_url("hello")

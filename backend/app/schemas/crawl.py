@@ -8,6 +8,7 @@ class CrawlTaskOut(BaseModel):
     source: str
     mode: str = "bookshelf"
     max_pages: int = 200
+    priority: int = 0
     status: str
     started_at: datetime | None = None
     finished_at: datetime | None = None

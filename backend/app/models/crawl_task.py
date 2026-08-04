@@ -41,6 +41,13 @@ class CrawlTask(Base):
     )
 
 
+    priority = Column(
+        Integer,
+        default=0,
+        nullable=False
+    )
+
+
     status = Column(
         String(32),
         default="pending"

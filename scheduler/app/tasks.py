@@ -59,77 +59,21 @@ async def _check_cookie_health_async() -> dict:
 async def _crawl_all_source_async(source_id: str, max_pages: int, task_id: str | None) -> dict:
     from app.core.database import SessionLocal
     from app.models import CrawlTask
-    from app.services.sync import SyncService
+    from app.services.crawl_runner import run_crawl_task_async
 
-    class TaskCancelled(Exception):
-        pass
-
-    async with SessionLocal() as db:
-        task_obj = None
-        if task_id:
-            task_obj = await db.get(CrawlTask, task_id)
-            if task_obj:
-                task_obj.status = "running"
-                task_obj.started_at = _naive_utcnow()
-                task_obj.error = None
-                await db.commit()
-
-        async def _wait_if_paused() -> None:
-            if task_obj is None:
-                return
-            while True:
-                await db.refresh(task_obj)
-                if task_obj.status == "cancelled":
-                    raise TaskCancelled("Task cancelled")
-                if task_obj.status != "paused":
-                    return
-                await asyncio.sleep(1)
-
-        async def _update_progress(page: int, found: int, synced: int, failed: int) -> None:
-            if task_obj is None:
-                return
-            task_obj.progress = {
-                "pages_checked": page,
-                "books_found": found,
-                "books_synced": synced,
-                "books_failed": failed,
-            }
-            await db.commit()
-
-        try:
-            result = await SyncService(db).discover_and_sync_all(
-                source_id,
+    if task_id is None:
+        async with SessionLocal() as db:
+            task = CrawlTask(
+                id=str(uuid4()),
+                source=source_id,
+                mode="discover_all",
                 max_pages=max_pages,
-                progress_cb=_update_progress,
-                before_step=_wait_if_paused,
+                status="pending",
             )
-            if task_obj:
-                task_obj.status = "completed"
-                task_obj.result = result
-                task_obj.progress = {
-                    "pages_checked": result.get("pages_checked", 0),
-                    "books_found": result.get("books_found", 0),
-                    "books_synced": result.get("books_synced", 0),
-                    "books_failed": result.get("books_failed", 0),
-                    "done": True,
-                }
-                task_obj.finished_at = _naive_utcnow()
-                await db.commit()
-            return result
-        except TaskCancelled as exc:
-            if task_obj:
-                task_obj.status = "cancelled"
-                task_obj.error = str(exc)
-                task_obj.finished_at = _naive_utcnow()
-                await db.commit()
-            raise
-        except Exception as exc:
-            if task_obj:
-                task_obj.status = "failed"
-                task_obj.error = str(exc)
-                task_obj.finished_at = _naive_utcnow()
-                await db.commit()
-            raise
+            db.add(task)
+            await db.commit()
+            task_id = task.id
+    return await run_crawl_task_async(task_id)
 
 
 async def _daily_sync_all_async() -> dict:

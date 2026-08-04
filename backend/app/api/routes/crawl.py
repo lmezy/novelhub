@@ -3,7 +3,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -21,6 +21,7 @@ router = APIRouter(prefix="/crawl", tags=["crawl"], dependencies=[Depends(requir
 class CrawlTaskCreateRequest(BaseModel):
     source: str
     max_pages: int = 200
+    priority: int = 0
 
 
 @router.post("/tasks", response_model=CrawlTaskOut, status_code=202)
@@ -38,6 +39,7 @@ async def create_crawl_task(
         source=payload.source,
         mode="discover_all",
         max_pages=payload.max_pages,
+        priority=payload.priority,
         status="pending",
     )
     db.add(task)
@@ -84,9 +86,10 @@ async def pause_task(task_id: str, db: AsyncSession = Depends(get_db)):
     task = await repo.get(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Crawl task not found")
-    if task.status != "running":
+    if task.status not in ("pending", "running"):
         raise HTTPException(status_code=400, detail=f"Cannot pause task in status: {task.status}")
-    task.status = "paused"
+    if task.status != "paused":
+        task.status = "paused"
     await db.commit()
     return {"task_id": task.id, "status": task.status}
 
@@ -99,9 +102,31 @@ async def resume_task(task_id: str, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Crawl task not found")
     if task.status != "paused":
         raise HTTPException(status_code=400, detail=f"Cannot resume task in status: {task.status}")
-    task.status = "running"
+    task.status = "pending"
     await db.commit()
     return {"task_id": task.id, "status": task.status}
+
+
+@router.post("/tasks/{task_id}/move-front")
+async def move_task_front(task_id: str, db: AsyncSession = Depends(get_db)):
+    """Move a queued task to the front of the DB-backed crawl queue."""
+    repo = CrawlTaskRepository(db)
+    task = await repo.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Crawl task not found")
+    if task.status not in ("pending", "paused"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot reorder task in status: {task.status}",
+        )
+    top_priority = await db.scalar(
+        select(func.max(CrawlTask.priority)).where(
+            CrawlTask.status.in_(["pending", "paused"])
+        )
+    )
+    task.priority = (top_priority or 0) + 1
+    await db.commit()
+    return {"task_id": task.id, "status": task.status, "priority": task.priority}
 
 
 @router.post("/tasks/{task_id}/cancel")

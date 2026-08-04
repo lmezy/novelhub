@@ -26,14 +26,15 @@ app.conf.update(
     task_reject_on_worker_lost=True,
     task_default_retry_delay=300,  # 5 minutes
     task_max_retries=3,
-    task_default_queue="crawl",
+    task_default_queue="scheduler",
     task_queues={
+        "scheduler": {"exchange": "scheduler", "routing_key": "scheduler"},
         "crawl": {"exchange": "crawl", "routing_key": "crawl"},
     },
     task_routes={
-        "tasks.daily_sync_all": {"queue": "crawl"},
-        "tasks.sync_single_source": {"queue": "crawl"},
-        "tasks.resync_all_books": {"queue": "crawl"},
+        "tasks.daily_sync_all": {"queue": "scheduler"},
+        "tasks.sync_single_source": {"queue": "scheduler"},
+        "tasks.resync_all_books": {"queue": "scheduler"},
         "tasks.crawl_all_source": {"queue": "crawl"},
     },
     beat_schedule={

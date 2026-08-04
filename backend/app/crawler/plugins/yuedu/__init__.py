@@ -1071,6 +1071,145 @@ class YueduPlugin:
             ))
         return books
 
+    async def search_books(
+        self,
+        keyword: str,
+        page: int = 1,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Search remote books using the source's searchUrl/ruleSearch rules.
+
+        Supports Legado URL options (POST JSON/body, headers, webView) and
+        legacy searchKey/searchPage placeholders found in exported sources.
+        """
+        if not self.engine:
+            raise RuntimeError("YueduPlugin not configured")
+
+        keyword = (keyword or "").strip()
+        if not keyword:
+            return []
+
+        search_url = self.engine.build_search_url(keyword, page)
+        options = self._parse_url_options(search_url)
+        request_url = options["url"] if options else search_url
+
+        if options and str(options.get("method", "GET")).upper() == "POST":
+            html = await self._post(
+                request_url,
+                body=options.get("body"),
+                headers=options.get("headers") or {},
+            )
+        else:
+            web_js = (options or {}).get("web_js") or self.engine.get_web_js()
+            if web_js or (options or {}).get("web_view"):
+                html = await self._get_with_web_js(request_url, web_js)
+            else:
+                html = await self._get(request_url)
+
+        items = self.engine.parse_search_results(html)
+        results = self._normalize_search_items(items, request_url)
+        if not results:
+            results = self._fallback_search_items(html, request_url)
+        return results[:limit] if limit and limit > 0 else results
+
+    def _normalize_search_items(
+        self,
+        items: list[dict[str, Any]],
+        page_url: str | None,
+    ) -> list[dict[str, Any]]:
+        """Normalize ruleSearch entries and filter non-book links."""
+        seen: set[str] = set()
+        results: list[dict[str, Any]] = []
+        link_base = self._make_absolute(page_url, self.base_url) if page_url else self.base_url
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or item.get("title") or "").strip()
+            book_url = str(item.get("bookUrl") or item.get("url") or "").strip()
+            if not name or not book_url:
+                continue
+            full_url = self._make_absolute(book_url, link_base)
+            if not full_url.startswith(("http://", "https://")):
+                continue
+            if not self._is_book_url(full_url, require_pattern=True):
+                continue
+            key = full_url.rstrip("/")
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append({
+                "name": name,
+                "author": str(item.get("author") or "").strip() or "Unknown",
+                "bookUrl": full_url,
+                "coverUrl": str(item.get("coverUrl") or "").strip() or None,
+                "intro": str(item.get("intro") or "").strip() or None,
+                "kind": str(item.get("kind") or "").strip() or None,
+                "lastChapter": (
+                    str(item.get("lastChapter") or item.get("latestChapterTitle") or "")
+                    .strip() or None
+                ),
+                "wordCount": str(item.get("wordCount") or "").strip() or None,
+            })
+        return results
+
+    def _fallback_search_items(
+        self,
+        html: str,
+        page_url: str,
+    ) -> list[dict[str, Any]]:
+        """Fall back to generic list parsing when ruleSearch misses."""
+        shelf_books = self._parse_bookshelf_html(html, base_url=page_url)
+        return [
+            {
+                "name": book.title,
+                "author": book.author,
+                "bookUrl": book.url,
+                "lastChapter": book.latest_chapter_title,
+            }
+            for book in shelf_books
+        ]
+
+    @staticmethod
+    def _parse_url_options(rule_url: str) -> dict[str, Any] | None:
+        """Split a Legado URL option suffix (`,{...}`) from the request URL."""
+        match = re.search(r"\s*,\s*(\{.*)$", rule_url, re.DOTALL)
+        if not match:
+            return None
+        base_url = rule_url[: match.start()].strip()
+        option_text = match.group(1)
+        try:
+            option = json.loads(option_text)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(option, dict):
+            return None
+
+        headers = option.get("headers") or {}
+        if isinstance(headers, str):
+            try:
+                headers = json.loads(headers)
+            except (json.JSONDecodeError, ValueError):
+                headers = {}
+        if not isinstance(headers, dict):
+            headers = {}
+
+        body = option.get("body")
+        if isinstance(body, dict):
+            body = json.dumps(body, ensure_ascii=False)
+            headers.setdefault("Content-Type", "application/json")
+        elif isinstance(body, str) and body.lstrip().startswith(("{", "[")):
+            headers.setdefault("Content-Type", "application/json")
+
+        return {
+            "url": base_url,
+            "method": str(option.get("method", "GET")),
+            "headers": {str(k): str(v) for k, v in headers.items()},
+            "body": body,
+            "web_view": bool(option.get("webView")),
+            "web_js": option.get("webJs") or "",
+        }
+
     async def update_book(self, url: str) -> RemoteBook | None:
         """Re-fetch a book to check for new chapters."""
         try:
@@ -1208,16 +1347,55 @@ class YueduPlugin:
                 })
         return cookies
 
-    async def _get(self, url: str) -> str:
-        """HTTP GET with cookie, headers from config, rate limiting, and cookie jar."""
+    def _build_headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+        """Build request headers from source config, cookies, and per-request extras."""
+        headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) Mobile Safari/537.36"}
+        if self._cookie:
+            headers["Cookie"] = self._cookie
+
+        header_rule = self.config.get("header", "")
+        if header_rule:
+            try:
+                if "JSON.stringify" in header_rule:
+                    m = re.search(r'JSON\.stringify\((\{.+?\})\)', header_rule, re.DOTALL)
+                    if m:
+                        custom_headers = json.loads(m.group(1))
+                        headers.update(custom_headers)
+                elif header_rule.startswith("{"):
+                    custom_headers = json.loads(header_rule)
+                    headers.update(custom_headers)
+                elif header_rule.startswith("@js:") or "<js>" in header_rule:
+                    js = header_rule
+                    if js.startswith("@js:"):
+                        js = js[4:]
+                    m = re.search(r'JSON\.stringify\((\{.+?\})\)', js, re.DOTALL)
+                    if not m:
+                        m = re.search(
+                            r'"(?:User-Agent|Content-Type|Cookie|Referer|Accept)[^}]*}',
+                            js,
+                            re.IGNORECASE,
+                        )
+                    if m:
+                        try:
+                            hdr_str = m.group(0)
+                            if not hdr_str.startswith("{"):
+                                hdr_str = "{" + hdr_str + "}"
+                            hdr_str = re.sub(r'(\w+):', r'"\1":', hdr_str)
+                            custom_headers = json.loads(hdr_str)
+                            headers.update(custom_headers)
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+            except Exception:
+                pass
+
+        if extra:
+            headers.update(extra)
+        return headers
+
+    async def _sleep_rate_limit(self) -> None:
+        """Polite rate limiting: source rule wins, otherwise use a safe default."""
         import asyncio
-        import json
-        import httpx
 
-        if not url.startswith(("http://", "https://")):
-            raise ValueError(f"Unsupported URL: {url}")
-
-        # Polite rate limiting: source rule wins, otherwise use a safe default.
         rate = self.config.get("concurrentRate", "")
         delay_ms = 0
         if rate:
@@ -1231,47 +1409,123 @@ class YueduPlugin:
         if delay_ms > 0:
             await asyncio.sleep((delay_ms + random.uniform(200, 600)) / 1000.0)
 
-        headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) Mobile Safari/537.36"}
+    def _capture_cookie_jar(self, resp) -> None:
+        """Collect Set-Cookie headers when the source enables its cookie jar."""
+        if not self.config.get("enabledCookieJar", False):
+            return
+        set_cookies = resp.headers.get_list("set-cookie")
+        if not set_cookies:
+            return
+        existing = dict(
+            (p.split("=", 1)[0], p)
+            for p in self._cookie.split("; ")
+            if "=" in p
+        )
+        for sc in set_cookies:
+            part = sc.split(";")[0].strip()
+            if "=" in part:
+                existing[part.split("=", 1)[0]] = part
+        self._cookie = "; ".join(existing.values())
 
-        # Add stored cookies
-        if self._cookie:
-            headers["Cookie"] = self._cookie
+    async def _post(
+        self,
+        url: str,
+        body: Any = None,
+        headers: dict[str, str] | None = None,
+    ) -> str:
+        """HTTP POST with the same retry/proxy behavior as _get."""
+        import asyncio
+        import httpx
 
-        # Parse header rule from config (may be JS or JSON)
-        header_rule = self.config.get("header", "")
-        header_rule = self.config.get("header", "")
-        if header_rule:
+        if not url.startswith(("http://", "https://")):
+            raise ValueError(f"Unsupported URL: {url}")
+        await self._sleep_rate_limit()
+        headers = self._build_headers(headers)
+
+        proxy_url = None
+        try:
+            from app.services.proxy_config import get_proxy_config
+            cfg = get_proxy_config()
+            if cfg.enabled:
+                proxy_url = cfg.https_proxy or cfg.http_proxy
+        except Exception:
+            pass
+
+        async def _request(proxy: str | None) -> str:
+            last_error: httpx.HTTPError | None = None
+            for attempt in range(3):
+                try:
+                    async with httpx.AsyncClient(
+                        headers=headers,
+                        timeout=30,
+                        follow_redirects=True,
+                        proxy=proxy,
+                        trust_env=False,
+                    ) as client:
+                        if isinstance(body, str):
+                            content_type = headers.get("Content-Type", "").lower()
+                            if "json" in content_type:
+                                resp = await client.post(url, content=body)
+                            else:
+                                resp = await client.post(url, data=body)
+                        elif body is None:
+                            resp = await client.post(url)
+                        else:
+                            resp = await client.post(url, json=body)
+
+                        if resp.status_code in (429, 500, 502, 503, 504):
+                            retry_after = resp.headers.get("Retry-After", "")
+                            wait = (
+                                float(retry_after)
+                                if retry_after and retry_after.replace(".", "", 1).isdigit()
+                                else 2 ** attempt
+                            )
+                            await asyncio.sleep(wait + random.uniform(0.5, 1.5))
+                            continue
+                        resp.raise_for_status()
+                        self._capture_cookie_jar(resp)
+                        return resp.text
+                except httpx.HTTPError as exc:
+                    last_error = exc
+                    if attempt < 2:
+                        await asyncio.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
+
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError(f"Request failed after retries: {url}")
+
+        proxies: list[str | None] = [None]
+        if proxy_url:
+            proxies.insert(0, proxy_url)
+
+        last_error: httpx.HTTPError | None = None
+        for proxy in proxies:
             try:
-                if "JSON.stringify" in header_rule:
-                    m = re.search(r'JSON\\.stringify\\((\\{.+?\\})\\)', header_rule, re.DOTALL)
-                    if m:
-                        custom_headers = json.loads(m.group(1))
-                        headers.update(custom_headers)
-                elif header_rule.startswith("{"):
-                    custom_headers = json.loads(header_rule)
-                    headers.update(custom_headers)
-                elif header_rule.startswith("@js:") or "<js>" in header_rule:
-                    js = header_rule
-                    if js.startswith("@js:"):
-                        js = js[4:]
-                    m = re.search(r'JSON\\.stringify\\((\\{.+?\\})\\)', js, re.DOTALL)
-                    if not m:
-                        m = re.search(r'"(?:User-Agent|Content-Type|Cookie|Referer|Accept)[^}]*}', js, re.IGNORECASE)
-                    if m:
-                        try:
-                            hdr_str = m.group(0)
-                            if not hdr_str.startswith("{"):
-                                hdr_str = "{" + hdr_str + "}"
-                            hdr_str = re.sub(r'(\\w+):', r'"\\1":', hdr_str)
-                            custom_headers = json.loads(hdr_str)
-                            headers.update(custom_headers)
-                        except (json.JSONDecodeError, ValueError):
-                            pass
-            except Exception:
-                pass
+                return await _request(proxy)
+            except httpx.RequestError as exc:
+                last_error = exc
+                if proxy is None:
+                    raise
+                logger.warning(
+                    "Configured proxy %s unreachable (%s); retrying direct",
+                    proxy_url,
+                    exc,
+                )
 
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f"Request failed after retries: {url}")
 
-        # Proxy support: read from global proxy config
+    async def _get(self, url: str) -> str:
+        """HTTP GET with cookie, headers from config, rate limiting, and cookie jar."""
+        import asyncio
+        import httpx
+
+        if not url.startswith(("http://", "https://")):
+            raise ValueError(f"Unsupported URL: {url}")
+        await self._sleep_rate_limit()
+        headers = self._build_headers()
+
         proxy_url = None
         try:
             from app.services.proxy_config import get_proxy_config
@@ -1303,22 +1557,7 @@ class YueduPlugin:
                             await asyncio.sleep(wait + random.uniform(0.5, 1.5))
                             continue
                         resp.raise_for_status()
-
-                        # Cookie jar: collect Set-Cookie headers
-                        if self.config.get("enabledCookieJar", False):
-                            set_cookies = resp.headers.get_list("set-cookie")
-                            if set_cookies:
-                                existing = dict(
-                                    (p.split("=", 1)[0], p)
-                                    for p in self._cookie.split("; ")
-                                    if "=" in p
-                                )
-                                for sc in set_cookies:
-                                    part = sc.split(";")[0].strip()
-                                    if "=" in part:
-                                        existing[part.split("=", 1)[0]] = part
-                                self._cookie = "; ".join(existing.values())
-
+                        self._capture_cookie_jar(resp)
                         return resp.text
                 except httpx.HTTPError as exc:
                     last_error = exc

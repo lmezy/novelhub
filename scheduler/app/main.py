@@ -1,7 +1,6 @@
 """Celery beat scheduler -- dispatches periodic sync tasks.
 
-Run inside the scheduler container to trigger daily-sync-all-sources
-and any other beat-scheduled tasks.
+The crawler container runs the worker that consumes the scheduler queue.
 """
 
 import subprocess

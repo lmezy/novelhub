@@ -385,6 +385,7 @@ class SyncService:
         sync: bool = True,
         progress_cb: Callable[[int, int, int, int], Awaitable[None]] | None = None,
         before_step: Callable[[], Awaitable[None]] | None = None,
+        start_page: int = 1,
     ) -> dict:
         """Discover every book across catalog pages and optionally sync them."""
         source = await self.db.get(Source, source_id)
@@ -420,8 +421,9 @@ class SyncService:
         chapters_created = 0
         chapters_skipped = 0
         pages_checked = 0
+        start_page = max(1, int(start_page or 1))
 
-        for page in range(1, max_pages + 1):
+        for page in range(start_page, max_pages + 1):
             if before_step is not None:
                 await before_step()
             page_books = await plugin.discover_books(url=url, page=page)
@@ -497,4 +499,5 @@ class SyncService:
             "chapters_created": chapters_created,
             "chapters_skipped": chapters_skipped,
             "details": details,
+            "next_page": min(max_pages, pages_checked) + 1 if pages_checked else start_page,
         }

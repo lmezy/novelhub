@@ -1,26 +1,11 @@
-"""Celery client helpers for enqueueing crawler tasks from the API process."""
+"""Crawl queue helpers.
 
-from celery import Celery
-
-from app.core.config import settings
-
-celery_app = Celery(
-    "novelhub",
-    broker=f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/0",
-)
-
-celery_app.conf.update(
-    task_default_queue="crawl",
-    task_routes={
-        "tasks.crawl_all_source": {"queue": "crawl"},
-    },
-)
+Full-site crawl tasks are now DB-backed: the API writes a ``crawl_tasks`` row
+with ``status=pending`` and the crawler worker polls that table in priority
+order. No Celery message is needed for manual crawl tasks.
+"""
 
 
 def enqueue_crawl_all(source_id: str, max_pages: int = 200, task_id: str | None = None) -> str:
-    result = celery_app.send_task(
-        "tasks.crawl_all_source",
-        args=[source_id, max_pages, task_id],
-        queue="crawl",
-    )
-    return result.id
+    """Return the task id; the DB queue worker picks it up automatically."""
+    return task_id or ""
