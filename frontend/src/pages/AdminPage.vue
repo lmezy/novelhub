@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue"
+import { useRouter } from "vue-router"
 import { api } from "../api/client"
 import { useI18nStore } from "../stores/i18n"
 import { useCrawlStore } from "../stores/crawl"
@@ -7,6 +8,7 @@ import NavBar from "../components/NavBar.vue"
 
 const i18n = useI18nStore()
 const crawlStore = useCrawlStore()
+const router = useRouter()
 
 interface Source {
   id: string
@@ -345,9 +347,13 @@ async function yueduImportAndSync() {
     if (yueduUrl.value) body.url = yueduUrl.value
     if (yueduJsonText.value) body.json_text = yueduJsonText.value
     if (yueduCookie.value.trim()) body.cookie = yueduCookie.value.trim()
-    yueduSyncResult.value = await api.post("/yuedu/import-and-sync", body)
+    yueduSyncResult.value = await api.post("/yuedu/import-task", body)
     await loadSources()
     await loadCookies()
+    if (yueduSyncResult.value?.tasks?.length) {
+      await crawlStore.setTask(yueduSyncResult.value.tasks[0])
+      router.push("/sync")
+    }
   } catch (e) {
     yueduSyncError.value = e instanceof Error ? e.message : "Import & Sync failed"
   } finally {

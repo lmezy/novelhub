@@ -17,9 +17,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.models import Source
+from app.models import CrawlTask, Source
 from app.services.auth import require_admin
 from app.services.proxy_config import get_proxy_config
+from app.services.task_queue import enqueue_crawl_all
 
 router = APIRouter(prefix="/yuedu", tags=["yuedu"])
 
@@ -155,6 +156,73 @@ class YueduImportSyncResult(BaseModel):
     books_discovered: int
     errors: list[dict[str, Any]]
     details: list[dict[str, Any]]
+
+
+class YueduImportTaskResult(BaseModel):
+    tasks: list[dict[str, Any]]
+
+
+@router.post("/import-task", response_model=YueduImportTaskResult, status_code=202, dependencies=[Depends(require_admin)])
+async def import_yuedu_sources_as_tasks(
+    payload: YueduImportSyncRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Import sources and enqueue one crawl task per source for progress tracking."""
+    from uuid import uuid4
+
+    from app.models import Cookie
+    from app.services.cookie_crypto import encrypt_cookie
+
+    import_result = await import_yuedu_sources(
+        YueduImportRequest(url=payload.url, json_text=payload.json_text),
+        db,
+    )
+
+    if payload.cookie and payload.cookie.strip():
+        for src_info in import_result.sources:
+            source_id = src_info["id"]
+            existing_cookie = await db.scalar(
+                select(Cookie).where(Cookie.source == source_id)
+            )
+            if existing_cookie is None:
+                db.add(Cookie(
+                    id=str(uuid4()),
+                    source=source_id,
+                    cookie_data=encrypt_cookie(payload.cookie.strip()),
+                ))
+        await db.commit()
+
+    tasks: list[dict[str, Any]] = []
+    if payload.discover:
+        for src_info in import_result.sources:
+            task = CrawlTask(
+                id=str(uuid4()),
+                source=src_info["id"],
+                mode="discover_all",
+                max_pages=payload.max_discover_pages,
+                status="pending",
+            )
+            db.add(task)
+            await db.flush()
+            enqueue_crawl_all(task.source, task.max_pages, task.id)
+            tasks.append({
+                "id": task.id,
+                "task_id": task.id,
+                "source_id": task.source,
+                "source_name": src_info.get("name", task.source),
+                "status": task.status,
+                "max_pages": task.max_pages,
+                "mode": task.mode,
+                "started_at": task.started_at,
+                "finished_at": task.finished_at,
+                "error": task.error,
+                "result": task.result,
+                "progress": task.progress,
+                "created_at": task.created_at,
+            })
+        await db.commit()
+
+    return YueduImportTaskResult(tasks=tasks)
 
 
 @router.post("/import-and-sync", response_model=YueduImportSyncResult, dependencies=[Depends(require_admin)])

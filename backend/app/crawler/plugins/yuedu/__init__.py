@@ -512,7 +512,7 @@ class YueduPlugin:
                 txt = a_tag.get_text(strip=True)
                 if txt and len(txt) >= 2 and len(txt) <= 60:
                     if any(seg in href.lower() for seg in ["/book/", "/novel/", "/read/", "/detail/", "/info/", "/article/", "/xiaoshuo/"]):
-                        items.append(a_tag.parent if a_tag.parent else a_tag)
+                        items.append(a_tag)
             if not items:
                 return []
 
@@ -599,6 +599,68 @@ class YueduPlugin:
                 url=full_url,
                 latest_chapter_title=latest,
             ))
+
+        if not books:
+            # Direct anchor fallback: some list pages do not use the common
+            # shelf-item wrappers, so scan every book-looking link instead.
+            seen_urls: set[str] = set()
+            skip_titles = {"首页", "上一页", "下一页", "末页", "home", "next", "prev", "login", "注册"}
+            nav_paths = ["/rank", "/top", "/sort", "/allvisit", "/lastupdate",
+                         "/update", "/new", "/finish", "/quanben", "/wanben",
+                         "/bookcase", "/bookshelf", "/history", "/index", "/list", "/page"]
+            skip_patterns = ["/search/", "/tag/", "/tags/", "/category/", "/categories/",
+                             "/author/", "/user/", "/users/", "/login", "/register",
+                             "/signup", "/about", "/help", "/faq", "/contact"]
+            for a_tag in soup.select("a[href]"):
+                href = (a_tag.get("href") or "").strip()
+                if not href or href in ("#", "javascript:;", "javascript:void(0)"):
+                    continue
+                full_url = self._make_absolute(href, self.base_url)
+                if not full_url.startswith(("http://", "https://")):
+                    continue
+                path = urlparse(full_url).path.lower()
+                if not any(seg in path for seg in ("/novel/", "/book/", "/read/", "/detail/", "/xiaoshuo/")):
+                    continue
+                if any(p in path for p in nav_paths):
+                    continue
+                if any(p in full_url.lower() for p in skip_patterns):
+                    continue
+                if full_url in seen_urls:
+                    continue
+
+                title = a_tag.get_text(" ", strip=True)
+                if not title:
+                    title = a_tag.get("title") or a_tag.get("alt") or ""
+                if not title and a_tag.parent is not None:
+                    heading = a_tag.parent.select_one("h3, h2, h4, .book-name, .book-title")
+                    title = heading.get_text(" ", strip=True) if heading else ""
+                title = title.strip()
+                if not title or len(title) < 2 or title.lower() in skip_titles:
+                    continue
+
+                book_id = full_url.split("/")[-1]
+                if not book_id or (
+                    book_id.isdigit()
+                    and not any(seg in path for seg in ("/novel/", "/book/", "/read/", "/detail/"))
+                ):
+                    continue
+
+                author = "Unknown"
+                if a_tag.parent is not None:
+                    for sel in SHELF_AUTHOR_SELECTORS:
+                        author_el = a_tag.parent.select_one(sel)
+                        if author_el:
+                            author = author_el.get_text(" ", strip=True) or "Unknown"
+                            break
+
+                seen_urls.add(full_url)
+                books.append(RemoteShelfBook(
+                    source_book_id=book_id,
+                    title=title,
+                    author=author,
+                    url=full_url,
+                    latest_chapter_title=None,
+                ))
 
         return books
 

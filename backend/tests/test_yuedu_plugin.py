@@ -27,6 +27,25 @@ def test_parse_bookshelf_skips_javascript_links():
     assert books[0].url == "https://example.com/novel/123.html"
 
 
+def test_parse_bookshelf_direct_anchor_fallback():
+    plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
+    html = """
+    <html><body>
+      <div class="rank">
+        <a href="/novel/123.html">Book One</a>
+        <a href="/novel/456">Book Two</a>
+        <a href="/rank/1.html">排行榜</a>
+      </div>
+    </body></html>
+    """
+
+    books = plugin._parse_bookshelf_html(html)
+
+    assert len(books) == 2
+    assert books[0].title == "Book One"
+    assert books[1].url == "https://example.com/novel/456"
+
+
 def test_substitute_page_expressions():
     engine = YueduRuleEngine({"bookSourceUrl": "https://example.com"})
 
