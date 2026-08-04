@@ -207,12 +207,26 @@ class YueduPlugin:
         toc_data = {"bookUrl": url, "baseUrl": self.base_url}
         self.engine.run_pre_update_js(toc_data)
 
-        toc = self.engine.parse_toc(html)
+        toc_url = str(info.get("tocUrl") or "").strip()
+        if toc_url and not toc_url.startswith(("http://", "https://")):
+            toc_url = self._make_absolute(toc_url, url)
+        if not toc_url:
+            toc_url = url
+
+        if toc_url.rstrip("/") == url.rstrip("/"):
+            toc_html = html
+        else:
+            toc_html = await self._get(toc_url)
+
+        toc = self._resolve_toc_entries(
+            self.engine.parse_toc(toc_html),
+            toc_url,
+        )
 
         # Follow nextTocUrl for paginated tables of contents
         max_toc_pages = 20
-        current_toc_html = html
-        current_toc_url = url
+        current_toc_html = toc_html
+        current_toc_url = toc_url
         for _ in range(max_toc_pages):
             next_toc_url = self.engine.get_next_toc_url(
                 current_toc_html,
@@ -224,7 +238,9 @@ class YueduPlugin:
             current_toc_url = next_toc_url
             more_toc = self.engine.parse_toc(current_toc_html)
             if more_toc:
-                toc.extend(more_toc)
+                toc.extend(
+                    self._resolve_toc_entries(more_toc, current_toc_url)
+                )
 
         generic = self._parse_book_generic(html, url)
         if not str(info.get("name") or "").strip():
@@ -1357,7 +1373,16 @@ class YueduPlugin:
 
     def _build_headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         """Build request headers from source config, cookies, and per-request extras."""
-        headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) Mobile Safari/537.36"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 13) Mobile Safari/537.36",
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/avif,image/webp,*/*;q=0.8"
+            ),
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        }
         if self._cookie:
             headers["Cookie"] = self._cookie
 
@@ -1465,7 +1490,7 @@ class YueduPlugin:
                 try:
                     async with httpx.AsyncClient(
                         headers=headers,
-                        timeout=30,
+                        timeout=httpx.Timeout(60.0, connect=15.0, write=15.0),
                         follow_redirects=True,
                         proxy=proxy,
                         trust_env=False,
@@ -1549,7 +1574,7 @@ class YueduPlugin:
                 try:
                     async with httpx.AsyncClient(
                         headers=headers,
-                        timeout=30,
+                        timeout=httpx.Timeout(60.0, connect=15.0, write=15.0),
                         follow_redirects=True,
                         proxy=proxy,
                         trust_env=False,
@@ -1607,6 +1632,18 @@ class YueduPlugin:
         if ck and ck.strip():
             return ck.strip()
         return default
+
+    @staticmethod
+    def _resolve_toc_entries(
+        entries: list[dict[str, Any]],
+        base_url: str,
+    ) -> list[dict[str, Any]]:
+        """Resolve TOC chapter URLs against the page they were parsed from."""
+        for entry in entries:
+            ch_url = str(entry.get("chapterUrl") or "").strip()
+            if ch_url and not ch_url.startswith(("http://", "https://")):
+                entry["chapterUrl"] = urljoin(base_url, ch_url)
+        return entries
 
     @staticmethod
     def _make_absolute(href: str, base: str) -> str:

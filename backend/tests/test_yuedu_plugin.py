@@ -286,6 +286,55 @@ async def test_fetch_book_accepts_relative_chapter_urls():
 
 
 @pytest.mark.asyncio
+async def test_fetch_book_uses_toc_url_and_resolves_relative_chapters():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "ruleBookInfo": {
+            "name": "h1@text",
+            "tocUrl": "a.toc@href",
+        },
+        "ruleToc": {
+            "chapterList": "ul.chapters li",
+            "chapterName": "a@text",
+            "chapterUrl": "a@href",
+        },
+        "concurrentRate": "0",
+    })
+    book_html = (
+        '<html><body><h1>Book One</h1>'
+        '<a class="toc" href="list.html">目录</a></body></html>'
+    )
+    toc_html = (
+        '<html><body><ul class="chapters">'
+        '<li><a href="1.html">Chapter 1</a></li>'
+        '<li><a href="2.html">Chapter 2</a></li>'
+        '</ul></body></html>'
+    )
+    requested: list[str] = []
+
+    async def fake_get(url):
+        requested.append(url)
+        if url == "https://example.com/books/123.html":
+            return book_html
+        if url == "https://example.com/books/list.html":
+            return toc_html
+        raise AssertionError(f"unexpected url: {url}")
+
+    with patch.object(plugin, "_get", fake_get):
+        book = await plugin.fetch_book("https://example.com/books/123.html")
+
+    assert book.title == "Book One"
+    assert [(c.title, c.url) for c in book.chapters] == [
+        ("Chapter 1", "https://example.com/books/1.html"),
+        ("Chapter 2", "https://example.com/books/2.html"),
+    ]
+    assert requested == [
+        "https://example.com/books/123.html",
+        "https://example.com/books/list.html",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_fetch_chapter_content_handles_replace_regex_list():
     plugin = YueduPlugin(ALICE_SOURCE)
     html = """
