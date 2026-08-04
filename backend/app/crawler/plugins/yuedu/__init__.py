@@ -348,18 +348,12 @@ class YueduPlugin:
                 break
 
         if not chapter_links:
-            book_segment = urlparse(url).path.rstrip("/").split("/")[-1].split(".")[0]
             for a in soup.select("a[href]"):
                 href = (a.get("href") or "").strip()
                 if not href or href in ("#", "javascript:;", "javascript:void(0)"):
                     continue
-                path = urlparse(self._make_absolute(href, url)).path.lower()
-                if (
-                    "/chapter/" in path
-                    or "/read/" in path
-                    or (book_segment and book_segment in path and "/novel/" in path)
-                    or (book_segment and book_segment in path and "/book/" in path)
-                ):
+                abs_url = self._make_absolute(href, url)
+                if self._is_chapter_url(abs_url, url):
                     chapter_links.append(a)
 
         chapters: list[RemoteChapter] = []
@@ -770,10 +764,14 @@ class YueduPlugin:
                 if same_host:
                     return False
         path = urlparse(url).path.lower()
-        return any(
-            seg in path
-            for seg in ("/novel/", "/book/", "/read/", "/detail/", "/xiaoshuo/")
-        )
+        segments = [seg for seg in path.split("/") if seg]
+        for prefix in ("novel", "book", "read", "detail", "xiaoshuo"):
+            if prefix not in segments:
+                continue
+            tail = segments[segments.index(prefix) + 1:]
+            if len(tail) == 1 and tail[0]:
+                return True
+        return False
 
     def _is_chapter_url(self, url: str, book_url: str) -> bool:
         """Filter out book-page, category, and navigation links from a TOC."""
@@ -784,21 +782,17 @@ class YueduPlugin:
 
         path = urlparse(abs_url).path.lower()
         skip_paths = (
-            "/lists/", "/category/", "/categories/", "/tag/", "/tags/",
-            "/author/", "/search/", "/bookcase/", "/bookshelf/", "/user/",
+            "/lists/", "/list", "/category/", "/categories/", "/tag/", "/tags/",
+            "/author/", "/search", "/bookcase/", "/bookshelf/", "/user/",
             "/login", "/register", "/signup", "/about", "/help", "/faq",
             "/contact", "/rank", "/top", "/sort", "/finish", "/wanben",
-            "/quanben", "/allvisit", "/lastupdate",
+            "/quanben", "/allvisit", "/lastupdate", "/history", "/index",
         )
         if any(seg in path for seg in skip_paths):
             return False
-        if "/chapter/" in path or "/read/" in path:
-            return True
-
-        book_path = urlparse(abs_book).path.lower().rstrip("/")
-        book_id = book_path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
-        segments = [seg for seg in path.split("/") if seg]
-        return bool(book_id and book_id in segments)
+        if self._is_book_url(abs_url, require_pattern=True):
+            return False
+        return True
 
     # ---- Bookshelf URL auto-detection ----
 

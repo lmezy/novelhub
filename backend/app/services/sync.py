@@ -54,7 +54,8 @@ class SyncService:
             or str(remote_book.title or "").strip() in ("", "Unknown")
         ):
             raise ValueError(
-                f"Book page returned no usable metadata/chapters: {url}"
+                f"Book page returned no usable metadata/chapters: {url} "
+                f"(title={remote_book.title!r}, chapters={len(remote_book.chapters)})"
             )
 
         book_title = self._safe_title(remote_book)
@@ -470,6 +471,12 @@ class SyncService:
                 except Exception as exc:
                     await self.db.rollback()
                     books_failed += 1
+                    logger.warning(
+                        "Failed to sync book {} ({}): {}",
+                        sb.title,
+                        sb.url,
+                        exc,
+                    )
                     details.append({
                         "title": sb.title,
                         "author": sb.author,

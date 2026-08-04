@@ -264,6 +264,27 @@ async def test_fetch_book_does_not_treat_book_page_as_chapter():
 
 
 @pytest.mark.asyncio
+async def test_fetch_book_accepts_relative_chapter_urls():
+    plugin = YueduPlugin(ALICE_SOURCE)
+    html = """
+    <html><body>
+      <h1>Book One</h1>
+      <div class="list">
+        <a href="123/1.html">Chapter 1</a>
+        <a href="123/2.html">Chapter 2</a>
+      </div>
+    </body></html>
+    """
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        book = await plugin.fetch_book("https://www.alicesw.com/novel/123.html")
+
+    assert [(c.title, c.url) for c in book.chapters] == [
+        ("Chapter 1", "https://www.alicesw.com/novel/123/1.html"),
+        ("Chapter 2", "https://www.alicesw.com/novel/123/2.html"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_fetch_chapter_content_handles_replace_regex_list():
     plugin = YueduPlugin(ALICE_SOURCE)
     html = """
