@@ -896,7 +896,8 @@ class YueduPlugin:
                 title, url = line.split("::", 1)
                 kinds.append({"title": title.strip(), "url": url.strip()})
             else:
-                kinds.append({"title": line, "url": line})
+                # Header/separator lines have no URL; fetch_explore skips them.
+                kinds.append({"title": line, "url": ""})
         return kinds
 
     def _parse_explore_json(self, text: str) -> list[dict[str, str]]:
@@ -911,7 +912,7 @@ class YueduPlugin:
                 items = json.loads(text)
                 if isinstance(items, list):
                     return [
-                        {"title": item.get("title", ""), "url": item.get("url", item.get("title", ""))}
+                        {"title": item.get("title", ""), "url": item.get("url", "")}
                         for item in items if isinstance(item, dict)
                     ]
             except (json.JSONDecodeError, ValueError):

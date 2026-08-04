@@ -465,3 +465,26 @@ def test_search_books_requires_search_url():
     })
     with pytest.raises(ValueError, match="searchUrl"):
         plugin.engine.build_search_url("hello")
+
+
+def test_explore_kinds_skip_header_lines_without_url():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "exploreUrl": "————分类————\n玄幻::https://example.com/list/1\n都市::https://example.com/list/2",
+    })
+    kinds = plugin.get_explore_kinds()
+    assert kinds == [
+        {"title": "————分类————", "url": ""},
+        {"title": "玄幻", "url": "https://example.com/list/1"},
+        {"title": "都市", "url": "https://example.com/list/2"},
+    ]
+
+
+def test_explore_json_kind_without_url_is_empty():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "exploreUrl": '[{"title":"Header"},{"title":"Fantasy","url":"/fantasy"}]',
+    })
+    kinds = plugin.get_explore_kinds()
+    assert kinds[0]["url"] == ""
+    assert kinds[1]["url"] == "/fantasy"
