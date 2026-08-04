@@ -41,7 +41,12 @@ async function resyncBook() {
   syncing.value = true
   try {
     const result = await api.post('/books/' + book.value.id + '/sync')
-    alert('Synced: ' + result.created_chapters + ' new chapters, ' + result.skipped_chapters + ' skipped')
+    const failed = result.failed_chapters?.length || 0
+    alert(
+      'Synced: ' + result.created_chapters + ' new chapters, ' +
+      result.skipped_chapters + ' skipped' +
+      (failed ? ', ' + failed + ' failed' : ''),
+    )
     chapters.value = await store.fetchChapters(book.value.id)
   } catch (e) {
     alert(e instanceof Error ? e.message : "Sync failed")

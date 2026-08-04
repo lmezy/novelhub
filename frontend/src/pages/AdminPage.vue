@@ -805,7 +805,7 @@ onUnmounted(() => {
           </button>
           <div v-if="syncResult" class="mt-4 p-3 rounded bg-green-50 text-sm">
             <p>{{ i18n.t('admin_book_id') }}: {{ syncResult.book_id }}</p>
-            <p>{{ i18n.t('admin_created_chapters') }}: {{ syncResult.created_chapters }} / {{ i18n.t('admin_skipped') }}: {{ syncResult.skipped_chapters }}</p>
+            <p>{{ i18n.t('admin_created_chapters') }}: {{ syncResult.created_chapters }} / {{ i18n.t('admin_skipped') }}: {{ syncResult.skipped_chapters }}<span v-if="syncResult.failed_chapters?.length"> / failed: {{ syncResult.failed_chapters.length }}</span></p>
           </div>
         </div>
 

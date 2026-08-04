@@ -2,7 +2,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.crawler.base import RemoteBook, RemoteShelfBook
+from app.crawler.base import RemoteBook, RemoteChapter, RemoteShelfBook
 from app.models import Book, Cookie, Source
 from app.services.sync import SyncService
 
@@ -65,6 +65,70 @@ async def test_sync_book_rejects_empty_remote_book():
 
 
 @pytest.mark.asyncio
+async def test_sync_book_continues_after_failed_chapter():
+    db = AsyncMock()
+    db.get.return_value = _source()
+    db.scalar.return_value = None
+    db.rollback = AsyncMock()
+    db.commit = AsyncMock()
+    db.flush = AsyncMock()
+    db.add = MagicMock()
+
+    remote_book = RemoteBook(
+        source_book_id="https://example.com/book/1",
+        title="Book",
+        author="Author",
+        description=None,
+        status=None,
+        chapters=[
+            RemoteChapter(
+                source_chapter_id="1",
+                title="Chapter 1",
+                url="https://example.com/book/1.html",
+                chapter_number=1,
+            ),
+            RemoteChapter(
+                source_chapter_id="2",
+                title="Chapter 2",
+                url="https://example.com/book/2.html",
+                chapter_number=2,
+            ),
+        ],
+        tags=["tag1"],
+    )
+    plugin = AsyncMock()
+    plugin.fetch_book.return_value = remote_book
+
+    async def fake_fetch_chapter(chapter):
+        if chapter.chapter_number == 1:
+            raise RuntimeError("network down")
+        return "content-2"
+
+    plugin.fetch_chapter_content.side_effect = fake_fetch_chapter
+
+    service = SyncService(db)
+    service.storage = MagicMock()
+    service.storage.write_metadata = MagicMock()
+    service.storage.write_chapter.return_value = ("path", "hash")
+
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.emit"),
+        patch("app.services.sync.search_service"),
+        patch("app.services.auto_categorize.AutoCategorizationService"),
+        patch.object(service, "_save_tags", AsyncMock()),
+        patch.object(service, "_find_same_title_books", AsyncMock(return_value=[])),
+    ):
+        result = await service.sync_book("src1", "https://example.com/book/1")
+
+    assert result["created_chapters"] == 1
+    assert result["skipped_chapters"] == 0
+    assert len(result["failed_chapters"]) == 1
+    assert result["failed_chapters"][0]["chapter_number"] == 1
+    assert "network down" in result["failed_chapters"][0]["error"]
+
+
+@pytest.mark.asyncio
 async def test_sync_bookshelf_rolls_back_and_continues_after_failure():
     db = AsyncMock()
     db.get.return_value = _source()
@@ -115,6 +179,7 @@ async def test_sync_bookshelf_rolls_back_and_continues_after_failure():
         "status": "ok",
         "created_chapters": 1,
         "skipped_chapters": 0,
+        "failed_chapters": [],
     }
 
 

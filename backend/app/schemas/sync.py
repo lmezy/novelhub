@@ -10,6 +10,7 @@ class SyncResult(BaseModel):
     book_id: str
     created_chapters: int
     skipped_chapters: int
+    failed_chapters: list[dict] = []
 
 
 class BookshelfSyncRequest(BaseModel):

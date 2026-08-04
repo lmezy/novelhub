@@ -1,3 +1,4 @@
+import asyncio
 import re
 from uuid import uuid4
 from collections.abc import Awaitable, Callable
@@ -34,6 +35,25 @@ class SyncService:
     @staticmethod
     def _safe_author(name: str | None) -> str:
         return SyncService._safe_text(name, "Unknown")
+
+    @staticmethod
+    async def _fetch_chapter_with_retry(
+        plugin,
+        remote_chapter,
+        attempts: int = 3,
+    ) -> str:
+        """Fetch a chapter, retrying transient network errors."""
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                return await plugin.fetch_chapter_content(remote_chapter)
+            except Exception as exc:
+                last_error = exc
+                if attempt < attempts - 1:
+                    await asyncio.sleep((2 ** attempt) + 0.5)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Chapter fetch failed")
 
     @staticmethod
     def _is_http_url(url: str) -> bool:
@@ -162,9 +182,8 @@ class SyncService:
         created = 0
         skipped = 0
         total = len(remote_book.chapters)
-        batch = 0
+        failed_chapters: list[dict] = []
         for remote_chapter in remote_book.chapters:
-            batch += 1
             existing = await self.db.scalar(
                 select(Chapter).where(
                     Chapter.book_id == book.id,
@@ -175,46 +194,76 @@ class SyncService:
                 skipped += 1
                 continue
 
-            content = await plugin.fetch_chapter_content(remote_chapter)
-            content_path, content_hash = self.storage.write_chapter(
-                author_name,
-                book_title,
-                remote_chapter.chapter_number,
-                remote_chapter.title,
-                content,
-            )
-            chapter = Chapter(
-                id=str(uuid4()),
-                book_id=book.id,
-                chapter_number=remote_chapter.chapter_number,
-                source_chapter_id=remote_chapter.source_chapter_id,
-                title=remote_chapter.title,
-                content_path=content_path,
-                hash=content_hash,
-            )
-            self.db.add(chapter)
-            await self.db.flush()
+            try:
+                content = await self._fetch_chapter_with_retry(
+                    plugin,
+                    remote_chapter,
+                )
+                content_path, content_hash = self.storage.write_chapter(
+                    author_name,
+                    book_title,
+                    remote_chapter.chapter_number,
+                    remote_chapter.title,
+                    content,
+                )
+                chapter = Chapter(
+                    id=str(uuid4()),
+                    book_id=book.id,
+                    chapter_number=remote_chapter.chapter_number,
+                    source_chapter_id=remote_chapter.source_chapter_id,
+                    title=remote_chapter.title,
+                    content_path=content_path,
+                    hash=content_hash,
+                )
+                self.db.add(chapter)
+                await self.db.flush()
 
-            search_service.index_chapter({
-                "id": chapter.id,
-                "book_id": book.id,
-                "title": chapter.title or "",
-                "chapter_number": chapter.chapter_number,
-                "content": content[:5000],
-                "is_r18": book.is_r18,
-            })
+                search_service.index_chapter({
+                    "id": chapter.id,
+                    "book_id": book.id,
+                    "title": chapter.title or "",
+                    "chapter_number": chapter.chapter_number,
+                    "content": content[:5000],
+                    "is_r18": book.is_r18,
+                })
 
-            emit(EventType.CHAPTER_CREATED, chapter_id=chapter.id, book_id=book.id)
-            created += 1
-
-            # Commit every 20 chapters so partial progress is saved on failure
-            if batch % 20 == 0:
+                emit(
+                    EventType.CHAPTER_CREATED,
+                    chapter_id=chapter.id,
+                    book_id=book.id,
+                )
+                created += 1
+                # Commit per chapter so a later failure cannot lose earlier work.
                 await self.db.commit()
-                logger.debug("Checkpoint: {}/{} chapters synced for book {}", created, total, book.id)
+            except Exception as exc:
+                await self.db.rollback()
+                failed_chapters.append({
+                    "chapter_number": remote_chapter.chapter_number,
+                    "title": remote_chapter.title,
+                    "url": remote_chapter.url,
+                    "error": str(exc)[:300],
+                })
+                logger.warning(
+                    "Failed to sync chapter {} ({}): {}",
+                    remote_chapter.title,
+                    remote_chapter.url,
+                    exc,
+                )
 
-        await self.db.commit()
-        emit(EventType.SYNC_COMPLETED, book_id=book.id, created=created, skipped=skipped)
-        logger.info("Sync complete book={} created={} skipped={}", book.id, created, skipped)
+        emit(
+            EventType.SYNC_COMPLETED,
+            book_id=book.id,
+            created=created,
+            skipped=skipped,
+            failed=len(failed_chapters),
+        )
+        logger.info(
+            "Sync complete book={} created={} skipped={} failed={}",
+            book.id,
+            created,
+            skipped,
+            len(failed_chapters),
+        )
 
         # Auto-categorize after sync (if new book or new tags)
         try:
@@ -227,6 +276,7 @@ class SyncService:
             "book_id": book.id,
             "created_chapters": created,
             "skipped_chapters": skipped,
+            "failed_chapters": failed_chapters,
         }
 
     async def _get_or_create_author(self, name: str) -> Author:
@@ -248,7 +298,9 @@ class SyncService:
         is_r18: bool = False,
     ) -> tuple[Book, bool]:
         book = await self.db.scalar(
-            select(Book).where(
+            select(Book)
+            .options(selectinload(Book.tags))
+            .where(
                 Book.source_id == source_id,
                 Book.source_book_id == remote_book.source_book_id,
             )
@@ -305,17 +357,31 @@ class SyncService:
                     "error": "Unsupported URL",
                     "created_chapters": 0,
                     "skipped_chapters": 0,
+                    "failed_chapters": [],
                 })
                 continue
             try:
                 result = await self.sync_book(source_id, shelf_book.url)
-                results.append({"book_id": result["book_id"], "status": "ok", "created_chapters": result.get("created_chapters", 0), "skipped_chapters": result.get("skipped_chapters", 0)})
+                results.append({
+                    "book_id": result["book_id"],
+                    "status": "ok",
+                    "created_chapters": result.get("created_chapters", 0),
+                    "skipped_chapters": result.get("skipped_chapters", 0),
+                    "failed_chapters": result.get("failed_chapters", []),
+                })
             except Exception as exc:
                 logger.opt(exception=exc).warning(
                     "Failed to sync shelf book {}", shelf_book.url
                 )
                 await self.db.rollback()
-                results.append({"url": shelf_book.url, "status": "failed", "error": str(exc), "created_chapters": 0, "skipped_chapters": 0})
+                results.append({
+                    "url": shelf_book.url,
+                    "status": "failed",
+                    "error": str(exc),
+                    "created_chapters": 0,
+                    "skipped_chapters": 0,
+                    "failed_chapters": [],
+                })
 
         return {"source_id": source_id, "total": len(shelf_books), "results": results}
 
@@ -483,6 +549,7 @@ class SyncService:
                 "books_failed": 0,
                 "chapters_created": 0,
                 "chapters_skipped": 0,
+                "chapters_failed": 0,
                 "details": [],
             }
 
@@ -493,6 +560,7 @@ class SyncService:
         books_failed = 0
         chapters_created = 0
         chapters_skipped = 0
+        chapters_failed = 0
         pages_checked = 0
         start_page = max(1, int(start_page or 1))
 
@@ -539,10 +607,12 @@ class SyncService:
                         "book_id": result.get("book_id"),
                         "created_chapters": result.get("created_chapters", 0),
                         "skipped_chapters": result.get("skipped_chapters", 0),
+                        "failed_chapters": result.get("failed_chapters", []),
                     })
                     books_synced += 1
                     chapters_created += result.get("created_chapters", 0)
                     chapters_skipped += result.get("skipped_chapters", 0)
+                    chapters_failed += len(result.get("failed_chapters", []))
                 except Exception as exc:
                     await self.db.rollback()
                     books_failed += 1
@@ -558,6 +628,7 @@ class SyncService:
                         "url": sb.url,
                         "synced": False,
                         "error": str(exc),
+                        "failed_chapters": [],
                     })
 
                 if progress_cb is not None:
@@ -571,6 +642,7 @@ class SyncService:
             "books_failed": books_failed,
             "chapters_created": chapters_created,
             "chapters_skipped": chapters_skipped,
+            "chapters_failed": chapters_failed,
             "details": details,
             "next_page": min(max_pages, pages_checked) + 1 if pages_checked else start_page,
         }

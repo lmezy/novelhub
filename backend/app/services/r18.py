@@ -19,7 +19,7 @@ def detect_r18(
 ) -> bool:
     if source_is_r18:
         return True
-    parts = [title, author, description]
+    parts = [str(title or ""), str(author or ""), str(description or "")]
     parts.extend(str(tag) for tag in tags or [])
     combined = " ".join(parts).lower()
     return any(keyword in combined for keyword in R18_KEYWORDS)
