@@ -231,6 +231,15 @@ class SyncService:
         book_id = book.id
         book_title = book.title
         book_is_r18 = book.is_r18
+        book_values = {
+            "source_id": book.source_id,
+            "author_id": book.author_id,
+            "source_book_id": book.source_book_id,
+            "title": book_title,
+            "description": book.description,
+            "status": book.status,
+            "is_r18": book_is_r18,
+        }
         created = 0
         skipped = 0
         total = len(remote_book.chapters)
@@ -285,6 +294,8 @@ class SyncService:
             for remote_chapter in missing_chapters
         ]
         remaining = len(producers)
+        # Make sure the book row really exists before chapter inserts begin.
+        book_row_verified = await self._ensure_book_row(book_id, book_values)
         try:
             while remaining > 0:
                 remote_chapter, content, error = await results_queue.get()
@@ -322,6 +333,12 @@ class SyncService:
                         content_path=content_path,
                         hash=content_hash,
                     )
+                    if not book_row_verified:
+                        if not await self._ensure_book_row(book_id, book_values):
+                            raise SQLAlchemyError(
+                                "Book row is missing and could not be restored"
+                            )
+                        book_row_verified = True
                     self.db.add(chapter)
                     await self.db.flush()
                     # Commit per chapter so a later failure cannot lose earlier work.
@@ -344,6 +361,7 @@ class SyncService:
                     created += 1
                 except SQLAlchemyError as exc:
                     await self.db.rollback()
+                    book_row_verified = False
                     failed_chapters.append({
                         "chapter_number": remote_chapter.chapter_number,
                         "title": remote_chapter.title,
@@ -501,6 +519,21 @@ class SyncService:
 
         await self.db.flush()
         return set(by_id)
+
+    async def _ensure_book_row(self, book_id: str, book_values: dict) -> bool:
+        """Restore a missing book row before chapter inserts."""
+        try:
+            existing = await self.db.scalar(
+                select(Book.id).where(Book.id == book_id)
+            )
+            if existing is not None:
+                return True
+            self.db.add(Book(id=book_id, **book_values))
+            await self.db.commit()
+            return True
+        except SQLAlchemyError:
+            await self.db.rollback()
+            return False
 
     async def sync_bookshelf(self, source_id: str) -> dict:
         """Sync all books from a user's bookshelf."""

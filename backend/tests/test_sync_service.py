@@ -442,6 +442,47 @@ async def test_reconcile_chapter_ids_keeps_existing_urls():
 
 
 @pytest.mark.asyncio
+async def test_ensure_book_row_restores_missing_book():
+    db = AsyncMock()
+    db.scalar = AsyncMock(return_value=None)
+    db.add = MagicMock()
+    db.commit = AsyncMock()
+    service = SyncService(db)
+
+    ok = await service._ensure_book_row(
+        "book-1",
+        {
+            "source_id": "src1",
+            "author_id": "author-1",
+            "source_book_id": "https://example.com/book/1",
+            "title": "Book",
+            "description": None,
+            "status": None,
+            "is_r18": False,
+        },
+    )
+
+    assert ok is True
+    db.add.assert_called_once()
+    db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ensure_book_row_keeps_existing_book():
+    db = AsyncMock()
+    db.scalar = AsyncMock(return_value="book-1")
+    db.add = MagicMock()
+    db.commit = AsyncMock()
+    service = SyncService(db)
+
+    ok = await service._ensure_book_row("book-1", {"title": "Book"})
+
+    assert ok is True
+    db.add.assert_not_called()
+    db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_resync_chapter_updates_existing_row():
     chapter = Chapter(
         id="c1",
