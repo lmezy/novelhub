@@ -286,6 +286,7 @@ class YueduPlugin:
 
         chapters: list[RemoteChapter] = []
         chapter_num = 0
+        seen_chapter_urls: set[str] = set()
         for ch in toc:
             # Skip volume headers
             is_volume = str(ch.get("isVolume", "")).strip().lower()
@@ -311,9 +312,12 @@ class YueduPlugin:
                 or (book_name and title == book_name)
             ):
                 continue
+            if ch_url in seen_chapter_urls:
+                continue
+            seen_chapter_urls.add(ch_url)
             chapter_num += 1
             chapters.append(RemoteChapter(
-                source_chapter_id=str(chapter_num),
+                source_chapter_id=ch_url,
                 title=title,
                 url=ch_url,
                 chapter_number=chapter_num,
@@ -429,7 +433,7 @@ class YueduPlugin:
             seen_urls.add(abs_url)
             chapter_number += 1
             chapters.append(RemoteChapter(
-                source_chapter_id=urlparse(abs_url).path,
+                source_chapter_id=abs_url,
                 title=text,
                 url=abs_url,
                 chapter_number=chapter_number,

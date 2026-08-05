@@ -13,7 +13,7 @@ class Chapter(Base):
     id = Column(String, primary_key=True)
     book_id = Column(String, ForeignKey("books.id"))
     chapter_number = Column(Integer)
-    source_chapter_id = Column(String(255))
+    source_chapter_id = Column(String(500))
     title = Column(String(255))
     content_path = Column(String(500))
     hash = Column(String(128))

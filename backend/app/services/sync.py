@@ -218,6 +218,9 @@ class SyncService:
         else:
             emit(EventType.BOOK_UPDATED, book_id=book.id, title=book.title)
 
+        book_id = book.id
+        book_title = book.title
+        book_is_r18 = book.is_r18
         created = 0
         skipped = 0
         total = len(remote_book.chapters)
@@ -226,8 +229,8 @@ class SyncService:
         async def _report_progress(remote_chapter) -> None:
             if progress_cb is not None:
                 await progress_cb({
-                    "book_id": book.id,
-                    "book_title": book.title,
+                    "book_id": book_id,
+                    "book_title": book_title,
                     "chapter_number": remote_chapter.chapter_number,
                     "chapter_title": remote_chapter.title,
                     "created_chapters": created,
@@ -236,14 +239,10 @@ class SyncService:
                     "total_chapters": total,
                 })
 
-        existing_rows = await self.db.scalars(
-            select(Chapter.source_chapter_id).where(Chapter.book_id == book.id)
+        existing_source_ids = await self._reconcile_chapter_ids(
+            book_id,
+            remote_book.chapters,
         )
-        existing_source_ids = {
-            source_id
-            for source_id in existing_rows.all()
-            if source_id is not None
-        }
 
         missing_chapters = [
             remote_chapter
@@ -306,7 +305,7 @@ class SyncService:
                     )
                     chapter = Chapter(
                         id=str(uuid4()),
-                        book_id=book.id,
+                        book_id=book_id,
                         chapter_number=remote_chapter.chapter_number,
                         source_chapter_id=remote_chapter.source_chapter_id,
                         title=remote_chapter.title,
@@ -315,23 +314,23 @@ class SyncService:
                     )
                     self.db.add(chapter)
                     await self.db.flush()
+                    # Commit per chapter so a later failure cannot lose earlier work.
+                    await self.db.commit()
 
                     search_service.buffer_chapter({
                         "id": chapter.id,
-                        "book_id": book.id,
+                        "book_id": book_id,
                         "title": chapter.title or "",
                         "chapter_number": chapter.chapter_number,
                         "content": content[:5000],
-                        "is_r18": book.is_r18,
+                        "is_r18": book_is_r18,
                     })
 
                     emit(
                         EventType.CHAPTER_CREATED,
                         chapter_id=chapter.id,
-                        book_id=book.id,
+                        book_id=book_id,
                     )
-                    # Commit per chapter so a later failure cannot lose earlier work.
-                    await self.db.commit()
                     created += 1
                 except SQLAlchemyError as exc:
                     await self.db.rollback()
@@ -348,7 +347,7 @@ class SyncService:
                         exc,
                     )
                     await _report_progress(remote_chapter)
-                    break
+                    continue
                 except Exception as exc:
                     await self.db.rollback()
                     failed_chapters.append({
@@ -372,14 +371,14 @@ class SyncService:
 
         emit(
             EventType.SYNC_COMPLETED,
-            book_id=book.id,
+            book_id=book_id,
             created=created,
             skipped=skipped,
             failed=len(failed_chapters),
         )
         logger.info(
             "Sync complete book={} created={} skipped={} failed={}",
-            book.id,
+            book_id,
             created,
             skipped,
             len(failed_chapters),
@@ -388,12 +387,12 @@ class SyncService:
         # Auto-categorize after sync (if new book or new tags)
         try:
             from app.services.auto_categorize import AutoCategorizationService
-            await AutoCategorizationService.categorize_book(self.db, book.id)
+            await AutoCategorizationService.categorize_book(self.db, book_id)
         except Exception:
             await self.db.rollback()
 
         return {
-            "book_id": book.id,
+            "book_id": book_id,
             "created_chapters": created,
             "skipped_chapters": skipped,
             "failed_chapters": failed_chapters,
@@ -447,6 +446,51 @@ class SyncService:
         self.db.add(book)
         await self.db.flush()
         return book, True
+
+    async def _reconcile_chapter_ids(
+        self,
+        book_id: str,
+        remote_chapters: list,
+    ) -> set[str]:
+        """Return existing source chapter ids, upgrading legacy numeric ids to URLs.
+
+        Legado identifies chapters by their URL, while older NovelHub syncs
+        stored the positional chapter number. Upgrading in place prevents a
+        full re-download when the TOC order is stable.
+        """
+        rows = await self.db.scalars(
+            select(Chapter).where(Chapter.book_id == book_id)
+        )
+        chapters = list(rows.all())
+        by_id = {
+            str(ch.source_chapter_id): ch
+            for ch in chapters
+            if ch.source_chapter_id is not None
+        }
+        by_number = {
+            ch.chapter_number: ch
+            for ch in chapters
+            if ch.chapter_number is not None
+        }
+
+        for remote_chapter in remote_chapters:
+            source_id = str(remote_chapter.source_chapter_id or "")
+            if not source_id or source_id in by_id:
+                continue
+            legacy = by_number.get(remote_chapter.chapter_number)
+            if legacy is None:
+                continue
+            legacy_id = str(legacy.source_chapter_id or "")
+            if legacy_id.startswith(("http://", "https://")):
+                continue
+            if legacy_id == source_id:
+                continue
+            by_id.pop(legacy_id, None)
+            legacy.source_chapter_id = source_id
+            by_id[source_id] = legacy
+
+        await self.db.flush()
+        return set(by_id)
 
     async def sync_bookshelf(self, source_id: str) -> dict:
         """Sync all books from a user's bookshelf."""

@@ -175,6 +175,31 @@ async def test_fetch_book_uses_generic_fallback():
 
 
 @pytest.mark.asyncio
+async def test_fetch_book_uses_chapter_url_as_source_id():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "ruleBookInfo": {},
+        "ruleToc": {},
+    })
+    html = """
+    <html><body>
+      <h1>书名</h1>
+      <div class="listmain">
+        <a href="/novel/123/1.html">第一章</a>
+        <a href="/novel/123/2.html">第二章</a>
+      </div>
+    </body></html>
+    """
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        book = await plugin.fetch_book("https://example.com/novel/123.html")
+
+    assert [(c.source_chapter_id, c.url) for c in book.chapters] == [
+        ("https://example.com/novel/123/1.html", "https://example.com/novel/123/1.html"),
+        ("https://example.com/novel/123/2.html", "https://example.com/novel/123/2.html"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_fetch_explore_uses_generic_fallback_when_rules_empty():
     plugin = YueduPlugin({
         "bookSourceUrl": "https://example.com",

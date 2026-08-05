@@ -64,7 +64,8 @@ async def run_crawl_task_async(task_id: str) -> dict:
         if task_obj.status != "running":
             return {"status": "skipped", "reason": task_obj.status}
 
-        start_page = int((task_obj.progress or {}).get("next_page") or 1)
+        progress_state = dict(task_obj.progress or {})
+        start_page = int(progress_state.get("next_page") or 1)
         chapter_progress_updates = 0
 
         async def _wait_if_paused() -> None:
@@ -80,26 +81,31 @@ async def run_crawl_task_async(task_id: str) -> dict:
             synced: int,
             failed: int,
         ) -> None:
-            task_obj.progress = {
-                **(task_obj.progress or {}),
+            nonlocal progress_state
+            progress_state.update({
                 "pages_checked": page,
                 "books_found": found,
                 "books_synced": synced,
                 "books_failed": failed,
                 "next_page": page,
+            })
+            task_obj.progress = {
+                **progress_state,
             }
             await db.commit()
 
         async def _update_chapter_progress(info: dict) -> None:
-            nonlocal chapter_progress_updates
-            task_obj.progress = {
-                **(task_obj.progress or {}),
+            nonlocal chapter_progress_updates, progress_state
+            progress_state.update({
                 "current_book": info.get("book_title") or "",
                 "current_chapter": info.get("chapter_title") or "",
                 "current_chapters_created": info.get("created_chapters", 0),
                 "current_chapters_skipped": info.get("skipped_chapters", 0),
                 "current_chapters_failed": info.get("failed_chapters", 0),
                 "current_chapters_total": info.get("total_chapters", 0),
+            })
+            task_obj.progress = {
+                **progress_state,
             }
             chapter_progress_updates += 1
             if chapter_progress_updates % 10 == 0:

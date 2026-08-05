@@ -89,6 +89,18 @@ curl -X POST http://localhost:8088/api/books/batch-delete \
 
 `alembic_version.version_num` 列只有 32 字符，迁移 ID 不能超过该长度。当前分类迁移已改为 `0009_categories`，更新后端代码后重新启动 backend 即可。
 
+### 同步任务报 chapters_book_id_fkey 或 MissingGreenlet
+
+旧版章节身份用的是目录里的位置序号，目录顺序变化后会把同一章当作新章节，并可能在章节入库前写入 `chapters`，触发外键错误；进度回调在会话回滚后再次读取过期 ORM 属性时还会报 `MissingGreenlet`。
+
+现在章节身份改为章节 URL（与 Legado 的 `BookChapter.url` 一致），同步时会自动把旧的位置 ID 升级为 URL，不再重复下载；进度回调也只读写内存中的进度字典，不会在回滚后触发懒加载。需要重新构建并启动 crawler 容器：
+
+```bash
+docker compose up -d --build crawler backend scheduler
+```
+
+如果之前同步产生了重复章节，删除对应书籍后重新同步即可。
+
 ## 任务控制
 
 全站同步任务会写入 `crawl_tasks`，前端在 Admin 页面启动后由全局状态持续轮询，离开页面再回来仍会显示当前任务。运行中的任务可以暂停、继续或取消。

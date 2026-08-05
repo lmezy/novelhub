@@ -5,7 +5,7 @@ import pytest
 from sqlalchemy.exc import MissingGreenlet, SQLAlchemyError
 
 from app.crawler.base import RemoteBook, RemoteChapter, RemoteShelfBook
-from app.models import Book, Cookie, Source
+from app.models import Book, Chapter, Cookie, Source
 from app.services.sync import SyncService
 
 
@@ -274,12 +274,20 @@ async def test_sync_book_reports_chapter_progress():
 
 
 @pytest.mark.asyncio
-async def test_sync_book_breaks_after_database_error():
+async def test_sync_book_continues_after_database_error():
     db = _mock_db()
     db.get.return_value = _source()
     db.scalar.return_value = None
     db.rollback = AsyncMock()
-    db.commit = AsyncMock(side_effect=[None, None, SQLAlchemyError("fk")])
+    commit_calls = 0
+
+    async def fake_commit():
+        nonlocal commit_calls
+        commit_calls += 1
+        if commit_calls == 3:
+            raise SQLAlchemyError("fk")
+
+    db.commit = AsyncMock(side_effect=fake_commit)
     db.flush = AsyncMock()
     db.add = MagicMock()
 
@@ -333,10 +341,89 @@ async def test_sync_book_breaks_after_database_error():
     ):
         result = await service.sync_book("src1", "https://example.com/book/1")
 
-    assert result["created_chapters"] == 1
+    assert result["created_chapters"] == 2
     assert len(result["failed_chapters"]) == 1
     assert "fk" in result["failed_chapters"][0]["error"]
     assert plugin.fetch_chapter_content.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_reconcile_chapter_ids_upgrades_legacy_numeric_ids():
+    legacy1 = Chapter(
+        id="c1",
+        book_id="book-1",
+        chapter_number=1,
+        source_chapter_id="1",
+    )
+    legacy2 = Chapter(
+        id="c2",
+        book_id="book-1",
+        chapter_number=2,
+        source_chapter_id="2",
+    )
+    db = AsyncMock()
+    db.scalars = AsyncMock(
+        return_value=SimpleNamespace(all=lambda: [legacy1, legacy2])
+    )
+    db.flush = AsyncMock()
+    service = SyncService(db)
+
+    result = await service._reconcile_chapter_ids(
+        "book-1",
+        [
+            RemoteChapter(
+                source_chapter_id="https://example.com/book/1.html",
+                title="Chapter 1",
+                url="https://example.com/book/1.html",
+                chapter_number=1,
+            ),
+            RemoteChapter(
+                source_chapter_id="https://example.com/book/2.html",
+                title="Chapter 2",
+                url="https://example.com/book/2.html",
+                chapter_number=2,
+            ),
+        ],
+    )
+
+    assert result == {
+        "https://example.com/book/1.html",
+        "https://example.com/book/2.html",
+    }
+    assert legacy1.source_chapter_id == "https://example.com/book/1.html"
+    assert legacy2.source_chapter_id == "https://example.com/book/2.html"
+    db.flush.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_chapter_ids_keeps_existing_urls():
+    existing = Chapter(
+        id="c1",
+        book_id="book-1",
+        chapter_number=1,
+        source_chapter_id="https://example.com/book/1.html",
+    )
+    db = AsyncMock()
+    db.scalars = AsyncMock(
+        return_value=SimpleNamespace(all=lambda: [existing])
+    )
+    db.flush = AsyncMock()
+    service = SyncService(db)
+
+    result = await service._reconcile_chapter_ids(
+        "book-1",
+        [
+            RemoteChapter(
+                source_chapter_id="https://example.com/book/1.html",
+                title="Chapter 1",
+                url="https://example.com/book/1.html",
+                chapter_number=1,
+            ),
+        ],
+    )
+
+    assert result == {"https://example.com/book/1.html"}
+    assert existing.source_chapter_id == "https://example.com/book/1.html"
 
 
 @pytest.mark.asyncio
