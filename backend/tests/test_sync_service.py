@@ -1,7 +1,7 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from sqlalchemy.exc import MissingGreenlet
+from sqlalchemy.exc import MissingGreenlet, SQLAlchemyError
 
 from app.crawler.base import RemoteBook, RemoteChapter, RemoteShelfBook
 from app.models import Book, Cookie, Source
@@ -197,6 +197,138 @@ async def test_sync_book_loads_existing_tags_without_lazy_load():
             "book-1",
             ["all-ages", "old", "remote"],
         )
+
+
+@pytest.mark.asyncio
+async def test_sync_book_reports_chapter_progress():
+    db = AsyncMock()
+    db.get.return_value = _source()
+    db.scalar.return_value = None
+    db.rollback = AsyncMock()
+    db.commit = AsyncMock()
+    db.flush = AsyncMock()
+    db.add = MagicMock()
+
+    remote_book = RemoteBook(
+        source_book_id="https://example.com/book/1",
+        title="Book",
+        author="Author",
+        description=None,
+        status=None,
+        chapters=[
+            RemoteChapter(
+                source_chapter_id="1",
+                title="Chapter 1",
+                url="https://example.com/book/1.html",
+                chapter_number=1,
+            ),
+            RemoteChapter(
+                source_chapter_id="2",
+                title="Chapter 2",
+                url="https://example.com/book/2.html",
+                chapter_number=2,
+            ),
+        ],
+        tags=["remote"],
+    )
+    plugin = AsyncMock()
+    plugin.fetch_book.return_value = remote_book
+    plugin.fetch_chapter_content.return_value = "content"
+
+    service = SyncService(db)
+    service.storage = MagicMock()
+    service.storage.write_metadata = MagicMock()
+    service.storage.write_chapter.return_value = ("path", "hash")
+    progress_cb = AsyncMock()
+
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.emit"),
+        patch("app.services.sync.search_service"),
+        patch("app.services.auto_categorize.AutoCategorizationService"),
+        patch.object(service, "_get_or_create_author", AsyncMock(return_value=MagicMock(id="author-1"))),
+        patch.object(service, "_get_or_create_book", AsyncMock(return_value=(MagicMock(id="book-1", title="Book", is_r18=False), True))),
+        patch.object(service, "_find_same_title_books", AsyncMock(return_value=[])),
+        patch.object(service, "_book_tag_names", AsyncMock(return_value=[])),
+        patch.object(service, "_save_tags", AsyncMock()),
+    ):
+        result = await service.sync_book(
+            "src1",
+            "https://example.com/book/1",
+            progress_cb=progress_cb,
+        )
+
+    assert result["created_chapters"] == 2
+    assert progress_cb.await_count == 2
+    last = progress_cb.await_args.args[0]
+    assert last["created_chapters"] == 2
+    assert last["total_chapters"] == 2
+
+
+@pytest.mark.asyncio
+async def test_sync_book_breaks_after_database_error():
+    db = AsyncMock()
+    db.get.return_value = _source()
+    db.scalar.return_value = None
+    db.rollback = AsyncMock()
+    db.commit = AsyncMock(side_effect=[None, None, SQLAlchemyError("fk")])
+    db.flush = AsyncMock()
+    db.add = MagicMock()
+
+    remote_book = RemoteBook(
+        source_book_id="https://example.com/book/1",
+        title="Book",
+        author="Author",
+        description=None,
+        status=None,
+        chapters=[
+            RemoteChapter(
+                source_chapter_id="1",
+                title="Chapter 1",
+                url="https://example.com/book/1.html",
+                chapter_number=1,
+            ),
+            RemoteChapter(
+                source_chapter_id="2",
+                title="Chapter 2",
+                url="https://example.com/book/2.html",
+                chapter_number=2,
+            ),
+            RemoteChapter(
+                source_chapter_id="3",
+                title="Chapter 3",
+                url="https://example.com/book/3.html",
+                chapter_number=3,
+            ),
+        ],
+        tags=["remote"],
+    )
+    plugin = AsyncMock()
+    plugin.fetch_book.return_value = remote_book
+    plugin.fetch_chapter_content.return_value = "content"
+
+    service = SyncService(db)
+    service.storage = MagicMock()
+    service.storage.write_metadata = MagicMock()
+    service.storage.write_chapter.return_value = ("path", "hash")
+
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.emit"),
+        patch("app.services.sync.search_service"),
+        patch("app.services.auto_categorize.AutoCategorizationService"),
+        patch.object(service, "_get_or_create_author", AsyncMock(return_value=MagicMock(id="author-1"))),
+        patch.object(service, "_get_or_create_book", AsyncMock(return_value=(MagicMock(id="book-1", title="Book", is_r18=False), True))),
+        patch.object(service, "_find_same_title_books", AsyncMock(return_value=[])),
+        patch.object(service, "_book_tag_names", AsyncMock(return_value=[])),
+        patch.object(service, "_save_tags", AsyncMock()),
+    ):
+        result = await service.sync_book("src1", "https://example.com/book/1")
+
+    assert result["created_chapters"] == 1
+    assert len(result["failed_chapters"]) == 1
+    assert "fk" in result["failed_chapters"][0]["error"]
+    assert plugin.fetch_chapter_content.await_count == 2
 
 
 @pytest.mark.asyncio

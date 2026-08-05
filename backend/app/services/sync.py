@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 from urllib.parse import urljoin
 
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from loguru import logger
@@ -103,7 +104,12 @@ class SyncService:
             tags=getattr(remote_book, "tags", []) or [],
         )
 
-    async def sync_book(self, source_id: str, url: str) -> dict:
+    async def sync_book(
+        self,
+        source_id: str,
+        url: str,
+        progress_cb: Callable[[dict], Awaitable[None]] | None = None,
+    ) -> dict:
         source = await self.db.get(Source, source_id)
         if source is None or not source.enabled:
             raise ValueError("Source not found or disabled")
@@ -158,6 +164,9 @@ class SyncService:
                 same_title_book.id,
                 sorted([*source_tags, other_classification]),
             )
+        # Persist the book before chapter downloads so a later chapter failure
+        # cannot leave chapters pointing at an uncommitted book row.
+        await self.db.commit()
 
         self.storage.write_metadata(
             author_name,
@@ -192,6 +201,20 @@ class SyncService:
         skipped = 0
         total = len(remote_book.chapters)
         failed_chapters: list[dict] = []
+
+        async def _report_progress(remote_chapter) -> None:
+            if progress_cb is not None:
+                await progress_cb({
+                    "book_id": book.id,
+                    "book_title": book.title,
+                    "chapter_number": remote_chapter.chapter_number,
+                    "chapter_title": remote_chapter.title,
+                    "created_chapters": created,
+                    "skipped_chapters": skipped,
+                    "failed_chapters": len(failed_chapters),
+                    "total_chapters": total,
+                })
+
         for remote_chapter in remote_book.chapters:
             existing = await self.db.scalar(
                 select(Chapter).where(
@@ -201,6 +224,7 @@ class SyncService:
             )
             if existing:
                 skipped += 1
+                await _report_progress(remote_chapter)
                 continue
 
             try:
@@ -241,9 +265,25 @@ class SyncService:
                     chapter_id=chapter.id,
                     book_id=book.id,
                 )
-                created += 1
                 # Commit per chapter so a later failure cannot lose earlier work.
                 await self.db.commit()
+                created += 1
+            except SQLAlchemyError as exc:
+                await self.db.rollback()
+                failed_chapters.append({
+                    "chapter_number": remote_chapter.chapter_number,
+                    "title": remote_chapter.title,
+                    "url": remote_chapter.url,
+                    "error": str(exc)[:300],
+                })
+                logger.warning(
+                    "Failed to sync chapter {} ({}): {}",
+                    remote_chapter.title,
+                    remote_chapter.url,
+                    exc,
+                )
+                await _report_progress(remote_chapter)
+                break
             except Exception as exc:
                 await self.db.rollback()
                 failed_chapters.append({
@@ -258,6 +298,7 @@ class SyncService:
                     remote_chapter.url,
                     exc,
                 )
+            await _report_progress(remote_chapter)
 
         emit(
             EventType.SYNC_COMPLETED,
@@ -532,6 +573,7 @@ class SyncService:
         max_pages: int = 200,
         sync: bool = True,
         progress_cb: Callable[[int, int, int, int], Awaitable[None]] | None = None,
+        chapter_progress_cb: Callable[[dict], Awaitable[None]] | None = None,
         before_step: Callable[[], Awaitable[None]] | None = None,
         start_page: int = 1,
     ) -> dict:
@@ -607,7 +649,11 @@ class SyncService:
                         await progress_cb(pages_checked, books_found, books_synced, books_failed)
                     continue
                 try:
-                    result = await self.sync_book(source_id, sb.url)
+                    result = await self.sync_book(
+                        source_id,
+                        sb.url,
+                        progress_cb=chapter_progress_cb,
+                    )
                     details.append({
                         "title": sb.title,
                         "author": sb.author,

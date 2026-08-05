@@ -80,6 +80,7 @@ async def run_crawl_task_async(task_id: str) -> dict:
             failed: int,
         ) -> None:
             task_obj.progress = {
+                **(task_obj.progress or {}),
                 "pages_checked": page,
                 "books_found": found,
                 "books_synced": synced,
@@ -88,11 +89,24 @@ async def run_crawl_task_async(task_id: str) -> dict:
             }
             await db.commit()
 
+        async def _update_chapter_progress(info: dict) -> None:
+            task_obj.progress = {
+                **(task_obj.progress or {}),
+                "current_book": info.get("book_title") or "",
+                "current_chapter": info.get("chapter_title") or "",
+                "current_chapters_created": info.get("created_chapters", 0),
+                "current_chapters_skipped": info.get("skipped_chapters", 0),
+                "current_chapters_failed": info.get("failed_chapters", 0),
+                "current_chapters_total": info.get("total_chapters", 0),
+            }
+            await db.commit()
+
         try:
             result = await SyncService(db).discover_and_sync_all(
                 task_obj.source,
                 max_pages=task_obj.max_pages or 200,
                 progress_cb=_update_progress,
+                chapter_progress_cb=_update_chapter_progress,
                 before_step=_wait_if_paused,
                 start_page=start_page,
             )
@@ -103,6 +117,9 @@ async def run_crawl_task_async(task_id: str) -> dict:
                 "books_found": result.get("books_found", 0),
                 "books_synced": result.get("books_synced", 0),
                 "books_failed": result.get("books_failed", 0),
+                "chapters_created": result.get("chapters_created", 0),
+                "chapters_skipped": result.get("chapters_skipped", 0),
+                "chapters_failed": result.get("chapters_failed", 0),
                 "done": True,
             }
             task_obj.finished_at = _naive_utcnow()

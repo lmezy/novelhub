@@ -225,21 +225,32 @@ class YueduPlugin:
 
         # Follow nextTocUrl for paginated tables of contents
         max_toc_pages = 20
-        current_toc_html = toc_html
+        toc_pending: list[str] = []
+        seen_toc_urls = {toc_url}
         current_toc_url = toc_url
-        for _ in range(max_toc_pages):
-            next_toc_url = self.engine.get_next_toc_url(
+        current_toc_html = toc_html
+        toc_pages_fetched = 1
+        while toc_pages_fetched < max_toc_pages:
+            for next_toc_url in self.engine.get_next_toc_urls(
                 current_toc_html,
                 current_toc_url,
-            )
-            if not next_toc_url:
+            ):
+                if next_toc_url not in seen_toc_urls:
+                    seen_toc_urls.add(next_toc_url)
+                    toc_pending.append(next_toc_url)
+            if not toc_pending:
                 break
-            current_toc_html = await self._get(next_toc_url)
-            current_toc_url = next_toc_url
-            more_toc = self.engine.parse_toc(current_toc_html)
-            if more_toc:
+            current_toc_url = toc_pending.pop(0)
+            current_toc_html = await self._get(current_toc_url)
+            toc_pages_fetched += 1
+            if current_toc_url not in seen_toc_urls:
+                seen_toc_urls.add(current_toc_url)
+            if current_toc_url != toc_url:
                 toc.extend(
-                    self._resolve_toc_entries(more_toc, current_toc_url)
+                    self._resolve_toc_entries(
+                        self.engine.parse_toc(current_toc_html),
+                        current_toc_url,
+                    )
                 )
 
         generic = self._parse_book_generic(html, url)
@@ -289,6 +300,7 @@ class YueduPlugin:
 
         if not chapters:
             chapters = generic["chapters"]
+        chapters = self._attach_next_urls(chapters)
 
         book_title = str(info.get("name") or "").strip() or "Unknown"
         author = str(info.get("author") or "").strip() or "Unknown"
@@ -436,17 +448,29 @@ class YueduPlugin:
 
         # Follow nextContentUrl for multi-page chapters
         max_pages = 20  # safety limit
-        current_html = html
-        current_url = chapter.url
-        for _ in range(max_pages):
-            next_url = self.engine.get_next_content_url(current_html, current_url)
-            if not next_url:
+        seen_content_urls = {chapter.url}
+        pending_content_urls = self.engine.get_next_content_urls(
+            html,
+            chapter.url,
+        )
+        pages_fetched = 0
+        while pending_content_urls and pages_fetched < max_pages:
+            next_url = pending_content_urls.pop(0)
+            if next_url in seen_content_urls:
+                continue
+            if getattr(chapter, "next_url", None) and next_url == chapter.next_url:
                 break
-            current_html = await self._get(next_url)
-            current_url = next_url
-            next_part = self.engine.parse_content(current_html)
-            if next_part and next_part != current_html:
+            seen_content_urls.add(next_url)
+            next_html = await self._get(next_url)
+            next_part = self.engine.parse_content(next_html)
+            if next_part and next_part != next_html:
                 parts.append(next_part)
+            pages_fetched += 1
+            pending_content_urls.extend(
+                url
+                for url in self.engine.get_next_content_urls(next_html, next_url)
+                if url not in seen_content_urls
+            )
 
         content = "\n".join(parts)
 
@@ -1646,6 +1670,23 @@ class YueduPlugin:
             if ch_url and not ch_url.startswith(("http://", "https://")):
                 entry["chapterUrl"] = urljoin(base_url, ch_url)
         return entries
+
+    @staticmethod
+    def _attach_next_urls(chapters: list[RemoteChapter]) -> list[RemoteChapter]:
+        return [
+            RemoteChapter(
+                source_chapter_id=chapter.source_chapter_id,
+                title=chapter.title,
+                url=chapter.url,
+                chapter_number=chapter.chapter_number,
+                next_url=(
+                    chapters[index + 1].url
+                    if index + 1 < len(chapters)
+                    else None
+                ),
+            )
+            for index, chapter in enumerate(chapters)
+        ]
 
     @staticmethod
     def _book_id_from_url(url: str) -> str:

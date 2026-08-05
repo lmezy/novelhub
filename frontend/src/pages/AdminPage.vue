@@ -119,9 +119,14 @@ const crawlTaskLoading = ref(false)
 
 const crawlTaskProgress = computed(() => {
   const task = crawlStore.activeTask
+  const progress = task?.progress || {}
   const max = task?.max_pages || 1
-  const pages = task?.progress?.pages_checked || 0
-  return Math.min(100, Math.round((pages / max) * 100))
+  const pages = progress.pages_checked || 0
+  const pagePct = (pages / max) * 100
+  const chapterTotal = progress.current_chapters_total || 0
+  const chapterDone = progress.current_chapters_created || 0
+  const chapterPct = chapterTotal ? (chapterDone / chapterTotal) * 100 : 0
+  return Math.min(100, Math.round(Math.max(pagePct, chapterPct)))
 })
 
 const yueduUrl = ref("")
@@ -867,6 +872,10 @@ onUnmounted(() => {
               </div>
               <p class="text-xs text-muted dark:text-gray-400 mt-1">
                 已检查 {{ crawlStore.activeTask.progress?.pages_checked || 0 }} 页，发现 {{ crawlStore.activeTask.progress?.books_found || 0 }} 本
+                <span v-if="crawlStore.activeTask.progress?.current_book">
+                  ，正在同步《{{ crawlStore.activeTask.progress.current_book }}》
+                  {{ crawlStore.activeTask.progress.current_chapters_created || 0 }}/{{ crawlStore.activeTask.progress.current_chapters_total || 0 }} 章
+                </span>
               </p>
             </div>
             <p v-if="crawlStore.activeTask.result">发现 {{ crawlStore.activeTask.result.books_found }} 本，成功 {{ crawlStore.activeTask.result.books_synced }} 本，失败 {{ crawlStore.activeTask.result.books_failed }} 本，新增章节 {{ crawlStore.activeTask.result.chapters_created }}</p>

@@ -298,16 +298,40 @@ class YueduRuleEngine:
     def parse_content(self, html_or_json: str) -> str:
         return self._extract_content(html_or_json, self.config.get("ruleContent", {}))
 
+    def get_next_content_urls(
+        self,
+        html_or_json: str,
+        current_url: str | None = None,
+    ) -> list[str]:
+        rules = self.config.get("ruleContent", {})
+        next_rule = rules.get("nextContentUrl", "")
+        if not next_rule:
+            return []
+        return self._eval_rule_list(
+            html_or_json,
+            next_rule,
+            is_url=True,
+            base_url=current_url,
+        )
+
     def get_next_content_url(
         self,
         html_or_json: str,
         current_url: str | None = None,
     ) -> str | None:
-        rules = self.config.get("ruleContent", {})
-        next_rule = rules.get("nextContentUrl", "")
+        urls = self.get_next_content_urls(html_or_json, current_url)
+        return urls[0] if urls else None
+
+    def get_next_toc_urls(
+        self,
+        html_or_json: str,
+        current_url: str | None = None,
+    ) -> list[str]:
+        rules = self.config.get("ruleToc", {})
+        next_rule = rules.get("nextTocUrl", "")
         if not next_rule:
-            return None
-        return self._eval_rule_str(
+            return []
+        return self._eval_rule_list(
             html_or_json,
             next_rule,
             is_url=True,
@@ -319,16 +343,8 @@ class YueduRuleEngine:
         html_or_json: str,
         current_url: str | None = None,
     ) -> str | None:
-        rules = self.config.get("ruleToc", {})
-        next_rule = rules.get("nextTocUrl", "")
-        if not next_rule:
-            return None
-        return self._eval_rule_str(
-            html_or_json,
-            next_rule,
-            is_url=True,
-            base_url=current_url,
-        )
+        urls = self.get_next_toc_urls(html_or_json, current_url)
+        return urls[0] if urls else None
 
     # ---- Internal extraction ----
 
@@ -613,6 +629,24 @@ class YueduRuleEngine:
         if is_url and result.strip():
             return urljoin(base_url or self.base_url, result)
         return result
+
+    def _eval_rule_list(
+        self,
+        raw: str | Any,
+        rule: str,
+        is_url: bool = False,
+        base_url: str | None = None,
+    ) -> list[str]:
+        result = self._eval_field(raw, rule)
+        if result is None:
+            return []
+        if isinstance(result, list):
+            values = [str(v).strip() for v in result if str(v).strip()]
+        else:
+            values = [line.strip() for line in str(result).splitlines() if line.strip()]
+        if is_url:
+            return [urljoin(base_url or self.base_url, v) for v in values]
+        return values
 
     def _eval_field(self, raw: Any, rule: str) -> Any:
         if not rule:

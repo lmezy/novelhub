@@ -379,6 +379,76 @@ async def test_fetch_book_uses_toc_url_and_resolves_relative_chapters():
 
 
 @pytest.mark.asyncio
+async def test_fetch_book_follows_multiple_toc_pages():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "ruleBookInfo": {
+            "name": "h1@text",
+            "tocUrl": "a.toc@href",
+        },
+        "ruleToc": {
+            "chapterList": "ul.chapters li",
+            "chapterName": "a@text",
+            "chapterUrl": "a@href",
+            "nextTocUrl": "a.page@href",
+        },
+        "concurrentRate": "0",
+    })
+    book_html = (
+        '<html><body><h1>Book One</h1>'
+        '<a class="toc" href="list.html">目录</a></body></html>'
+    )
+    page1 = (
+        '<html><body><ul class="chapters">'
+        '<li><a href="1.html">Chapter 1</a></li>'
+        '</ul>'
+        '<a class="page" href="list_2.html">2</a>'
+        '<a class="page" href="list_3.html">3</a>'
+        '</body></html>'
+    )
+    page2 = (
+        '<html><body><ul class="chapters">'
+        '<li><a href="2.html">Chapter 2</a></li>'
+        '</ul>'
+        '<a class="page" href="list_3.html">3</a>'
+        '</body></html>'
+    )
+    page3 = (
+        '<html><body><ul class="chapters">'
+        '<li><a href="3.html">Chapter 3</a></li>'
+        '</ul></body></html>'
+    )
+    requested: list[str] = []
+
+    async def fake_get(url):
+        requested.append(url)
+        if url == "https://example.com/books/123.html":
+            return book_html
+        if url == "https://example.com/books/list.html":
+            return page1
+        if url == "https://example.com/books/list_2.html":
+            return page2
+        if url == "https://example.com/books/list_3.html":
+            return page3
+        raise AssertionError(f"unexpected url: {url}")
+
+    with patch.object(plugin, "_get", fake_get):
+        book = await plugin.fetch_book("https://example.com/books/123.html")
+
+    assert [c.title for c in book.chapters] == [
+        "Chapter 1",
+        "Chapter 2",
+        "Chapter 3",
+    ]
+    assert requested == [
+        "https://example.com/books/123.html",
+        "https://example.com/books/list.html",
+        "https://example.com/books/list_2.html",
+        "https://example.com/books/list_3.html",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_fetch_chapter_content_handles_replace_regex_list():
     plugin = YueduPlugin(ALICE_SOURCE)
     html = """
@@ -452,6 +522,26 @@ def test_next_toc_url_resolves_relative_against_current_page():
     ) == "http://m.5859ycdh.com/wuba/29416/list_2.html"
 
 
+def test_next_content_urls_returns_multiple_absolute_urls():
+    engine = YueduRuleEngine({
+        "bookSourceUrl": "http://m.5859ycdh.com",
+        "ruleContent": {"nextContentUrl": "a.page@href"},
+    })
+    html = (
+        '<html><body>'
+        '<a class="page" href="16555538-2.html">2</a>'
+        '<a class="page" href="16555538-3.html">3</a>'
+        '</body></html>'
+    )
+    assert engine.get_next_content_urls(
+        html,
+        "http://m.5859ycdh.com/wubashu/29416/16555538.html",
+    ) == [
+        "http://m.5859ycdh.com/wubashu/29416/16555538-2.html",
+        "http://m.5859ycdh.com/wubashu/29416/16555538-3.html",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_fetch_chapter_content_resolves_relative_next_pages():
     plugin = YueduPlugin({
@@ -499,6 +589,39 @@ async def test_fetch_chapter_content_resolves_relative_next_pages():
         "http://m.5859ycdh.com/wubashu/29416/16555538-2.html",
         "http://m.5859ycdh.com/wubashu/29416/16555538-3.html",
     ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_chapter_content_stops_at_next_chapter_url():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "http://m.5859ycdh.com",
+        "ruleContent": {
+            "content": "#content@text",
+            "nextContentUrl": "a.next@href",
+        },
+        "concurrentRate": "0",
+    })
+    page1 = (
+        '<html><body><div id="content">Page one.</div>'
+        '<a class="next" href="16555539.html">下一章</a></body></html>'
+    )
+    requested: list[str] = []
+
+    async def fake_get(url):
+        requested.append(url)
+        if url.endswith("16555538.html"):
+            return page1
+        raise AssertionError(f"unexpected url: {url}")
+
+    chapter = SimpleNamespace(
+        url="http://m.5859ycdh.com/wubashu/29416/16555538.html",
+        next_url="http://m.5859ycdh.com/wubashu/29416/16555539.html",
+    )
+    with patch.object(plugin, "_get", fake_get):
+        content = await plugin.fetch_chapter_content(chapter)
+
+    assert content == "Page one."
+    assert requested == ["http://m.5859ycdh.com/wubashu/29416/16555538.html"]
 
 
 @pytest.mark.asyncio

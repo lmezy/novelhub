@@ -8,6 +8,7 @@ class RemoteChapter:
     title: str
     url: str
     chapter_number: int
+    next_url: str | None = None
 
 
 @dataclass(frozen=True)
