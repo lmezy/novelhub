@@ -836,3 +836,36 @@ def test_explore_json_kind_without_url_is_empty():
     kinds = plugin.get_explore_kinds()
     assert kinds[0]["url"] == ""
     assert kinds[1]["url"] == "/fantasy"
+
+
+@pytest.mark.asyncio
+async def test_fetch_book_skips_javascript_chapter_and_extracts_generic_tags():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "ruleBookInfo": {
+            "name": "h1@text",
+        },
+        "ruleToc": {
+            "chapterList": "ul.chapters li",
+            "chapterName": "a@text",
+            "chapterUrl": "a@href",
+        },
+        "concurrentRate": "0",
+    })
+    html = (
+        '<html><head><meta name="keywords" content="都市,爽文"></head><body>'
+        '<h1>Book One</h1>'
+        '<div class="tags"><a href="/tag/1">都市</a></div>'
+        '<ul class="chapters">'
+        '<li><a href="javascript:void(0);">默认</a></li>'
+        '<li><a href="123/1.html">Chapter 1</a></li>'
+        '</ul></body></html>'
+    )
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        book = await plugin.fetch_book("https://example.com/novel/123.html")
+
+    assert len(book.chapters) == 1
+    assert book.chapters[0].url == "https://example.com/novel/123/1.html"
+    assert "都市" in book.tags
+    assert "爽文" in book.tags

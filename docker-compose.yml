@@ -76,6 +76,9 @@
         condition: service_started
     volumes:
       - ./storage:/app/storage
+      # Optional: expose another host book library to the backend, then scan
+      # paths like /library from the local import UI.
+      # - /path/to/books:/library:ro
     deploy:
       resources:
         limits:
@@ -107,6 +110,8 @@
         condition: service_healthy
     volumes:
       - ./storage:/app/storage
+      # Optional: expose the same host book library to the crawler worker.
+      # - /path/to/books:/library:ro
 
   scheduler:
     build:

@@ -143,6 +143,11 @@ const localPath = ref("")
 const localImporting = ref(false)
 const localResult = ref<any>(null)
 const localError = ref("")
+const localScan = ref<any[]>([])
+const localScanRoot = ref("")
+const localSelected = ref<string[]>([])
+const localScanning = ref(false)
+const localDirectResult = ref<any>(null)
 
 const manualTitle = ref("")
 const manualAuthor = ref("")
@@ -398,6 +403,82 @@ async function importLocal() {
       path: localPath.value.trim(),
     })
     await loadSources()
+  } catch (e) {
+    localError.value = e instanceof Error ? e.message : i18n.t('admin_local_import_failed')
+  } finally {
+    localImporting.value = false
+  }
+}
+
+async function scanLocal() {
+  localError.value = ""
+  localResult.value = null
+  localDirectResult.value = null
+  localScan.value = []
+  localSelected.value = []
+  if (!localPath.value.trim()) {
+    localError.value = i18n.t('admin_local_path_required')
+    return
+  }
+  localScanning.value = true
+  try {
+    const res = await api.post<any>("/sync/local/scan", {
+      path: localPath.value.trim(),
+      max_depth: 3,
+    })
+    localScanRoot.value = res.root || ""
+    localScan.value = res.books || []
+  } catch (e) {
+    localError.value = e instanceof Error ? e.message : i18n.t('admin_local_import_failed')
+  } finally {
+    localScanning.value = false
+  }
+}
+
+function toggleLocalBook(path: string) {
+  const idx = localSelected.value.indexOf(path)
+  if (idx === -1) {
+    localSelected.value.push(path)
+  } else {
+    localSelected.value.splice(idx, 1)
+  }
+}
+
+async function importLocalSelected() {
+  localError.value = ""
+  localResult.value = null
+  if (localSelected.value.length === 0) {
+    localError.value = i18n.t('admin_local_select_required')
+    return
+  }
+  localImporting.value = true
+  try {
+    localResult.value = await api.post<any>("/sync/local/import", {
+      path: localPath.value.trim(),
+      book_paths: localSelected.value,
+    })
+    await loadSources()
+  } catch (e) {
+    localError.value = e instanceof Error ? e.message : i18n.t('admin_local_import_failed')
+  } finally {
+    localImporting.value = false
+  }
+}
+
+async function directLocalSelected() {
+  localError.value = ""
+  localResult.value = null
+  localDirectResult.value = null
+  if (localSelected.value.length === 0) {
+    localError.value = i18n.t('admin_local_select_required')
+    return
+  }
+  localImporting.value = true
+  try {
+    localDirectResult.value = await api.post<any>("/sync/local/direct", {
+      path: localPath.value.trim(),
+      book_paths: localSelected.value,
+    })
   } catch (e) {
     localError.value = e instanceof Error ? e.message : i18n.t('admin_local_import_failed')
   } finally {
@@ -1064,14 +1145,62 @@ onUnmounted(() => {
             class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
           />
           <p v-if="localError" class="text-sm text-red-600 mt-2">{{ localError }}</p>
-          <button
-            @click="importLocal"
-            :disabled="localImporting"
-            class="mt-3 px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50"
-          >{{ localImporting ? i18n.t('admin_importing_short') : i18n.t('admin_local_import') }}</button>
+          <div class="mt-3 flex flex-wrap gap-2">
+            <button
+              @click="scanLocal"
+              :disabled="localScanning"
+              class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50"
+            >{{ localScanning ? i18n.t('admin_importing_short') : i18n.t('admin_local_scan') }}</button>
+            <button
+              @click="importLocal"
+              :disabled="localImporting"
+              class="px-4 py-2 rounded border border-accent text-accent text-sm font-medium hover:bg-accent/10 disabled:opacity-50"
+            >{{ localImporting ? i18n.t('admin_importing_short') : i18n.t('admin_local_import') }}</button>
+          </div>
+          <p v-if="localScan.length" class="text-xs text-muted dark:text-gray-400 mt-3">
+            {{ i18n.t('admin_local_scan_count', { n: localScan.length }) }}: {{ localScanRoot }}
+          </p>
+          <div v-if="localScan.length" class="mt-3 max-h-64 overflow-y-auto divide-y divide-border border border-border dark:border-gray-700 rounded">
+            <label
+              v-for="book in localScan"
+              :key="book.path"
+              class="flex items-start gap-2 px-3 py-2 cursor-pointer hover:bg-accent/5"
+            >
+              <input
+                type="checkbox"
+                :checked="localSelected.includes(book.path)"
+                @change="toggleLocalBook(book.path)"
+                class="mt-1 rounded"
+              />
+              <span class="min-w-0">
+                <span class="block text-sm font-medium truncate">{{ book.title }}</span>
+                <span class="block text-xs text-muted dark:text-gray-400 truncate">{{ book.author }} · {{ book.chapter_count }} chapters</span>
+                <span class="block text-xs text-muted dark:text-gray-400 truncate">{{ book.path }}</span>
+              </span>
+            </label>
+          </div>
+          <div v-if="localScan.length" class="mt-3 flex flex-wrap gap-2">
+            <button
+              @click="importLocalSelected"
+              :disabled="localImporting || localSelected.length === 0"
+              class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50"
+            >{{ i18n.t('admin_local_import_selected') }}</button>
+            <button
+              @click="directLocalSelected"
+              :disabled="localImporting || localSelected.length === 0"
+              class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm hover:bg-accent/5 disabled:opacity-50"
+            >{{ i18n.t('admin_local_direct') }}</button>
+          </div>
           <div v-if="localResult" class="mt-3 p-3 rounded bg-green-50 dark:bg-green-950 text-sm">
-            <p>{{ i18n.t('admin_book_id') }}: {{ localResult.book_id }}</p>
-            <p>{{ i18n.t('admin_created_chapters_label') }}: {{ localResult.created_chapters }}</p>
+            <p v-if="localResult.book_id">{{ i18n.t('admin_book_id') }}: {{ localResult.book_id }}</p>
+            <p v-for="item in localResult.results || []" :key="item.path">
+              {{ item.path }}: {{ item.status }} {{ item.book_id || item.error || '' }}
+            </p>
+          </div>
+          <div v-if="localDirectResult" class="mt-3 p-3 rounded bg-blue-50 dark:bg-blue-950 text-sm">
+            <p v-for="book in localDirectResult.books || []" :key="book.path">
+              {{ book.title }} · {{ book.chapter_count }} chapters · {{ book.path }}
+            </p>
           </div>
         </div>
 

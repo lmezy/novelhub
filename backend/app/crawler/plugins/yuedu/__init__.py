@@ -293,6 +293,18 @@ class YueduPlugin:
             info["intro"] = generic["description"]
         if not info.get("status"):
             info["status"] = generic["status"]
+        generic_tags = generic.get("tags") or []
+        raw_kind = info.get("kind") or ""
+        if isinstance(raw_kind, list):
+            kind_tags = [str(x).strip() for x in raw_kind if str(x).strip()]
+        else:
+            kind_tags = [
+                tag.strip()
+                for tag in str(raw_kind).split(",")
+                if tag.strip()
+            ]
+        tags = list(dict.fromkeys([*kind_tags, *generic_tags]))
+        info["kind"] = ",".join(tags)
 
         chapters: list[RemoteChapter] = []
         chapter_num = 0
@@ -313,6 +325,8 @@ class YueduPlugin:
                 continue
             if ch_url and not ch_url.startswith("http"):
                 ch_url = self._make_absolute(ch_url, url)
+            if urlparse(ch_url).scheme not in ("http", "https"):
+                continue
             if not self._is_chapter_url(ch_url, url):
                 continue
             title = str(title or "").strip() or f"Chapter {chapter_num + 1}"
@@ -349,7 +363,7 @@ class YueduPlugin:
             description=description if description else None,
             status=status if status else None,
             chapters=chapters,
-            tags=info.get("kind", "").split(",") if info.get("kind") else [],
+            tags=tags,
         )
 
     def _parse_book_generic(
@@ -408,6 +422,53 @@ class YueduPlugin:
                 status = "completed" if marker in ("已完结", "完结") else "ongoing"
                 break
 
+        tags: list[str] = []
+        seen_tags: set[str] = set()
+
+        def _add_tag(value: str) -> None:
+            value = value.strip().strip("#").strip()
+            if not value or len(value) > 20 or value.lower() in (
+                "tags", "tag", "标签", "分类", "类别", "类型", "最新章节",
+            ):
+                return
+            if value not in seen_tags:
+                seen_tags.add(value)
+                tags.append(value)
+
+        meta_keywords = soup.find(
+            "meta",
+            attrs={"name": re.compile(r"^keywords$", re.I)},
+        )
+        if meta_keywords and meta_keywords.get("content"):
+            content = str(meta_keywords["content"]).replace("，", ",")
+            for part in content.split(","):
+                _add_tag(part)
+
+        for selector in (
+            ".tags a",
+            ".tag a",
+            "[class*='tag'] a",
+            "[class*='kind'] a",
+            "[class*='category'] a",
+        ):
+            for link in soup.select(selector):
+                _add_tag(link.get_text(" ", strip=True))
+
+        for link in soup.select("a[href]"):
+            href = (link.get("href") or "").strip()
+            if not href or href.startswith("javascript:"):
+                continue
+            abs_href = self._make_absolute(href, url)
+            path = urlparse(abs_href).path.lower()
+            if any(
+                segment in path
+                for segment in (
+                    "/tag/", "/tags/", "/booktag/", "/booktags/",
+                    "/category/", "/categories/", "/fenlei/", "/sort/",
+                )
+            ):
+                _add_tag(link.get_text(" ", strip=True))
+
         chapter_links: list[Tag] = []
         for selector in GENERIC_CHAPTER_SELECTORS:
             links = soup.select(selector)
@@ -418,7 +479,7 @@ class YueduPlugin:
         if not chapter_links:
             for a in soup.select("a[href]"):
                 href = (a.get("href") or "").strip()
-                if not href or href in ("#", "javascript:;", "javascript:void(0)"):
+                if not href or href == "#" or href.startswith("javascript:"):
                     continue
                 abs_url = self._make_absolute(href, url)
                 if self._is_chapter_url(abs_url, url):
@@ -433,7 +494,7 @@ class YueduPlugin:
             if not text or text in skip_titles or len(text) > 80:
                 continue
             href = (a.get("href") or "").strip()
-            if not href or href in ("#", "javascript:;", "javascript:void(0)"):
+            if not href or href == "#" or href.startswith("javascript:"):
                 continue
             abs_url = self._make_absolute(href, url)
             if abs_url in seen_urls:
@@ -454,6 +515,7 @@ class YueduPlugin:
             "author": author,
             "description": description,
             "status": status,
+            "tags": tags,
             "chapters": chapters,
         }
 
@@ -787,7 +849,7 @@ class YueduPlugin:
                          "/signup", "/about", "/help", "/faq", "/contact"]
         for a_tag in soup.select("a[href]"):
             href = (a_tag.get("href") or "").strip()
-            if not href or href in ("#", "javascript:;", "javascript:void(0)"):
+            if not href or href == "#" or href.startswith("javascript:"):
                 continue
             full_url = self._make_absolute(href, base_url)
             if not full_url.startswith(("http://", "https://")):

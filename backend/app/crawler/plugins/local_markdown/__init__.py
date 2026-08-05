@@ -37,6 +37,8 @@ class LocalMarkdownPlugin:
 
         chapters: list[RemoteChapter] = []
         md_files = sorted(book_dir.glob("[0-9]*.md"))
+        if not md_files:
+            md_files = sorted(book_dir.glob("*.md"))
         for md_file in md_files:
             match = re.match(r"^(\d+)", md_file.stem)
             num = int(match.group(1)) if match else len(chapters) + 1

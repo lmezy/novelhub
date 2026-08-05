@@ -72,6 +72,7 @@ class ManualImportService:
                 "description": description,
                 "status": status,
                 "is_r18": is_r18,
+                "tags": tags,
             },
         )
         search_service.index_book({

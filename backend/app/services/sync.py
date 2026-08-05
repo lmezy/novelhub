@@ -221,6 +221,7 @@ class SyncService:
                 "description": remote_book.description,
                 "status": remote_book.status,
                 "is_r18": is_r18,
+                "tags": remote_book.tags,
             },
         )
 
