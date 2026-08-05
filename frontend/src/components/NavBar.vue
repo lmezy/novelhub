@@ -31,7 +31,7 @@ function closeMenu() {
       <button
         @click="i18n.toggleLocale()"
         class="w-7 h-7 flex items-center justify-center rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors text-xs font-medium"
-        :title="i18n.isZh ? 'Switch to English' : '切换到中文'"
+        :title="i18n.isZh ? i18n.t('nav_switch_en') : i18n.t('nav_switch_zh')"
       >{{ i18n.isZh ? 'EN' : '中' }}</button>
       <button
         @click="auth.toggleDark()"

@@ -27,19 +27,19 @@ const showAI = ref(false)
 const alternates = ref<any[]>([])
 const showSourceMenu = ref(false)
 
-const cnFonts = [
-  { value: "default", label: "\u7cfb\u7edf\u9ed8\u8ba4" },
-  { value: "song", label: "\u5b8b\u4f53" },
-  { value: "kai", label: "\u6977\u4f53" },
-  { value: "hei", label: "\u9ed1\u4f53" },
-  { value: "fang", label: "\u4eff\u5b8b" },
-]
-const enFonts = [
-  { value: "default", label: "System" },
-  { value: "serif", label: "Serif" },
-  { value: "sans", label: "Sans" },
-  { value: "mono", label: "Mono" },
-]
+const cnFonts = computed(() => [
+  { value: "default", label: i18n.t('reader_font_system') },
+  { value: "song", label: i18n.t('reader_font_song') },
+  { value: "kai", label: i18n.t('reader_font_kai') },
+  { value: "hei", label: i18n.t('reader_font_hei') },
+  { value: "fang", label: i18n.t('reader_font_fang') },
+])
+const enFonts = computed(() => [
+  { value: "default", label: i18n.t('reader_font_system') },
+  { value: "serif", label: i18n.t('reader_font_serif') },
+  { value: "sans", label: i18n.t('reader_font_sans') },
+  { value: "mono", label: i18n.t('reader_font_mono') },
+])
 
 const cnFontStack: Record<string, string> = {
   default: "",
@@ -128,7 +128,7 @@ async function loadChapter(id: string) {
     chapter.value = await store.fetchChapter(id)
     await saveProgress()
   } catch (e) {
-    error.value = e instanceof Error ? e.message : "Failed to load chapter"
+    error.value = e instanceof Error ? e.message : i18n.t('reader_failed_load_chapter')
   } finally {
     loading.value = false
   }
@@ -203,7 +203,7 @@ watch(
           :class="showAI ? 'text-accent' : ''"
         >{{ i18n.t('reader_ai') }}</button>
         <span v-if="chapter" class="text-sm truncate max-w-[200px]">
-          {{ chapter.title || 'Chapter ' + chapter.chapter_number }}
+          {{ chapter.title || i18n.t('reader_chapter_fallback', { n: chapter.chapter_number }) }}
         </span>
       </div>
       <div class="flex items-center gap-2">
@@ -212,8 +212,8 @@ watch(
             @click="showSourceMenu = !showSourceMenu"
             class="w-7 h-7 flex items-center justify-center rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors text-sm"
             :class="showSourceMenu ? 'text-accent' : ''"
-            :title="'Sources'"
-          >Src</button>
+            :title="i18n.t('reader_sources')"
+          >{{ i18n.t('reader_sources_short') }}</button>
           <div
             v-if="showSourceMenu"
             class="absolute right-0 top-full mt-1 w-60 rounded-lg border shadow-lg p-2 z-50"
@@ -228,8 +228,8 @@ watch(
                 ? 'bg-accent text-white font-medium'
                 : isDark ? 'hover:bg-gray-700' : 'hover:bg-gray-100'"
             >
-              {{ alt.source_name || alt.source_id || "Unknown" }}
-              <span v-if="alt.is_current" class="ml-1 opacity-70">(current)</span>
+              {{ alt.source_name || alt.source_id || i18n.t('reader_unknown') }}
+              <span v-if="alt.is_current" class="ml-1 opacity-70">{{ i18n.t('reader_current') }}</span>
             </button>
           </div>
         </div>
@@ -305,7 +305,7 @@ watch(
         :style="readerFontStyle"
       >
         <h1 class="text-2xl font-bold mb-8 text-center">
-          {{ chapter.title || 'Chapter ' + chapter.chapter_number }}
+          {{ chapter.title || i18n.t('reader_chapter_fallback', { n: chapter.chapter_number }) }}
         </h1>
         <div v-html="chapter.content.replace(/\n\n/g, '</p><p>').replace(/\n/g, '<br>')" />
       </article>
@@ -319,13 +319,13 @@ watch(
           v-if="prevChapter"
           :to="'/books/' + bookId + '/chapters/' + prevChapter.id"
           class="text-sm hover:opacity-70 transition-opacity no-underline"
-        >&larr; {{ prevChapter.title || 'Ch. ' + prevChapter.chapter_number }}</router-link>
+        >&larr; {{ prevChapter.title || i18n.t('reader_ch_short', { n: prevChapter.chapter_number }) }}</router-link>
         <span v-else class="text-sm text-muted">{{ i18n.t('reader_start') }}</span>
         <router-link
           v-if="nextChapter"
           :to="'/books/' + bookId + '/chapters/' + nextChapter.id"
           class="text-sm hover:opacity-70 transition-opacity no-underline"
-        >{{ nextChapter.title || 'Ch. ' + nextChapter.chapter_number }} &rarr;</router-link>
+        >{{ nextChapter.title || i18n.t('reader_ch_short', { n: nextChapter.chapter_number }) }} &rarr;</router-link>
         <span v-else class="text-sm text-muted">{{ i18n.t('reader_end') }}</span>
       </nav>
     </main>
@@ -355,7 +355,7 @@ watch(
                 ? 'text-accent font-medium'
                 : isDark ? 'text-gray-400 hover:text-gray-200' : 'text-muted hover:text-ink'
             "
-          >{{ ch.chapter_number }}. {{ ch.title || 'Chapter ' + ch.chapter_number }}</router-link>
+          >{{ ch.chapter_number }}. {{ ch.title || i18n.t('reader_chapter_fallback', { n: ch.chapter_number }) }}</router-link>
         </div>
         <div class="flex-1" @click="showToc = false" />
       </div>

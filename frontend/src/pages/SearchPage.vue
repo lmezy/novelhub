@@ -4,11 +4,13 @@ import { api } from "../api/client"
 import NavBar from "../components/NavBar.vue"
 import { useRouter } from "vue-router"
 import { useAuthStore } from "../stores/auth"
+import { useI18nStore } from "../stores/i18n"
 
 type SearchMode = "library" | "sources"
 
 const router = useRouter()
 const auth = useAuthStore()
+const i18n = useI18nStore()
 const mode = ref<SearchMode>("library")
 const query = ref("")
 const scope = ref<"books" | "chapters">("books")
@@ -32,7 +34,7 @@ async function loadSources() {
       sourceId.value = sources.value[0].id
     }
   } catch (e) {
-    error.value = e instanceof Error ? e.message : "Failed to load sources"
+    error.value = e instanceof Error ? e.message : i18n.t('search_failed_load_sources')
   }
 }
 
@@ -53,7 +55,7 @@ function doSearch() {
         total.value = res.total
       } else {
         if (!sourceId.value) {
-          error.value = "Please select a source"
+          error.value = i18n.t('search_select_source')
           return
         }
         const res = await api.get<{ results: any[]; total: number }>(
@@ -63,7 +65,7 @@ function doSearch() {
         remoteTotal.value = res.total
       }
     } catch (e) {
-      error.value = e instanceof Error ? e.message : "Search failed"
+      error.value = e instanceof Error ? e.message : i18n.t('search_failed')
     } finally {
       searching.value = false
     }
@@ -80,7 +82,7 @@ async function syncRemote(item: any) {
     })
     router.push("/books/" + res.book_id)
   } catch (e) {
-    alert(e instanceof Error ? e.message : "Sync failed")
+    alert(e instanceof Error ? e.message : i18n.t('search_sync_failed'))
   } finally {
     syncingUrl.value = ""
   }
@@ -112,7 +114,7 @@ onMounted(async () => {
     <NavBar />
 
     <main class="max-w-3xl mx-auto px-4 py-8">
-      <h1 class="text-2xl font-bold mb-6">Search</h1>
+      <h1 class="text-2xl font-bold mb-6">{{ i18n.t('search_title') }}</h1>
 
       <div class="flex gap-2 mb-4">
         <button
@@ -121,25 +123,25 @@ onMounted(async () => {
           @click="mode = m"
           class="text-xs px-3 py-1 rounded-full transition-colors"
           :class="mode === m ? 'bg-accent text-white' : 'bg-gray-100 dark:bg-gray-700 text-muted dark:text-gray-400 hover:bg-gray-200'"
-        >{{ m === 'library' ? 'Library' : 'Book Sources' }}</button>
+        >{{ m === 'library' ? i18n.t('search_library') : i18n.t('search_book_sources') }}</button>
       </div>
 
       <div class="flex gap-2 mb-4">
         <input
           v-model="query"
           type="search"
-          placeholder="Search books, authors, content..."
+          :placeholder="i18n.t('search_placeholder')"
           class="flex-1 px-4 py-2.5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-ink placeholder:text-muted dark:text-gray-400 focus:outline-none focus:ring-2 focus:ring-accent/30 text-sm"
           @keydown.enter="doSearch"
         />
         <button
           @click="doSearch"
           class="px-5 py-2.5 rounded-lg bg-accent text-white text-sm font-medium hover:opacity-90 transition-opacity"
-        >Search</button>
+        >{{ i18n.t('search_button') }}</button>
       </div>
 
       <div v-if="mode === 'sources'" class="mb-4">
-        <label class="block text-xs font-medium text-muted dark:text-gray-400 mb-1.5">Source</label>
+        <label class="block text-xs font-medium text-muted dark:text-gray-400 mb-1.5">{{ i18n.t('search_source') }}</label>
         <select
           v-model="sourceId"
           class="w-full px-3 py-2 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-sm"
@@ -155,19 +157,19 @@ onMounted(async () => {
           @click="scope = s"
           class="text-xs px-3 py-1 rounded-full transition-colors"
           :class="scope === s ? 'bg-accent text-white' : 'bg-gray-100 dark:bg-gray-700 text-muted dark:text-gray-400 hover:bg-gray-200'"
-        >{{ s === 'books' ? 'Books' : 'Chapters' }}</button>
+        >{{ s === 'books' ? i18n.t('search_books') : i18n.t('search_chapters') }}</button>
       </div>
 
       <p v-if="error" class="text-sm text-red-600 mb-4">{{ error }}</p>
-      <p v-if="searching" class="text-muted dark:text-gray-400 text-sm">Searching...</p>
+      <p v-if="searching" class="text-muted dark:text-gray-400 text-sm">{{ i18n.t('search_searching') }}</p>
 
       <template v-else-if="searched">
         <p class="text-sm text-muted dark:text-gray-400 mb-4">
-          {{ mode === 'library' ? total : remoteTotal }} results for "{{ query }}"
+          {{ i18n.t('search_results_for', { n: mode === 'library' ? total : remoteTotal, q: query }) }}
         </p>
 
         <p v-if="(mode === 'library' ? results : remoteResults).length === 0" class="text-muted dark:text-gray-400">
-          No results found.
+          {{ i18n.t('search_no_results') }}
         </p>
 
         <div
@@ -211,13 +213,13 @@ onMounted(async () => {
                 v-if="item.in_library"
                 @click="router.push('/books/' + item.book_id)"
                 class="shrink-0 px-3 py-1.5 rounded border border-accent text-accent text-xs hover:bg-accent/10"
-              >Open</button>
+              >{{ i18n.t('search_open') }}</button>
               <button
                 v-else-if="auth.isAdmin"
                 @click="syncRemote(item)"
                 :disabled="syncingUrl === item.url"
                 class="shrink-0 px-3 py-1.5 rounded bg-accent text-white text-xs hover:opacity-90 disabled:opacity-50"
-              >{{ syncingUrl === item.url ? 'Syncing...' : 'Sync' }}</button>
+              >{{ syncingUrl === item.url ? i18n.t('search_syncing') : i18n.t('search_sync') }}</button>
             </div>
           </div>
         </div>

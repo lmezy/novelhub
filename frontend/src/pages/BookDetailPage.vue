@@ -3,6 +3,7 @@ import { onMounted, ref } from "vue"
 import { useRoute, useRouter } from "vue-router"
 import { useBooksStore, type Book, type Chapter } from "../stores/books"
 import { useAuthStore } from "../stores/auth"
+import { useI18nStore } from "../stores/i18n"
 import { api } from "../api/client"
 import NavBar from "../components/NavBar.vue"
 
@@ -10,6 +11,7 @@ const route = useRoute()
 const router = useRouter()
 const store = useBooksStore()
 const auth = useAuthStore()
+const i18n = useI18nStore()
 
 const book = ref<Book | null>(null)
 const chapters = ref<Chapter[]>([])
@@ -27,12 +29,12 @@ async function toggleFavorite() {
 }
 
 async function deleteThisBook() {
-  if (!book.value || !confirm('Delete "' + book.value.title + '"? This cannot be undone.')) return
+  if (!book.value || !confirm(i18n.t('home_delete_confirm', { title: book.value.title }))) return
   try {
     await api.delete('/books/' + book.value.id)
     router.push("/")
   } catch (e) {
-    alert(e instanceof Error ? e.message : "Delete failed")
+    alert(e instanceof Error ? e.message : i18n.t('book_delete_failed'))
   }
 }
 
@@ -42,14 +44,15 @@ async function resyncBook() {
   try {
     const result = await api.post('/books/' + book.value.id + '/sync')
     const failed = result.failed_chapters?.length || 0
-    alert(
-      'Synced: ' + result.created_chapters + ' new chapters, ' +
-      result.skipped_chapters + ' skipped' +
-      (failed ? ', ' + failed + ' failed' : ''),
-    )
+    const failedSuffix = failed ? i18n.t('book_failed_suffix', { n: failed }) : ''
+    alert(i18n.t('book_sync_result', {
+      created: result.created_chapters,
+      skipped: result.skipped_chapters,
+      failed: failedSuffix,
+    }))
     chapters.value = await store.fetchChapters(book.value.id)
   } catch (e) {
-    alert(e instanceof Error ? e.message : "Sync failed")
+    alert(e instanceof Error ? e.message : i18n.t('book_sync_failed'))
   } finally {
     syncing.value = false
   }
@@ -80,7 +83,7 @@ onMounted(async () => {
       } catch { /* non-critical */ }
     }
   } catch (e) {
-    error.value = e instanceof Error ? e.message : "Failed to load book"
+    error.value = e instanceof Error ? e.message : i18n.t('book_load_failed')
   } finally {
     loading.value = false
   }
@@ -95,9 +98,9 @@ onMounted(async () => {
       <button
         @click="router.back()"
         class="text-sm text-muted dark:text-gray-400 hover:text-ink mb-6 inline-flex items-center gap-1 transition-colors"
-      >&larr; Back</button>
+      >&larr; {{ i18n.t('book_back') }}</button>
 
-      <p v-if="loading" class="text-muted dark:text-gray-400">Loading...</p>
+      <p v-if="loading" class="text-muted dark:text-gray-400">{{ i18n.t('book_loading') }}</p>
       <p v-else-if="error" class="text-red-600">{{ error }}</p>
 
       <template v-else-if="book">
@@ -105,7 +108,7 @@ onMounted(async () => {
           v-if="savedChapterId"
           :to="'/books/' + book.id + '/chapters/' + savedChapterId"
           class="inline-flex items-center gap-1 px-4 py-2 mb-6 rounded-lg bg-accent/10 text-accent text-sm font-medium hover:bg-accent/20 transition-colors no-underline"
-        >Continue Reading &rarr;</router-link>
+        >{{ i18n.t('book_continue') }} &rarr;</router-link>
 
         <header class="mb-8">
           <h1 class="text-3xl font-bold mb-2">{{ book.title }}</h1>
@@ -122,16 +125,16 @@ onMounted(async () => {
             <span
               class="text-xs px-2 py-0.5 rounded-full"
               :class="book.status === 'completed' ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'"
-            >{{ book.status || "unknown" }}</span>
+            >{{ book.status || i18n.t('book_unknown_status') }}</span>
             <span class="text-xs text-muted dark:text-gray-400">
-              Updated {{ new Date(book.updated_at).toLocaleDateString() }}
+              {{ i18n.t('book_updated', { date: new Date(book.updated_at).toLocaleDateString() }) }}
             </span>
           </div>
           <div v-if="alternates.length > 1" class="mt-4">
             <button
               @click="showSources = !showSources"
               class="px-3 py-1 text-xs border border-border dark:border-gray-700 rounded hover:bg-accent/5 transition-colors"
-            >Sources ({{ alternates.length }})</button>
+            >{{ i18n.t('book_sources') }} ({{ alternates.length }})</button>
             <div
               v-if="showSources"
               class="mt-2 divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900"
@@ -144,13 +147,13 @@ onMounted(async () => {
                 :class="alt.is_current ? 'text-accent font-medium' : ''"
               >
                 <span>
-                  {{ alt.source_name || alt.source_id || "Unknown" }}
+                  {{ alt.source_name || alt.source_id || i18n.t('book_unknown_source') }}
                   <span class="text-xs text-muted dark:text-gray-400">
-                    ({{ alt.chapter_count }} chapters)
+                    ({{ i18n.t('book_chapters_count', { n: alt.chapter_count }) }})
                   </span>
                 </span>
                 <span class="text-xs text-muted dark:text-gray-400">
-                  {{ alt.is_current ? "current" : "switch" }}
+                  {{ alt.is_current ? i18n.t('book_current') : i18n.t('book_switch') }}
                 </span>
               </button>
             </div>
@@ -159,33 +162,33 @@ onMounted(async () => {
             <button
               @click="toggleFavorite"
               class="px-3 py-1 text-xs border border-border dark:border-gray-700 rounded hover:bg-accent/5 transition-colors"
-            >{{ favorite ? '★ 已收藏' : '☆ 收藏' }}</button>
+            >{{ favorite ? i18n.t('book_favorite_added') : i18n.t('book_favorite') }}</button>
             <button
               v-if="auth.isAdmin"
               @click="deleteThisBook"
               class="px-3 py-1 text-xs text-red-500 border border-red-200 rounded hover:bg-red-50 transition-colors"
-            >Delete Book</button>
+            >{{ i18n.t('book_delete') }}</button>
             <a
               :href="'/api/books/' + book.id + '/epub'"
               class="inline-flex items-center gap-1 px-4 py-2 rounded-lg border border-border dark:border-gray-700 text-sm hover:bg-accent/5 transition-colors no-underline"
               download
-            >Download EPUB</a>
+            >{{ i18n.t('book_download_epub') }}</a>
             <button
               v-if="auth.isAdmin && book.source_id"
               @click="resyncBook"
               :disabled="syncing"
               class="px-3 py-1 text-xs border border-border dark:border-gray-700 rounded hover:bg-accent/5 transition-colors disabled:opacity-50"
-            >{{ syncing ? 'Syncing...' : 'Re-sync' }}</button>
+            >{{ syncing ? i18n.t('book_syncing') : i18n.t('book_resync') }}</button>
           </div>
         </header>
 
         <section>
           <h2 class="text-lg font-semibold mb-3">
-            Chapters
+            {{ i18n.t('book_chapters') }}
             <span class="text-sm font-normal text-muted dark:text-gray-400">({{ chapters.length }})</span>
           </h2>
 
-          <p v-if="chapters.length === 0" class="text-muted dark:text-gray-400 text-sm">No chapters yet.</p>
+          <p v-if="chapters.length === 0" class="text-muted dark:text-gray-400 text-sm">{{ i18n.t('book_no_chapters') }}</p>
 
           <div class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900">
             <router-link
@@ -196,7 +199,7 @@ onMounted(async () => {
             >
               <span class="text-sm">
                 <span class="text-muted dark:text-gray-400 mr-2">{{ ch.chapter_number }}.</span>
-                {{ ch.title || 'Chapter ' + ch.chapter_number }}
+                {{ ch.title || i18n.t('book_chapter', { n: ch.chapter_number }) }}
               </span>
               <span class="text-xs text-muted dark:text-gray-400">&rarr;</span>
             </router-link>

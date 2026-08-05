@@ -22,7 +22,7 @@ async function loadFavorites() {
   try {
     favoriteBooks.value = await store.fetchFavorites()
   } catch (e) {
-    favoriteError.value = e instanceof Error ? e.message : "加载书架失败"
+    favoriteError.value = e instanceof Error ? e.message : i18n.t('home_load_favorites_failed')
   } finally {
     favoriteLoading.value = false
   }
@@ -54,14 +54,14 @@ function toggleSelect(id: string) {
 
 async function batchDelete() {
   if (!selectedIds.value.length) return
-  if (!confirm(`确定删除选中的 ${selectedIds.value.length} 本书吗？此操作不可撤销。`)) return
+  if (!confirm(i18n.t('home_batch_delete_confirm', { n: selectedIds.value.length }))) return
   batchDeleting.value = true
   try {
     await api.post('/books/batch-delete', { ids: selectedIds.value })
     selectedIds.value = []
     await loadFavorites()
   } catch (e) {
-    alert(e instanceof Error ? e.message : '批量删除失败')
+    alert(e instanceof Error ? e.message : i18n.t('home_batch_delete_failed'))
   } finally {
     batchDeleting.value = false
   }
@@ -73,7 +73,7 @@ async function toggleSelfVisibility(key: "r18_enabled" | "non_r18_enabled") {
     await auth.updateVisibility({ [key]: !auth.user[key] })
     await loadFavorites()
   } catch (e) {
-    alert(e instanceof Error ? e.message : "Update failed")
+    alert(e instanceof Error ? e.message : i18n.t('home_update_failed'))
   }
 }
 
@@ -122,12 +122,12 @@ onMounted(async () => {
                 @click="toggleSelfVisibility('r18_enabled')"
                 class="text-xs px-3 py-1.5 rounded border text-sm"
                 :class="auth.user.r18_enabled ? 'bg-purple-100 text-purple-700 border-purple-400 dark:bg-purple-900 dark:text-purple-300' : 'border-border dark:border-gray-700 text-muted dark:text-gray-400'"
-              >{{ auth.user.r18_enabled ? 'R18 On' : 'R18 Off' }}</button>
+              >{{ auth.user.r18_enabled ? i18n.t('home_r18_on') : i18n.t('home_r18_off') }}</button>
               <button
                 @click="toggleSelfVisibility('non_r18_enabled')"
                 class="text-xs px-3 py-1.5 rounded border text-sm"
                 :class="auth.user.non_r18_enabled ? 'bg-green-100 text-green-700 border-green-400 dark:bg-green-900 dark:text-green-300' : 'border-border dark:border-gray-700 text-muted dark:text-gray-400'"
-              >{{ auth.user.non_r18_enabled ? 'All-Ages On' : 'All-Ages Off' }}</button>
+              >{{ auth.user.non_r18_enabled ? i18n.t('home_all_ages_on') : i18n.t('home_all_ages_off') }}</button>
             </template>
             <span class="text-sm text-muted dark:text-gray-400">{{ i18n.t('home_books_count', { n: favoriteBooks.length }) }}</span>
             <button
@@ -135,7 +135,7 @@ onMounted(async () => {
               @click="batchDelete"
               :disabled="batchDeleting"
               class="text-xs px-3 py-1.5 rounded bg-red-500 text-white hover:bg-red-600 disabled:opacity-50"
-            >批量删除 ({{ selectedIds.length }})</button>
+            >{{ i18n.t('books_batch_delete') }} ({{ selectedIds.length }})</button>
           </div>
         </div>
 
@@ -143,14 +143,12 @@ onMounted(async () => {
         <p v-else-if="favoriteError" class="text-red-600">{{ favoriteError }}</p>
 
         <div v-else-if="favoriteBooks.length === 0" class="text-center py-16">
-          <p class="text-muted dark:text-gray-400 text-lg mb-2">书架还是空的</p>
-          <p class="text-sm text-muted dark:text-gray-400">
-            去“全部书籍”里把想读的小说收藏到书架。
-          </p>
+          <p class="text-muted dark:text-gray-400 text-lg mb-2">{{ i18n.t('home_shelf_empty') }}</p>
+          <p class="text-sm text-muted dark:text-gray-400">{{ i18n.t('home_shelf_empty_hint') }}</p>
           <router-link
             to="/books"
             class="inline-block mt-4 text-sm text-accent hover:underline"
-          >前往全部书籍</router-link>
+          >{{ i18n.t('home_goto_books') }}</router-link>
         </div>
 
         <div v-else class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -171,7 +169,7 @@ onMounted(async () => {
             <button
               @click.prevent.stop="toggleFavorite(book)"
               class="absolute top-2 right-2 w-7 h-7 flex items-center justify-center rounded text-amber-500 text-base"
-              title="取消收藏"
+              :title="i18n.t('home_favorite_remove')"
             >★</button>
             <button
               v-if="auth.isAdmin"

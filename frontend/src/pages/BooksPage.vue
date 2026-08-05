@@ -35,14 +35,14 @@ async function deleteBook(id: string, title: string) {
 
 async function batchDelete() {
   if (!selectedIds.value.length) return
-  if (!confirm(`确定删除选中的 ${selectedIds.value.length} 本书吗？此操作不可撤销。`)) return
+  if (!confirm(i18n.t('books_batch_delete_confirm', { n: selectedIds.value.length }))) return
   batchDeleting.value = true
   try {
     await api.post('/books/batch-delete', { ids: selectedIds.value })
     selectedIds.value = []
     await store.fetchBooks()
   } catch (e) {
-    alert(e instanceof Error ? e.message : '批量删除失败')
+    alert(e instanceof Error ? e.message : i18n.t('books_batch_delete_failed'))
   } finally {
     batchDeleting.value = false
   }
@@ -61,8 +61,8 @@ onMounted(async () => {
       <section>
         <div class="flex items-center justify-between mb-6">
           <div>
-            <h1 class="text-2xl font-bold">全部书籍</h1>
-            <p class="text-sm text-muted dark:text-gray-400 mt-1">仓库中已经保存的所有小说</p>
+            <h1 class="text-2xl font-bold">{{ i18n.t('books_title') }}</h1>
+            <p class="text-sm text-muted dark:text-gray-400 mt-1">{{ i18n.t('books_subtitle') }}</p>
           </div>
           <div class="flex items-center gap-3">
             <span class="text-sm text-muted dark:text-gray-400">{{ i18n.t('home_books_count', { n: store.books.length }) }}</span>
@@ -71,7 +71,7 @@ onMounted(async () => {
               @click="batchDelete"
               :disabled="batchDeleting"
               class="text-xs px-3 py-1.5 rounded bg-red-500 text-white hover:bg-red-600 disabled:opacity-50"
-            >批量删除 ({{ selectedIds.length }})</button>
+            >{{ i18n.t('books_batch_delete') }} ({{ selectedIds.length }})</button>
           </div>
         </div>
 
@@ -79,8 +79,8 @@ onMounted(async () => {
         <p v-else-if="store.error" class="text-red-600">{{ store.error }}</p>
 
         <div v-else-if="store.books.length === 0" class="text-center py-16">
-          <p class="text-muted dark:text-gray-400 text-lg mb-2">仓库还没有书籍</p>
-          <router-link to="/admin" class="inline-block mt-4 text-sm text-accent hover:underline">前往管理页同步</router-link>
+          <p class="text-muted dark:text-gray-400 text-lg mb-2">{{ i18n.t('books_empty') }}</p>
+          <router-link to="/admin" class="inline-block mt-4 text-sm text-accent hover:underline">{{ i18n.t('books_empty_hint') }}</router-link>
         </div>
 
         <div v-else class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -101,7 +101,7 @@ onMounted(async () => {
               @click.prevent.stop="toggleFavorite(book)"
               class="absolute top-2 right-2 w-7 h-7 flex items-center justify-center rounded text-base"
               :class="book.is_favorite ? 'text-amber-500' : 'text-muted hover:text-amber-500'"
-              :title="book.is_favorite ? '取消收藏' : '收藏到书架'"
+              :title="book.is_favorite ? i18n.t('books_favorite_on') : i18n.t('books_favorite_off')"
             >{{ book.is_favorite ? '★' : '☆' }}</button>
             <h3 class="font-semibold text-ink mb-1 truncate pr-6">{{ book.title }}</h3>
             <p v-if="book.author_name" class="text-xs text-muted dark:text-gray-400 mb-1">{{ book.author_name }}</p>

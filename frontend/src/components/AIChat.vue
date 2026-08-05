@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { nextTick, ref, watch } from "vue"
 import { api } from "../api/client"
+import { useI18nStore } from "../stores/i18n"
 
 const props = defineProps<{ bookId: string }>()
+const i18n = useI18nStore()
 
 interface Message {
   role: "user" | "assistant"
@@ -30,7 +32,7 @@ async function send() {
   } catch (e) {
     messages.value.push({
       role: "assistant",
-      content: e instanceof Error ? e.message : "AI request failed",
+      content: e instanceof Error ? e.message : i18n.t('ai_request_failed'),
     })
   } finally {
     loading.value = false
@@ -49,12 +51,12 @@ async function scrollBottom() {
 <template>
   <div class="flex flex-col h-full">
     <div class="text-xs text-muted px-4 py-2 border-b border-border bg-surface/50 shrink-0">
-      AI Assistant
+      {{ i18n.t('ai_title') }}
     </div>
 
     <div ref="container" class="flex-1 overflow-y-auto px-4 py-3 space-y-3">
       <div v-if="messages.length === 0" class="text-xs text-muted text-center py-8">
-        Ask questions about this book
+        {{ i18n.t('ai_empty') }}
       </div>
 
       <div
@@ -73,7 +75,7 @@ async function scrollBottom() {
         >{{ msg.content }}</div>
       </div>
 
-      <div v-if="loading" class="text-xs text-muted">Thinking...</div>
+      <div v-if="loading" class="text-xs text-muted">{{ i18n.t('ai_thinking') }}</div>
     </div>
 
     <div class="px-4 py-3 border-t border-border bg-surface/50 shrink-0">
@@ -81,7 +83,7 @@ async function scrollBottom() {
         <input
           v-model="input"
           type="text"
-          placeholder="Ask about this book..."
+          :placeholder="i18n.t('ai_placeholder')"
           class="flex-1 px-3 py-1.5 rounded border border-border bg-paper text-sm text-ink placeholder:text-muted focus:outline-none focus:ring-1 focus:ring-accent/30"
           :disabled="loading"
         />
@@ -89,7 +91,7 @@ async function scrollBottom() {
           type="submit"
           :disabled="loading || !input.trim()"
           class="px-3 py-1.5 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-40 transition-opacity shrink-0"
-        >Send</button>
+        >{{ i18n.t('ai_send') }}</button>
       </form>
     </div>
   </div>

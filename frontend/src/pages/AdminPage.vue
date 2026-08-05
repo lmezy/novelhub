@@ -43,7 +43,7 @@ async function deleteSource(id: string) {
     await api.delete("/sources/" + id)
     await loadSources()
   } catch (e) {
-    sourceError.value = e instanceof Error ? e.message : "Delete failed"
+    sourceError.value = e instanceof Error ? e.message : i18n.t('admin_delete_source_failed')
   }
 }
 async function createSource() {
@@ -53,7 +53,7 @@ async function createSource() {
     await loadSources()
     sourceForm.value = { id: "", name: "", url: "", plugin_name: "alicesw", is_r18: false }
   } catch (e) {
-    sourceError.value = e instanceof Error ? e.message : "Failed"
+    sourceError.value = e instanceof Error ? e.message : i18n.t('admin_failed')
   }
 }
 
@@ -74,7 +74,7 @@ async function testCookie() {
       cookie_data: cookieForm.value.cookie_data,
     })
   } catch (e) {
-    cookieTestError.value = e instanceof Error ? e.message : "Test failed"
+    cookieTestError.value = e instanceof Error ? e.message : i18n.t('admin_test_failed')
   } finally {
     cookieTesting.value = false
   }
@@ -93,7 +93,7 @@ async function createCookie() {
     await loadCookies()
     cookieForm.value = { source: "", cookie_data: "", expired_at: "" }
   } catch (e) {
-    cookieError.value = e instanceof Error ? e.message : "Failed"
+    cookieError.value = e instanceof Error ? e.message : i18n.t('admin_failed')
   }
 }
 
@@ -189,7 +189,7 @@ async function createCred() {
     await loadCreds()
     credForm.value = { source: "", username: "", password: "" }
   } catch (e) {
-    credError.value = e instanceof Error ? e.message : "Failed"
+    credError.value = e instanceof Error ? e.message : i18n.t('admin_failed')
   }
 }
 
@@ -206,7 +206,7 @@ async function autoLogin(id: string) {
     credLoginResult.value[id] = await api.post("/credentials/" + id + "/auto-login")
     await loadCookies()
   } catch (e) {
-    credLoginError.value[id] = e instanceof Error ? e.message : "Login failed"
+    credLoginError.value[id] = e instanceof Error ? e.message : i18n.t('admin_login_failed')
   } finally {
     credLoggingIn.value[id] = false
   }
@@ -233,7 +233,7 @@ async function saveProxyConfig() {
     proxyHttps.value = res.https_proxy || ""
     proxyHttp.value = res.http_proxy || ""
   } catch (e) {
-    alert(e instanceof Error ? e.message : "Failed to save proxy config")
+    alert(e instanceof Error ? e.message : i18n.t('admin_proxy_save_failed'))
   } finally {
     proxySaving.value = false
   }
@@ -270,7 +270,7 @@ function handleManualClick(e: MouseEvent) {
   api.post("/manual-login/" + manualLoginSessionId.value + "/click", { x, y }).then((res: any) => {
     manualLoginScreenshot.value = res.screenshot
   }).catch(e => {
-    manualLoginError.value = e instanceof Error ? e.message : "Click failed"
+    manualLoginError.value = e instanceof Error ? e.message : i18n.t('admin_click_failed')
   }).finally(() => {
     manualLoginLoading.value = false
   })
@@ -284,7 +284,7 @@ async function handleManualType() {
     manualLoginScreenshot.value = res.screenshot
     manualLoginInput.value = ""
   } catch (e) {
-    manualLoginError.value = e instanceof Error ? e.message : "Type failed"
+    manualLoginError.value = e instanceof Error ? e.message : i18n.t('admin_type_failed')
   } finally {
     manualLoginLoading.value = false
   }
@@ -296,7 +296,7 @@ async function handleManualKey(key: string) {
     const res = await api.post("/manual-login/" + manualLoginSessionId.value + "/key", { key }) as any
     manualLoginScreenshot.value = res.screenshot
   } catch (e) {
-    manualLoginError.value = e instanceof Error ? e.message : "Key press failed"
+    manualLoginError.value = e instanceof Error ? e.message : i18n.t('admin_key_failed')
   } finally {
     manualLoginLoading.value = false
   }
@@ -309,7 +309,7 @@ async function finishManualLogin() {
     manualLoginActive.value = false
     await loadCookies()
   } catch (e) {
-    manualLoginError.value = e instanceof Error ? e.message : "Failed to save cookies"
+    manualLoginError.value = e instanceof Error ? e.message : i18n.t('admin_cookie_save_failed')
   } finally {
     manualLoginLoading.value = false
   }
@@ -340,7 +340,7 @@ async function yueduImport() {
     await loadSources()
     await loadCreds()
   } catch (e) {
-    yueduError.value = e instanceof Error ? e.message : "Import failed"
+    yueduError.value = e instanceof Error ? e.message : i18n.t('admin_import_failed')
   } finally {
     yueduImporting.value = false
   }
@@ -379,7 +379,7 @@ async function yueduPreviewAction() {
     if (yueduJsonText.value) body.json_text = yueduJsonText.value
     yueduPreview.value = await api.post("/yuedu/preview", body)
   } catch (e) {
-    yueduError.value = e instanceof Error ? e.message : "Preview failed"
+    yueduError.value = e instanceof Error ? e.message : i18n.t('admin_preview_failed')
   } finally {
     yueduPreviewing.value = false
   }
@@ -389,7 +389,7 @@ async function importLocal() {
   localError.value = ""
   localResult.value = null
   if (!localPath.value.trim()) {
-    localError.value = "请输入服务器上的书籍目录路径"
+    localError.value = i18n.t('admin_local_path_required')
     return
   }
   localImporting.value = true
@@ -399,7 +399,7 @@ async function importLocal() {
     })
     await loadSources()
   } catch (e) {
-    localError.value = e instanceof Error ? e.message : "本地导入失败"
+    localError.value = e instanceof Error ? e.message : i18n.t('admin_local_import_failed')
   } finally {
     localImporting.value = false
   }
@@ -418,7 +418,7 @@ function parseManualChapters() {
   const text = manualChaptersText.value.trim()
   if (!text) return []
   const chapters: { title: string; content: string }[] = []
-  let title = "第一章"
+  let title = i18n.t('admin_default_chapter_title')
   let lines: string[] = []
 
   const push = () => {
@@ -446,19 +446,19 @@ async function submitManualBook() {
   manualError.value = ""
   manualResult.value = null
   if (!manualTitle.value.trim()) {
-    manualError.value = "请输入书名"
+    manualError.value = i18n.t('admin_manual_title_required')
     return
   }
   const chapters = parseManualChapters()
   if (!chapters.length) {
-    manualError.value = "请输入至少一章内容"
+    manualError.value = i18n.t('admin_manual_chapter_required')
     return
   }
   manualImporting.value = true
   try {
     manualResult.value = await api.post<any>("/books/manual", {
       title: manualTitle.value.trim(),
-      author: manualAuthor.value.trim() || "未知作者",
+      author: manualAuthor.value.trim() || i18n.t('admin_unknown_author'),
       status: manualStatus.value,
       description: manualDescription.value.trim() || null,
       tags: manualTags.value.split(/[,，\s]+/).filter(Boolean),
@@ -471,7 +471,7 @@ async function submitManualBook() {
     manualChaptersText.value = ""
     manualStatus.value = "ongoing"
   } catch (e) {
-    manualError.value = e instanceof Error ? e.message : "手动上传失败"
+    manualError.value = e instanceof Error ? e.message : i18n.t('admin_manual_upload_failed')
   } finally {
     manualImporting.value = false
   }
@@ -487,7 +487,7 @@ async function triggerSync() {
       url: syncUrl.value,
     })
   } catch (e) {
-    syncError.value = e instanceof Error ? e.message : "Sync failed"
+    syncError.value = e instanceof Error ? e.message : i18n.t('admin_sync_failed')
   } finally {
     syncing.value = false
   }
@@ -502,7 +502,7 @@ async function triggerBookshelfSync() {
       source_id: bookshelfSourceId.value,
     })
   } catch (e) {
-    bookshelfError.value = e instanceof Error ? e.message : "Sync failed"
+    bookshelfError.value = e instanceof Error ? e.message : i18n.t('admin_sync_failed')
   } finally {
     bookshelfLoading.value = false
   }
@@ -511,7 +511,7 @@ async function triggerBookshelfSync() {
 async function startCrawlAll() {
   crawlTaskError.value = ""
   if (!crawlAllSourceId.value) {
-    crawlTaskError.value = "请输入书源 ID"
+    crawlTaskError.value = i18n.t('admin_crawl_source_required')
     return
   }
   crawlTaskLoading.value = true
@@ -522,7 +522,7 @@ async function startCrawlAll() {
     })
     await crawlStore.setTask(task)
   } catch (e) {
-    crawlTaskError.value = e instanceof Error ? e.message : "启动失败"
+    crawlTaskError.value = e instanceof Error ? e.message : i18n.t('admin_crawl_start_failed')
   } finally {
     crawlTaskLoading.value = false
   }
@@ -532,7 +532,7 @@ async function pauseCrawlTask() {
   try {
     await crawlStore.pauseTask()
   } catch (e) {
-    crawlTaskError.value = e instanceof Error ? e.message : "暂停任务失败"
+    crawlTaskError.value = e instanceof Error ? e.message : i18n.t('admin_crawl_pause_failed')
   }
 }
 
@@ -540,16 +540,16 @@ async function resumeCrawlTask() {
   try {
     await crawlStore.resumeTask()
   } catch (e) {
-    crawlTaskError.value = e instanceof Error ? e.message : "恢复任务失败"
+    crawlTaskError.value = e instanceof Error ? e.message : i18n.t('admin_crawl_resume_failed')
   }
 }
 
 async function cancelCrawlTask() {
-  if (!confirm("确定取消当前同步任务吗？")) return
+  if (!confirm(i18n.t('admin_crawl_cancel_confirm'))) return
   try {
     await crawlStore.cancelTask()
   } catch (e) {
-    crawlTaskError.value = e instanceof Error ? e.message : "取消任务失败"
+    crawlTaskError.value = e instanceof Error ? e.message : i18n.t('admin_crawl_cancel_failed')
   }
 }
 
@@ -579,7 +579,7 @@ async function createToken() {
     tokenExpires.value = null
     await loadTokens()
   } catch (e) {
-    tokenError.value = e instanceof Error ? e.message : "Failed"
+    tokenError.value = e instanceof Error ? e.message : i18n.t('admin_failed')
   }
 }
 
@@ -597,7 +597,7 @@ async function loadIndexStats() {
   try {
     indexStats.value = await api.get<any>("/search/index/stats")
   } catch (e) {
-    indexError.value = e instanceof Error ? e.message : "Failed"
+    indexError.value = e instanceof Error ? e.message : i18n.t('admin_failed')
     indexStats.value = null
   }
 }
@@ -609,7 +609,7 @@ async function rebuildIndex() {
     await api.post("/search/index/rebuild")
     await loadIndexStats()
   } catch (e) {
-    indexError.value = e instanceof Error ? e.message : "Rebuild failed"
+    indexError.value = e instanceof Error ? e.message : i18n.t('admin_rebuild_failed')
   } finally {
     indexRebuilding.value = false
   }
@@ -640,16 +640,16 @@ const approvalReviewing = ref<Record<string, boolean>>({})
 
 async function loadUsers() {
   userError.value = ""
-  try { users.value = await api.get<any[]>("/admin/users") } catch (e) { userError.value = e instanceof Error ? e.message : "Failed" }
+  try { users.value = await api.get<any[]>("/admin/users") } catch (e) { userError.value = e instanceof Error ? e.message : i18n.t('admin_failed') }
 }
 
 async function deleteUser(id: string, username: string) {
-  if (!confirm("Delete user " + username + "?")) return
-  try { await api.delete("/admin/users/" + id); await loadUsers() } catch (e) { alert(e instanceof Error ? e.message : "Failed") }
+  if (!confirm(i18n.t('admin_delete_user_confirm', { username }))) return
+  try { await api.delete("/admin/users/" + id); await loadUsers() } catch (e) { alert(e instanceof Error ? e.message : i18n.t('admin_failed')) }
 }
 
 async function changeUserRole(id: string, role: string) {
-  try { await api.put("/admin/users/" + id + "/role", { role }); await loadUsers() } catch (e) { alert(e instanceof Error ? e.message : "Failed") }
+  try { await api.put("/admin/users/" + id + "/role", { role }); await loadUsers() } catch (e) { alert(e instanceof Error ? e.message : i18n.t('admin_failed')) }
 }
 
 async function toggleUserVisibility(
@@ -662,18 +662,18 @@ async function toggleUserVisibility(
     await api.put("/admin/users/" + u.id + "/visibility", body)
     await loadUsers()
   } catch (e) {
-    alert(e instanceof Error ? e.message : "Failed")
+    alert(e instanceof Error ? e.message : i18n.t('admin_failed'))
   }
 }
 
 async function loadApprovals() {
   approvalError.value = ""
-  try { approvals.value = await api.get<any[]>("/source-changes?status=pending") } catch (e) { approvalError.value = e instanceof Error ? e.message : "Failed" }
+  try { approvals.value = await api.get<any[]>("/source-changes?status=pending") } catch (e) { approvalError.value = e instanceof Error ? e.message : i18n.t('admin_failed') }
 }
 
 async function reviewChange(id: string, action: string) {
   approvalReviewing.value[id] = true
-  try { await api.post("/source-changes/" + id + "/review", { action }); await loadApprovals(); await loadSources() } catch (e) { alert(e instanceof Error ? e.message : "Failed") }
+  try { await api.post("/source-changes/" + id + "/review", { action }); await loadApprovals(); await loadSources() } catch (e) { alert(e instanceof Error ? e.message : i18n.t('admin_failed')) }
   finally { approvalReviewing.value[id] = false }
 }
 
@@ -728,7 +728,7 @@ onUnmounted(() => {
           </div>
           <div class="flex items-center gap-2 mb-3">
             <input type="checkbox" id="source-r18" v-model="sourceForm.is_r18" class="rounded" />
-            <label for="source-r18" class="text-xs text-muted dark:text-gray-400">R18 source</label>
+            <label for="source-r18" class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_r18_label') }}</label>
           </div>
           <p v-if="sourceError" class="text-sm text-red-600 mb-2">{{ sourceError }}</p>
           <button @click="createSource" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90">{{ i18n.t('admin_create_source') }}</button>
@@ -810,7 +810,7 @@ onUnmounted(() => {
           </button>
           <div v-if="syncResult" class="mt-4 p-3 rounded bg-green-50 text-sm">
             <p>{{ i18n.t('admin_book_id') }}: {{ syncResult.book_id }}</p>
-            <p>{{ i18n.t('admin_created_chapters') }}: {{ syncResult.created_chapters }} / {{ i18n.t('admin_skipped') }}: {{ syncResult.skipped_chapters }}<span v-if="syncResult.failed_chapters?.length"> / failed: {{ syncResult.failed_chapters.length }}</span></p>
+            <p>{{ i18n.t('admin_created_chapters') }}: {{ syncResult.created_chapters }} / {{ i18n.t('admin_skipped') }}: {{ syncResult.skipped_chapters }}<span v-if="syncResult.failed_chapters?.length"> / {{ i18n.t('admin_failed') }}: {{ syncResult.failed_chapters.length }}</span></p>
           </div>
         </div>
 
@@ -825,11 +825,11 @@ onUnmounted(() => {
             {{ bookshelfLoading ? i18n.t('admin_syncing') : i18n.t('admin_sync_bookshelf') }}
           </button>
           <div v-if="bookshelfResult" class="mt-4 p-3 rounded bg-green-50 text-sm">
-            <p>Source: {{ bookshelfResult.source_id }}</p>
+            <p>{{ i18n.t('admin_tab_sources') }}: {{ bookshelfResult.source_id }}</p>
             <p>{{ i18n.t('admin_total') }}: {{ bookshelfResult.total }}</p>
             <div v-for="(r, i) in bookshelfResult.results" :key="i" class="mt-2 text-xs">
               <span :class="r.status === 'ok' ? 'text-green-700' : 'text-red-600'">
-                {{ r.status === 'ok' ? 'OK' : 'Failed' }}: {{ r.book_id || r.url }}
+                {{ r.status === 'ok' ? 'OK' : i18n.t('admin_failed') }}: {{ r.book_id || r.url }}
               </span>
               <span v-if="r.error" class="text-red-500 ml-1">{{ r.error }}</span>
             </div>
@@ -837,48 +837,59 @@ onUnmounted(() => {
         </div>
 
         <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 mt-4">
-          <h2 class="text-sm font-semibold mb-4">全站同步</h2>
-          <p class="text-xs text-muted dark:text-gray-400 mb-3">遍历书源的发现/分类分页，抓取全部小说并增量更新。</p>
+          <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_full_site_sync') }}</h2>
+          <p class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('admin_full_site_hint') }}</p>
           <div class="flex gap-3 mb-3">
             <input v-model="crawlAllSourceId" :placeholder="i18n.t('admin_placeholder_source')" class="flex-1 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
           </div>
           <p v-if="crawlTaskError" class="text-sm text-red-600 mb-2">{{ crawlTaskError }}</p>
           <button @click="startCrawlAll" :disabled="crawlTaskLoading" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">
-            {{ crawlTaskLoading ? '启动中...' : '开始全站同步' }}
+            {{ crawlTaskLoading ? i18n.t('admin_starting_short') : i18n.t('admin_start_full_site') }}
           </button>
           <div v-if="crawlStore.activeTask" class="mt-4 p-3 rounded bg-green-50 text-sm">
-            <p>任务: {{ crawlStore.activeTask.id }}</p>
-            <p>状态: {{ crawlStore.activeTask.status }}</p>
+            <p>{{ i18n.t('admin_task') }}: {{ crawlStore.activeTask.id }}</p>
+            <p>{{ i18n.t('admin_status') }}: {{ crawlStore.activeTask.status }}</p>
             <div class="flex gap-2 mt-2">
               <button
                 v-if="crawlStore.activeTask.status === 'running'"
                 @click="pauseCrawlTask"
                 class="px-3 py-1 text-xs border border-border rounded hover:bg-white/60"
-              >暂停</button>
+              >{{ i18n.t('sync_pause') }}</button>
               <button
                 v-if="crawlStore.activeTask.status === 'paused'"
                 @click="resumeCrawlTask"
                 class="px-3 py-1 text-xs border border-green-600 text-green-700 rounded hover:bg-green-50"
-              >继续</button>
+              >{{ i18n.t('admin_resume') }}</button>
               <button
                 v-if="!['completed', 'failed', 'cancelled', 'completed_with_errors'].includes(crawlStore.activeTask.status)"
                 @click="cancelCrawlTask"
                 class="px-3 py-1 text-xs border border-red-500 text-red-600 rounded hover:bg-red-50"
-              >取消</button>
+              >{{ i18n.t('sync_cancel') }}</button>
             </div>
             <div v-if="!['completed', 'failed', 'cancelled', 'completed_with_errors'].includes(crawlStore.activeTask.status)" class="mt-3">
               <div class="h-2 rounded bg-gray-200 dark:bg-gray-700 overflow-hidden">
                 <div class="h-full bg-accent transition-all" :style="{ width: crawlTaskProgress + '%' }"></div>
               </div>
               <p class="text-xs text-muted dark:text-gray-400 mt-1">
-                已检查 {{ crawlStore.activeTask.progress?.pages_checked || 0 }} 页，发现 {{ crawlStore.activeTask.progress?.books_found || 0 }} 本
+                {{ i18n.t('admin_checked_found', {
+                  pages: crawlStore.activeTask.progress?.pages_checked || 0,
+                  found: crawlStore.activeTask.progress?.books_found || 0,
+                }) }}
                 <span v-if="crawlStore.activeTask.progress?.current_book">
-                  ，正在同步《{{ crawlStore.activeTask.progress.current_book }}》
-                  {{ crawlStore.activeTask.progress.current_chapters_created || 0 }}/{{ crawlStore.activeTask.progress.current_chapters_total || 0 }} 章
+                  {{ i18n.t('admin_syncing_book', {
+                    title: crawlStore.activeTask.progress.current_book,
+                    done: crawlStore.activeTask.progress.current_chapters_created || 0,
+                    total: crawlStore.activeTask.progress.current_chapters_total || 0,
+                  }) }}
                 </span>
               </p>
             </div>
-            <p v-if="crawlStore.activeTask.result">发现 {{ crawlStore.activeTask.result.books_found }} 本，成功 {{ crawlStore.activeTask.result.books_synced }} 本，失败 {{ crawlStore.activeTask.result.books_failed }} 本，新增章节 {{ crawlStore.activeTask.result.chapters_created }}</p>
+            <p v-if="crawlStore.activeTask.result">{{ i18n.t('admin_full_result', {
+              found: crawlStore.activeTask.result.books_found,
+              synced: crawlStore.activeTask.result.books_synced,
+              failed: crawlStore.activeTask.result.books_failed,
+              chapters: crawlStore.activeTask.result.chapters_created,
+            }) }}</p>
             <p v-if="crawlStore.activeTask.error" class="text-red-600 mt-1">{{ crawlStore.activeTask.error }}</p>
           </div>
         </div>
@@ -975,7 +986,7 @@ onUnmounted(() => {
             </div>
             <div class="flex items-center gap-2">
               <input type="checkbox" id="yuedu-r18" v-model="yueduIsR18" class="rounded" />
-              <label for="yuedu-r18" class="text-xs text-muted dark:text-gray-400">R18 source</label>
+              <label for="yuedu-r18" class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_r18_label') }}</label>
             </div>
 
             <p v-if="yueduSyncError" class="text-sm text-red-600">{{ yueduSyncError }}</p>
@@ -1015,8 +1026,8 @@ onUnmounted(() => {
             <p v-if="yueduError" class="text-sm text-red-600 mt-3">{{ yueduError }}</p>
             <div v-if="yueduResult" class="mt-3 p-3 rounded bg-green-50 dark:bg-green-950 text-sm">
               <p class="font-medium">{{ i18n.t('admin_yuedu_imported_count', { imported: yueduResult.imported, total: yueduResult.total }) }}</p>
-              <p class="text-xs text-muted dark:text-gray-400">跳过 {{ yueduResult.skipped }} 个已存在书源</p>
-              <p v-if="yueduResult.updated" class="text-xs text-muted dark:text-gray-400">更新 {{ yueduResult.updated }} 个已存在书源</p>
+              <p class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_skipped_count', { skipped: yueduResult.skipped }) }}</p>
+              <p v-if="yueduResult.updated" class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_updated_count', { updated: yueduResult.updated }) }}</p>
             </div>
 
             <details class="mt-3">
@@ -1045,11 +1056,11 @@ onUnmounted(() => {
 
       <section v-if="tab === 'add'" class="space-y-6">
         <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 max-w-3xl">
-          <h2 class="text-sm font-semibold mb-4">本地 Markdown 导入</h2>
-          <p class="text-xs text-muted dark:text-gray-400 mb-3">输入服务器上已经准备好的书籍目录，目录内需要有章节 Markdown 文件，可附带 metadata.json。</p>
+          <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_local_markdown') }}</h2>
+          <p class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('admin_local_hint') }}</p>
           <input
             v-model="localPath"
-            placeholder="/app/storage/imports/书名"
+            :placeholder="i18n.t('admin_local_path_placeholder')"
             class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
           />
           <p v-if="localError" class="text-sm text-red-600 mt-2">{{ localError }}</p>
@@ -1057,47 +1068,47 @@ onUnmounted(() => {
             @click="importLocal"
             :disabled="localImporting"
             class="mt-3 px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50"
-          >{{ localImporting ? '导入中...' : '导入本地书籍' }}</button>
+          >{{ localImporting ? i18n.t('admin_importing_short') : i18n.t('admin_local_import') }}</button>
           <div v-if="localResult" class="mt-3 p-3 rounded bg-green-50 dark:bg-green-950 text-sm">
-            <p>Book ID: {{ localResult.book_id }}</p>
-            <p>新增章节: {{ localResult.created_chapters }}</p>
+            <p>{{ i18n.t('admin_book_id') }}: {{ localResult.book_id }}</p>
+            <p>{{ i18n.t('admin_created_chapters_label') }}: {{ localResult.created_chapters }}</p>
           </div>
         </div>
 
         <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 max-w-3xl">
-          <h2 class="text-sm font-semibold mb-4">手动上传</h2>
-          <p class="text-xs text-muted dark:text-gray-400 mb-3">填写书名和作者，章节用 <code>## 章节标题</code> 分隔，也可以直接选择 .txt / .md 文件读取。</p>
+          <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_manual_upload') }}</h2>
+          <p class="text-xs text-muted dark:text-gray-400 mb-3" v-html="i18n.t('admin_manual_hint')"></p>
 
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
-            <input v-model="manualTitle" placeholder="书名" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-            <input v-model="manualAuthor" placeholder="作者" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            <input v-model="manualTitle" :placeholder="i18n.t('admin_manual_title_placeholder')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            <input v-model="manualAuthor" :placeholder="i18n.t('admin_manual_author_placeholder')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
           </div>
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
             <select v-model="manualStatus" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800">
-              <option value="ongoing">连载中</option>
-              <option value="completed">已完结</option>
+              <option value="ongoing">{{ i18n.t('admin_manual_status_ongoing') }}</option>
+              <option value="completed">{{ i18n.t('admin_manual_status_completed') }}</option>
             </select>
-            <input v-model="manualTags" placeholder="标签，逗号分隔" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            <input v-model="manualTags" :placeholder="i18n.t('admin_manual_tags_placeholder')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
           </div>
           <textarea
             v-model="manualDescription"
             rows="3"
-            placeholder="简介"
+            :placeholder="i18n.t('admin_manual_desc_placeholder')"
             class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 resize-y mb-3"
           ></textarea>
           <textarea
             v-model="manualChaptersText"
             rows="10"
-            placeholder="## 第一章&#10;正文内容..."
+            :placeholder="i18n.t('admin_manual_chapters_placeholder')"
             class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 resize-y font-mono mb-3"
           ></textarea>
 
           <div class="flex items-center gap-3 mb-3">
             <label class="inline-flex px-3 py-2 rounded border border-border dark:border-gray-700 text-sm cursor-pointer hover:bg-accent/5">
-              选择 .txt / .md
+              {{ i18n.t('admin_manual_pick_file') }}
               <input type="file" accept=".txt,.md,text/plain,text/markdown" class="hidden" @change="onManualFile" />
             </label>
-            <span class="text-xs text-muted dark:text-gray-400">章节标题用 <code>## </code> 开头</span>
+            <span class="text-xs text-muted dark:text-gray-400" v-html="i18n.t('admin_manual_chapter_hint')"></span>
           </div>
 
           <p v-if="manualError" class="text-sm text-red-600 mb-2">{{ manualError }}</p>
@@ -1105,10 +1116,10 @@ onUnmounted(() => {
             @click="submitManualBook"
             :disabled="manualImporting"
             class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50"
-          >{{ manualImporting ? '保存中...' : '保存书籍' }}</button>
+          >{{ manualImporting ? i18n.t('admin_saving') : i18n.t('admin_save_book') }}</button>
           <div v-if="manualResult" class="mt-3 p-3 rounded bg-green-50 dark:bg-green-950 text-sm">
-            <p>Book ID: {{ manualResult.book_id }}</p>
-            <p>新增章节: {{ manualResult.created_chapters }}</p>
+            <p>{{ i18n.t('admin_book_id') }}: {{ manualResult.book_id }}</p>
+            <p>{{ i18n.t('admin_created_chapters_label') }}: {{ manualResult.created_chapters }}</p>
           </div>
         </div>
       </section>
@@ -1151,8 +1162,8 @@ onUnmounted(() => {
       </section>
       <section v-if="tab === 'users'" class="space-y-6">
         <div class="flex items-center justify-between mb-4">
-          <h2 class="text-lg font-semibold">User Management</h2>
-          <button @click="loadUsers" class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm hover:bg-surface transition-colors">Refresh</button>
+          <h2 class="text-lg font-semibold">{{ i18n.t('admin_user_management') }}</h2>
+          <button @click="loadUsers" class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm hover:bg-surface transition-colors">{{ i18n.t('admin_refresh') }}</button>
         </div>
         <p v-if="userError" class="text-sm text-red-600 mb-3">{{ userError }}</p>
         <div class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900">
@@ -1160,35 +1171,35 @@ onUnmounted(() => {
             <div>
               <span class="text-sm font-medium">{{ u.username }}</span>
               <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ u.email || '' }}</span>
-              <span class="text-xs px-1.5 py-0.5 rounded-full ml-2" :class="u.role === 'super_admin' ? 'bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-300' : u.role === 'admin' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300' : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400'">{{ u.role }}</span>
+              <span class="text-xs px-1.5 py-0.5 rounded-full ml-2" :class="u.role === 'super_admin' ? 'bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-300' : u.role === 'admin' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300' : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400'">{{ u.role === 'super_admin' ? i18n.t('admin_role_super_admin') : u.role === 'admin' ? i18n.t('admin_role_admin') : i18n.t('admin_role_user') }}</span>
             </div>
             <div class="flex items-center gap-2">
               <button @click="toggleUserVisibility(u, 'r18_enabled')" class="text-xs px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5" :class="u.r18_enabled ? 'text-purple-700 dark:text-purple-300 border-purple-500' : ''">
-                {{ u.r18_enabled ? 'R18 On' : 'R18 Off' }}
+                {{ u.r18_enabled ? i18n.t('admin_r18_on') : i18n.t('admin_r18_off') }}
               </button>
               <button @click="toggleUserVisibility(u, 'non_r18_enabled')" class="text-xs px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5" :class="u.non_r18_enabled ? 'text-green-700 dark:text-green-300 border-green-500' : ''">
-                {{ u.non_r18_enabled ? 'All-Ages On' : 'All-Ages Off' }}
+                {{ u.non_r18_enabled ? i18n.t('admin_all_ages_on') : i18n.t('admin_all_ages_off') }}
               </button>
               <button @click="toggleUserVisibility(u, 'can_manage_visibility')" class="text-xs px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5" :class="u.can_manage_visibility ? 'text-blue-700 dark:text-blue-300 border-blue-500' : ''">
-                {{ u.can_manage_visibility ? 'Controls On' : 'Controls Off' }}
+                {{ u.can_manage_visibility ? i18n.t('admin_controls_on') : i18n.t('admin_controls_off') }}
               </button>
               <select @change="(e: any) => changeUserRole(u.id, e.target.value)" class="text-xs px-2 py-1 rounded border border-border dark:border-gray-700 bg-paper dark:bg-gray-800">
-                <option value="" disabled selected>Change role</option>
-                <option value="user">User</option>
-                <option value="admin">Admin</option>
-                <option value="super_admin">Super Admin</option>
+                <option value="" disabled selected>{{ i18n.t('admin_change_role') }}</option>
+                <option value="user">{{ i18n.t('admin_role_user') }}</option>
+                <option value="admin">{{ i18n.t('admin_role_admin') }}</option>
+                <option value="super_admin">{{ i18n.t('admin_role_super_admin') }}</option>
               </select>
-              <button @click="deleteUser(u.id, u.username)" class="text-xs text-red-500 hover:text-red-700">Delete</button>
+              <button @click="deleteUser(u.id, u.username)" class="text-xs text-red-500 hover:text-red-700">{{ i18n.t('admin_delete') }}</button>
             </div>
           </div>
-          <p v-if="users.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">No users found.</p>
+          <p v-if="users.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">{{ i18n.t('admin_no_users') }}</p>
         </div>
       </section>
 
       <section v-if="tab === 'approvals'" class="space-y-6">
         <div class="flex items-center justify-between mb-4">
-          <h2 class="text-lg font-semibold">Pending Approvals</h2>
-          <button @click="loadApprovals" class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm hover:bg-surface transition-colors">Refresh</button>
+          <h2 class="text-lg font-semibold">{{ i18n.t('admin_pending_approvals') }}</h2>
+          <button @click="loadApprovals" class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm hover:bg-surface transition-colors">{{ i18n.t('admin_refresh') }}</button>
         </div>
         <p v-if="approvalError" class="text-sm text-red-600 mb-3">{{ approvalError }}</p>
         <div class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900">
@@ -1200,16 +1211,16 @@ onUnmounted(() => {
                 <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ a.source_data.id }} ({{ a.source_data.plugin_name }})</span>
               </template>
               <template v-else-if="a.source_id">
-                <span class="text-sm font-medium">Delete: {{ a.source_id }}</span>
+                <span class="text-sm font-medium">{{ i18n.t('admin_delete_source', { id: a.source_id }) }}</span>
               </template>
-              <span class="text-xs text-muted dark:text-gray-400 ml-2">by user {{ a.user_id?.slice(0, 8) }}...</span>
+              <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ i18n.t('admin_by_user', { id: a.user_id?.slice(0, 8) }) }}...</span>
             </div>
             <div class="flex items-center gap-2">
-              <button @click="reviewChange(a.id, 'approve')" :disabled="approvalReviewing[a.id]" class="px-3 py-1 rounded bg-green-600 text-white text-xs font-medium hover:bg-green-700 disabled:opacity-50">Approve</button>
-              <button @click="reviewChange(a.id, 'reject')" :disabled="approvalReviewing[a.id]" class="px-3 py-1 rounded bg-red-500 text-white text-xs font-medium hover:bg-red-600 disabled:opacity-50">Reject</button>
+              <button @click="reviewChange(a.id, 'approve')" :disabled="approvalReviewing[a.id]" class="px-3 py-1 rounded bg-green-600 text-white text-xs font-medium hover:bg-green-700 disabled:opacity-50">{{ i18n.t('admin_approve') }}</button>
+              <button @click="reviewChange(a.id, 'reject')" :disabled="approvalReviewing[a.id]" class="px-3 py-1 rounded bg-red-500 text-white text-xs font-medium hover:bg-red-600 disabled:opacity-50">{{ i18n.t('admin_reject') }}</button>
             </div>
           </div>
-          <p v-if="approvals.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">No pending approvals.</p>
+          <p v-if="approvals.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">{{ i18n.t('admin_no_approvals') }}</p>
         </div>
       </section>
 
@@ -1224,11 +1235,11 @@ onUnmounted(() => {
             </button>
           </div>
           <div class="mb-3">
-            <label class="block text-xs text-muted dark:text-gray-400 mb-1">HTTPS Proxy</label>
+            <label class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_https_proxy') }}</label>
             <input v-model="proxyHttps" placeholder="http://127.0.0.1:7890" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
           </div>
           <div class="mb-4">
-            <label class="block text-xs text-muted dark:text-gray-400 mb-1">HTTP Proxy</label>
+            <label class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_http_proxy') }}</label>
             <input v-model="proxyHttp" placeholder="http://127.0.0.1:7890" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
           </div>
           <button @click="saveProxyConfig" :disabled="proxySaving" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">
