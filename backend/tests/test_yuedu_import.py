@@ -7,13 +7,16 @@ import pytest
 from bs4 import BeautifulSoup
 
 from app.api.routes.yuedu import (
+    YueduImportSyncRequest,
     YueduImportRequest,
     _fetch_sources_from_url,
     _make_source_id,
     _normalize_import_url,
     _parse_yckceo_listing_ids,
+    import_and_sync_all,
     import_yuedu_sources,
 )
+from app.services.sync import SyncService
 
 
 def fake_response(text: str, url: str) -> httpx.Response:
@@ -207,6 +210,59 @@ async def test_import_yuedu_sources_imports_yckceo_listing(mock_db):
     assert result.imported == 2
     assert result.updated == 0
     assert mock_db.commit.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_import_and_sync_all_runs_all_sources(mock_db):
+    mock_db.scalar = AsyncMock(return_value=SimpleNamespace())
+    source_infos = [
+        {"id": "s1", "name": "One"},
+        {"id": "s2", "name": "Two"},
+    ]
+    session = AsyncMock()
+    session.__aenter__ = AsyncMock(return_value=mock_db)
+    session.__aexit__ = AsyncMock(return_value=False)
+
+    with (
+        patch(
+            "app.api.routes.yuedu.import_yuedu_sources",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    total=2,
+                    imported=2,
+                    skipped=0,
+                    updated=0,
+                    sources=source_infos,
+                )
+            ),
+        ),
+        patch("app.core.database.SessionLocal", return_value=session),
+        patch.object(
+            SyncService,
+            "sync_bookshelf",
+            AsyncMock(return_value={"total": 1, "results": []}),
+        ),
+        patch.object(
+            SyncService,
+            "discover_and_sync_all",
+            AsyncMock(return_value={
+                "pages_checked": 1,
+                "books_found": 2,
+                "books_synced": 1,
+                "books_failed": 0,
+                "chapters_created": 3,
+            }),
+        ),
+    ):
+        result = await import_and_sync_all(
+            YueduImportSyncRequest(url="https://repo.example/json", discover=True),
+            mock_db,
+        )
+
+    assert result.sources_total == 2
+    assert len(result.details) == 2
+    assert result.books_discovered == 4
+    assert result.chapters_downloaded == 6
 
 
 @pytest.mark.asyncio

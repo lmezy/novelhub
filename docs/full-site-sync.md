@@ -32,11 +32,11 @@ Admin 的 `Sync` 页也提供“全站同步”按钮，启动后会自动轮询
 - 未配置时使用环境变量 `CRAWL_DELAY_MS`，默认 `1200`；
 - 每次延迟额外叠加 200-600ms 随机抖动；
 - 遇到 429/5xx 会自动重试并退避；
-- crawler worker 同一时间只跑一个爬取任务；任务内章节下载按 `SYNC_CHAPTER_CONCURRENCY` 并发，默认 `9`。
+- crawler 队列 worker 可按 `SYNC_WORKER_CONCURRENCY` 并行跑多个爬取任务；单个任务内章节下载按 `SYNC_CHAPTER_CONCURRENCY` 并发，默认 `9`。
 - 并发模型对齐 Legado：`SYNC_THREAD_COUNT` 默认 `9`，最大封顶 `9`；目录分页和正文分页也按这个线程数并行抓取。
 - 全站同步默认按 `SYNC_BOOK_CONCURRENCY` 并发处理书籍，默认 `3`；调大前请确认书站能承受请求量。
 - 书源里的 `concurrentRate` 默认仍会生效；如果明确愿意承担被限流/封禁的风险，可设置 `SYNC_IGNORE_RATE_LIMIT=true`，让章节并发直接使用 `SYNC_CHAPTER_CONCURRENCY`。
-- 多个书源任务可以通过 `SYNC_WORKER_CONCURRENCY` 并行执行，默认 `2`；手动全站同步和每天 `03:00` 的自动同步都会并行处理多个书源，每个任务使用独立数据库会话。
+- 多个书源任务可以通过 `SYNC_WORKER_CONCURRENCY` 并行执行，默认 `3`；手动全站同步、书源导入并同步、每天 `03:00` 的自动同步都会并行处理多个书源，每个任务使用独立数据库会话。
 - 设置 `SYNC_PAGE_BATCH_SIZE`（默认 `0`）后，全站任务每处理完 N 页就保存 `next_page` 并自动重新排队，间隔由 `SYNC_BATCH_INTERVAL_MS` 控制，避免单个任务长时间连续占用。
 - Admin 里配置的代理会写入共享 storage，backend 和 crawler worker 都能读取。
 

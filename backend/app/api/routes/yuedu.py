@@ -5,6 +5,7 @@ Endpoints:
 - GET  /api/yuedu/preview  Preview what sources a URL would import
 """
 
+import asyncio
 import hashlib
 import json
 import re
@@ -992,60 +993,95 @@ async def import_and_sync_all(payload: YueduImportSyncRequest, db: AsyncSession 
                 db.add(cookie_obj)
         await db.commit()
 
-    # Step 3 & 4: Sync bookshelf + discover for each imported source
-    sync_service = SyncService(db)
-    for src_info in import_result.sources:
+    # Step 3 & 4: Sync bookshelf + discover for each imported source in parallel
+    from app.core.config import settings, sync_thread_count
+    from app.core.database import SessionLocal
+
+    async def _sync_source(src_info):
         source_id = src_info["id"]
         source_name = src_info.get("name", source_id)
         detail = {"source_id": source_id, "name": source_name, "sync": {}, "discover": {}}
-
-        # Sync bookshelf
-        try:
-            # Check if there's a cookie for this source
-            cookie_record = await db.scalar(
-                select(Cookie).where(Cookie.source == source_id)
-            )
-            if cookie_record:
-                shelf_result = await sync_service.sync_bookshelf(source_id)
-                synced = sum(
-                    r.get("created_chapters", 0)
-                    for r in shelf_result.get("results", [])
-                    if isinstance(r, dict)
-                )
-                detail["sync"] = {
-                    "books_found": shelf_result.get("total", 0),
-                    "chapters_downloaded": synced,
-                }
-                result.books_synced += shelf_result.get("total", 0)
-                result.chapters_downloaded += synced
-            else:
-                detail["sync"] = {"skipped": "no cookie"}
-        except Exception as exc:
-            await db.rollback()
-            detail["sync"] = {"error": str(exc)[:200]}
-            result.errors.append({"source": source_id, "stage": "sync", "error": str(exc)[:200]})
-
-        # Discover books from explore/category pages
-        if payload.discover:
+        errors: list[dict[str, Any]] = []
+        async with SessionLocal() as session:
+            sync_service = SyncService(session)
             try:
-                discover_result = await sync_service.discover_and_sync_all(
-                    source_id,
-                    max_pages=payload.max_discover_pages,
+                cookie_record = await session.scalar(
+                    select(Cookie).where(Cookie.source == source_id)
                 )
-                result.books_discovered += discover_result["books_found"]
-                result.chapters_downloaded += discover_result["chapters_created"]
-                detail["discover"] = {
-                    "pages_checked": discover_result["pages_checked"],
-                    "books_found": discover_result["books_found"],
-                    "books_synced": discover_result["books_synced"],
-                    "books_failed": discover_result["books_failed"],
-                    "chapters_created": discover_result["chapters_created"],
-                }
+                if cookie_record:
+                    shelf_result = await sync_service.sync_bookshelf(source_id)
+                    synced = sum(
+                        r.get("created_chapters", 0)
+                        for r in shelf_result.get("results", [])
+                        if isinstance(r, dict)
+                    )
+                    detail["sync"] = {
+                        "books_found": shelf_result.get("total", 0),
+                        "chapters_downloaded": synced,
+                    }
+                else:
+                    detail["sync"] = {"skipped": "no cookie"}
             except Exception as exc:
-                await db.rollback()
-                detail["discover"] = {"error": str(exc)[:200]}
+                await session.rollback()
+                detail["sync"] = {"error": str(exc)[:200]}
+                errors.append({"source": source_id, "stage": "sync", "error": str(exc)[:200]})
 
+            if payload.discover:
+                try:
+                    discover_result = await sync_service.discover_and_sync_all(
+                        source_id,
+                        max_pages=payload.max_discover_pages,
+                    )
+                    detail["discover"] = {
+                        "pages_checked": discover_result["pages_checked"],
+                        "books_found": discover_result["books_found"],
+                        "books_synced": discover_result["books_synced"],
+                        "books_failed": discover_result["books_failed"],
+                        "chapters_created": discover_result["chapters_created"],
+                    }
+                except Exception as exc:
+                    await session.rollback()
+                    detail["discover"] = {"error": str(exc)[:200]}
+                    errors.append({"source": source_id, "stage": "discover", "error": str(exc)[:200]})
+        return detail, errors
+
+    concurrency = min(
+        max(1, int(getattr(settings, "SYNC_WORKER_CONCURRENCY", 2))),
+        sync_thread_count(),
+    )
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def _limited(src_info):
+        async with semaphore:
+            return await _sync_source(src_info)
+
+    outcomes = await asyncio.gather(
+        *(_limited(src_info) for src_info in import_result.sources),
+        return_exceptions=True,
+    )
+    for src_info, outcome in zip(import_result.sources, outcomes):
+        if isinstance(outcome, BaseException):
+            result.errors.append({
+                "source": src_info["id"],
+                "stage": "source",
+                "error": str(outcome)[:200],
+            })
+            result.details.append({
+                "source_id": src_info["id"],
+                "name": src_info.get("name", src_info["id"]),
+                "sync": {"error": str(outcome)[:200]},
+                "discover": {},
+            })
+            continue
+        detail, errors = outcome
         result.details.append(detail)
+        result.errors.extend(errors)
+        sync_info = detail.get("sync") or {}
+        discover_info = detail.get("discover") or {}
+        result.books_synced += sync_info.get("books_found", 0)
+        result.chapters_downloaded += sync_info.get("chapters_downloaded", 0)
+        result.chapters_downloaded += discover_info.get("chapters_created", 0)
+        result.books_discovered += discover_info.get("books_found", 0)
 
     return result
 
