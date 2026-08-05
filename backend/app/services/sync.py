@@ -22,6 +22,10 @@ from app.services.cookie_crypto import safe_decrypt_cookie
 from app.services.r18 import detect_r18
 
 
+class SyncPaused(Exception):
+    """Raised by a task checkpoint when a crawl task has been paused."""
+
+
 class SyncService:
     def __init__(self, db: AsyncSession, storage: BookStorage | None = None):
         self.db = db
@@ -135,6 +139,7 @@ class SyncService:
         source_id: str,
         url: str,
         progress_cb: Callable[[dict], Awaitable[None]] | None = None,
+        checkpoint_cb: Callable[[], Awaitable[None]] | None = None,
     ) -> dict:
         source = await self.db.get(Source, source_id)
         if source is None or not source.enabled:
@@ -161,6 +166,12 @@ class SyncService:
                 f"Book page returned no usable metadata/chapters: {url} "
                 f"(title={remote_book.title!r}, chapters={len(remote_book.chapters)})"
             )
+
+        async def _checkpoint() -> None:
+            if checkpoint_cb is not None:
+                await checkpoint_cb()
+
+        await _checkpoint()
 
         book_title = self._safe_title(remote_book)
         author_name = self._safe_author(remote_book.author)
@@ -273,6 +284,8 @@ class SyncService:
                 skipped += 1
                 await _report_progress(remote_chapter)
 
+        await _checkpoint()
+
         concurrency = self._chapter_concurrency(config)
         semaphore = asyncio.Semaphore(concurrency)
         results_queue = asyncio.Queue(maxsize=concurrency * 2)
@@ -300,6 +313,7 @@ class SyncService:
             while remaining > 0:
                 remote_chapter, content, error = await results_queue.get()
                 remaining -= 1
+                await _checkpoint()
                 if error is not None:
                     failed_chapters.append({
                         "chapter_number": remote_chapter.chapter_number,
@@ -832,6 +846,7 @@ class SyncService:
         progress_cb: Callable[[int, int, int, int], Awaitable[None]] | None = None,
         chapter_progress_cb: Callable[[dict], Awaitable[None]] | None = None,
         before_step: Callable[[], Awaitable[None]] | None = None,
+        checkpoint_cb: Callable[[], Awaitable[None]] | None = None,
         start_page: int = 1,
         page_batch_size: int = 0,
     ) -> dict:
@@ -904,6 +919,9 @@ class SyncService:
                 max(1, int(getattr(settings, "SYNC_BOOK_CONCURRENCY", 3))),
                 sync_thread_count(),
             )
+            continuous_books = bool(
+                getattr(settings, "SYNC_BOOK_CONTINUOUS", False)
+            )
             chapter_progress_lock = asyncio.Lock()
 
             async def _guarded_chapter_progress(info: dict) -> None:
@@ -918,11 +936,14 @@ class SyncService:
                         source_id,
                         sb.url,
                         progress_cb=_guarded_chapter_progress,
+                        checkpoint_cb=checkpoint_cb,
                     )
 
             async def _record_outcome(sb, outcome) -> None:
                 nonlocal books_synced, books_failed
                 nonlocal chapters_created, chapters_skipped, chapters_failed
+                if isinstance(outcome, SyncPaused):
+                    raise outcome
                 if isinstance(outcome, BaseException):
                     await self.db.rollback()
                     books_failed += 1
@@ -959,57 +980,91 @@ class SyncService:
                 if progress_cb is not None:
                     await progress_cb(pages_checked, books_found, books_synced, books_failed)
 
-            pending_tasks = []
-            for sb in new_books:
-                if before_step is not None:
-                    await before_step()
-                books_found += 1
-                if not sync:
-                    details.append({
-                        "title": sb.title,
-                        "author": sb.author,
-                        "url": sb.url,
-                        "synced": False,
-                    })
-                    if progress_cb is not None:
-                        await progress_cb(pages_checked, books_found, books_synced, books_failed)
-                    continue
-                if book_concurrency <= 1:
-                    try:
-                        result = await self.sync_book(
-                            source_id,
-                            sb.url,
-                            progress_cb=chapter_progress_cb,
+            active_tasks: dict[asyncio.Task, object] = {}
+
+            async def _record_finished(finished_tasks) -> None:
+                for finished in finished_tasks:
+                    sb_done = active_tasks.pop(finished)
+                    if finished.cancelled():
+                        continue
+                    exc = finished.exception()
+                    outcome = exc if exc is not None else finished.result()
+                    await _record_outcome(sb_done, outcome)
+
+            try:
+                for sb in new_books:
+                    if before_step is not None:
+                        await before_step()
+                    books_found += 1
+                    if not sync:
+                        details.append({
+                            "title": sb.title,
+                            "author": sb.author,
+                            "url": sb.url,
+                            "synced": False,
+                        })
+                        if progress_cb is not None:
+                            await progress_cb(pages_checked, books_found, books_synced, books_failed)
+                        continue
+                    if book_concurrency <= 1:
+                        try:
+                            result = await self.sync_book(
+                                source_id,
+                                sb.url,
+                                progress_cb=chapter_progress_cb,
+                                checkpoint_cb=checkpoint_cb,
+                            )
+                        except SyncPaused:
+                            raise
+                        except Exception as exc:
+                            await _record_outcome(sb, exc)
+                        else:
+                            await _record_outcome(sb, result)
+                        continue
+
+                    task = asyncio.create_task(_sync_one(sb))
+                    active_tasks[task] = sb
+                    if not continuous_books and len(active_tasks) >= book_concurrency:
+                        finished_tasks, _ = await asyncio.wait(
+                            list(active_tasks.keys()),
+                            return_when=asyncio.ALL_COMPLETED,
                         )
-                    except Exception as exc:
-                        await _record_outcome(sb, exc)
-                    else:
-                        await _record_outcome(sb, result)
-                    continue
+                        await _record_finished(finished_tasks)
+                        if before_step is not None:
+                            await before_step()
+                    elif continuous_books:
+                        while len(active_tasks) >= book_concurrency:
+                            finished_tasks, _ = await asyncio.wait(
+                                list(active_tasks.keys()),
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            await _record_finished(finished_tasks)
+                            if before_step is not None:
+                                await before_step()
 
-                pending_tasks.append((sb, asyncio.create_task(_sync_one(sb))))
-                if len(pending_tasks) >= book_concurrency:
-                    outcomes = await asyncio.gather(
-                        *(task for _, task in pending_tasks),
-                        return_exceptions=True,
+                while active_tasks:
+                    finished_tasks, _ = await asyncio.wait(
+                        list(active_tasks.keys()),
+                        return_when=asyncio.ALL_COMPLETED,
                     )
-                    for (pending_sb, _task), outcome in zip(pending_tasks, outcomes):
-                        await _record_outcome(pending_sb, outcome)
-                    pending_tasks.clear()
-
-            if pending_tasks:
-                outcomes = await asyncio.gather(
-                    *(task for _, task in pending_tasks),
-                    return_exceptions=True,
-                )
-                for (pending_sb, _task), outcome in zip(pending_tasks, outcomes):
-                    await _record_outcome(pending_sb, outcome)
+                    await _record_finished(finished_tasks)
+                    if before_step is not None:
+                        await before_step()
+            except BaseException:
+                for task in active_tasks:
+                    task.cancel()
+                if active_tasks:
+                    await asyncio.gather(*active_tasks, return_exceptions=True)
+                raise
             if max_pages > 0 and page >= max_pages:
                 done = True
                 break
             if page_batch_size > 0 and pages_in_run >= page_batch_size:
                 break
             page += 1
+
+        if before_step is not None:
+            await before_step()
 
         return {
             "source_id": source_id,

@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -6,7 +7,7 @@ from sqlalchemy.exc import MissingGreenlet, SQLAlchemyError
 
 from app.crawler.base import RemoteBook, RemoteChapter, RemoteShelfBook
 from app.models import Book, Chapter, Cookie, Source
-from app.services.sync import SyncService
+from app.services.sync import SyncPaused, SyncService
 
 
 
@@ -890,3 +891,232 @@ async def test_discover_and_sync_all_page_batch_requeues():
     assert result["books_found"] == 2
     assert result["done"] is False
     assert result["next_page"] == 2
+
+
+@pytest.mark.asyncio
+async def test_discover_and_sync_all_starts_next_book_when_one_slot_frees():
+    db = _mock_db()
+    db.get.return_value = _source()
+    db.rollback = AsyncMock()
+
+    plugin = AsyncMock()
+    plugin.set_cookie = MagicMock()
+    plugin.discover_books.return_value = [
+        RemoteShelfBook(
+            source_book_id="a.html",
+            title="A",
+            author="Author",
+            url="https://example.com/a.html",
+        ),
+        RemoteShelfBook(
+            source_book_id="b.html",
+            title="B",
+            author="Author",
+            url="https://example.com/b.html",
+        ),
+        RemoteShelfBook(
+            source_book_id="c.html",
+            title="C",
+            author="Author",
+            url="https://example.com/c.html",
+        ),
+        RemoteShelfBook(
+            source_book_id="d.html",
+            title="D",
+            author="Author",
+            url="https://example.com/d.html",
+        ),
+    ]
+
+    release_slow = asyncio.Event()
+    fourth_started = asyncio.Event()
+    starts: list[str] = []
+
+    async def fake_sync_book(source_id: str, url: str, **kwargs):
+        starts.append(url)
+        if url.endswith("a.html"):
+            await release_slow.wait()
+        if url.endswith("d.html"):
+            fourth_started.set()
+        return {"book_id": url, "created_chapters": 1, "skipped_chapters": 0}
+
+    session = AsyncMock()
+    session.__aenter__ = AsyncMock(return_value=_mock_db())
+    session.__aexit__ = AsyncMock(return_value=False)
+    from app.core.config import settings
+    with (
+        patch.object(settings, "SYNC_BOOK_CONTINUOUS", True),
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.SessionLocal", return_value=session),
+        patch.object(
+            SyncService,
+            "sync_book",
+            AsyncMock(side_effect=fake_sync_book),
+        ),
+    ):
+        service = SyncService(db)
+        discover_task = asyncio.create_task(
+            service.discover_and_sync_all("src1", max_pages=1)
+        )
+        await asyncio.wait_for(fourth_started.wait(), timeout=2)
+        assert set(starts[:3]) == {
+            "https://example.com/a.html",
+            "https://example.com/b.html",
+            "https://example.com/c.html",
+        }
+        assert starts[-1] == "https://example.com/d.html"
+        release_slow.set()
+        result = await asyncio.wait_for(discover_task, timeout=2)
+
+    assert result["books_synced"] == 4
+
+
+@pytest.mark.asyncio
+async def test_discover_and_sync_all_batch_waits_for_full_batch_by_default():
+    db = _mock_db()
+    db.get.return_value = _source()
+    db.rollback = AsyncMock()
+
+    plugin = AsyncMock()
+    plugin.set_cookie = MagicMock()
+    plugin.discover_books.return_value = [
+        RemoteShelfBook(
+            source_book_id="a.html",
+            title="A",
+            author="Author",
+            url="https://example.com/a.html",
+        ),
+        RemoteShelfBook(
+            source_book_id="b.html",
+            title="B",
+            author="Author",
+            url="https://example.com/b.html",
+        ),
+        RemoteShelfBook(
+            source_book_id="c.html",
+            title="C",
+            author="Author",
+            url="https://example.com/c.html",
+        ),
+        RemoteShelfBook(
+            source_book_id="d.html",
+            title="D",
+            author="Author",
+            url="https://example.com/d.html",
+        ),
+    ]
+
+    release_slow = asyncio.Event()
+    b_done = asyncio.Event()
+    c_done = asyncio.Event()
+    fourth_started = asyncio.Event()
+    starts: list[str] = []
+
+    async def fake_sync_book(source_id: str, url: str, **kwargs):
+        starts.append(url)
+        if url.endswith("a.html"):
+            await release_slow.wait()
+        elif url.endswith("b.html"):
+            b_done.set()
+        elif url.endswith("c.html"):
+            c_done.set()
+        elif url.endswith("d.html"):
+            fourth_started.set()
+        return {"book_id": url, "created_chapters": 1, "skipped_chapters": 0}
+
+    session = AsyncMock()
+    session.__aenter__ = AsyncMock(return_value=_mock_db())
+    session.__aexit__ = AsyncMock(return_value=False)
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.SessionLocal", return_value=session),
+        patch.object(
+            SyncService,
+            "sync_book",
+            AsyncMock(side_effect=fake_sync_book),
+        ),
+    ):
+        service = SyncService(db)
+        discover_task = asyncio.create_task(
+            service.discover_and_sync_all("src1", max_pages=1)
+        )
+        await asyncio.wait_for(
+            asyncio.gather(b_done.wait(), c_done.wait()),
+            timeout=2,
+        )
+        await asyncio.sleep(0.05)
+        assert "https://example.com/d.html" not in starts
+        release_slow.set()
+        await asyncio.wait_for(fourth_started.wait(), timeout=2)
+        result = await asyncio.wait_for(discover_task, timeout=2)
+
+    assert result["books_synced"] == 4
+    assert len(starts) == 4
+
+
+@pytest.mark.asyncio
+async def test_sync_book_checkpoint_stops_before_next_chapter():
+    db = _mock_db()
+    db.get.return_value = _source()
+    db.scalar.return_value = None
+    db.rollback = AsyncMock()
+    db.commit = AsyncMock()
+    db.flush = AsyncMock()
+    db.add = MagicMock()
+
+    remote_book = RemoteBook(
+        source_book_id="https://example.com/book/1",
+        title="Book",
+        author="Author",
+        description=None,
+        status=None,
+        chapters=[
+            RemoteChapter(
+                source_chapter_id="1",
+                title="Chapter 1",
+                url="https://example.com/book/1.html",
+                chapter_number=1,
+            ),
+            RemoteChapter(
+                source_chapter_id="2",
+                title="Chapter 2",
+                url="https://example.com/book/2.html",
+                chapter_number=2,
+            ),
+        ],
+        tags=[],
+    )
+    plugin = AsyncMock()
+    plugin.fetch_book.return_value = remote_book
+    plugin.fetch_chapter_content.side_effect = ["content-1", "content-2"]
+
+    service = SyncService(db)
+    service.storage = MagicMock()
+    service.storage.write_metadata = MagicMock()
+    service.storage.write_chapter.return_value = ("path", "hash")
+
+    checkpoint_calls = 0
+
+    async def checkpoint() -> None:
+        nonlocal checkpoint_calls
+        checkpoint_calls += 1
+        if checkpoint_calls >= 3:
+            raise SyncPaused("paused")
+
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.emit"),
+        patch("app.services.sync.search_service"),
+        patch("app.services.auto_categorize.AutoCategorizationService"),
+        patch.object(service, "_save_tags", AsyncMock()),
+        patch.object(service, "_find_same_title_books", AsyncMock(return_value=[])),
+        patch.object(service, "_book_tag_names", AsyncMock(return_value=[])),
+    ):
+        with pytest.raises(SyncPaused):
+            await service.sync_book(
+                "src1",
+                "https://example.com/book/1",
+                checkpoint_cb=checkpoint,
+            )
+
+    assert checkpoint_calls >= 3

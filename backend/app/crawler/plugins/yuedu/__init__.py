@@ -1558,16 +1558,23 @@ class YueduPlugin:
     async def _sleep_rate_limit(self) -> None:
         """Reserve a request slot based on the source concurrentRate.
 
-        Legado leaves unset/0 sources unthrottled; the SyncService controls
-        overall chapter concurrency instead.  A plain integer rate means one
-        request per interval, while "count/window" allows count starts per
-        window milliseconds.
+        A plain integer rate means one request per interval, while
+        "count/window" allows count starts per window milliseconds.  Sources
+        without concurrentRate fall back to CRAWL_DELAY_MS when it is
+        configured, matching Legado's unthrottled behavior by default.
         """
         if self._rate_limit_disabled():
             return
         spec = self._parse_concurrent_rate()
         if spec is None:
-            return
+            try:
+                from app.core.config import settings
+                delay_ms = int(getattr(settings, "CRAWL_DELAY_MS", 0) or 0)
+            except Exception:
+                delay_ms = 0
+            if delay_ms <= 0:
+                return
+            spec = ("interval", 1, delay_ms)
         mode, count, window_ms = spec
         key = self.base_url or "default"
         lock = self.__class__._rate_locks.get(key)

@@ -47,12 +47,9 @@ async def _reset_stale_running_tasks() -> None:
 
 async def run_crawl_task_async(task_id: str) -> dict:
     """Execute one pending crawl task with pause/cancel/progress support."""
-    from app.services.sync import SyncService
+    from app.services.sync import SyncPaused, SyncService
 
     class TaskCancelled(Exception):
-        pass
-
-    class TaskPaused(Exception):
         pass
 
     async with SessionLocal() as db:
@@ -74,13 +71,15 @@ async def run_crawl_task_async(task_id: str) -> dict:
         progress_state = dict(task_obj.progress or {})
         start_page = int(progress_state.get("next_page") or 1)
         chapter_progress_updates = 0
+        db_lock = asyncio.Lock()
 
         async def _wait_if_paused() -> None:
-            await db.refresh(task_obj)
-            if task_obj.status == "cancelled":
-                raise TaskCancelled("Task cancelled")
-            if task_obj.status == "paused":
-                raise TaskPaused("Task paused")
+            async with db_lock:
+                await db.refresh(task_obj)
+                if task_obj.status == "cancelled":
+                    raise TaskCancelled("Task cancelled")
+                if task_obj.status == "paused":
+                    raise SyncPaused("Task paused")
 
         async def _update_progress(
             page: int,
@@ -89,34 +88,36 @@ async def run_crawl_task_async(task_id: str) -> dict:
             failed: int,
         ) -> None:
             nonlocal progress_state
-            progress_state.update({
-                "pages_checked": page,
-                "books_found": found,
-                "books_synced": synced,
-                "books_failed": failed,
-                "next_page": page,
-            })
-            task_obj.progress = {
-                **progress_state,
-            }
-            await db.commit()
+            async with db_lock:
+                progress_state.update({
+                    "pages_checked": page,
+                    "books_found": found,
+                    "books_synced": synced,
+                    "books_failed": failed,
+                    "next_page": page,
+                })
+                task_obj.progress = {
+                    **progress_state,
+                }
+                await db.commit()
 
         async def _update_chapter_progress(info: dict) -> None:
             nonlocal chapter_progress_updates, progress_state
-            progress_state.update({
-                "current_book": info.get("book_title") or "",
-                "current_chapter": info.get("chapter_title") or "",
-                "current_chapters_created": info.get("created_chapters", 0),
-                "current_chapters_skipped": info.get("skipped_chapters", 0),
-                "current_chapters_failed": info.get("failed_chapters", 0),
-                "current_chapters_total": info.get("total_chapters", 0),
-            })
-            task_obj.progress = {
-                **progress_state,
-            }
-            chapter_progress_updates += 1
-            if chapter_progress_updates % 10 == 0:
-                await db.commit()
+            async with db_lock:
+                progress_state.update({
+                    "current_book": info.get("book_title") or "",
+                    "current_chapter": info.get("chapter_title") or "",
+                    "current_chapters_created": info.get("created_chapters", 0),
+                    "current_chapters_skipped": info.get("skipped_chapters", 0),
+                    "current_chapters_failed": info.get("failed_chapters", 0),
+                    "current_chapters_total": info.get("total_chapters", 0),
+                })
+                task_obj.progress = {
+                    **progress_state,
+                }
+                chapter_progress_updates += 1
+                if chapter_progress_updates % 10 == 0:
+                    await db.commit()
 
         try:
             result = await SyncService(db).discover_and_sync_all(
@@ -129,9 +130,21 @@ async def run_crawl_task_async(task_id: str) -> dict:
                 progress_cb=_update_progress,
                 chapter_progress_cb=_update_chapter_progress,
                 before_step=_wait_if_paused,
+                checkpoint_cb=_wait_if_paused,
                 start_page=start_page,
                 page_batch_size=int(getattr(settings, "SYNC_PAGE_BATCH_SIZE", 0) or 0),
             )
+            await db.refresh(task_obj)
+            if task_obj.status == "paused":
+                task_obj.status = "paused"
+                task_obj.resume_at = None
+                await db.commit()
+                return {"status": "paused", "task_id": task_id}
+            if task_obj.status == "cancelled":
+                task_obj.status = "cancelled"
+                task_obj.finished_at = _naive_utcnow()
+                await db.commit()
+                raise TaskCancelled("Task cancelled")
             batch_size = int(getattr(settings, "SYNC_PAGE_BATCH_SIZE", 0) or 0)
             if batch_size > 0 and not result.get("done"):
                 task_obj.status = "pending"
@@ -171,7 +184,7 @@ async def run_crawl_task_async(task_id: str) -> dict:
             task_obj.finished_at = _naive_utcnow()
             await db.commit()
             return result
-        except TaskPaused:
+        except SyncPaused:
             task_obj.status = "paused"
             task_obj.resume_at = None
             await db.commit()

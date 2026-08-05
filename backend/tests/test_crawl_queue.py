@@ -9,6 +9,7 @@ from app.services.crawl_runner import _next_pending_task_ids, run_crawl_task_asy
 from app.core.database import get_db
 from app.main import app
 from app.services.auth import require_admin
+from app.services.sync import SyncPaused
 
 
 def _task(**overrides):
@@ -192,3 +193,31 @@ async def test_crawl_runner_progress_does_not_lazy_load_expired_orm_state():
     assert task.status == "completed"
     assert chapter_seen["current_book"] == "Book"
     assert chapter_seen["pages_checked"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_crawl_task_async_marks_paused_when_checkpoint_raises():
+    task = _task()
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=task)
+    db.commit = AsyncMock()
+    db.refresh = AsyncMock()
+
+    class FakeSyncService:
+        def __init__(self, db):
+            self.db = db
+
+        async def discover_and_sync_all(self, *args, **kwargs):
+            raise SyncPaused("paused")
+
+    session = AsyncMock()
+    session.__aenter__ = AsyncMock(return_value=db)
+    session.__aexit__ = AsyncMock(return_value=False)
+    with (
+        patch("app.services.crawl_runner.SessionLocal", return_value=session),
+        patch("app.services.sync.SyncService", FakeSyncService),
+    ):
+        result = await run_crawl_task_async("task-1")
+
+    assert result == {"status": "paused", "task_id": "task-1"}
+    assert task.status == "paused"

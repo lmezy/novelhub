@@ -47,10 +47,11 @@ class Settings(BaseSettings):
 
 
 
-    CRAWL_DELAY_MS:int=1200
+    CRAWL_DELAY_MS:int=0
 
     SYNC_CHAPTER_CONCURRENCY:int=9
     SYNC_BOOK_CONCURRENCY:int=3
+    SYNC_BOOK_CONTINUOUS:bool=False
     SYNC_IGNORE_RATE_LIMIT:bool=False
     SYNC_THREAD_COUNT:int=9
     SYNC_WORKER_CONCURRENCY:int=3
