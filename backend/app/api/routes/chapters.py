@@ -5,8 +5,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.models import Book, Chapter, User
 from app.schemas.chapter import ChapterContentOut, ChapterOut
-from app.services.auth import get_current_user
+from app.services.auth import get_current_user, require_admin
 from app.services.storage import BookStorage
+from app.services.sync import SyncService
 from app.services.visibility import ensure_book_visible
 
 
@@ -48,3 +49,11 @@ async def get_chapter(chapter_id: str, user: User = Depends(get_current_user), d
         content_path=chapter.content_path,
         content=content or "",
     )
+
+
+@router.post("/chapters/{chapter_id}/sync", dependencies=[Depends(require_admin)])
+async def resync_chapter(chapter_id: str, db: AsyncSession = Depends(get_db)):
+    try:
+        return await SyncService(db).resync_chapter(chapter_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -427,6 +427,130 @@ async def test_reconcile_chapter_ids_keeps_existing_urls():
 
 
 @pytest.mark.asyncio
+async def test_resync_chapter_updates_existing_row():
+    chapter = Chapter(
+        id="c1",
+        book_id="b1",
+        chapter_number=1,
+        source_chapter_id="https://example.com/book/1.html",
+        title="Chapter 1",
+        content_path="/old/000001.md",
+        hash="old-hash",
+    )
+    book = Book(
+        id="b1",
+        source_id="src1",
+        source_book_id="https://example.com/book/1",
+        title="Book",
+        author_id="a1",
+    )
+    book.author = SimpleNamespace(name="Author")
+    source = _source()
+    db = AsyncMock()
+    db.get = AsyncMock(side_effect=[chapter, book, source])
+    db.scalar = AsyncMock(return_value=None)
+    db.commit = AsyncMock()
+
+    remote_book = RemoteBook(
+        source_book_id="https://example.com/book/1",
+        title="Book",
+        author="Author",
+        description=None,
+        status=None,
+        chapters=[
+            RemoteChapter(
+                source_chapter_id="https://example.com/book/1.html",
+                title="Chapter 1",
+                url="https://example.com/book/1.html",
+                chapter_number=1,
+            ),
+        ],
+    )
+    plugin = AsyncMock()
+    plugin.fetch_book.return_value = remote_book
+    plugin.fetch_chapter_content.return_value = "new content"
+
+    service = SyncService(db)
+    service.storage = MagicMock()
+    service.storage.write_chapter.return_value = ("/new/000001.md", "new-hash")
+
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.emit"),
+        patch("app.services.sync.search_service") as search_mock,
+    ):
+        result = await service.resync_chapter("c1")
+
+    assert result["updated"] is True
+    assert chapter.content_path == "/new/000001.md"
+    assert chapter.hash == "new-hash"
+    assert chapter.source_chapter_id == "https://example.com/book/1.html"
+    search_mock.index_chapter.assert_called_once()
+    db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_resync_chapter_matches_legacy_id_by_number():
+    chapter = Chapter(
+        id="c1",
+        book_id="b1",
+        chapter_number=7,
+        source_chapter_id="7",
+        title="Chapter 7",
+        content_path="/old/000007.md",
+        hash="old-hash",
+    )
+    book = Book(
+        id="b1",
+        source_id="src1",
+        source_book_id="https://example.com/book/1",
+        title="Book",
+        author_id="a1",
+    )
+    book.author = SimpleNamespace(name="Author")
+    source = _source()
+    db = AsyncMock()
+    db.get = AsyncMock(side_effect=[chapter, book, source])
+    db.scalar = AsyncMock(return_value=None)
+    db.commit = AsyncMock()
+
+    remote_book = RemoteBook(
+        source_book_id="https://example.com/book/1",
+        title="Book",
+        author="Author",
+        description=None,
+        status=None,
+        chapters=[
+            RemoteChapter(
+                source_chapter_id="https://example.com/book/7.html",
+                title="Chapter 7",
+                url="https://example.com/book/7.html",
+                chapter_number=7,
+            ),
+        ],
+    )
+    plugin = AsyncMock()
+    plugin.fetch_book.return_value = remote_book
+    plugin.fetch_chapter_content.return_value = "fixed content"
+
+    service = SyncService(db)
+    service.storage = MagicMock()
+    service.storage.write_chapter.return_value = ("/new/000007.md", "new-hash")
+
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.emit"),
+        patch("app.services.sync.search_service"),
+    ):
+        result = await service.resync_chapter("c1")
+
+    assert result["updated"] is True
+    assert chapter.source_chapter_id == "https://example.com/book/7.html"
+    assert chapter.content_path == "/new/000007.md"
+    assert chapter.hash == "new-hash"
+
+
+@pytest.mark.asyncio
 async def test_sync_bookshelf_rolls_back_and_continues_after_failure():
     db = _mock_db()
     db.get.return_value = _source()

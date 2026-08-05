@@ -24,6 +24,7 @@ const showFontMenu = ref(false)
 const isDark = ref(localStorage.getItem("novelhub_dark") === "true")
 const showToc = ref(false)
 const showAI = ref(false)
+const chapterSyncing = ref(false)
 const alternates = ref<any[]>([])
 const showSourceMenu = ref(false)
 
@@ -134,6 +135,20 @@ async function loadChapter(id: string) {
   }
 }
 
+async function resyncChapter() {
+  if (!chapter.value) return
+  chapterSyncing.value = true
+  try {
+    await api.post('/chapters/' + chapter.value.id + '/sync')
+    await loadChapter(chapter.value.id)
+    alert(i18n.t('reader_chapter_synced'))
+  } catch (e) {
+    alert(e instanceof Error ? e.message : i18n.t('reader_chapter_sync_failed'))
+  } finally {
+    chapterSyncing.value = false
+  }
+}
+
 async function loadAlternates() {
   try {
     const res = await api.get<any>("/books/" + bookId.value + "/sources")
@@ -207,6 +222,13 @@ watch(
         </span>
       </div>
       <div class="flex items-center gap-2">
+        <button
+          v-if="auth.isAdmin && chapter"
+          @click="resyncChapter"
+          :disabled="chapterSyncing"
+          class="text-xs px-2 py-1 rounded border transition-colors disabled:opacity-50"
+          :class="isDark ? 'border-gray-700 hover:bg-gray-800' : 'border-border hover:bg-black/5'"
+        >{{ chapterSyncing ? i18n.t('reader_chapter_syncing') : i18n.t('reader_chapter_resync') }}</button>
         <div v-if="alternates.length > 1" class="relative">
           <button
             @click="showSourceMenu = !showSourceMenu"

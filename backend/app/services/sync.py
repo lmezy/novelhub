@@ -578,23 +578,123 @@ class SyncService:
             raise ValueError("Book not found")
         if not book.source_id or not book.source_book_id:
             raise ValueError("Book has no source reference")
+        source, plugin = await self._book_plugin(book)
+        url = self._book_url(book, source, plugin)
+        return await self.sync_book(book.source_id, url)
+
+    async def resync_chapter(self, chapter_id: str) -> dict:
+        """Re-fetch and overwrite a single chapter from its book source."""
+        chapter = await self.db.get(Chapter, chapter_id)
+        if chapter is None:
+            raise ValueError("Chapter not found")
+        book = await self.db.get(Book, chapter.book_id)
+        if book is None:
+            raise ValueError("Book not found")
+        if not book.source_id or not book.source_book_id:
+            raise ValueError("Book has no source reference")
+
+        source, plugin = await self._book_plugin(book)
+        url = self._book_url(book, source, plugin)
+        remote_book = await plugin.fetch_book(url)
+        remote_chapter = self._match_remote_chapter(chapter, remote_book.chapters)
+        if remote_chapter is None:
+            raise ValueError("Chapter not found in source TOC")
+
+        content = await self._fetch_chapter_with_retry(plugin, remote_chapter)
+        book_id = book.id
+        book_is_r18 = book.is_r18
+        author_name = book.author_name or "Unknown"
+        content_path, content_hash = self.storage.write_chapter(
+            author_name,
+            book.title,
+            remote_chapter.chapter_number,
+            remote_chapter.title,
+            content,
+        )
+
+        chapter.title = remote_chapter.title
+        chapter.chapter_number = remote_chapter.chapter_number
+        chapter.source_chapter_id = remote_chapter.source_chapter_id
+        chapter.content_path = content_path
+        chapter.hash = content_hash
+        await self.db.commit()
+
+        search_service.index_chapter({
+            "id": chapter.id,
+            "book_id": book_id,
+            "title": chapter.title or "",
+            "chapter_number": chapter.chapter_number,
+            "content": content[:5000],
+            "is_r18": book_is_r18,
+        })
+        emit(
+            EventType.CHAPTER_UPDATED,
+            chapter_id=chapter.id,
+            book_id=book_id,
+        )
+
+        return {
+            "chapter_id": chapter.id,
+            "book_id": book_id,
+            "updated": True,
+            "title": chapter.title,
+            "chapter_number": chapter.chapter_number,
+            "content_path": content_path,
+            "content_length": len(content),
+        }
+
+    async def _book_plugin(self, book: Book) -> tuple[Source, object]:
+        """Load a book's source and plugin instance for re-sync operations."""
         source = await self.db.get(Source, book.source_id)
         if source is None:
             raise ValueError("Source not found")
-        config = source.config if source.plugin_name == 'yuedu' else None
+        if not source.enabled:
+            raise ValueError("Source disabled")
+        config = source.config if source.plugin_name == "yuedu" else None
         plugin = get_plugin(source.plugin_name, config=config)
-        # Construct URL from config
-        cfg = plugin.config if hasattr(plugin, 'config') else None
+        cookie_record = await self.db.scalar(
+            select(Cookie).where(Cookie.source == book.source_id)
+        )
+        if cookie_record:
+            plugin.set_cookie(safe_decrypt_cookie(cookie_record.cookie_data))
+        return source, plugin
+
+    @staticmethod
+    def _book_url(book: Book, source: Source, plugin) -> str:
+        """Construct the remote book URL used by re-sync operations."""
         if hasattr(plugin, "build_book_url"):
-            url = plugin.build_book_url(book.source_book_id)
-        elif cfg and hasattr(cfg, 'book_url'):
-            url = cfg.base_url + cfg.book_url.format(book_id=book.source_book_id)
-        else:
-            url = source.url or ""
-            if not url:
-                raise ValueError("Cannot determine book URL for re-sync")
-            url = urljoin(url.rstrip("/") + "/", book.source_book_id)
-        return await self.sync_book(book.source_id, url)
+            return plugin.build_book_url(book.source_book_id)
+        cfg = plugin.config if hasattr(plugin, "config") else None
+        if cfg and hasattr(cfg, "book_url"):
+            return cfg.base_url + cfg.book_url.format(book_id=book.source_book_id)
+        url = source.url or ""
+        if not url:
+            raise ValueError("Cannot determine book URL for re-sync")
+        return urljoin(url.rstrip("/") + "/", book.source_book_id)
+
+    @staticmethod
+    def _match_remote_chapter(chapter: Chapter, remote_chapters: list):
+        """Find the remote chapter by URL, position, or normalized title."""
+        for remote_chapter in remote_chapters:
+            if (
+                chapter.source_chapter_id
+                and remote_chapter.source_chapter_id == chapter.source_chapter_id
+            ):
+                return remote_chapter
+        for remote_chapter in remote_chapters:
+            if (
+                chapter.chapter_number is not None
+                and remote_chapter.chapter_number == chapter.chapter_number
+            ):
+                return remote_chapter
+        normalized = SyncService._normalize_title_for_match(chapter.title)
+        for remote_chapter in remote_chapters:
+            if (
+                normalized
+                and SyncService._normalize_title_for_match(remote_chapter.title) == normalized
+            ):
+                return remote_chapter
+        return None
 
     async def discover_and_sync(
         self,
