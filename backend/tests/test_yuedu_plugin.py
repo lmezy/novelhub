@@ -126,6 +126,25 @@ def test_build_book_url_accepts_full_source_book_id():
     ) == "http://m.5859ycdh.com/wuba/29416"
 
 
+def test_build_headers_uses_http_user_agent():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "httpUserAgent": "CustomAgent/1.0",
+    })
+    assert plugin._build_headers()["User-Agent"] == "CustomAgent/1.0"
+
+
+def test_403_fallback_uses_desktop_ua_and_referer():
+    plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
+    fallback = plugin._with_403_fallback({
+        "User-Agent": "mobile",
+        "Accept": "text/html",
+    })
+    assert "Windows NT" in fallback["User-Agent"]
+    assert fallback["Referer"] == "https://example.com/"
+    assert fallback["Accept"] == "text/html"
+
+
 def test_book_id_from_url_handles_trailing_slash():
     assert YueduPlugin._book_id_from_url(
         "http://m.5859ycdh.com/wuba/29416/"

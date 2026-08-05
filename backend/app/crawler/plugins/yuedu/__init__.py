@@ -1467,6 +1467,10 @@ class YueduPlugin:
         if self._cookie:
             headers["Cookie"] = self._cookie
 
+        http_user_agent = str(self.config.get("httpUserAgent", "") or "").strip()
+        if http_user_agent:
+            headers["User-Agent"] = http_user_agent
+
         header_rule = self.config.get("header", "")
         if header_rule:
             try:
@@ -1505,6 +1509,17 @@ class YueduPlugin:
         if extra:
             headers.update(extra)
         return headers
+
+    def _with_403_fallback(self, headers: dict[str, str]) -> dict[str, str]:
+        """Retry 403 responses with a desktop UA and site Referer."""
+        fallback = dict(headers)
+        fallback["User-Agent"] = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        )
+        fallback.setdefault("Referer", self.base_url.rstrip("/") + "/")
+        fallback.setdefault("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+        return fallback
 
     def _parse_concurrent_rate(self) -> tuple[str, int, int] | None:
         """Parse Legado concurrentRate: "interval" or "count/window"."""
@@ -1633,6 +1648,7 @@ class YueduPlugin:
             pass
 
         async def _request(proxy: str | None) -> str:
+            nonlocal headers
             last_error: httpx.HTTPError | None = None
             for attempt in range(3):
                 try:
@@ -1648,6 +1664,10 @@ class YueduPlugin:
                     else:
                         resp = await client.post(url, json=body, headers=headers)
 
+                    if resp.status_code == 403 and attempt == 0:
+                        headers = self._with_403_fallback(headers)
+                        await asyncio.sleep(1.0 + random.uniform(0.5, 1.0))
+                        continue
                     if resp.status_code in (429, 500, 502, 503, 504):
                         retry_after = resp.headers.get("Retry-After", "")
                         wait = (
@@ -1711,11 +1731,16 @@ class YueduPlugin:
             pass
 
         async def _request(proxy: str | None) -> str:
+            nonlocal headers
             last_error: httpx.HTTPError | None = None
             for attempt in range(3):
                 try:
                     client = await self._get_http_client(proxy)
                     resp = await client.get(url, headers=headers)
+                    if resp.status_code == 403 and attempt == 0:
+                        headers = self._with_403_fallback(headers)
+                        await asyncio.sleep(1.0 + random.uniform(0.5, 1.0))
+                        continue
                     if resp.status_code in (429, 500, 502, 503, 504):
                         retry_after = resp.headers.get("Retry-After", "")
                         wait = (
