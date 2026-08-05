@@ -1016,6 +1016,7 @@ onUnmounted(() => {
             <div v-if="yueduResult" class="mt-3 p-3 rounded bg-green-50 dark:bg-green-950 text-sm">
               <p class="font-medium">{{ i18n.t('admin_yuedu_imported_count', { imported: yueduResult.imported, total: yueduResult.total }) }}</p>
               <p class="text-xs text-muted dark:text-gray-400">跳过 {{ yueduResult.skipped }} 个已存在书源</p>
+              <p v-if="yueduResult.updated" class="text-xs text-muted dark:text-gray-400">更新 {{ yueduResult.updated }} 个已存在书源</p>
             </div>
 
             <details class="mt-3">
