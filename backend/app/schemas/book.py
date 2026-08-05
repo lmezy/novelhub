@@ -35,6 +35,21 @@ class ManualBookCreate(BaseModel):
     chapters: list[ManualChapterIn]
 
 
+class CustomTagUserOut(BaseModel):
+    id: str
+    username: str
+
+
+class CustomTagOnBookOut(BaseModel):
+    id: str
+    name: str
+    is_public: bool = False
+    show_user: bool = True
+    count: int = 1
+    applied_by_me: bool = False
+    users: list[CustomTagUserOut] = []
+
+
 class BookOut(BaseModel):
     id: str
     title: str
@@ -53,6 +68,8 @@ class BookOut(BaseModel):
         from_attributes = True
     tag_names: list[str] = []
     author_name: str | None = None
+    custom_tags: list[CustomTagOnBookOut] = []
+    shelf_group_ids: list[str] = []
 
 
 class BookSourceAlternate(BaseModel):

@@ -16,6 +16,8 @@ export interface Book {
   updated_at: string
   tag_names: string[]
   author_name: string | null
+  custom_tags?: CustomTagOnBook[]
+  shelf_group_ids?: string[]
 }
 
 export interface Chapter {
@@ -29,6 +31,29 @@ export interface Chapter {
 
 export interface ChapterContent extends Chapter {
   content: string
+}
+
+export interface CustomTagUser {
+  id: string
+  username: string
+}
+
+export interface CustomTagOnBook {
+  id: string
+  name: string
+  is_public: boolean
+  show_user: boolean
+  count: number
+  applied_by_me: boolean
+  users: CustomTagUser[]
+}
+
+export interface ShelfGroup {
+  id: string
+  name: string
+  order: number
+  show: boolean
+  count: number
 }
 
 export const useBooksStore = defineStore("books", () => {
@@ -60,8 +85,9 @@ export const useBooksStore = defineStore("books", () => {
     return api.get<ChapterContent>(`/chapters/${chapterId}`)
   }
 
-  async function fetchFavorites(): Promise<Book[]> {
-    return api.get<Book[]>("/books/favorites")
+  async function fetchFavorites(groupId?: string): Promise<Book[]> {
+    const query = groupId ? `?group_id=${encodeURIComponent(groupId)}` : ""
+    return api.get<Book[]>(`/books/favorites${query}`)
   }
 
   async function toggleFavorite(book: Book): Promise<boolean> {

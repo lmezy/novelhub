@@ -9,9 +9,11 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.models import Book, BookFavorite, Chapter, Source, User
+from app.models import Book, BookFavorite, BookFavoriteGroup, Chapter, Source, User
 from app.services.auth import get_current_user, require_admin
 from app.services.book_cleanup import delete_books
+from app.services.bookshelf import favorite_group_ids_by_book
+from app.services.custom_tags import list_book_custom_tags_map
 from app.services.epub import EpubService
 from app.services.sync import SyncService
 from app.services.visibility import (
@@ -37,6 +39,10 @@ class BatchDeleteRequest(BaseModel):
     ids: list[str]
 
 
+class BatchFavoriteRequest(BaseModel):
+    ids: list[str]
+
+
 def _normalize_book_title(title: str) -> str:
     return re.sub(
         r"[\s《》「」『』〈〉（）【】\[\]\"'“”‘’]+",
@@ -45,7 +51,13 @@ def _normalize_book_title(title: str) -> str:
     ).lower()
 
 
-def _serialize_book(book: Book, user: User, is_favorite: bool = False) -> BookOut:
+def _serialize_book(
+    book: Book,
+    user: User,
+    is_favorite: bool = False,
+    custom_tags: dict[str, list[dict]] | None = None,
+    shelf_group_ids: dict[str, list[str]] | None = None,
+) -> BookOut:
     is_admin = user.role in ("admin", "super_admin")
     return BookOut(
         id=book.id,
@@ -62,6 +74,8 @@ def _serialize_book(book: Book, user: User, is_favorite: bool = False) -> BookOu
         updated_at=book.updated_at,
         tag_names=visible_tags(user, book.tag_names),
         author_name=book.author_name,
+        custom_tags=(custom_tags or {}).get(book.id, []),
+        shelf_group_ids=(shelf_group_ids or {}).get(book.id, []),
     )
 
 
@@ -82,9 +96,17 @@ async def list_books(user: User = Depends(get_current_user), db: AsyncSession = 
             select(BookFavorite.book_id).where(BookFavorite.user_id == user.id)
         )
     )
+    custom_tags = await list_book_custom_tags_map(
+        db,
+        [book.id for book in books],
+        user,
+    )
     for book in books:
         book.is_favorite = book.id in favorite_ids
-    return [_serialize_book(book, user, book.is_favorite) for book in books]
+    return [
+        _serialize_book(book, user, book.is_favorite, custom_tags)
+        for book in books
+    ]
 
 
 @router.post("/batch-delete", dependencies=[Depends(require_admin)])
@@ -104,6 +126,55 @@ async def batch_delete_books(
     book_ids = [book.id for book in books]
     await delete_books(db, book_ids)
     return {"deleted": len(book_ids)}
+
+
+@router.post("/batch-favorite")
+async def batch_favorite_books(
+    payload: BatchFavoriteRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if not payload.ids:
+        raise HTTPException(status_code=400, detail="No book ids provided")
+    books = (
+        await db.scalars(select(Book).where(Book.id.in_(payload.ids)))
+    ).all()
+    existing = set(
+        await db.scalars(
+            select(BookFavorite.book_id).where(
+                BookFavorite.user_id == user.id,
+                BookFavorite.book_id.in_(payload.ids),
+            )
+        )
+    )
+    added = 0
+    for book in books:
+        if not ensure_book_visible(user, book):
+            continue
+        if book.id in existing:
+            continue
+        db.add(BookFavorite(id=str(uuid4()), user_id=user.id, book_id=book.id))
+        added += 1
+    await db.commit()
+    return {"added": added}
+
+
+@router.post("/batch-unfavorite")
+async def batch_unfavorite_books(
+    payload: BatchFavoriteRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if not payload.ids:
+        raise HTTPException(status_code=400, detail="No book ids provided")
+    result = await db.execute(
+        delete(BookFavorite).where(
+            BookFavorite.user_id == user.id,
+            BookFavorite.book_id.in_(payload.ids),
+        )
+    )
+    await db.commit()
+    return {"removed": result.rowcount}
 
 
 @router.post("/manual", dependencies=[Depends(require_admin)])
@@ -135,6 +206,7 @@ async def create_book(payload: BookCreate, user: User = Depends(get_current_user
 
 @router.get("/favorites", response_model=list[BookOut])
 async def list_favorite_books(
+    group_id: str | None = None,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -145,6 +217,11 @@ async def list_favorite_books(
         .options(selectinload(Book.tags))
         .order_by(BookFavorite.created_at.desc())
     )
+    if group_id:
+        query = query.join(
+            BookFavoriteGroup,
+            BookFavoriteGroup.favorite_id == BookFavorite.id,
+        ).where(BookFavoriteGroup.group_id == group_id)
     if user.role not in ("admin", "super_admin"):
         conditions = []
         if can_view_all_ages(user):
@@ -154,7 +231,20 @@ async def list_favorite_books(
         query = query.where(or_(*conditions)) if conditions else query.where(Book.id == "__none__")
     result = await db.scalars(query)
     books = list(result)
-    return [_serialize_book(book, user, True) for book in books]
+    custom_tags = await list_book_custom_tags_map(
+        db,
+        [book.id for book in books],
+        user,
+    )
+    shelf_groups = await favorite_group_ids_by_book(
+        db,
+        user.id,
+        [book.id for book in books],
+    )
+    return [
+        _serialize_book(book, user, True, custom_tags, shelf_groups)
+        for book in books
+    ]
 
 
 @router.post("/{book_id}/favorite")
@@ -209,7 +299,9 @@ async def get_book(book_id: str, user: User = Depends(get_current_user), db: Asy
         )
     )
     book.is_favorite = favorite is not None
-    return _serialize_book(book, user, book.is_favorite)
+    custom_tags = await list_book_custom_tags_map(db, [book.id], user)
+    shelf_groups = await favorite_group_ids_by_book(db, user.id, [book.id])
+    return _serialize_book(book, user, book.is_favorite, custom_tags, shelf_groups)
 
 
 @router.get("/{book_id}/sources", response_model=BookSourceAlternatesOut)

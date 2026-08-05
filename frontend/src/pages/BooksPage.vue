@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue"
+import { computed, onMounted, ref } from "vue"
 import { useBooksStore, type Book } from "../stores/books"
 import { useAuthStore } from "../stores/auth"
 import { useI18nStore } from "../stores/i18n"
@@ -11,11 +11,31 @@ const auth = useAuthStore()
 const i18n = useI18nStore()
 const selectedIds = ref<string[]>([])
 const batchDeleting = ref(false)
+const batchFavoriting = ref(false)
+
+const allSelected = computed(() =>
+  store.books.length > 0 && selectedIds.value.length === store.books.length
+)
 
 function toggleSelect(id: string) {
   selectedIds.value = selectedIds.value.includes(id)
     ? selectedIds.value.filter((x) => x !== id)
     : [...selectedIds.value, id]
+}
+
+function selectAll() {
+  selectedIds.value = store.books.map((book) => book.id)
+}
+
+function invertSelection() {
+  const selected = new Set(selectedIds.value)
+  selectedIds.value = store.books
+    .filter((book) => !selected.has(book.id))
+    .map((book) => book.id)
+}
+
+function clearSelection() {
+  selectedIds.value = []
 }
 
 async function toggleFavorite(book: Book) {
@@ -48,6 +68,21 @@ async function batchDelete() {
   }
 }
 
+async function batchAddShelf() {
+  if (!selectedIds.value.length) return
+  batchFavoriting.value = true
+  try {
+    const res = await api.post('/books/batch-favorite', { ids: selectedIds.value }) as { added: number }
+    alert(i18n.t('books_batch_add_shelf_done', { n: res.added }))
+    selectedIds.value = []
+    await store.fetchBooks()
+  } catch (e) {
+    alert(e instanceof Error ? e.message : i18n.t('books_batch_add_shelf_failed'))
+  } finally {
+    batchFavoriting.value = false
+  }
+}
+
 onMounted(async () => {
   await store.fetchBooks()
 })
@@ -67,6 +102,12 @@ onMounted(async () => {
           <div class="flex items-center gap-3">
             <span class="text-sm text-muted dark:text-gray-400">{{ i18n.t('home_books_count', { n: store.books.length }) }}</span>
             <button
+              v-if="selectedIds.length"
+              @click="batchAddShelf"
+              :disabled="batchFavoriting"
+              class="text-xs px-3 py-1.5 rounded bg-accent text-white hover:opacity-90 disabled:opacity-50"
+            >{{ i18n.t('books_batch_add_shelf') }} ({{ selectedIds.length }})</button>
+            <button
               v-if="auth.isAdmin && selectedIds.length"
               @click="batchDelete"
               :disabled="batchDeleting"
@@ -76,14 +117,38 @@ onMounted(async () => {
         </div>
 
         <p v-if="store.loading" class="text-muted dark:text-gray-400">{{ i18n.t('home_loading') }}</p>
-        <p v-else-if="store.error" class="text-red-600">{{ store.error }}</p>
+          <p v-else-if="store.error" class="text-red-600">{{ store.error }}</p>
 
         <div v-else-if="store.books.length === 0" class="text-center py-16">
           <p class="text-muted dark:text-gray-400 text-lg mb-2">{{ i18n.t('books_empty') }}</p>
           <router-link to="/admin" class="inline-block mt-4 text-sm text-accent hover:underline">{{ i18n.t('books_empty_hint') }}</router-link>
         </div>
 
-        <div v-else class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+        <template v-else>
+          <div class="mb-3 flex flex-wrap items-center gap-2 text-xs">
+            <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                :checked="allSelected"
+                @change="allSelected ? clearSelection() : selectAll()"
+                class="rounded"
+              />
+              <span>{{ i18n.t('books_select_all') }}</span>
+            </label>
+            <button
+              type="button"
+              @click="invertSelection"
+              class="px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5"
+            >{{ i18n.t('books_select_invert') }}</button>
+            <button
+              type="button"
+              @click="clearSelection"
+              class="px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5"
+            >{{ i18n.t('books_select_none') }}</button>
+            <span class="text-muted dark:text-gray-400">{{ i18n.t('books_selected_count', { n: selectedIds.length }) }}</span>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
           <router-link
             v-for="book in store.books"
             :key="book.id"
@@ -91,7 +156,6 @@ onMounted(async () => {
             class="relative group block p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 hover:shadow-md hover:border-accent/30 transition-all duration-200 no-underline"
           >
             <input
-              v-if="auth.isAdmin"
               type="checkbox"
               :checked="selectedIds.includes(book.id)"
               @click.stop="toggleSelect(book.id)"
@@ -105,12 +169,17 @@ onMounted(async () => {
             >{{ book.is_favorite ? '★' : '☆' }}</button>
             <h3 class="font-semibold text-ink mb-1 truncate pr-6">{{ book.title }}</h3>
             <p v-if="book.author_name" class="text-xs text-muted dark:text-gray-400 mb-1">{{ book.author_name }}</p>
-            <div v-if="book.tag_names?.length" class="flex flex-wrap gap-1 mb-2">
+            <div v-if="book.tag_names?.length || book.custom_tags?.length" class="flex flex-wrap gap-1 mb-2">
               <span
                 v-for="tag in book.tag_names"
                 :key="tag"
                 class="text-xs px-2 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-muted dark:text-gray-400"
               >{{ tag }}</span>
+              <span
+                v-for="tag in book.custom_tags || []"
+                :key="tag.id"
+                class="text-xs px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-900/60 text-amber-700 dark:text-amber-300"
+              >{{ tag.name }}<template v-if="tag.count > 1"> ×{{ tag.count }}</template></span>
             </div>
             <p class="text-sm text-muted dark:text-gray-400 line-clamp-2 mb-3">
               {{ book.description || i18n.t('home_no_desc') }}
@@ -125,7 +194,8 @@ onMounted(async () => {
               </span>
             </div>
           </router-link>
-        </div>
+          </div>
+        </template>
       </section>
     </main>
   </div>

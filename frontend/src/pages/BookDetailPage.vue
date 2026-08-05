@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue"
 import { useRoute, useRouter } from "vue-router"
-import { useBooksStore, type Book, type Chapter } from "../stores/books"
+import { useBooksStore, type Book, type Chapter, type CustomTagOnBook, type ShelfGroup } from "../stores/books"
 import { useAuthStore } from "../stores/auth"
 import { useI18nStore } from "../stores/i18n"
 import { api } from "../api/client"
@@ -22,10 +22,97 @@ const syncing = ref(false)
 const favorite = ref(false)
 const alternates = ref<any[]>([])
 const showSources = ref(false)
+const customTags = ref<CustomTagOnBook[]>([])
+const tagDetail = ref<CustomTagOnBook | null>(null)
+const newTagName = ref("")
+const newTagPublic = ref(false)
+const newTagShowUser = ref(true)
+const tagSaving = ref(false)
+const tagError = ref("")
+const shelfGroups = ref<ShelfGroup[]>([])
+const bookGroupIds = ref<string[]>([])
+const groupSaving = ref(false)
+const groupError = ref("")
 
 async function toggleFavorite() {
   if (!book.value) return
   favorite.value = await store.toggleFavorite(book.value)
+  await loadBookGroups()
+}
+
+async function loadCustomTags() {
+  if (!book.value) return
+  try {
+    customTags.value = await api.get<CustomTagOnBook[]>("/custom-tags/books/" + book.value.id)
+  } catch {
+    customTags.value = []
+  }
+}
+
+async function addCustomTag() {
+  if (!book.value || !newTagName.value.trim()) return
+  tagSaving.value = true
+  tagError.value = ""
+  try {
+    customTags.value = await api.post<CustomTagOnBook[]>("/custom-tags/apply", {
+      book_id: book.value.id,
+      name: newTagName.value.trim(),
+      is_public: newTagPublic.value,
+      show_user: newTagShowUser.value,
+    })
+    newTagName.value = ""
+  } catch (e) {
+    tagError.value = e instanceof Error ? e.message : i18n.t('book_tag_failed')
+  } finally {
+    tagSaving.value = false
+  }
+}
+
+async function removeCustomTag(tag: CustomTagOnBook) {
+  if (!book.value) return
+  tagError.value = ""
+  try {
+    customTags.value = await api.delete<CustomTagOnBook[]>("/custom-tags/books/" + book.value.id + "/tags/" + tag.id)
+  } catch (e) {
+    tagError.value = e instanceof Error ? e.message : i18n.t('book_tag_failed')
+  }
+}
+
+async function loadShelfGroups() {
+  try {
+    shelfGroups.value = await api.get<ShelfGroup[]>("/bookshelf/groups")
+  } catch {
+    shelfGroups.value = []
+  }
+}
+
+async function loadBookGroups() {
+  if (!book.value || !favorite.value) {
+    bookGroupIds.value = []
+    return
+  }
+  try {
+    const res = await api.get<{ group_ids: string[] }>("/bookshelf/favorites/" + book.value.id + "/groups")
+    bookGroupIds.value = res.group_ids || []
+  } catch {
+    bookGroupIds.value = []
+  }
+}
+
+async function saveBookGroups() {
+  if (!book.value) return
+  groupSaving.value = true
+  groupError.value = ""
+  try {
+    await api.put("/bookshelf/favorites/" + book.value.id + "/groups", {
+      group_ids: bookGroupIds.value,
+    })
+    alert(i18n.t('book_group_saved'))
+  } catch (e) {
+    groupError.value = e instanceof Error ? e.message : i18n.t('book_group_failed')
+  } finally {
+    groupSaving.value = false
+  }
 }
 
 async function deleteThisBook() {
@@ -42,7 +129,7 @@ async function resyncBook() {
   if (!book.value) return
   syncing.value = true
   try {
-    const result = await api.post('/books/' + book.value.id + '/sync')
+    const result = await api.post<any>('/books/' + book.value.id + '/sync')
     const failed = result.failed_chapters?.length || 0
     const failedSuffix = failed ? i18n.t('book_failed_suffix', { n: failed }) : ''
     alert(i18n.t('book_sync_result', {
@@ -74,6 +161,9 @@ onMounted(async () => {
     book.value = await store.fetchBook(route.params.id as string)
     favorite.value = book.value.is_favorite || false
     chapters.value = await store.fetchChapters(route.params.id as string)
+    await loadCustomTags()
+    await loadShelfGroups()
+    await loadBookGroups()
     await loadAlternates()
     if (auth.user) {
       try {
@@ -182,6 +272,67 @@ onMounted(async () => {
           </div>
         </header>
 
+        <section class="mb-8">
+          <h2 class="text-lg font-semibold mb-3">{{ i18n.t('book_custom_tags') }}</h2>
+          <div v-if="customTags.length" class="flex flex-wrap gap-2 mb-3">
+            <button
+              v-for="tag in customTags"
+              :key="tag.id"
+              @click="tag.is_public ? tagDetail = tag : null"
+              class="inline-flex items-center gap-1 text-xs px-2 py-1 rounded bg-amber-100 dark:bg-amber-900/60 text-amber-700 dark:text-amber-300"
+              :class="tag.is_public ? 'cursor-pointer hover:opacity-80' : 'cursor-default'"
+            >
+              {{ tag.name }} ×{{ tag.count }}
+              <span
+                v-if="tag.applied_by_me"
+                @click.stop="removeCustomTag(tag)"
+                class="text-red-500 hover:text-red-700 cursor-pointer"
+                :title="i18n.t('book_tag_remove')"
+              >&times;</span>
+            </button>
+          </div>
+          <p v-else class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('book_custom_tags_empty') }}</p>
+          <div class="flex flex-wrap items-center gap-2">
+            <input
+              v-model="newTagName"
+              :placeholder="i18n.t('book_tag_name_placeholder')"
+              @keyup.enter="addCustomTag"
+              class="w-36 px-3 py-1.5 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
+            />
+            <label class="inline-flex items-center gap-1 text-xs text-muted dark:text-gray-400 cursor-pointer">
+              <input type="checkbox" v-model="newTagPublic" class="rounded" />
+              {{ i18n.t('book_tag_public') }}
+            </label>
+            <label v-if="newTagPublic" class="inline-flex items-center gap-1 text-xs text-muted dark:text-gray-400 cursor-pointer">
+              <input type="checkbox" v-model="newTagShowUser" class="rounded" />
+              {{ i18n.t('book_tag_show_user') }}
+            </label>
+            <button
+              @click="addCustomTag"
+              :disabled="tagSaving"
+              class="px-3 py-1.5 rounded bg-accent text-white text-xs font-medium hover:opacity-90 disabled:opacity-50"
+            >{{ i18n.t('book_tag_add') }}</button>
+          </div>
+          <p v-if="tagError" class="text-xs text-red-600 mt-2">{{ tagError }}</p>
+        </section>
+
+        <section v-if="favorite" class="mb-8">
+          <h2 class="text-lg font-semibold mb-3">{{ i18n.t('book_shelf_groups') }}</h2>
+          <div v-if="shelfGroups.length" class="flex flex-wrap gap-3 mb-3">
+            <label v-for="g in shelfGroups" :key="g.id" class="inline-flex items-center gap-1.5 text-sm cursor-pointer">
+              <input type="checkbox" :value="g.id" v-model="bookGroupIds" class="rounded" />
+              <span>{{ g.name }}</span>
+            </label>
+          </div>
+          <p v-else class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('home_group_empty') }}</p>
+          <button
+            @click="saveBookGroups"
+            :disabled="groupSaving"
+            class="px-3 py-1.5 rounded bg-accent text-white text-xs font-medium hover:opacity-90 disabled:opacity-50"
+          >{{ i18n.t('book_group_save') }}</button>
+          <p v-if="groupError" class="text-xs text-red-600 mt-2">{{ groupError }}</p>
+        </section>
+
         <section>
           <h2 class="text-lg font-semibold mb-3">
             {{ i18n.t('book_chapters') }}
@@ -206,6 +357,21 @@ onMounted(async () => {
           </div>
         </section>
       </template>
+
+      <div v-if="tagDetail" class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" @click.self="tagDetail = null">
+        <div class="w-full max-w-sm rounded-lg border border-border dark:border-gray-700 bg-white dark:bg-gray-900 p-4">
+          <h3 class="text-sm font-semibold mb-1">{{ tagDetail.name }}</h3>
+          <p class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('book_tag_count', { n: tagDetail.count }) }}</p>
+          <ul v-if="tagDetail.show_user && tagDetail.users.length" class="space-y-1 text-sm max-h-48 overflow-y-auto">
+            <li v-for="u in tagDetail.users" :key="u.id">{{ u.username }}</li>
+          </ul>
+          <p v-else class="text-xs text-muted dark:text-gray-400">{{ i18n.t('book_tag_users_hidden') }}</p>
+          <button
+            @click="tagDetail = null"
+            class="mt-4 px-3 py-1.5 rounded border border-border dark:border-gray-700 text-xs"
+          >{{ i18n.t('home_close') }}</button>
+        </div>
+      </div>
     </main>
   </div>
 </template>

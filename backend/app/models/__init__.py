@@ -64,3 +64,5 @@ from .api_token import ApiToken  # noqa: F401
 from .category import Category  # noqa: F401
 from .book_category import BookCategory  # noqa: F401
 from .book_favorite import BookFavorite  # noqa: F401
+from .custom_tag import CustomTag, BookCustomTag  # noqa: F401
+from .bookshelf_group import BookshelfGroup, BookFavoriteGroup  # noqa: F401

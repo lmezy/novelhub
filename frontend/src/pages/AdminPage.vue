@@ -444,6 +444,29 @@ function toggleLocalBook(path: string) {
   }
 }
 
+const allLocalSelected = computed(() =>
+  localScan.value.length > 0 && localSelected.value.length === localScan.value.length
+)
+
+function toggleAllLocalBooks() {
+  if (allLocalSelected.value) {
+    localSelected.value = []
+  } else {
+    localSelected.value = localScan.value.map(book => book.path)
+  }
+}
+
+function invertLocalBooks() {
+  const selected = new Set(localSelected.value)
+  localSelected.value = localScan.value
+    .map(book => book.path)
+    .filter(path => !selected.has(path))
+}
+
+function clearLocalBooks() {
+  localSelected.value = []
+}
+
 async function importLocalSelected() {
   localError.value = ""
   localResult.value = null
@@ -456,6 +479,27 @@ async function importLocalSelected() {
     localResult.value = await api.post<any>("/sync/local/import", {
       path: localPath.value.trim(),
       book_paths: localSelected.value,
+    })
+    await loadSources()
+  } catch (e) {
+    localError.value = e instanceof Error ? e.message : i18n.t('admin_local_import_failed')
+  } finally {
+    localImporting.value = false
+  }
+}
+
+async function importLocalAll() {
+  localError.value = ""
+  localResult.value = null
+  if (localScan.value.length === 0) {
+    localError.value = i18n.t('admin_local_select_required')
+    return
+  }
+  localImporting.value = true
+  try {
+    localResult.value = await api.post<any>("/sync/local/import", {
+      path: localPath.value.trim(),
+      book_paths: localScan.value.map(book => book.path),
     })
     await loadSources()
   } catch (e) {
@@ -1160,6 +1204,28 @@ onUnmounted(() => {
           <p v-if="localScan.length" class="text-xs text-muted dark:text-gray-400 mt-3">
             {{ i18n.t('admin_local_scan_count', { n: localScan.length }) }}: {{ localScanRoot }}
           </p>
+          <div v-if="localScan.length" class="mt-2 flex flex-wrap items-center gap-2 text-xs">
+            <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                :checked="allLocalSelected"
+                @change="toggleAllLocalBooks"
+                class="rounded"
+              />
+              <span>{{ i18n.t('admin_local_select_all') }}</span>
+            </label>
+            <button
+              type="button"
+              @click="invertLocalBooks"
+              class="px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5"
+            >{{ i18n.t('admin_local_select_invert') }}</button>
+            <button
+              type="button"
+              @click="clearLocalBooks"
+              class="px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5"
+            >{{ i18n.t('admin_local_select_none') }}</button>
+            <span class="text-muted dark:text-gray-400">{{ i18n.t('admin_local_selected_count', { n: localSelected.length }) }}</span>
+          </div>
           <div v-if="localScan.length" class="mt-3 max-h-64 overflow-y-auto divide-y divide-border border border-border dark:border-gray-700 rounded">
             <label
               v-for="book in localScan"
@@ -1180,6 +1246,11 @@ onUnmounted(() => {
             </label>
           </div>
           <div v-if="localScan.length" class="mt-3 flex flex-wrap gap-2">
+            <button
+              @click="importLocalAll"
+              :disabled="localImporting || localScan.length === 0"
+              class="px-4 py-2 rounded border border-accent text-accent text-sm font-medium hover:bg-accent/10 disabled:opacity-50"
+            >{{ i18n.t('admin_local_import_all') }}</button>
             <button
               @click="importLocalSelected"
               :disabled="localImporting || localSelected.length === 0"

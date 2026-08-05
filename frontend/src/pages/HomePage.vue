@@ -1,6 +1,6 @@
 ﻿<script setup lang="ts">
-import { onMounted, ref } from "vue"
-import { useBooksStore, type Book } from "../stores/books"
+import { computed, onMounted, ref } from "vue"
+import { useBooksStore, type Book, type ShelfGroup } from "../stores/books"
 import { useAuthStore } from "../stores/auth"
 import { useI18nStore } from "../stores/i18n"
 import { api } from "../api/client"
@@ -15,12 +15,39 @@ const favoriteLoading = ref(false)
 const favoriteError = ref("")
 const selectedIds = ref<string[]>([])
 const batchDeleting = ref(false)
+const batchRemoving = ref(false)
+const groups = ref<ShelfGroup[]>([])
+const activeGroupId = ref("")
+const groupName = ref("")
+const groupCreating = ref(false)
+const groupSaving = ref(false)
+const managingGroups = ref(false)
+const moveOpen = ref(false)
+const moveGroupIds = ref<string[]>([])
+const groupForm = ref<Record<string, { name: string; show: boolean }>>({})
+
+const allSelected = computed(() =>
+  favoriteBooks.value.length > 0 &&
+  selectedIds.value.length === favoriteBooks.value.length
+)
+
+const groupNameMap = computed(() =>
+  Object.fromEntries(groups.value.map((g) => [g.id, g.name]))
+)
+
+async function loadGroups() {
+  try {
+    groups.value = await api.get<ShelfGroup[]>("/bookshelf/groups")
+  } catch {
+    groups.value = []
+  }
+}
 
 async function loadFavorites() {
   favoriteLoading.value = true
   favoriteError.value = ""
   try {
-    favoriteBooks.value = await store.fetchFavorites()
+    favoriteBooks.value = await store.fetchFavorites(activeGroupId.value || undefined)
   } catch (e) {
     favoriteError.value = e instanceof Error ? e.message : i18n.t('home_load_favorites_failed')
   } finally {
@@ -32,6 +59,7 @@ async function toggleFavorite(book: Book) {
   const isFavorite = await store.toggleFavorite(book)
   if (!isFavorite) {
     favoriteBooks.value = favoriteBooks.value.filter((b) => b.id !== book.id)
+    await loadGroups()
   }
 }
 
@@ -41,6 +69,7 @@ async function deleteBook(id: string, title: string) {
     await api.delete('/books/' + id)
     selectedIds.value = selectedIds.value.filter((x) => x !== id)
     await loadFavorites()
+    await loadGroups()
   } catch (e) {
     alert(e instanceof Error ? e.message : i18n.t('home_delete_failed'))
   }
@@ -52,6 +81,21 @@ function toggleSelect(id: string) {
     : [...selectedIds.value, id]
 }
 
+function selectAll() {
+  selectedIds.value = favoriteBooks.value.map((book) => book.id)
+}
+
+function invertSelection() {
+  const selected = new Set(selectedIds.value)
+  selectedIds.value = favoriteBooks.value
+    .filter((book) => !selected.has(book.id))
+    .map((book) => book.id)
+}
+
+function clearSelection() {
+  selectedIds.value = []
+}
+
 async function batchDelete() {
   if (!selectedIds.value.length) return
   if (!confirm(i18n.t('home_batch_delete_confirm', { n: selectedIds.value.length }))) return
@@ -60,10 +104,112 @@ async function batchDelete() {
     await api.post('/books/batch-delete', { ids: selectedIds.value })
     selectedIds.value = []
     await loadFavorites()
+    await loadGroups()
   } catch (e) {
     alert(e instanceof Error ? e.message : i18n.t('home_batch_delete_failed'))
   } finally {
     batchDeleting.value = false
+  }
+}
+
+async function batchRemoveShelf() {
+  if (!selectedIds.value.length) return
+  batchRemoving.value = true
+  try {
+    const res = await api.post('/bookshelf/batch-unfavorite', { ids: selectedIds.value }) as { removed: number }
+    alert(i18n.t('home_batch_remove_done', { n: res.removed }))
+    selectedIds.value = []
+    await loadFavorites()
+    await loadGroups()
+  } catch (e) {
+    alert(e instanceof Error ? e.message : i18n.t('home_batch_remove_failed'))
+  } finally {
+    batchRemoving.value = false
+  }
+}
+
+async function selectGroup(id: string) {
+  activeGroupId.value = id
+  selectedIds.value = []
+  await loadFavorites()
+}
+
+async function createGroup() {
+  const name = groupName.value.trim()
+  if (!name) return
+  groupCreating.value = true
+  try {
+    await api.post('/bookshelf/groups', { name })
+    groupName.value = ""
+    await loadGroups()
+    if (!activeGroupId.value) await loadFavorites()
+  } catch (e) {
+    alert(e instanceof Error ? e.message : i18n.t('home_group_create_failed'))
+  } finally {
+    groupCreating.value = false
+  }
+}
+
+function startManageGroups() {
+  groupForm.value = Object.fromEntries(
+    groups.value.map((g) => [g.id, { name: g.name, show: g.show }])
+  )
+  managingGroups.value = true
+}
+
+async function saveGroup(group: ShelfGroup) {
+  const form = groupForm.value[group.id]
+  if (!form || !form.name.trim()) return
+  groupSaving.value = true
+  try {
+    await api.patch('/bookshelf/groups/' + group.id, {
+      name: form.name.trim(),
+      show: form.show,
+    })
+    await loadGroups()
+    await loadFavorites()
+  } catch (e) {
+    alert(e instanceof Error ? e.message : i18n.t('home_group_save_failed'))
+  } finally {
+    groupSaving.value = false
+  }
+}
+
+async function deleteGroup(group: ShelfGroup) {
+  if (!confirm(i18n.t('home_group_delete_confirm', { name: group.name }))) return
+  try {
+    await api.delete('/bookshelf/groups/' + group.id)
+    if (activeGroupId.value === group.id) {
+      activeGroupId.value = ""
+    }
+    await loadGroups()
+    await loadFavorites()
+  } catch (e) {
+    alert(e instanceof Error ? e.message : i18n.t('home_group_delete_failed'))
+  }
+}
+
+function openMoveGroups() {
+  moveGroupIds.value = []
+  moveOpen.value = true
+}
+
+async function saveMoveGroups() {
+  if (!selectedIds.value.length) return
+  groupSaving.value = true
+  try {
+    await api.post('/bookshelf/favorites/batch-groups', {
+      book_ids: selectedIds.value,
+      group_ids: moveGroupIds.value,
+    })
+    moveOpen.value = false
+    selectedIds.value = []
+    await loadFavorites()
+    await loadGroups()
+  } catch (e) {
+    alert(e instanceof Error ? e.message : i18n.t('home_group_move_failed'))
+  } finally {
+    groupSaving.value = false
   }
 }
 
@@ -78,6 +224,7 @@ async function toggleSelfVisibility(key: "r18_enabled" | "non_r18_enabled") {
 }
 
 onMounted(async () => {
+  await loadGroups()
   await loadFavorites()
   if (auth.user) {
     try {
@@ -131,12 +278,55 @@ onMounted(async () => {
             </template>
             <span class="text-sm text-muted dark:text-gray-400">{{ i18n.t('home_books_count', { n: favoriteBooks.length }) }}</span>
             <button
+              v-if="selectedIds.length"
+              @click="batchRemoveShelf"
+              :disabled="batchRemoving"
+              class="text-xs px-3 py-1.5 rounded bg-accent text-white hover:opacity-90 disabled:opacity-50"
+            >{{ i18n.t('home_batch_remove_shelf') }} ({{ selectedIds.length }})</button>
+            <button
+              v-if="selectedIds.length"
+              @click="openMoveGroups"
+              class="text-xs px-3 py-1.5 rounded border border-border dark:border-gray-700 hover:bg-accent/5"
+            >{{ i18n.t('home_group_move') }}</button>
+            <button
               v-if="auth.isAdmin && selectedIds.length"
               @click="batchDelete"
               :disabled="batchDeleting"
               class="text-xs px-3 py-1.5 rounded bg-red-500 text-white hover:bg-red-600 disabled:opacity-50"
             >{{ i18n.t('books_batch_delete') }} ({{ selectedIds.length }})</button>
           </div>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-2 mb-4">
+          <button
+            @click="selectGroup('')"
+            class="text-xs px-3 py-1.5 rounded border"
+            :class="activeGroupId === '' ? 'bg-accent text-white border-accent' : 'border-border dark:border-gray-700 text-muted dark:text-gray-400 hover:bg-accent/5'"
+          >{{ i18n.t('home_group_all') }}</button>
+          <button
+            v-for="g in groups.filter(g => g.show)"
+            :key="g.id"
+            @click="selectGroup(g.id)"
+            class="text-xs px-3 py-1.5 rounded border"
+            :class="activeGroupId === g.id ? 'bg-accent text-white border-accent' : 'border-border dark:border-gray-700 text-muted dark:text-gray-400 hover:bg-accent/5'"
+          >{{ g.name }} ({{ g.count }})</button>
+          <div class="inline-flex items-center gap-1">
+            <input
+              v-model="groupName"
+              :placeholder="i18n.t('home_group_name_placeholder')"
+              @keyup.enter="createGroup"
+              class="w-32 px-2 py-1.5 rounded border border-border dark:border-gray-700 text-xs bg-paper dark:bg-gray-800"
+            />
+            <button
+              @click="createGroup"
+              :disabled="groupCreating"
+              class="text-xs px-2 py-1.5 rounded bg-accent text-white disabled:opacity-50"
+            >{{ i18n.t('home_group_create') }}</button>
+          </div>
+          <button
+            @click="startManageGroups"
+            class="text-xs px-2 py-1.5 rounded border border-border dark:border-gray-700 hover:bg-accent/5"
+          >{{ i18n.t('home_group_manage') }}</button>
         </div>
 
         <p v-if="favoriteLoading" class="text-muted dark:text-gray-400">{{ i18n.t('home_loading') }}</p>
@@ -151,7 +341,31 @@ onMounted(async () => {
           >{{ i18n.t('home_goto_books') }}</router-link>
         </div>
 
-        <div v-else class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+        <template v-else>
+          <div class="mb-3 flex flex-wrap items-center gap-2 text-xs">
+            <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                :checked="allSelected"
+                @change="allSelected ? clearSelection() : selectAll()"
+                class="rounded"
+              />
+              <span>{{ i18n.t('books_select_all') }}</span>
+            </label>
+            <button
+              type="button"
+              @click="invertSelection"
+              class="px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5"
+            >{{ i18n.t('books_select_invert') }}</button>
+            <button
+              type="button"
+              @click="clearSelection"
+              class="px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5"
+            >{{ i18n.t('books_select_none') }}</button>
+            <span class="text-muted dark:text-gray-400">{{ i18n.t('books_selected_count', { n: selectedIds.length }) }}</span>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
           <router-link
             v-for="book in favoriteBooks"
             :key="book.id"
@@ -159,7 +373,6 @@ onMounted(async () => {
             class="relative group block p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 hover:shadow-md hover:border-accent/30 transition-all duration-200 no-underline"
           >
             <input
-              v-if="auth.isAdmin"
               type="checkbox"
               :checked="selectedIds.includes(book.id)"
               @click.stop="toggleSelect(book.id)"
@@ -179,12 +392,20 @@ onMounted(async () => {
             >&times;</button>
             <h3 class="font-semibold text-ink mb-1 truncate">{{ book.title }}</h3>
             <p v-if="book.author_name" class="text-xs text-muted dark:text-gray-400 mb-1">{{ book.author_name }}</p>
-            <div v-if="book.tag_names?.length" class="flex flex-wrap gap-1 mb-2">
+            <p v-if="book.shelf_group_ids?.length" class="text-xs text-accent/80 dark:text-accent/70 mb-1">
+              {{ i18n.t('home_group_books') }}: {{ book.shelf_group_ids.map(id => groupNameMap[id]).filter(Boolean).join(', ') }}
+            </p>
+            <div v-if="book.tag_names?.length || book.custom_tags?.length" class="flex flex-wrap gap-1 mb-2">
               <span
                 v-for="tag in book.tag_names"
                 :key="tag"
                 class="text-xs px-2 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-muted dark:text-gray-400"
               >{{ tag }}</span>
+              <span
+                v-for="tag in book.custom_tags || []"
+                :key="tag.id"
+                class="text-xs px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-900/60 text-amber-700 dark:text-amber-300"
+              >{{ tag.name }}<template v-if="tag.count > 1"> ×{{ tag.count }}</template></span>
             </div>
             <p class="text-sm text-muted dark:text-gray-400 line-clamp-2 mb-3">
               {{ book.description || i18n.t('home_no_desc') }}
@@ -199,6 +420,41 @@ onMounted(async () => {
               </span>
             </div>
           </router-link>
+          </div>
+        </template>
+
+        <div v-if="moveOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" @click.self="moveOpen = false">
+          <div class="w-full max-w-sm rounded-lg border border-border dark:border-gray-700 bg-white dark:bg-gray-900 p-4">
+            <h3 class="text-sm font-semibold mb-3">{{ i18n.t('home_group_move') }}</h3>
+            <label v-for="g in groups" :key="g.id" class="flex items-center gap-2 py-1.5 text-sm cursor-pointer">
+              <input type="checkbox" :value="g.id" v-model="moveGroupIds" class="rounded" />
+              <span>{{ g.name }}</span>
+            </label>
+            <p class="text-xs text-muted dark:text-gray-400 mt-2">{{ i18n.t('home_group_move_hint') }}</p>
+            <div class="flex gap-2 mt-4">
+              <button @click="saveMoveGroups" :disabled="groupSaving" class="px-3 py-1.5 rounded bg-accent text-white text-xs disabled:opacity-50">{{ i18n.t('home_group_save') }}</button>
+              <button @click="moveOpen = false" class="px-3 py-1.5 rounded border border-border dark:border-gray-700 text-xs">{{ i18n.t('home_cancel') }}</button>
+            </div>
+          </div>
+        </div>
+
+        <div v-if="managingGroups" class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" @click.self="managingGroups = false">
+          <div class="w-full max-w-md rounded-lg border border-border dark:border-gray-700 bg-white dark:bg-gray-900 p-4 max-h-[80vh] overflow-y-auto">
+            <h3 class="text-sm font-semibold mb-3">{{ i18n.t('home_group_manage') }}</h3>
+            <p v-if="groups.length === 0" class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('home_group_empty') }}</p>
+            <div v-for="g in groups" :key="g.id" class="py-2 border-b border-border dark:border-gray-700 last:border-0">
+              <div class="flex flex-wrap items-center gap-2">
+                <input v-model="groupForm[g.id].name" class="flex-1 min-w-24 px-2 py-1.5 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+                <label class="inline-flex items-center gap-1 text-xs text-muted dark:text-gray-400 cursor-pointer">
+                  <input type="checkbox" v-model="groupForm[g.id].show" class="rounded" />
+                  {{ i18n.t('home_group_show') }}
+                </label>
+                <button @click="saveGroup(g)" :disabled="groupSaving" class="text-xs px-2 py-1 rounded border border-accent text-accent hover:bg-accent/10">{{ i18n.t('home_group_save') }}</button>
+                <button @click="deleteGroup(g)" class="text-xs px-2 py-1 rounded border border-red-200 text-red-500 hover:bg-red-50">{{ i18n.t('home_group_delete') }}</button>
+              </div>
+            </div>
+            <button @click="managingGroups = false" class="mt-4 px-3 py-1.5 rounded border border-border dark:border-gray-700 text-xs">{{ i18n.t('home_close') }}</button>
+          </div>
         </div>
       </section>
     </main>
