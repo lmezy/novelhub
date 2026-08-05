@@ -11,7 +11,7 @@ const i18n = useI18nStore()
 const crawlStore = useCrawlStore()
 const sources = ref<any[]>([])
 const tasks = ref<any[]>([])
-const sourceId = ref("")
+const selectedSourceIds = ref<string[]>([])
 const starting = ref(false)
 const loadingTasks = ref(false)
 const pageError = ref("")
@@ -82,17 +82,23 @@ async function selectTask(task: any) {
 
 async function startCrawl() {
   pageError.value = ""
-  if (!sourceId.value) {
+  if (selectedSourceIds.value.length === 0) {
     pageError.value = i18n.t('sync_please_select_source')
     return
   }
   starting.value = true
   try {
-    const task = await api.post<any>("/crawl/tasks", {
-      source: sourceId.value,
-      max_pages: 0,
-    })
-    await crawlStore.setTask(task)
+    const created: any[] = []
+    for (const id of selectedSourceIds.value) {
+      const task = await api.post<any>("/crawl/tasks", {
+        source: id,
+        max_pages: 0,
+      })
+      created.push(task)
+    }
+    if (created.length > 0) {
+      await crawlStore.setTask(created[0])
+    }
     await loadTasks()
   } catch (e) {
     pageError.value = e instanceof Error ? e.message : i18n.t('sync_failed_start')
@@ -168,8 +174,12 @@ onMounted(async () => {
       <section v-if="auth.isAdmin" class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 mb-6">
         <h2 class="text-sm font-semibold mb-3">{{ i18n.t('sync_start_full') }}</h2>
         <div class="flex flex-col sm:flex-row gap-3">
-          <select v-model="sourceId" class="flex-1 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800">
-            <option value="" disabled>{{ i18n.t('sync_select_source') }}</option>
+          <select
+            v-model="selectedSourceIds"
+            multiple
+            size="6"
+            class="flex-1 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
+          >
             <option v-for="s in sources" :key="s.id" :value="s.id">{{ s.name }} ({{ s.id }})</option>
           </select>
           <button @click="startCrawl" :disabled="starting" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">

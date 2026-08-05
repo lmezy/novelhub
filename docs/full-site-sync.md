@@ -116,6 +116,8 @@ docker compose up -d --build crawler backend scheduler
 
 同步进度集中在 `/sync` 页面展示：可以发起全站同步、查看当前任务的页数/书籍/章节进度、暂停/继续/取消，以及查看最近任务列表。书源导入现在也会先创建同步任务，再跳转到该页面查看进度。
 
+`/sync` 页面的书源选择框支持多选，一次会为每个选中的书源创建一个全站同步任务；队列 worker 会按 `SYNC_WORKER_CONCURRENCY` 同时运行多个任务，而不是等前一个完成。
+
 ## 自动更新与错误章节
 
 - Celery Beat 每天 `03:00` 自动执行 `daily_sync_all`：有 Cookie 的书源同步书架，没有 Cookie 的书源对库内已有书籍逐本检查新章节。它不会自动全站发现新书，发现新书仍需手动发起全站同步。

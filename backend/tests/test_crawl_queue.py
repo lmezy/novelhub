@@ -5,7 +5,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.exc import MissingGreenlet
 
-from app.services.crawl_runner import run_crawl_task_async
+from app.services.crawl_runner import _next_pending_task_ids, run_crawl_task_async
 from app.core.database import get_db
 from app.main import app
 from app.services.auth import require_admin
@@ -91,6 +91,22 @@ async def test_resume_paused_task_requeues_it():
 
     assert resp.status_code == 200
     assert resp.json()["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_next_pending_task_ids_returns_batch():
+    db = AsyncMock()
+    db.scalars = AsyncMock(
+        return_value=SimpleNamespace(all=lambda: ["task-a", "task-b"])
+    )
+    session = AsyncMock()
+    session.__aenter__ = AsyncMock(return_value=db)
+    session.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("app.services.crawl_runner.SessionLocal", return_value=session):
+        ids = await _next_pending_task_ids(3)
+
+    assert ids == ["task-a", "task-b"]
 
 
 @pytest.mark.asyncio

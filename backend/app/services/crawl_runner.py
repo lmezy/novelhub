@@ -20,9 +20,9 @@ def _naive_utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-async def _next_pending_task_id() -> str | None:
+async def _next_pending_task_ids(limit: int = 1) -> list[str]:
     async with SessionLocal() as db:
-        return await db.scalar(
+        rows = await db.scalars(
             select(CrawlTask.id)
             .where(
                 CrawlTask.status == "pending",
@@ -30,8 +30,9 @@ async def _next_pending_task_id() -> str | None:
                 | (CrawlTask.resume_at <= _naive_utcnow()),
             )
             .order_by(CrawlTask.priority.desc(), CrawlTask.created_at.asc())
-            .limit(1)
+            .limit(limit)
         )
+        return list(rows.all())
 
 
 async def _reset_stale_running_tasks() -> None:
@@ -206,12 +207,23 @@ async def _worker_loop() -> None:
 
     while True:
         while len(active) < concurrency:
-            task_id = await _next_pending_task_id()
-            if task_id is None or task_id in claimed:
+            candidates = await _next_pending_task_ids(concurrency)
+            if not candidates:
                 break
-            claimed.add(task_id)
-            task = asyncio.create_task(_run_guarded(task_id))
-            active[task] = task_id
+            started_any = False
+            for task_id in candidates:
+                if len(active) >= concurrency:
+                    break
+                if task_id in claimed:
+                    continue
+                claimed.add(task_id)
+                task = asyncio.create_task(_run_guarded(task_id))
+                active[task] = task_id
+                started_any = True
+            if not started_any:
+                # All candidates are already claimed but not yet running.
+                await asyncio.sleep(0.1)
+                break
 
         if not active:
             await asyncio.sleep(2)
