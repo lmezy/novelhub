@@ -235,7 +235,7 @@ async def list_book_sources(
     normalized = _normalize_book_title(book.title)
     candidates = [
         b
-        for b in (await db.scalars(query)).all()
+        for b in (await db.scalars(query)).unique().all()
         if _normalize_book_title(b.title) == normalized
     ]
     candidates.append(book)

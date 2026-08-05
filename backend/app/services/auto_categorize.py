@@ -89,7 +89,7 @@ class AutoCategorizationService:
     async def categorize_all_books(db: AsyncSession) -> dict:
         """Auto-categorize all uncategorized books in the library."""
         await AutoCategorizationService.ensure_default_categories(db)
-        books = await db.scalars(select(Book))
+        books = (await db.scalars(select(Book))).unique().all()
         results = {"total": 0, "categorized": 0, "details": []}
         for book in books:
             results["total"] += 1

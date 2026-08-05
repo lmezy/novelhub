@@ -2,14 +2,67 @@
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
 
-from app.api.routes.books import _normalize_book_title
+from app.api.routes.books import _normalize_book_title, list_book_sources
 
 
 def test_normalize_book_title():
     assert _normalize_book_title("《剑来》") == "剑来"
     assert _normalize_book_title(" 剑来 ") == "剑来"
     assert _normalize_book_title("剑来（全文）") == "剑来全文"
+
+
+class _UniqueAwareScalarResult:
+    def __init__(self, rows):
+        self._rows = rows
+        self._unique_called = False
+
+    def unique(self):
+        self._unique_called = True
+        return self
+
+    def all(self):
+        if not self._unique_called:
+            raise AssertionError("unique() must be called before all()")
+        return self._rows
+
+
+@pytest.mark.asyncio
+async def test_list_book_sources_calls_unique_before_all():
+    db = AsyncMock()
+    current = SimpleNamespace(
+        id="current",
+        title="剑来",
+        is_r18=False,
+        source_id=None,
+        source_book_id=None,
+        author_name="作者甲",
+        status=None,
+        updated_at=None,
+    )
+    other = SimpleNamespace(
+        id="other",
+        title="剑来",
+        is_r18=False,
+        source_id="src-1",
+        source_book_id="book-1",
+        author_name="作者甲",
+        status=None,
+        updated_at=None,
+    )
+    db.get.return_value = current
+    db.scalars.return_value = _UniqueAwareScalarResult([other])
+    db.execute.return_value = MagicMock()
+    db.execute.return_value.all.return_value = []
+
+    result = await list_book_sources(
+        "current",
+        SimpleNamespace(role="super_admin"),
+        db,
+    )
+
+    assert [s.id for s in result.sources] == ["current", "other"]
 
 
 @pytest.mark.asyncio

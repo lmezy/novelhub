@@ -131,8 +131,7 @@ class SearchService:
                 self._ensure_index(self.INDEX_CHAPTERS)
 
                 # Reindex books
-                books = await db.scalars(select(Book))
-                book_list = list(books)
+                book_list = (await db.scalars(select(Book))).unique().all()
                 for b in book_list:
                     self.index_book({
                         "id": b.id,

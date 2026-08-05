@@ -20,7 +20,11 @@ class BookRepository(BaseRepository[Book]):
         )
 
     async def list_recent(self, *, offset: int = 0, limit: int = 20) -> list[Book]:
-        result = await self.db.scalars(
-            select(Book).order_by(Book.updated_at.desc()).offset(offset).limit(limit)
-        )
-        return list(result)
+        return (
+            await self.db.scalars(
+                select(Book)
+                .order_by(Book.updated_at.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+        ).unique().all()
