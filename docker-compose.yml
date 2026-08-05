@@ -10,7 +10,10 @@
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       TZ: ${TZ}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      # Host directory keeps PostgreSQL data outside Docker named volumes.
+      # On Linux, make sure data/postgres is writable by UID 999:
+      #   sudo chown -R 999:999 data/postgres
+      - ./data/postgres:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 10s
@@ -40,7 +43,7 @@
     ports:
       - "6379:6379"
     volumes:
-      - redis_data:/data
+      - ./data/redis:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -57,7 +60,7 @@
       MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
       TZ: ${TZ}
     volumes:
-      - meili_data:/meili_data
+      - ./data/meili:/meili_data
 
   backend:
     build:
@@ -154,7 +157,7 @@
       PGDATABASE: ${POSTGRES_DB}
       TZ: ${TZ}
     volumes:
-      - backup_data:/backup
+      - ./data/backup:/backup
       - ./storage:/app/storage:ro
     entrypoint: >
       sh -c '
@@ -206,9 +209,3 @@
   #   volumes:
   #     - /var/run/docker.sock:/var/run/docker.sock
   #   command: --interval 86400 --cleanup
-
-volumes:
-  postgres_data:
-  redis_data:
-  meili_data:
-  backup_data:
