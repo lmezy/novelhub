@@ -49,7 +49,13 @@ class Settings(BaseSettings):
 
     CRAWL_DELAY_MS:int=1200
 
-    SYNC_CHAPTER_CONCURRENCY:int=12
+    SYNC_CHAPTER_CONCURRENCY:int=9
+    SYNC_BOOK_CONCURRENCY:int=3
+    SYNC_IGNORE_RATE_LIMIT:bool=False
+    SYNC_THREAD_COUNT:int=9
+    SYNC_WORKER_CONCURRENCY:int=2
+    SYNC_PAGE_BATCH_SIZE:int=0
+    SYNC_BATCH_INTERVAL_MS:int=5000
 
 
     class Config:
@@ -59,4 +65,8 @@ class Settings(BaseSettings):
 
 
 settings=Settings()
+
+def sync_thread_count() -> int:
+    """Effective concurrent thread pool size, capped like Legado's MAX_THREAD."""
+    return max(1, min(int(settings.SYNC_THREAD_COUNT), 9))
 

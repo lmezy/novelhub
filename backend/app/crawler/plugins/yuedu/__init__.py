@@ -246,33 +246,43 @@ class YueduPlugin:
 
         # Follow nextTocUrl for paginated tables of contents
         max_toc_pages = 20
-        toc_pending: list[str] = []
         seen_toc_urls = {toc_url}
-        current_toc_url = toc_url
-        current_toc_html = toc_html
         toc_pages_fetched = 1
-        while toc_pages_fetched < max_toc_pages:
-            for next_toc_url in self.engine.get_next_toc_urls(
-                current_toc_html,
-                current_toc_url,
-            ):
-                if next_toc_url not in seen_toc_urls:
-                    seen_toc_urls.add(next_toc_url)
-                    toc_pending.append(next_toc_url)
-            if not toc_pending:
-                break
-            current_toc_url = toc_pending.pop(0)
-            current_toc_html = await self._get(current_toc_url)
-            toc_pages_fetched += 1
-            if current_toc_url not in seen_toc_urls:
-                seen_toc_urls.add(current_toc_url)
-            if current_toc_url != toc_url:
+        toc_semaphore = asyncio.Semaphore(self._thread_count())
+
+        async def _fetch_toc_page(page_url: str) -> str:
+            async with toc_semaphore:
+                return await self._get(page_url)
+
+        toc_pending = [
+            next_toc_url
+            for next_toc_url in self.engine.get_next_toc_urls(toc_html, toc_url)
+            if next_toc_url not in seen_toc_urls
+        ]
+        seen_toc_urls.update(toc_pending)
+        while toc_pending and toc_pages_fetched < max_toc_pages:
+            batch = toc_pending
+            toc_pending = []
+            htmls = await asyncio.gather(
+                *(_fetch_toc_page(page_url) for page_url in batch)
+            )
+            for page_url, page_html in zip(batch, htmls):
+                if toc_pages_fetched >= max_toc_pages:
+                    break
+                toc_pages_fetched += 1
                 toc.extend(
                     self._resolve_toc_entries(
-                        self.engine.parse_toc(current_toc_html),
-                        current_toc_url,
+                        self.engine.parse_toc(page_html),
+                        page_url,
                     )
                 )
+                for next_toc_url in self.engine.get_next_toc_urls(
+                    page_html,
+                    page_url,
+                ):
+                    if next_toc_url not in seen_toc_urls:
+                        seen_toc_urls.add(next_toc_url)
+                        toc_pending.append(next_toc_url)
 
         generic = self._parse_book_generic(html, url)
         if not str(info.get("name") or "").strip():
@@ -474,28 +484,48 @@ class YueduPlugin:
         # Follow nextContentUrl for multi-page chapters
         max_pages = 20  # safety limit
         seen_content_urls = {chapter.url}
-        pending_content_urls = self.engine.get_next_content_urls(
-            html,
-            chapter.url,
-        )
+        content_semaphore = asyncio.Semaphore(self._thread_count())
+
+        async def _fetch_content_page(page_url: str) -> str:
+            async with content_semaphore:
+                return await self._get(page_url)
+
+        pending_content_urls = [
+            url
+            for url in self.engine.get_next_content_urls(html, chapter.url)
+            if url not in seen_content_urls
+        ]
+        seen_content_urls.update(pending_content_urls)
         pages_fetched = 0
         while pending_content_urls and pages_fetched < max_pages:
-            next_url = pending_content_urls.pop(0)
-            if next_url in seen_content_urls:
-                continue
-            if getattr(chapter, "next_url", None) and next_url == chapter.next_url:
-                break
-            seen_content_urls.add(next_url)
-            next_html = await self._get(next_url)
-            next_part = self.engine.parse_content(next_html)
-            if next_part and next_part != next_html:
-                parts.append(next_part)
-            pages_fetched += 1
-            pending_content_urls.extend(
+            eligible = [
                 url
-                for url in self.engine.get_next_content_urls(next_html, next_url)
-                if url not in seen_content_urls
+                for url in pending_content_urls
+                if not (
+                    getattr(chapter, "next_url", None)
+                    and url == chapter.next_url
+                )
+            ]
+            batch = eligible[: max_pages - pages_fetched]
+            pending_content_urls = eligible[max_pages - pages_fetched:]
+            if not batch:
+                break
+            htmls = await asyncio.gather(
+                *(_fetch_content_page(page_url) for page_url in batch)
             )
+            for next_url, next_html in zip(batch, htmls):
+                if pages_fetched >= max_pages:
+                    break
+                next_part = self.engine.parse_content(next_html)
+                if next_part and next_part != next_html:
+                    parts.append(next_part)
+                pages_fetched += 1
+                pending_content_urls.extend(
+                    url
+                    for url in self.engine.get_next_content_urls(next_html, next_url)
+                    if url not in seen_content_urls
+                )
+            seen_content_urls.update(pending_content_urls)
 
         content = "\n".join(parts)
 
@@ -1494,6 +1524,22 @@ class YueduPlugin:
             return None
         return "interval", 1, interval_ms
 
+    @staticmethod
+    def _thread_count() -> int:
+        try:
+            from app.core.config import sync_thread_count
+            return sync_thread_count()
+        except Exception:
+            return 9
+
+    @staticmethod
+    def _rate_limit_disabled() -> bool:
+        try:
+            from app.core.config import settings
+            return bool(getattr(settings, "SYNC_IGNORE_RATE_LIMIT", False))
+        except Exception:
+            return False
+
     async def _sleep_rate_limit(self) -> None:
         """Reserve a request slot based on the source concurrentRate.
 
@@ -1502,6 +1548,8 @@ class YueduPlugin:
         request per interval, while "count/window" allows count starts per
         window milliseconds.
         """
+        if self._rate_limit_disabled():
+            return
         spec = self._parse_concurrent_rate()
         if spec is None:
             return

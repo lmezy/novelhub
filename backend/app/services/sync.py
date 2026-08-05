@@ -11,6 +11,8 @@ from sqlalchemy.orm import selectinload
 from loguru import logger
 
 from app.crawler.registry import get_plugin
+from app.core.config import settings, sync_thread_count
+from app.core.database import SessionLocal
 from app.core.events import emit, EventType
 from app.models import Author, Book, BookTag, Chapter, Cookie, Source, Tag
 from app.repositories.tag import TagRepository
@@ -59,9 +61,12 @@ class SyncService:
     @staticmethod
     def _chapter_concurrency(config: dict | None) -> int:
         """Pick chapter fetch concurrency, mirroring Legado's thread model."""
-        from app.core.config import settings
-
-        default = max(1, int(getattr(settings, "SYNC_CHAPTER_CONCURRENCY", 12)))
+        default = min(
+            max(1, int(getattr(settings, "SYNC_CHAPTER_CONCURRENCY", 9))),
+            sync_thread_count(),
+        )
+        if getattr(settings, "SYNC_IGNORE_RATE_LIMIT", False):
+            return default
         if not config:
             return default
         rate = str(config.get("concurrentRate", "") or "").strip()
@@ -142,6 +147,11 @@ class SyncService:
 
         config = source.config if source.plugin_name == 'yuedu' else None
         plugin = get_plugin(source.plugin_name, config=config)
+        cookie_record = await self.db.scalar(
+            select(Cookie).where(Cookie.source == source_id)
+        )
+        if cookie_record:
+            plugin.set_cookie(safe_decrypt_cookie(cookie_record.cookie_data))
         remote_book = await plugin.fetch_book(url)
         if (
             not remote_book.chapters
@@ -790,6 +800,7 @@ class SyncService:
         chapter_progress_cb: Callable[[dict], Awaitable[None]] | None = None,
         before_step: Callable[[], Awaitable[None]] | None = None,
         start_page: int = 1,
+        page_batch_size: int = 0,
     ) -> dict:
         """Discover every book across catalog pages and optionally sync them."""
         source = await self.db.get(Source, source_id)
@@ -829,13 +840,18 @@ class SyncService:
         pages_checked = 0
         start_page = max(1, int(start_page or 1))
         max_pages = max_pages or 0
+        page_batch_size = max(0, int(page_batch_size or 0))
+        pages_in_run = 0
+        done = max_pages > 0 and start_page > max_pages
 
         page = start_page
         while max_pages <= 0 or page <= max_pages:
+            pages_in_run += 1
             if before_step is not None:
                 await before_step()
             page_books = await plugin.discover_books(url=url, page=page)
             if not page_books:
+                done = True
                 break
             pages_checked = page
 
@@ -848,8 +864,69 @@ class SyncService:
                 new_books.append(sb)
 
             if not new_books:
+                done = True
                 break
 
+            book_concurrency = min(
+                max(1, int(getattr(settings, "SYNC_BOOK_CONCURRENCY", 3))),
+                sync_thread_count(),
+            )
+            chapter_progress_lock = asyncio.Lock()
+
+            async def _guarded_chapter_progress(info: dict) -> None:
+                if chapter_progress_cb is None:
+                    return
+                async with chapter_progress_lock:
+                    await chapter_progress_cb(info)
+
+            async def _sync_one(sb):
+                async with SessionLocal() as session:
+                    return await SyncService(session).sync_book(
+                        source_id,
+                        sb.url,
+                        progress_cb=_guarded_chapter_progress,
+                    )
+
+            async def _record_outcome(sb, outcome) -> None:
+                nonlocal books_synced, books_failed
+                nonlocal chapters_created, chapters_skipped, chapters_failed
+                if isinstance(outcome, BaseException):
+                    await self.db.rollback()
+                    books_failed += 1
+                    logger.warning(
+                        "Failed to sync book {} ({}): {}",
+                        sb.title,
+                        sb.url,
+                        outcome,
+                    )
+                    details.append({
+                        "title": sb.title,
+                        "author": sb.author,
+                        "url": sb.url,
+                        "synced": False,
+                        "error": str(outcome),
+                        "failed_chapters": [],
+                    })
+                else:
+                    details.append({
+                        "title": sb.title,
+                        "author": sb.author,
+                        "url": sb.url,
+                        "synced": True,
+                        "book_id": outcome.get("book_id"),
+                        "created_chapters": outcome.get("created_chapters", 0),
+                        "skipped_chapters": outcome.get("skipped_chapters", 0),
+                        "failed_chapters": outcome.get("failed_chapters", []),
+                    })
+                    books_synced += 1
+                    chapters_created += outcome.get("created_chapters", 0)
+                    chapters_skipped += outcome.get("skipped_chapters", 0)
+                    chapters_failed += len(outcome.get("failed_chapters", []))
+
+                if progress_cb is not None:
+                    await progress_cb(pages_checked, books_found, books_synced, books_failed)
+
+            pending_tasks = []
             for sb in new_books:
                 if before_step is not None:
                     await before_step()
@@ -864,46 +941,41 @@ class SyncService:
                     if progress_cb is not None:
                         await progress_cb(pages_checked, books_found, books_synced, books_failed)
                     continue
-                try:
-                    result = await self.sync_book(
-                        source_id,
-                        sb.url,
-                        progress_cb=chapter_progress_cb,
-                    )
-                    details.append({
-                        "title": sb.title,
-                        "author": sb.author,
-                        "url": sb.url,
-                        "synced": True,
-                        "book_id": result.get("book_id"),
-                        "created_chapters": result.get("created_chapters", 0),
-                        "skipped_chapters": result.get("skipped_chapters", 0),
-                        "failed_chapters": result.get("failed_chapters", []),
-                    })
-                    books_synced += 1
-                    chapters_created += result.get("created_chapters", 0)
-                    chapters_skipped += result.get("skipped_chapters", 0)
-                    chapters_failed += len(result.get("failed_chapters", []))
-                except Exception as exc:
-                    await self.db.rollback()
-                    books_failed += 1
-                    logger.warning(
-                        "Failed to sync book {} ({}): {}",
-                        sb.title,
-                        sb.url,
-                        exc,
-                    )
-                    details.append({
-                        "title": sb.title,
-                        "author": sb.author,
-                        "url": sb.url,
-                        "synced": False,
-                        "error": str(exc),
-                        "failed_chapters": [],
-                    })
+                if book_concurrency <= 1:
+                    try:
+                        result = await self.sync_book(
+                            source_id,
+                            sb.url,
+                            progress_cb=chapter_progress_cb,
+                        )
+                    except Exception as exc:
+                        await _record_outcome(sb, exc)
+                    else:
+                        await _record_outcome(sb, result)
+                    continue
 
-                if progress_cb is not None:
-                    await progress_cb(pages_checked, books_found, books_synced, books_failed)
+                pending_tasks.append((sb, asyncio.create_task(_sync_one(sb))))
+                if len(pending_tasks) >= book_concurrency:
+                    outcomes = await asyncio.gather(
+                        *(task for _, task in pending_tasks),
+                        return_exceptions=True,
+                    )
+                    for (pending_sb, _task), outcome in zip(pending_tasks, outcomes):
+                        await _record_outcome(pending_sb, outcome)
+                    pending_tasks.clear()
+
+            if pending_tasks:
+                outcomes = await asyncio.gather(
+                    *(task for _, task in pending_tasks),
+                    return_exceptions=True,
+                )
+                for (pending_sb, _task), outcome in zip(pending_tasks, outcomes):
+                    await _record_outcome(pending_sb, outcome)
+            if max_pages > 0 and page >= max_pages:
+                done = True
+                break
+            if page_batch_size > 0 and pages_in_run >= page_batch_size:
+                break
             page += 1
 
         return {
@@ -917,4 +989,5 @@ class SyncService:
             "chapters_failed": chapters_failed,
             "details": details,
             "next_page": pages_checked + 1 if pages_checked else start_page,
+            "done": done,
         }

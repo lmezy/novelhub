@@ -77,10 +77,58 @@ async def _crawl_all_source_async(source_id: str, max_pages: int, task_id: str |
 
 
 async def _daily_sync_all_async() -> dict:
+    from app.core.config import settings, sync_thread_count
     from app.core.database import SessionLocal
     from app.models import Book, CrawlLog, CrawlTask, Source
     from app.services.sync import SyncService
     from sqlalchemy import select
+
+    async def _sync_source_in_session(src):
+        async with SessionLocal() as db:
+            service = SyncService(db)
+            try:
+                shelf_result = await service.sync_bookshelf(src.id)
+                return {
+                    "source_id": src.id,
+                    "method": "bookshelf",
+                    "status": "ok",
+                    "books_on_shelf": shelf_result.get("total", 0),
+                }
+            except ValueError:
+                books = await db.scalars(
+                    select(Book).where(Book.source_id == src.id)
+                )
+                book_list = list(books)
+                if not book_list:
+                    return {
+                        "source_id": src.id,
+                        "method": "skip",
+                        "status": "ok",
+                        "reason": "no books and no cookie",
+                    }
+                book_details = []
+                for book in book_list:
+                    try:
+                        r = await service.resync_book(book.id)
+                        book_details.append({
+                            "book_id": book.id,
+                            "method": "resync",
+                            "status": "ok",
+                            "chapters": r.get("created_chapters", 0),
+                        })
+                    except Exception as exc:
+                        book_details.append({
+                            "book_id": book.id,
+                            "method": "resync",
+                            "status": "failed",
+                            "error": str(exc),
+                        })
+                return {
+                    "source_id": src.id,
+                    "method": "resync",
+                    "status": "ok",
+                    "details": book_details,
+                }
 
     async with SessionLocal() as db:
         sources = await db.scalars(
@@ -102,58 +150,34 @@ async def _daily_sync_all_async() -> dict:
             "failed": 0,
             "details": [],
         }
-        service = SyncService(db)
-        for src in source_list:
-            try:
-                try:
-                    shelf_result = await service.sync_bookshelf(src.id)
-                    results["details"].append({
-                        "source_id": src.id,
-                        "method": "bookshelf",
-                        "status": "ok",
-                        "books_on_shelf": shelf_result.get("total", 0),
-                    })
-                except ValueError:
-                    books = await db.scalars(
-                        select(Book).where(Book.source_id == src.id)
-                    )
-                    book_list = list(books)
-                    if not book_list:
-                        results["details"].append({
-                            "source_id": src.id,
-                            "method": "skip",
-                            "status": "ok",
-                            "reason": "no books and no cookie",
-                        })
-                        results["synced"] += 1
-                        continue
-                    for book in book_list:
-                        try:
-                            r = await service.resync_book(book.id)
-                            results["details"].append({
-                                "book_id": book.id,
-                                "method": "resync",
-                                "status": "ok",
-                                "chapters": r.get("created_chapters", 0),
-                            })
-                        except Exception as exc:
-                            results["details"].append({
-                                "book_id": book.id,
-                                "method": "resync",
-                                "status": "failed",
-                                "error": str(exc),
-                            })
-                results["synced"] += 1
-            except Exception as exc:
-                logger.opt(exception=exc).error(
+        concurrency = min(
+            max(1, int(getattr(settings, "SYNC_WORKER_CONCURRENCY", 2))),
+            sync_thread_count(),
+        )
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def _limited(src):
+            async with semaphore:
+                return await _sync_source_in_session(src)
+
+        outcomes = await asyncio.gather(
+            *(_limited(src) for src in source_list),
+            return_exceptions=True,
+        )
+        for src, outcome in zip(source_list, outcomes):
+            if isinstance(outcome, BaseException):
+                logger.opt(exception=outcome).error(
                     "Sync failed for source {}", src.id
                 )
                 results["failed"] += 1
                 results["details"].append({
                     "source_id": src.id,
                     "status": "failed",
-                    "error": str(exc),
+                    "error": str(outcome),
                 })
+            else:
+                results["details"].append(outcome)
+                results["synced"] += 1
         task_obj.status = "completed" if results["failed"] == 0 else "completed_with_errors"
         task_obj.finished_at = _naive_utcnow()
         await db.commit()

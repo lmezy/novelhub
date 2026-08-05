@@ -6,11 +6,12 @@ a specific source to the front without waiting for every earlier task.
 """
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from loguru import logger
 from sqlalchemy import select, update
 
+from app.core.config import settings, sync_thread_count
 from app.core.database import SessionLocal
 from app.models import CrawlTask
 
@@ -23,7 +24,11 @@ async def _next_pending_task_id() -> str | None:
     async with SessionLocal() as db:
         return await db.scalar(
             select(CrawlTask.id)
-            .where(CrawlTask.status == "pending")
+            .where(
+                CrawlTask.status == "pending",
+                (CrawlTask.resume_at.is_(None))
+                | (CrawlTask.resume_at <= _naive_utcnow()),
+            )
             .order_by(CrawlTask.priority.desc(), CrawlTask.created_at.asc())
             .limit(1)
         )
@@ -34,7 +39,7 @@ async def _reset_stale_running_tasks() -> None:
         await db.execute(
             update(CrawlTask)
             .where(CrawlTask.status == "running")
-            .values(status="pending")
+            .values(status="pending", resume_at=None)
         )
         await db.commit()
 
@@ -59,6 +64,7 @@ async def run_crawl_task_async(task_id: str) -> dict:
         task_obj.status = "running"
         task_obj.started_at = _naive_utcnow()
         task_obj.error = None
+        task_obj.resume_at = None
         await db.commit()
         await db.refresh(task_obj)
         if task_obj.status != "running":
@@ -123,7 +129,32 @@ async def run_crawl_task_async(task_id: str) -> dict:
                 chapter_progress_cb=_update_chapter_progress,
                 before_step=_wait_if_paused,
                 start_page=start_page,
+                page_batch_size=int(getattr(settings, "SYNC_PAGE_BATCH_SIZE", 0) or 0),
             )
+            batch_size = int(getattr(settings, "SYNC_PAGE_BATCH_SIZE", 0) or 0)
+            if batch_size > 0 and not result.get("done"):
+                task_obj.status = "pending"
+                task_obj.result = result
+                task_obj.progress = {
+                    "pages_checked": result.get("pages_checked", 0),
+                    "books_found": result.get("books_found", 0),
+                    "books_synced": result.get("books_synced", 0),
+                    "books_failed": result.get("books_failed", 0),
+                    "chapters_created": result.get("chapters_created", 0),
+                    "chapters_skipped": result.get("chapters_skipped", 0),
+                    "chapters_failed": result.get("chapters_failed", 0),
+                    "next_page": result.get("next_page", start_page),
+                }
+                task_obj.finished_at = None
+                task_obj.resume_at = _naive_utcnow() + timedelta(
+                    milliseconds=int(getattr(settings, "SYNC_BATCH_INTERVAL_MS", 5000) or 0)
+                )
+                await db.commit()
+                return {
+                    "status": "queued",
+                    "task_id": task_id,
+                    "next_page": result.get("next_page", start_page),
+                }
             task_obj.status = "completed"
             task_obj.result = result
             task_obj.progress = {
@@ -141,6 +172,7 @@ async def run_crawl_task_async(task_id: str) -> dict:
             return result
         except TaskPaused:
             task_obj.status = "paused"
+            task_obj.resume_at = None
             await db.commit()
             return {"status": "paused", "task_id": task_id}
         except TaskCancelled as exc:
@@ -159,16 +191,46 @@ async def run_crawl_task_async(task_id: str) -> dict:
 
 
 async def _worker_loop() -> None:
-    while True:
-        task_id = await _next_pending_task_id()
-        if task_id is None:
-            await asyncio.sleep(2)
-            continue
+    concurrency = min(
+        max(1, int(getattr(settings, "SYNC_WORKER_CONCURRENCY", 2))),
+        sync_thread_count(),
+    )
+    claimed: set[str] = set()
+    active: dict[asyncio.Task, str] = {}
+
+    async def _run_guarded(task_id: str) -> None:
         try:
             await run_crawl_task_async(task_id)
         except Exception as exc:
             logger.error("Crawl task {} stopped: {}", task_id, exc)
-        await asyncio.sleep(0.5)
+
+    while True:
+        while len(active) < concurrency:
+            task_id = await _next_pending_task_id()
+            if task_id is None or task_id in claimed:
+                break
+            claimed.add(task_id)
+            task = asyncio.create_task(_run_guarded(task_id))
+            active[task] = task_id
+
+        if not active:
+            await asyncio.sleep(2)
+            continue
+
+        done, _ = await asyncio.wait(
+            active.keys(),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for finished in done:
+            task_id = active.pop(finished)
+            claimed.discard(task_id)
+            if finished.cancelled():
+                logger.warning("Crawl task {} cancelled", task_id)
+                continue
+            exc = finished.exception()
+            if exc is not None:
+                logger.error("Crawl task {} stopped: {}", task_id, exc)
+        await asyncio.sleep(0.2)
 
 
 async def main_async() -> None:

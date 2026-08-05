@@ -12,6 +12,7 @@ class CrawlTaskOut(BaseModel):
     status: str
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    resume_at: datetime | None = None
     error: str | None = None
     result: dict[str, Any] | None = None
     progress: dict[str, Any] | None = None

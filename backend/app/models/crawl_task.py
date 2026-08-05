@@ -64,6 +64,11 @@ class CrawlTask(Base):
     )
 
 
+    resume_at = Column(
+        DateTime
+    )
+
+
     error = Column(
         Text
     )

@@ -14,6 +14,7 @@ from app.services.sync import SyncService
 def _mock_db() -> AsyncMock:
     db = AsyncMock()
     db.scalars = AsyncMock(return_value=SimpleNamespace(all=lambda: []))
+    db.scalar = AsyncMock(return_value=None)
     return db
 
 def _source(source_id: str = "src1") -> Source:
@@ -31,6 +32,20 @@ def test_normalize_title_for_match():
     assert SyncService._normalize_title_for_match("《剑来》") == "剑来"
     assert SyncService._normalize_title_for_match("剑来（全文）") == "剑来全文"
     assert SyncService._normalize_title_for_match(" 剑来 ") == "剑来"
+
+
+def test_chapter_concurrency_uses_env_override():
+    from app.core.config import settings
+
+    with patch.object(settings, "SYNC_IGNORE_RATE_LIMIT", True):
+        assert SyncService._chapter_concurrency({"concurrentRate": "2000"}) == 9
+
+
+def test_sync_thread_count_caps_at_legado_max():
+    from app.core.config import settings, sync_thread_count
+
+    with patch.object(settings, "SYNC_THREAD_COUNT", 32):
+        assert sync_thread_count() == 9
 
 
 @pytest.mark.asyncio
@@ -690,14 +705,20 @@ async def test_discover_and_sync_all_dedupes_and_stops_on_empty():
         [],
     ]
 
-    with patch("app.services.sync.get_plugin", return_value=plugin):
-        service = SyncService(db)
-        with patch.object(
-            service,
+    session = AsyncMock()
+    session.__aenter__ = AsyncMock(return_value=_mock_db())
+    session.__aexit__ = AsyncMock(return_value=False)
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.SessionLocal", return_value=session),
+        patch.object(
+            SyncService,
             "sync_book",
-            return_value={"book_id": "x", "created_chapters": 2, "skipped_chapters": 1},
-        ) as sync_book_mock:
-            result = await service.discover_and_sync_all("src1", max_pages=10)
+            AsyncMock(return_value={"book_id": "x", "created_chapters": 2, "skipped_chapters": 1}),
+        ) as sync_book_mock,
+    ):
+        service = SyncService(db)
+        result = await service.discover_and_sync_all("src1", max_pages=10)
 
     assert sync_book_mock.await_count == 3
     assert result["pages_checked"] == 2
@@ -751,16 +772,80 @@ async def test_discover_and_sync_all_unlimited_continues_until_empty():
         [],
     ]
 
-    with patch("app.services.sync.get_plugin", return_value=plugin):
-        service = SyncService(db)
-        with patch.object(
-            service,
+    session = AsyncMock()
+    session.__aenter__ = AsyncMock(return_value=_mock_db())
+    session.__aexit__ = AsyncMock(return_value=False)
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.SessionLocal", return_value=session),
+        patch.object(
+            SyncService,
             "sync_book",
-            return_value={"book_id": "x", "created_chapters": 1, "skipped_chapters": 0},
-        ) as sync_book_mock:
-            result = await service.discover_and_sync_all("src1", max_pages=0)
+            AsyncMock(return_value={"book_id": "x", "created_chapters": 1, "skipped_chapters": 0}),
+        ) as sync_book_mock,
+    ):
+        service = SyncService(db)
+        result = await service.discover_and_sync_all("src1", max_pages=0)
 
     assert sync_book_mock.await_count == 4
     assert result["pages_checked"] == 4
     assert result["books_found"] == 4
     assert result["next_page"] == 5
+
+
+@pytest.mark.asyncio
+async def test_discover_and_sync_all_page_batch_requeues():
+    db = _mock_db()
+    db.get.return_value = _source()
+    db.rollback = AsyncMock()
+
+    plugin = AsyncMock()
+    plugin.set_cookie = MagicMock()
+    plugin.discover_books.side_effect = [
+        [
+            RemoteShelfBook(
+                source_book_id="1.html",
+                title="1",
+                author="Author",
+                url="https://example.com/1.html",
+            ),
+            RemoteShelfBook(
+                source_book_id="2.html",
+                title="2",
+                author="Author",
+                url="https://example.com/2.html",
+            ),
+        ],
+        [
+            RemoteShelfBook(
+                source_book_id="3.html",
+                title="3",
+                author="Author",
+                url="https://example.com/3.html",
+            ),
+        ],
+    ]
+
+    session = AsyncMock()
+    session.__aenter__ = AsyncMock(return_value=_mock_db())
+    session.__aexit__ = AsyncMock(return_value=False)
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.SessionLocal", return_value=session),
+        patch.object(
+            SyncService,
+            "sync_book",
+            AsyncMock(return_value={"book_id": "x", "created_chapters": 1, "skipped_chapters": 0}),
+        ),
+    ):
+        service = SyncService(db)
+        result = await service.discover_and_sync_all(
+            "src1",
+            max_pages=10,
+            page_batch_size=1,
+        )
+
+    assert result["pages_checked"] == 1
+    assert result["books_found"] == 2
+    assert result["done"] is False
+    assert result["next_page"] == 2

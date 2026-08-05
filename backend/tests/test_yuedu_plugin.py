@@ -28,6 +28,15 @@ def test_parse_bookshelf_skips_javascript_links():
     assert books[0].url == "https://example.com/novel/123.html"
 
 
+def test_rate_limit_disabled_reflects_env_override():
+    from app.core.config import settings
+
+    with patch.object(settings, "SYNC_IGNORE_RATE_LIMIT", True):
+        assert YueduPlugin._rate_limit_disabled() is True
+    with patch.object(settings, "SYNC_IGNORE_RATE_LIMIT", False):
+        assert YueduPlugin._rate_limit_disabled() is False
+
+
 def test_parse_bookshelf_direct_anchor_fallback():
     plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
     html = """

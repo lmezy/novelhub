@@ -103,6 +103,8 @@
         condition: service_healthy
       redis:
         condition: service_healthy
+      backend:
+        condition: service_healthy
     volumes:
       - ./storage:/app/storage
 

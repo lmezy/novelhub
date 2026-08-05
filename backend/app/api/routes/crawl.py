@@ -90,6 +90,7 @@ async def pause_task(task_id: str, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=400, detail=f"Cannot pause task in status: {task.status}")
     if task.status != "paused":
         task.status = "paused"
+    task.resume_at = None
     await db.commit()
     return {"task_id": task.id, "status": task.status}
 
@@ -103,6 +104,7 @@ async def resume_task(task_id: str, db: AsyncSession = Depends(get_db)):
     if task.status != "paused":
         raise HTTPException(status_code=400, detail=f"Cannot resume task in status: {task.status}")
     task.status = "pending"
+    task.resume_at = None
     await db.commit()
     return {"task_id": task.id, "status": task.status}
 
@@ -125,6 +127,7 @@ async def move_task_front(task_id: str, db: AsyncSession = Depends(get_db)):
         )
     )
     task.priority = (top_priority or 0) + 1
+    task.resume_at = None
     await db.commit()
     return {"task_id": task.id, "status": task.status, "priority": task.priority}
 
@@ -138,6 +141,7 @@ async def cancel_task(task_id: str, db: AsyncSession = Depends(get_db)):
     if task.status in ("completed", "failed", "cancelled", "completed_with_errors"):
         raise HTTPException(status_code=400, detail=f"Cannot cancel task in status: {task.status}")
     task.status = "cancelled"
+    task.resume_at = None
     task.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
     await db.commit()
     return {"task_id": task.id, "status": task.status}
@@ -158,6 +162,7 @@ async def retry_task(task_id: str, db: AsyncSession = Depends(get_db)):
         task.error = None
         task.result = None
         task.progress = None
+        task.resume_at = None
         task.started_at = None
         task.finished_at = None
         await db.commit()
@@ -169,6 +174,7 @@ async def retry_task(task_id: str, db: AsyncSession = Depends(get_db)):
 
     task.status = "running"
     task.error = None
+    task.resume_at = None
     task.started_at = datetime.now(timezone.utc).replace(tzinfo=None)
     task.finished_at = None
     await db.commit()
