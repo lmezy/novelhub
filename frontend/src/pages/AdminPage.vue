@@ -1174,7 +1174,7 @@ onUnmounted(() => {
               />
               <span class="min-w-0">
                 <span class="block text-sm font-medium truncate">{{ book.title }}</span>
-                <span class="block text-xs text-muted dark:text-gray-400 truncate">{{ book.author }} · {{ book.chapter_count }} chapters</span>
+                <span class="block text-xs text-muted dark:text-gray-400 truncate">{{ book.author }} · {{ book.chapter_count }} chapters · {{ book.format }}</span>
                 <span class="block text-xs text-muted dark:text-gray-400 truncate">{{ book.path }}</span>
               </span>
             </label>

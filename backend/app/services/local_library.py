@@ -6,6 +6,11 @@ import json
 import os
 from pathlib import Path
 
+from app.services.local_file_parser import (
+    is_supported_file,
+    parse_local_file,
+)
+
 
 def _read_metadata(book_dir: Path) -> dict:
     meta_path = book_dir / "metadata.json"
@@ -41,6 +46,28 @@ def looks_like_book_dir(path: Path) -> bool:
 def parse_local_book(path: str | Path) -> dict:
     """Parse one local book directory without touching the database."""
     book_dir = Path(path).expanduser().resolve()
+    if book_dir.is_file():
+        meta, chapters = parse_local_file(book_dir)
+        chapter_refs = [
+            {
+                "title": title,
+                "path": str(book_dir),
+                "chapter_number": index,
+            }
+            for index, (title, _content) in enumerate(chapters, start=1)
+        ]
+        return {
+            "path": str(book_dir),
+            "title": str(meta.get("title") or book_dir.stem),
+            "author": str(meta.get("author") or "Unknown"),
+            "description": None,
+            "status": None,
+            "tags": [],
+            "chapter_count": len(chapter_refs),
+            "has_metadata": False,
+            "format": book_dir.suffix.lower().lstrip("."),
+            "chapters": chapter_refs,
+        }
     if not book_dir.is_dir():
         raise ValueError(f"Not a directory: {path}")
 
@@ -66,6 +93,7 @@ def parse_local_book(path: str | Path) -> dict:
         "tags": list(meta.get("tags") or []),
         "chapter_count": len(chapter_refs),
         "has_metadata": bool(meta),
+        "format": "markdown",
         "chapters": chapter_refs,
     }
 
@@ -78,6 +106,7 @@ def scan_local_library(root: str, max_depth: int = 3) -> list[dict]:
 
     max_depth = max(1, int(max_depth or 3))
     books: list[dict] = []
+    added_paths: set[str] = set()
 
     for dirpath, dirnames, filenames in os.walk(root_path):
         current = Path(dirpath)
@@ -86,10 +115,8 @@ def scan_local_library(root: str, max_depth: int = 3) -> list[dict]:
         if depth > max_depth:
             dirnames[:] = []
             continue
-        if depth == 0 and not (current / "metadata.json").is_file():
-            continue
-
-        if looks_like_book_dir(current):
+        root_book_ok = depth > 0 or (current / "metadata.json").is_file()
+        if root_book_ok and looks_like_book_dir(current):
             try:
                 info = parse_local_book(current)
             except ValueError:
@@ -107,7 +134,38 @@ def scan_local_library(root: str, max_depth: int = 3) -> list[dict]:
                 "tags": info["tags"],
                 "chapter_count": info["chapter_count"],
                 "has_metadata": info["has_metadata"],
+                "format": info.get("format", "markdown"),
             })
+            added_paths.add(info["path"])
             dirnames[:] = []
+            continue
+
+        for filename in filenames:
+            file_path = current / filename
+            if not is_supported_file(file_path):
+                continue
+            if file_path.suffix.lower() == ".md":
+                continue
+            key = str(file_path)
+            if key in added_paths:
+                continue
+            try:
+                info = parse_local_book(file_path)
+            except ValueError:
+                continue
+            if info["chapter_count"] == 0:
+                continue
+            books.append({
+                "path": info["path"],
+                "title": info["title"],
+                "author": info["author"],
+                "description": info["description"],
+                "status": info["status"],
+                "tags": info["tags"],
+                "chapter_count": info["chapter_count"],
+                "has_metadata": info["has_metadata"],
+                "format": info.get("format", "markdown"),
+            })
+            added_paths.add(key)
 
     return books

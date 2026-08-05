@@ -33,14 +33,19 @@ def test_scan_local_library_finds_book_directories(tmp_path):
     )
     _book_dir(tmp_path, "Bob", "Book Two")
     (tmp_path / "readme.md").write_text("# readme\n", encoding="utf-8")
+    (tmp_path / "单独小说 - 作者.txt").write_text(
+        "第一章 测试\n正文\n",
+        encoding="utf-8",
+    )
 
     books = scan_local_library(str(tmp_path), max_depth=3)
 
-    assert len(books) == 2
+    assert len(books) == 3
     by_title = {b["title"]: b for b in books}
     assert by_title["Book One"]["author"] == "Alice"
     assert by_title["Book One"]["chapter_count"] == 1
     assert by_title["Book Two"]["has_metadata"] is False
+    assert by_title["单独小说"]["format"] == "txt"
 
 
 def test_scan_local_library_respects_max_depth(tmp_path):

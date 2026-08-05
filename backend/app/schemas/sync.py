@@ -46,6 +46,7 @@ class LocalBookCandidate(BaseModel):
     path: str
     title: str
     author: str
+    format: str = "markdown"
     description: str | None = None
     status: str | None = None
     tags: list[str] = []
@@ -73,6 +74,7 @@ class LocalBookDetail(BaseModel):
     path: str
     title: str
     author: str
+    format: str = "markdown"
     description: str | None = None
     status: str | None = None
     tags: list[str] = []
