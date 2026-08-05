@@ -1,6 +1,6 @@
 """add custom tags and bookshelf groups
 
-Revision ID: 0017_custom_tags_bookshelf_groups
+Revision ID: 0017_custom_tags_bookshelf
 Revises: 0016_crawl_task_resume_at
 Create Date: 2026-08-05
 """
@@ -9,7 +9,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "0017_custom_tags_bookshelf_groups"
+revision = "0017_custom_tags_bookshelf"
 down_revision = "0016_crawl_task_resume_at"
 branch_labels = None
 depends_on = None
