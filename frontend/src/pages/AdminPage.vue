@@ -122,7 +122,7 @@ const crawlTaskProgress = computed(() => {
   const progress = task?.progress || {}
   const max = task?.max_pages || 1
   const pages = progress.pages_checked || 0
-  const pagePct = (pages / max) * 100
+  const pagePct = task?.max_pages > 0 ? (pages / max) * 100 : 0
   const chapterTotal = progress.current_chapters_total || 0
   const chapterDone = progress.current_chapters_created || 0
   const chapterPct = chapterTotal ? (chapterDone / chapterTotal) * 100 : 0
@@ -518,7 +518,7 @@ async function startCrawlAll() {
   try {
     const task = await api.post<any>("/crawl/tasks", {
       source: crawlAllSourceId.value,
-      max_pages: 500,
+      max_pages: 0,
     })
     await crawlStore.setTask(task)
   } catch (e) {

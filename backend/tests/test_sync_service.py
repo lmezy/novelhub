@@ -494,3 +494,62 @@ async def test_discover_and_sync_all_dedupes_and_stops_on_empty():
     assert result["books_synced"] == 3
     assert result["chapters_created"] == 6
     assert result["chapters_skipped"] == 3
+
+
+@pytest.mark.asyncio
+async def test_discover_and_sync_all_unlimited_continues_until_empty():
+    db = _mock_db()
+    db.get.return_value = _source()
+    db.rollback = AsyncMock()
+
+    plugin = AsyncMock()
+    plugin.set_cookie = MagicMock()
+    plugin.discover_books.side_effect = [
+        [
+            RemoteShelfBook(
+                source_book_id="1.html",
+                title="1",
+                author="Author",
+                url="https://example.com/1.html",
+            )
+        ],
+        [
+            RemoteShelfBook(
+                source_book_id="2.html",
+                title="2",
+                author="Author",
+                url="https://example.com/2.html",
+            )
+        ],
+        [
+            RemoteShelfBook(
+                source_book_id="3.html",
+                title="3",
+                author="Author",
+                url="https://example.com/3.html",
+            )
+        ],
+        [
+            RemoteShelfBook(
+                source_book_id="4.html",
+                title="4",
+                author="Author",
+                url="https://example.com/4.html",
+            )
+        ],
+        [],
+    ]
+
+    with patch("app.services.sync.get_plugin", return_value=plugin):
+        service = SyncService(db)
+        with patch.object(
+            service,
+            "sync_book",
+            return_value={"book_id": "x", "created_chapters": 1, "skipped_chapters": 0},
+        ) as sync_book_mock:
+            result = await service.discover_and_sync_all("src1", max_pages=0)
+
+    assert sync_book_mock.await_count == 4
+    assert result["pages_checked"] == 4
+    assert result["books_found"] == 4
+    assert result["next_page"] == 5

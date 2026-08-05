@@ -684,8 +684,10 @@ class SyncService:
         chapters_failed = 0
         pages_checked = 0
         start_page = max(1, int(start_page or 1))
+        max_pages = max_pages or 0
 
-        for page in range(start_page, max_pages + 1):
+        page = start_page
+        while max_pages <= 0 or page <= max_pages:
             if before_step is not None:
                 await before_step()
             page_books = await plugin.discover_books(url=url, page=page)
@@ -758,6 +760,7 @@ class SyncService:
 
                 if progress_cb is not None:
                     await progress_cb(pages_checked, books_found, books_synced, books_failed)
+            page += 1
 
         return {
             "source_id": source_id,
@@ -769,5 +772,5 @@ class SyncService:
             "chapters_skipped": chapters_skipped,
             "chapters_failed": chapters_failed,
             "details": details,
-            "next_page": min(max_pages, pages_checked) + 1 if pages_checked else start_page,
+            "next_page": pages_checked + 1 if pages_checked else start_page,
         }

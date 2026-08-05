@@ -44,7 +44,7 @@ def check_cookie_health() -> dict:
 
 
 @app.task(name="tasks.crawl_all_source")
-def crawl_all_source(source_id: str, max_pages: int = 200, task_id: str | None = None) -> dict:
+def crawl_all_source(source_id: str, max_pages: int = 0, task_id: str | None = None) -> dict:
     """Crawl every discoverable book from a source in the background."""
     return asyncio.get_event_loop().run_until_complete(
         _crawl_all_source_async(source_id, max_pages, task_id)

@@ -20,7 +20,7 @@ router = APIRouter(prefix="/crawl", tags=["crawl"], dependencies=[Depends(requir
 
 class CrawlTaskCreateRequest(BaseModel):
     source: str
-    max_pages: int = 200
+    max_pages: int = 0
     priority: int = 0
 
 

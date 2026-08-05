@@ -31,7 +31,7 @@ Create a task:
 curl -X POST http://localhost:8088/api/crawl/tasks \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"source":"yuedu_xxx","max_pages":500,"priority":0}'
+  -d '{"source":"yuedu_xxx","max_pages":0,"priority":0}'
 ```
 
 Control a task:

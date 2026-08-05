@@ -19,6 +19,7 @@ const activeTask = computed(() => crawlStore.activeTask)
 const activeProgress = computed(() => {
   const task = activeTask.value
   if (!task) return 0
+  if (!task.max_pages) return 0
   const max = task.max_pages || 1
   const pages = task.progress?.pages_checked || 0
   return Math.min(100, Math.round((pages / max) * 100))
@@ -87,7 +88,7 @@ async function startCrawl() {
   try {
     const task = await api.post<any>("/crawl/tasks", {
       source: sourceId.value,
-      max_pages: 500,
+      max_pages: 0,
     })
     await crawlStore.setTask(task)
     await loadTasks()
@@ -187,7 +188,8 @@ onMounted(async () => {
           <div class="h-full bg-accent transition-all" :style="{ width: activeProgress + '%' }"></div>
         </div>
         <div class="flex items-center justify-between text-xs text-muted dark:text-gray-400 mb-3">
-          <span>Pages {{ activeTask.progress?.pages_checked || 0 }} / {{ activeTask.max_pages || 1 }}</span>
+          <span v-if="activeTask.max_pages > 0">Pages {{ activeTask.progress?.pages_checked || 0 }} / {{ activeTask.max_pages }}</span>
+          <span v-else>Pages {{ activeTask.progress?.pages_checked || 0 }} (unlimited)</span>
           <span>Found {{ activeTask.progress?.books_found || 0 }}</span>
           <span v-if="activeTask.priority !== undefined">Priority {{ activeTask.priority }}</span>
         </div>
@@ -244,13 +246,14 @@ onMounted(async () => {
             </div>
             <div class="flex items-center gap-3 text-xs text-muted dark:text-gray-400">
               <span>{{ task.mode || 'bookshelf' }}</span>
-              <span>Pages {{ task.progress?.pages_checked || 0 }}/{{ task.max_pages || 200 }}</span>
+              <span v-if="task.max_pages > 0">Pages {{ task.progress?.pages_checked || 0 }}/{{ task.max_pages }}</span>
+              <span v-else>Pages {{ task.progress?.pages_checked || 0 }} (unlimited)</span>
               <span>Books {{ task.progress?.books_found || 0 }}</span>
               <span v-if="task.priority !== undefined">Priority {{ task.priority }}</span>
               <span v-if="task.finished_at">Finished {{ new Date(task.finished_at).toLocaleString() }}</span>
             </div>
             <div class="h-1 rounded bg-gray-200 dark:bg-gray-700 overflow-hidden mt-2">
-              <div class="h-full bg-accent" :style="{ width: Math.min(100, Math.round(((task.progress?.pages_checked || 0) / (task.max_pages || 1)) * 100)) + '%' }"></div>
+              <div class="h-full bg-accent" :style="{ width: Math.min(100, Math.round(((task.max_pages > 0 ? (task.progress?.pages_checked || 0) / task.max_pages : 0)) * 100)) + '%' }"></div>
             </div>
           </div>
         </div>

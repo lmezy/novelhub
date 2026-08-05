@@ -11,8 +11,10 @@
 curl -X POST http://localhost:8088/api/crawl/tasks \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"source": "yuedu_xxx", "max_pages": 500}'
+  -d '{"source": "yuedu_xxx", "max_pages": 0}'
 ```
+
+`max_pages` 是“发现/分类页数”上限，不是书本数量；设为 `0` 表示不限制页数，任务会一直翻页直到书源没有下一页或没有新书为止。
 
 3. 轮询任务状态：
 
@@ -30,7 +32,7 @@ Admin 的 `Sync` 页也提供“全站同步”按钮，启动后会自动轮询
 - 未配置时使用环境变量 `CRAWL_DELAY_MS`，默认 `1200`；
 - 每次延迟额外叠加 200-600ms 随机抖动；
 - 遇到 429/5xx 会自动重试并退避；
-- crawler worker 固定并发数为 1，同一时间只跑一个爬取任务。
+- crawler worker 同一时间只跑一个爬取任务；任务内章节下载按 `SYNC_CHAPTER_CONCURRENCY` 并发，默认 `12`。
 - Admin 里配置的代理会写入共享 storage，backend 和 crawler worker 都能读取。
 
 ## 任务进度

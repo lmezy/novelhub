@@ -108,7 +108,11 @@ async def run_crawl_task_async(task_id: str) -> dict:
         try:
             result = await SyncService(db).discover_and_sync_all(
                 task_obj.source,
-                max_pages=task_obj.max_pages or 200,
+                max_pages=(
+                    task_obj.max_pages
+                    if task_obj.max_pages is not None
+                    else 200
+                ),
                 progress_cb=_update_progress,
                 chapter_progress_cb=_update_chapter_progress,
                 before_step=_wait_if_paused,
