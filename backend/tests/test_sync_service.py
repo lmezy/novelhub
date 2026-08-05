@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -7,6 +8,13 @@ from app.crawler.base import RemoteBook, RemoteChapter, RemoteShelfBook
 from app.models import Book, Cookie, Source
 from app.services.sync import SyncService
 
+
+
+
+def _mock_db() -> AsyncMock:
+    db = AsyncMock()
+    db.scalars = AsyncMock(return_value=SimpleNamespace(all=lambda: []))
+    return db
 
 def _source(source_id: str = "src1") -> Source:
     return Source(
@@ -27,7 +35,7 @@ def test_normalize_title_for_match():
 
 @pytest.mark.asyncio
 async def test_find_same_title_books_filters_normalized_title():
-    db = AsyncMock()
+    db = _mock_db()
     db.scalars.return_value = MagicMock()
     db.scalars.return_value.all.return_value = [
         Book(id="a", source_id="s1", title="《剑来》"),
@@ -45,7 +53,7 @@ async def test_find_same_title_books_filters_normalized_title():
 
 @pytest.mark.asyncio
 async def test_sync_book_rejects_empty_remote_book():
-    db = AsyncMock()
+    db = _mock_db()
     db.get.return_value = _source()
 
     remote_book = RemoteBook(
@@ -67,7 +75,7 @@ async def test_sync_book_rejects_empty_remote_book():
 
 @pytest.mark.asyncio
 async def test_sync_book_continues_after_failed_chapter():
-    db = AsyncMock()
+    db = _mock_db()
     db.get.return_value = _source()
     db.scalar.return_value = None
     db.rollback = AsyncMock()
@@ -132,7 +140,7 @@ async def test_sync_book_continues_after_failed_chapter():
 
 @pytest.mark.asyncio
 async def test_sync_book_loads_existing_tags_without_lazy_load():
-    db = AsyncMock()
+    db = _mock_db()
     db.get.return_value = _source()
     db.scalar.return_value = None
     db.rollback = AsyncMock()
@@ -201,7 +209,7 @@ async def test_sync_book_loads_existing_tags_without_lazy_load():
 
 @pytest.mark.asyncio
 async def test_sync_book_reports_chapter_progress():
-    db = AsyncMock()
+    db = _mock_db()
     db.get.return_value = _source()
     db.scalar.return_value = None
     db.rollback = AsyncMock()
@@ -267,7 +275,7 @@ async def test_sync_book_reports_chapter_progress():
 
 @pytest.mark.asyncio
 async def test_sync_book_breaks_after_database_error():
-    db = AsyncMock()
+    db = _mock_db()
     db.get.return_value = _source()
     db.scalar.return_value = None
     db.rollback = AsyncMock()
@@ -328,12 +336,12 @@ async def test_sync_book_breaks_after_database_error():
     assert result["created_chapters"] == 1
     assert len(result["failed_chapters"]) == 1
     assert "fk" in result["failed_chapters"][0]["error"]
-    assert plugin.fetch_chapter_content.await_count == 2
+    assert plugin.fetch_chapter_content.await_count == 3
 
 
 @pytest.mark.asyncio
 async def test_sync_bookshelf_rolls_back_and_continues_after_failure():
-    db = AsyncMock()
+    db = _mock_db()
     db.get.return_value = _source()
     db.scalar.return_value = Cookie(
         id="cookie-1",
@@ -388,7 +396,7 @@ async def test_sync_bookshelf_rolls_back_and_continues_after_failure():
 
 @pytest.mark.asyncio
 async def test_sync_bookshelf_skips_non_http_urls():
-    db = AsyncMock()
+    db = _mock_db()
     db.get.return_value = _source()
     db.scalar.return_value = Cookie(
         id="cookie-1",
@@ -433,7 +441,7 @@ async def test_sync_bookshelf_skips_non_http_urls():
 
 @pytest.mark.asyncio
 async def test_discover_and_sync_all_dedupes_and_stops_on_empty():
-    db = AsyncMock()
+    db = _mock_db()
     db.get.return_value = _source()
     db.rollback = AsyncMock()
 

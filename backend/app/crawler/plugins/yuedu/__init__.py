@@ -10,14 +10,17 @@ Usage:
     content = await plugin.fetch_chapter_content(chapter)
 """
 
+import asyncio
 import base64
 import json
 import logging
 import random
 import re
+import time
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
+import httpx
 from bs4 import BeautifulSoup, Tag
 
 from app.crawler.base import RemoteBook, RemoteChapter, RemoteShelfBook
@@ -146,6 +149,9 @@ class YueduPlugin:
     """A NovelSourcePlugin implementation driven by a YueDu book source JSON."""
 
     name = "yuedu"
+    _clients: dict[str | None, httpx.AsyncClient] = {}
+    _rate_locks: dict[str, asyncio.Lock] = {}
+    _rate_state: dict[str, dict[str, float | int]] = {}
 
     def __init__(self, source_config: dict[str, Any] | None = None):
         self.config: dict[str, Any] = source_config or {}
@@ -154,6 +160,7 @@ class YueduPlugin:
             self.engine = YueduRuleEngine(self.config)
         self.base_url: str = self.config.get("bookSourceUrl", "")
         self._cookie: str = ""
+        self._client_lock = asyncio.Lock()
 
     @property
     def display_name(self) -> str:
@@ -170,6 +177,20 @@ class YueduPlugin:
         self.config = config
         self.engine = YueduRuleEngine(config)
         self.base_url = config.get("bookSourceUrl", "")
+
+    async def _get_http_client(self, proxy: str | None) -> httpx.AsyncClient:
+        """Reuse one AsyncClient per proxy so TLS/connections are pooled."""
+        async with self._client_lock:
+            client = self.__class__._clients.get(proxy)
+            if client is None:
+                client = httpx.AsyncClient(
+                    timeout=httpx.Timeout(60.0, connect=15.0, write=15.0),
+                    follow_redirects=True,
+                    proxy=proxy,
+                    trust_env=False,
+                )
+                self.__class__._clients[proxy] = client
+            return client
 
     def build_book_url(self, book_id: str) -> str:
         """Reconstruct a book detail URL from a stored source book id."""
@@ -1451,22 +1472,71 @@ class YueduPlugin:
             headers.update(extra)
         return headers
 
-    async def _sleep_rate_limit(self) -> None:
-        """Polite rate limiting: source rule wins, otherwise use a safe default."""
-        import asyncio
-
-        rate = self.config.get("concurrentRate", "")
-        delay_ms = 0
-        if rate:
+    def _parse_concurrent_rate(self) -> tuple[str, int, int] | None:
+        """Parse Legado concurrentRate: "interval" or "count/window"."""
+        rate = str(self.config.get("concurrentRate", "") or "").strip()
+        if not rate or rate == "0":
+            return None
+        if "/" in rate:
             try:
-                delay_ms = int(str(rate).strip()) if str(rate).strip().isdigit() else 0
-            except (ValueError, TypeError):
-                delay_ms = 0
-        if delay_ms <= 0:
-            from app.core.config import settings
-            delay_ms = settings.CRAWL_DELAY_MS
-        if delay_ms > 0:
-            await asyncio.sleep((delay_ms + random.uniform(200, 600)) / 1000.0)
+                count = max(1, int(rate.split("/", 1)[0].strip()))
+                window_ms = max(1, int(rate.split("/", 1)[1].strip()))
+            except ValueError:
+                return None
+            return "window", count, window_ms
+        try:
+            interval_ms = max(1, int(rate))
+        except ValueError:
+            return None
+        return "interval", 1, interval_ms
+
+    async def _sleep_rate_limit(self) -> None:
+        """Reserve a request slot based on the source concurrentRate.
+
+        Legado leaves unset/0 sources unthrottled; the SyncService controls
+        overall chapter concurrency instead.  A plain integer rate means one
+        request per interval, while "count/window" allows count starts per
+        window milliseconds.
+        """
+        spec = self._parse_concurrent_rate()
+        if spec is None:
+            return
+        mode, count, window_ms = spec
+        key = self.base_url or "default"
+        lock = self.__class__._rate_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.__class__._rate_locks[key] = lock
+        state = self.__class__._rate_state.setdefault(
+            key,
+            {
+                "interval_slot": 0.0,
+                "window_start": 0.0,
+                "window_used": 0,
+            },
+        )
+        async with lock:
+            now = time.monotonic()
+            if mode == "interval":
+                wait_s = state["interval_slot"] + window_ms / 1000.0 - now
+                if wait_s > 0:
+                    await asyncio.sleep(wait_s)
+                    now = time.monotonic()
+                state["interval_slot"] = now
+                return
+
+            window_s = window_ms / 1000.0
+            if state["window_start"] + window_s <= now:
+                state["window_start"] = now
+                state["window_used"] = 0
+            if state["window_used"] >= count:
+                wait_s = state["window_start"] + window_s - now
+                if wait_s > 0:
+                    await asyncio.sleep(wait_s)
+                    now = time.monotonic()
+                    state["window_start"] = now
+                    state["window_used"] = 0
+            state["window_used"] += 1
 
     def _capture_cookie_jar(self, resp) -> None:
         """Collect Set-Cookie headers when the source enables its cookie jar."""
@@ -1514,36 +1584,30 @@ class YueduPlugin:
             last_error: httpx.HTTPError | None = None
             for attempt in range(3):
                 try:
-                    async with httpx.AsyncClient(
-                        headers=headers,
-                        timeout=httpx.Timeout(60.0, connect=15.0, write=15.0),
-                        follow_redirects=True,
-                        proxy=proxy,
-                        trust_env=False,
-                    ) as client:
-                        if isinstance(body, str):
-                            content_type = headers.get("Content-Type", "").lower()
-                            if "json" in content_type:
-                                resp = await client.post(url, content=body)
-                            else:
-                                resp = await client.post(url, data=body)
-                        elif body is None:
-                            resp = await client.post(url)
+                    client = await self._get_http_client(proxy)
+                    if isinstance(body, str):
+                        content_type = headers.get("Content-Type", "").lower()
+                        if "json" in content_type:
+                            resp = await client.post(url, content=body, headers=headers)
                         else:
-                            resp = await client.post(url, json=body)
+                            resp = await client.post(url, data=body, headers=headers)
+                    elif body is None:
+                        resp = await client.post(url, headers=headers)
+                    else:
+                        resp = await client.post(url, json=body, headers=headers)
 
-                        if resp.status_code in (429, 500, 502, 503, 504):
-                            retry_after = resp.headers.get("Retry-After", "")
-                            wait = (
-                                float(retry_after)
-                                if retry_after and retry_after.replace(".", "", 1).isdigit()
-                                else 2 ** attempt
-                            )
-                            await asyncio.sleep(wait + random.uniform(0.5, 1.5))
-                            continue
-                        resp.raise_for_status()
-                        self._capture_cookie_jar(resp)
-                        return resp.text
+                    if resp.status_code in (429, 500, 502, 503, 504):
+                        retry_after = resp.headers.get("Retry-After", "")
+                        wait = (
+                            float(retry_after)
+                            if retry_after and retry_after.replace(".", "", 1).isdigit()
+                            else 2 ** attempt
+                        )
+                        await asyncio.sleep(wait + random.uniform(0.5, 1.5))
+                        continue
+                    resp.raise_for_status()
+                    self._capture_cookie_jar(resp)
+                    return resp.text
                 except httpx.HTTPError as exc:
                     last_error = exc
                     if attempt < 2:
@@ -1598,26 +1662,20 @@ class YueduPlugin:
             last_error: httpx.HTTPError | None = None
             for attempt in range(3):
                 try:
-                    async with httpx.AsyncClient(
-                        headers=headers,
-                        timeout=httpx.Timeout(60.0, connect=15.0, write=15.0),
-                        follow_redirects=True,
-                        proxy=proxy,
-                        trust_env=False,
-                    ) as client:
-                        resp = await client.get(url)
-                        if resp.status_code in (429, 500, 502, 503, 504):
-                            retry_after = resp.headers.get("Retry-After", "")
-                            wait = (
-                                float(retry_after)
-                                if retry_after and retry_after.replace(".", "", 1).isdigit()
-                                else 2 ** attempt
-                            )
-                            await asyncio.sleep(wait + random.uniform(0.5, 1.5))
-                            continue
-                        resp.raise_for_status()
-                        self._capture_cookie_jar(resp)
-                        return resp.text
+                    client = await self._get_http_client(proxy)
+                    resp = await client.get(url, headers=headers)
+                    if resp.status_code in (429, 500, 502, 503, 504):
+                        retry_after = resp.headers.get("Retry-After", "")
+                        wait = (
+                            float(retry_after)
+                            if retry_after and retry_after.replace(".", "", 1).isdigit()
+                            else 2 ** attempt
+                        )
+                        await asyncio.sleep(wait + random.uniform(0.5, 1.5))
+                        continue
+                    resp.raise_for_status()
+                    self._capture_cookie_jar(resp)
+                    return resp.text
                 except httpx.HTTPError as exc:
                     last_error = exc
                     if attempt < 2:

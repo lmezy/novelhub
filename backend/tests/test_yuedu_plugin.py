@@ -626,6 +626,7 @@ async def test_fetch_chapter_content_stops_at_next_chapter_url():
 
 @pytest.mark.asyncio
 async def test_get_falls_back_to_direct_when_proxy_unreachable():
+    YueduPlugin._clients.clear()
     plugin = YueduPlugin({
         "bookSourceUrl": "https://example.com",
         "concurrentRate": "0",
@@ -636,39 +637,36 @@ async def test_get_falls_back_to_direct_when_proxy_unreachable():
     class FakeClient:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
-
-        async def __aenter__(self):
             proxy = self.kwargs.get("proxy")
             proxy_calls.append(proxy)
-            if proxy:
-                raise httpx.ConnectError("proxy down", request=None)
             self.response = SimpleNamespace(
                 status_code=200,
                 headers={},
                 text="<html>ok</html>",
                 raise_for_status=lambda: None,
             )
-            return self
 
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        async def get(self, url):
+        async def get(self, url, headers=None):
+            if self.kwargs.get("proxy"):
+                raise httpx.ConnectError("proxy down", request=None)
             return self.response
 
-    with (
-        patch("httpx.AsyncClient", FakeClient),
-        patch("asyncio.sleep", AsyncMock()),
-        patch(
-            "app.services.proxy_config.get_proxy_config",
-            return_value=ProxyConfig(
-                enabled=True,
-                https_proxy="http://127.0.0.1:1",
-                http_proxy="http://127.0.0.1:1",
+    try:
+        with (
+            patch("httpx.AsyncClient", FakeClient),
+            patch("asyncio.sleep", AsyncMock()),
+            patch(
+                "app.services.proxy_config.get_proxy_config",
+                return_value=ProxyConfig(
+                    enabled=True,
+                    https_proxy="http://127.0.0.1:1",
+                    http_proxy="http://127.0.0.1:1",
+                ),
             ),
-        ),
-    ):
-        html = await plugin._get("https://example.com/page")
+        ):
+            html = await plugin._get("https://example.com/page")
+    finally:
+        YueduPlugin._clients.clear()
 
     assert html == "<html>ok</html>"
     assert proxy_calls[0] == "http://127.0.0.1:1"

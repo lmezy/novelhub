@@ -57,6 +57,27 @@ class SyncService:
         raise RuntimeError("Chapter fetch failed")
 
     @staticmethod
+    def _chapter_concurrency(config: dict | None) -> int:
+        """Pick chapter fetch concurrency, mirroring Legado's thread model."""
+        from app.core.config import settings
+
+        default = max(1, int(getattr(settings, "SYNC_CHAPTER_CONCURRENCY", 12)))
+        if not config:
+            return default
+        rate = str(config.get("concurrentRate", "") or "").strip()
+        if "/" in rate:
+            try:
+                count = int(rate.split("/", 1)[0].strip())
+            except ValueError:
+                count = 0
+            if count > 0:
+                return min(count, 16)
+        elif rate and rate != "0":
+            # Legado treats a plain interval as one request per interval.
+            return 1
+        return default
+
+    @staticmethod
     def _is_http_url(url: str) -> bool:
         return url.startswith(("http://", "https://"))
 
@@ -215,90 +236,139 @@ class SyncService:
                     "total_chapters": total,
                 })
 
+        existing_rows = await self.db.scalars(
+            select(Chapter.source_chapter_id).where(Chapter.book_id == book.id)
+        )
+        existing_source_ids = {
+            source_id
+            for source_id in existing_rows.all()
+            if source_id is not None
+        }
+
+        missing_chapters = [
+            remote_chapter
+            for remote_chapter in remote_book.chapters
+            if remote_chapter.source_chapter_id not in existing_source_ids
+        ]
         for remote_chapter in remote_book.chapters:
-            existing = await self.db.scalar(
-                select(Chapter).where(
-                    Chapter.book_id == book.id,
-                    Chapter.source_chapter_id == remote_chapter.source_chapter_id,
-                )
-            )
-            if existing:
+            if remote_chapter.source_chapter_id in existing_source_ids:
                 skipped += 1
                 await _report_progress(remote_chapter)
-                continue
 
-            try:
-                content = await self._fetch_chapter_with_retry(
-                    plugin,
-                    remote_chapter,
-                )
-                content_path, content_hash = self.storage.write_chapter(
-                    author_name,
-                    book_title,
-                    remote_chapter.chapter_number,
-                    remote_chapter.title,
-                    content,
-                )
-                chapter = Chapter(
-                    id=str(uuid4()),
-                    book_id=book.id,
-                    chapter_number=remote_chapter.chapter_number,
-                    source_chapter_id=remote_chapter.source_chapter_id,
-                    title=remote_chapter.title,
-                    content_path=content_path,
-                    hash=content_hash,
-                )
-                self.db.add(chapter)
-                await self.db.flush()
+        concurrency = self._chapter_concurrency(config)
+        semaphore = asyncio.Semaphore(concurrency)
+        results_queue = asyncio.Queue(maxsize=concurrency * 2)
 
-                search_service.index_chapter({
-                    "id": chapter.id,
-                    "book_id": book.id,
-                    "title": chapter.title or "",
-                    "chapter_number": chapter.chapter_number,
-                    "content": content[:5000],
-                    "is_r18": book.is_r18,
-                })
+        async def _producer(remote_chapter) -> None:
+            async with semaphore:
+                try:
+                    content = await self._fetch_chapter_with_retry(
+                        plugin,
+                        remote_chapter,
+                    )
+                    result = (remote_chapter, content, None)
+                except Exception as exc:
+                    result = (remote_chapter, None, exc)
+            await results_queue.put(result)
 
-                emit(
-                    EventType.CHAPTER_CREATED,
-                    chapter_id=chapter.id,
-                    book_id=book.id,
-                )
-                # Commit per chapter so a later failure cannot lose earlier work.
-                await self.db.commit()
-                created += 1
-            except SQLAlchemyError as exc:
-                await self.db.rollback()
-                failed_chapters.append({
-                    "chapter_number": remote_chapter.chapter_number,
-                    "title": remote_chapter.title,
-                    "url": remote_chapter.url,
-                    "error": str(exc)[:300],
-                })
-                logger.warning(
-                    "Failed to sync chapter {} ({}): {}",
-                    remote_chapter.title,
-                    remote_chapter.url,
-                    exc,
-                )
+        producers = [
+            asyncio.create_task(_producer(remote_chapter))
+            for remote_chapter in missing_chapters
+        ]
+        remaining = len(producers)
+        try:
+            while remaining > 0:
+                remote_chapter, content, error = await results_queue.get()
+                remaining -= 1
+                if error is not None:
+                    failed_chapters.append({
+                        "chapter_number": remote_chapter.chapter_number,
+                        "title": remote_chapter.title,
+                        "url": remote_chapter.url,
+                        "error": str(error)[:300],
+                    })
+                    logger.warning(
+                        "Failed to sync chapter {} ({}): {}",
+                        remote_chapter.title,
+                        remote_chapter.url,
+                        error,
+                    )
+                    await _report_progress(remote_chapter)
+                    continue
+
+                try:
+                    content_path, content_hash = self.storage.write_chapter(
+                        author_name,
+                        book_title,
+                        remote_chapter.chapter_number,
+                        remote_chapter.title,
+                        content,
+                    )
+                    chapter = Chapter(
+                        id=str(uuid4()),
+                        book_id=book.id,
+                        chapter_number=remote_chapter.chapter_number,
+                        source_chapter_id=remote_chapter.source_chapter_id,
+                        title=remote_chapter.title,
+                        content_path=content_path,
+                        hash=content_hash,
+                    )
+                    self.db.add(chapter)
+                    await self.db.flush()
+
+                    search_service.buffer_chapter({
+                        "id": chapter.id,
+                        "book_id": book.id,
+                        "title": chapter.title or "",
+                        "chapter_number": chapter.chapter_number,
+                        "content": content[:5000],
+                        "is_r18": book.is_r18,
+                    })
+
+                    emit(
+                        EventType.CHAPTER_CREATED,
+                        chapter_id=chapter.id,
+                        book_id=book.id,
+                    )
+                    # Commit per chapter so a later failure cannot lose earlier work.
+                    await self.db.commit()
+                    created += 1
+                except SQLAlchemyError as exc:
+                    await self.db.rollback()
+                    failed_chapters.append({
+                        "chapter_number": remote_chapter.chapter_number,
+                        "title": remote_chapter.title,
+                        "url": remote_chapter.url,
+                        "error": str(exc)[:300],
+                    })
+                    logger.warning(
+                        "Failed to sync chapter {} ({}): {}",
+                        remote_chapter.title,
+                        remote_chapter.url,
+                        exc,
+                    )
+                    await _report_progress(remote_chapter)
+                    break
+                except Exception as exc:
+                    await self.db.rollback()
+                    failed_chapters.append({
+                        "chapter_number": remote_chapter.chapter_number,
+                        "title": remote_chapter.title,
+                        "url": remote_chapter.url,
+                        "error": str(exc)[:300],
+                    })
+                    logger.warning(
+                        "Failed to sync chapter {} ({}): {}",
+                        remote_chapter.title,
+                        remote_chapter.url,
+                        exc,
+                    )
                 await _report_progress(remote_chapter)
-                break
-            except Exception as exc:
-                await self.db.rollback()
-                failed_chapters.append({
-                    "chapter_number": remote_chapter.chapter_number,
-                    "title": remote_chapter.title,
-                    "url": remote_chapter.url,
-                    "error": str(exc)[:300],
-                })
-                logger.warning(
-                    "Failed to sync chapter {} ({}): {}",
-                    remote_chapter.title,
-                    remote_chapter.url,
-                    exc,
-                )
-            await _report_progress(remote_chapter)
+        finally:
+            for producer in producers:
+                producer.cancel()
+            await asyncio.gather(*producers, return_exceptions=True)
+            search_service.flush_chapters()
 
         emit(
             EventType.SYNC_COMPLETED,

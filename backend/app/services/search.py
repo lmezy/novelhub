@@ -7,11 +7,16 @@ from app.core.config import settings
 class SearchService:
     INDEX_BOOKS = "books"
     INDEX_CHAPTERS = "chapters"
+    CHAPTER_BUFFER_SIZE = 100
 
     def __init__(self):
         self.client = meilisearch.Client(settings.MEILI_HOST, settings.MEILI_KEY)
+        self._chapter_buffer: list[dict] = []
+        self._ensured: set[str] = set()
 
     def _ensure_index(self, name: str, primary_key: str = "id") -> None:
+        if name in self._ensured:
+            return
         try:
             self.client.get_index(name)
         except meilisearch.errors.MeilisearchApiError:
@@ -19,6 +24,7 @@ class SearchService:
         self.client.index(name).update_filterable_attributes(
             ["source_id", "book_id", "author_id", "is_r18"]
         )
+        self._ensured.add(name)
 
     def index_book(self, book: dict) -> None:
         self._ensure_index(self.INDEX_BOOKS)
@@ -29,6 +35,25 @@ class SearchService:
         self._ensure_index(self.INDEX_CHAPTERS)
         self.client.index(self.INDEX_CHAPTERS).add_documents([chapter])
         logger.debug("Indexed chapter {}", chapter.get("id"))
+
+    def buffer_chapter(self, chapter: dict) -> None:
+        """Queue a chapter for batched indexing, flushing in chunks."""
+        self._ensure_index(self.INDEX_CHAPTERS)
+        self._chapter_buffer.append(chapter)
+        if len(self._chapter_buffer) >= self.CHAPTER_BUFFER_SIZE:
+            self.flush_chapters()
+
+    def flush_chapters(self) -> None:
+        """Send queued chapter documents to Meilisearch in one batch."""
+        if not self._chapter_buffer:
+            return
+        docs = self._chapter_buffer
+        self._chapter_buffer = []
+        try:
+            self.client.index(self.INDEX_CHAPTERS).add_documents(docs)
+            logger.debug("Indexed {} chapters", len(docs))
+        except Exception as exc:
+            logger.warning("Failed to index {} chapters: {}", len(docs), exc)
 
     @staticmethod
     def _visibility_filter(allow_r18: bool, allow_all_ages: bool) -> str | None:
@@ -127,6 +152,7 @@ class SearchService:
                     self.client.delete_index(self.INDEX_CHAPTERS)
                 except Exception:
                     pass
+                self._ensured.clear()
                 self._ensure_index(self.INDEX_BOOKS)
                 self._ensure_index(self.INDEX_CHAPTERS)
 

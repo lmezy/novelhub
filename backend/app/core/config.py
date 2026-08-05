@@ -49,6 +49,8 @@ class Settings(BaseSettings):
 
     CRAWL_DELAY_MS:int=1200
 
+    SYNC_CHAPTER_CONCURRENCY:int=12
+
 
     class Config:
 
