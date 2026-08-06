@@ -134,6 +134,17 @@ async function removeCustomTag(tag: CustomTagOnBook) {
   }
 }
 
+async function removeSourceTag(tag: string) {
+  if (!book.value) return
+  if (!confirm(i18n.t('book_source_tag_remove_confirm', { tag }))) return
+  try {
+    await api.delete("/books/" + book.value.id + "/tags?name=" + encodeURIComponent(tag))
+    book.value.tag_names = (book.value.tag_names || []).filter((t) => t !== tag)
+  } catch (e) {
+    tagError.value = e instanceof Error ? e.message : i18n.t('book_tag_failed')
+  }
+}
+
 async function loadShelfGroups() {
   try {
     shelfGroups.value = await api.get<ShelfGroup[]>("/bookshelf/groups")
@@ -272,7 +283,15 @@ onMounted(async () => {
               v-for="tag in book.tag_names"
               :key="tag"
               class="text-xs px-2 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-muted dark:text-gray-400"
-            >{{ tag }}</span>
+            >
+              {{ tag }}
+              <button
+                v-if="auth.isAdmin"
+                @click="removeSourceTag(tag)"
+                class="ml-1 text-red-400 hover:text-red-600"
+                :title="i18n.t('book_source_tag_remove')"
+              >&times;</button>
+            </span>
           </div>
           <div v-if="book.category_names?.length" class="flex flex-wrap gap-1 mb-2">
             <span

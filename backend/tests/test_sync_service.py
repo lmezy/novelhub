@@ -35,13 +35,6 @@ def test_normalize_title_for_match():
     assert SyncService._normalize_title_for_match(" 剑来 ") == "剑来"
 
 
-def test_is_metadata_noise_tag_filters_title_author_and_site():
-    assert SyncService._is_metadata_noise_tag("紫影玉茗", "紫影玉茗", "lisianthus") is True
-    assert SyncService._is_metadata_noise_tag("lisianthus", "紫影玉茗", "lisianthus") is True
-    assert SyncService._is_metadata_noise_tag("爱丽丝书屋", "紫影玉茗", "lisianthus") is True
-    assert SyncService._is_metadata_noise_tag("重口", "紫影玉茗", "lisianthus") is False
-
-
 def test_chapter_concurrency_uses_env_override():
     from app.core.config import settings
 
@@ -255,7 +248,7 @@ async def test_sync_book_loads_existing_tags_without_lazy_load():
         patch.object(service, "_get_or_create_author", AsyncMock(return_value=MagicMock(id="author-1"))),
         patch.object(service, "_get_or_create_book", AsyncMock(return_value=(book, True))),
         patch.object(service, "_find_same_title_books", AsyncMock(return_value=[])),
-        patch.object(service, "_book_tag_names", AsyncMock(return_value=["old"])),
+        patch.object(service, "_book_tag_names", AsyncMock(return_value=["Book", "old"])),
         patch.object(service, "_save_tags", AsyncMock()),
     ):
         result = await service.sync_book("src1", "https://example.com/book/1")
@@ -263,7 +256,7 @@ async def test_sync_book_loads_existing_tags_without_lazy_load():
         assert result["created_chapters"] == 1
         service._save_tags.assert_awaited_once_with(
             "book-1",
-            ["all-ages", "old", "remote"],
+            ["all-ages", "book", "old", "remote"],
         )
 
 

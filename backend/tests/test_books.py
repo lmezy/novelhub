@@ -4,7 +4,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from types import SimpleNamespace
 
-from app.api.routes.books import _normalize_book_title, list_book_sources
+from app.api.routes.books import _normalize_book_title, list_book_sources, remove_book_tag
 
 
 def test_normalize_book_title():
@@ -63,6 +63,28 @@ async def test_list_book_sources_calls_unique_before_all():
     )
 
     assert [s.id for s in result.sources] == ["current", "other"]
+
+
+@pytest.mark.asyncio
+async def test_remove_book_tag_deletes_association_and_reindexes():
+    db = AsyncMock()
+    book = SimpleNamespace(id="book-1")
+    tag = SimpleNamespace(id="tag-1", name="都市")
+    book_tag = SimpleNamespace(book_id="book-1", tag_id="tag-1")
+    db.get = AsyncMock(return_value=book)
+    db.scalar = AsyncMock(side_effect=[tag, book_tag, 0])
+    db.delete = AsyncMock()
+    db.commit = AsyncMock()
+    execute_result = MagicMock()
+    execute_result.all.return_value = [("穿越",)]
+    db.execute = AsyncMock(return_value=execute_result)
+
+    with patch("app.api.routes.books.search_service") as search:
+        await remove_book_tag("book-1", "都市", db)
+
+    db.delete.assert_any_call(book_tag)
+    db.delete.assert_any_call(tag)
+    search.update_book_tags.assert_called_once_with("book-1", ["穿越"])
 
 
 @pytest.mark.asyncio

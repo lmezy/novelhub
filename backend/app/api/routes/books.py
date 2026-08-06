@@ -2,7 +2,7 @@ import re
 from uuid import uuid4
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse, RedirectResponse, Response
 from pydantic import BaseModel
 from sqlalchemy import delete, func, or_, select
@@ -11,12 +11,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.models import Book, BookFavorite, BookFavoriteGroup, Chapter, Source, User
+from app.models import Book, BookFavorite, BookFavoriteGroup, BookTag, Chapter, Source, Tag, User
 from app.services.auth import get_current_user, require_admin
 from app.services.book_cleanup import delete_books
 from app.services.bookshelf import favorite_group_ids_by_book
 from app.services.custom_tags import list_book_custom_tags_map
 from app.services.epub import EpubService
+from app.services.search import search_service
 from app.services.sync import SyncService
 from app.services.visibility import (
     can_view_r18,
@@ -271,6 +272,49 @@ async def get_book_cover(book_id: str, db: AsyncSession = Depends(get_db)):
     if not cover_path.is_file():
         raise HTTPException(status_code=404, detail="Cover not found")
     return FileResponse(cover_path)
+
+
+@router.delete("/{book_id}/tags", status_code=204, dependencies=[Depends(require_admin)])
+async def remove_book_tag(
+    book_id: str,
+    tag_name: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove one source tag from a book without touching other books' tags."""
+    book = await db.get(Book, book_id)
+    if book is None:
+        raise HTTPException(status_code=404, detail="Book not found")
+    tag = await db.scalar(select(Tag).where(Tag.name == tag_name))
+    if tag is None:
+        raise HTTPException(status_code=404, detail="Tag not found")
+    book_tag = await db.scalar(
+        select(BookTag).where(
+            BookTag.book_id == book_id,
+            BookTag.tag_id == tag.id,
+        )
+    )
+    if book_tag is None:
+        raise HTTPException(status_code=404, detail="Tag not found on book")
+
+    await db.delete(book_tag)
+    remaining = await db.scalar(
+        select(func.count()).select_from(BookTag).where(BookTag.tag_id == tag.id)
+    )
+    if not remaining:
+        await db.delete(tag)
+    await db.commit()
+
+    remaining_names = [
+        name
+        for (name,) in (
+            await db.execute(
+                select(Tag.name)
+                .join(BookTag, BookTag.tag_id == Tag.id)
+                .where(BookTag.book_id == book_id)
+            )
+        ).all()
+    ]
+    search_service.update_book_tags(book_id, remaining_names)
 
 
 @router.post("/{book_id}/favorite")

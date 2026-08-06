@@ -98,33 +98,6 @@ class SyncService:
             title or "",
         ).lower()
 
-    @staticmethod
-    def _is_metadata_noise_tag(tag: str, title: str, author: str) -> bool:
-        """Filter old title/author/site noise that leaked into tag tables."""
-        normalized = re.sub(
-            r"[\s《》「」『』〈〉（）【】\[\]\"'“”‘’]+",
-            "",
-            tag or "",
-        ).lower()
-        title_norm = SyncService._normalize_title_for_match(title)
-        author_norm = SyncService._normalize_title_for_match(author)
-        if normalized == title_norm or normalized == author_norm:
-            return True
-        if title_norm and title_norm in normalized and "最新章节" in normalized:
-            return True
-        noise = {
-            "tags", "tag", "标签", "分类", "类别", "类型",
-            "最新章节", "最新章节列表", "全文阅读", "免费阅读", "阅读更多",
-            "书友正在看", "大家都在看", "上一章", "下一章", "目录",
-            "返回目录", "首页", "开始阅读", "小说", "本站",
-        }
-        if normalized in noise:
-            return True
-        lowered = tag.lower()
-        if "alicesw" in lowered or "爱丽丝书屋" in tag:
-            return True
-        return len(tag) > 20
-
     async def _find_same_title_books(self, book: Book) -> list[Book]:
         """Find other source books with the same normalized title."""
         normalized = self._normalize_title_for_match(book.title)
@@ -230,23 +203,11 @@ class SyncService:
         for candidate in [book, *same_title_books]:
             for tag in await self._book_tag_names(candidate.id):
                 tag = tag.strip().lower()
-                if (
-                    tag
-                    and tag not in ("all-ages", "r18")
-                    and not self._is_metadata_noise_tag(
-                        tag,
-                        book_title,
-                        author_name,
-                    )
-                ):
+                if tag and tag not in ("all-ages", "r18"):
                     source_tags.add(tag)
         for tag in remote_book.tags:
             tag = str(tag).strip().lower()
-            if tag and not self._is_metadata_noise_tag(
-                tag,
-                book_title,
-                author_name,
-            ):
+            if tag:
                 source_tags.add(tag)
         await self._save_tags(
             book.id,
