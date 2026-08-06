@@ -25,6 +25,7 @@ from .reading_progress import ReadingProgress
 
 from .book_version import BookVersion
 from .source_change import SourceChange
+from .app_setting import AppSetting
 
 
 
@@ -56,6 +57,7 @@ __all__=[
 
     "BookVersion",
 
+    "AppSetting",
 ]
 
 from .chapter_embedding import ChapterEmbedding  # noqa: F401

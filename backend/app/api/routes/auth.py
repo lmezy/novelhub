@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.models import User
-from app.schemas.auth import TokenOut
+from app.schemas.auth import RegisterResult, TokenOut
 from app.schemas.user import (
     UserCreate,
     UserLogin,
@@ -16,28 +16,46 @@ from app.schemas.user import (
 from app.services.auth import get_current_user
 from app.services.jwt import create_token
 from app.services.security import hash_password, verify_password
+from app.services.settings import get_registration_approval_enabled
 
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
-@router.post("/register", response_model=TokenOut, status_code=201)
+@router.post("/register", response_model=RegisterResult, status_code=201)
 async def register(payload: UserCreate, db: AsyncSession = Depends(get_db)):
     existing = await db.scalar(select(User).where(User.username == payload.username))
     if existing:
         raise HTTPException(status_code=409, detail="Username already exists")
+    if payload.email:
+        existing_email = await db.scalar(
+            select(User).where(User.email == payload.email)
+        )
+        if existing_email:
+            raise HTTPException(status_code=409, detail="Email already exists")
 
+    approval_enabled = await get_registration_approval_enabled(db)
     user = User(
         id=str(uuid4()),
         username=payload.username,
         email=payload.email,
         password_hash=hash_password(payload.password),
         role="user",
+        approved=not approval_enabled,
+        r18_enabled=False,
+        non_r18_enabled=True,
+        can_manage_visibility=False,
     )
     db.add(user)
     await db.commit()
     await db.refresh(user)
-    return TokenOut(access_token=create_token(user.id), user=user)
+    if approval_enabled:
+        return RegisterResult(status="pending", user=user)
+    return RegisterResult(
+        status="approved",
+        access_token=create_token(user.id),
+        user=user,
+    )
 
 
 @router.post("/login", response_model=TokenOut)
@@ -45,6 +63,8 @@ async def login(payload: UserLogin, db: AsyncSession = Depends(get_db)):
     user = await db.scalar(select(User).where(User.username == payload.username))
     if user is None or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid username or password")
+    if not user.approved and user.role not in ("admin", "super_admin"):
+        raise HTTPException(status_code=403, detail="Account pending approval")
     return TokenOut(access_token=create_token(user.id), user=user)
 
 

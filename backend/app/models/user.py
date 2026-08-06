@@ -62,6 +62,12 @@ class User(Base):
         default=False
     )
 
+    approved=Column(
+        Boolean,
+        nullable=False,
+        default=True
+    )
+
 
     created_at=Column(
         DateTime,

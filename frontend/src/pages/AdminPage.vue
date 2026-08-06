@@ -758,6 +758,23 @@ async function loadLogs() {
 
 const users = ref<any[]>([])
 const userError = ref("")
+const registrationApprovalEnabled = ref(false)
+const userCreateForm = ref({ username: "", email: "", password: "", role: "user" })
+const showUserCreate = ref(true)
+const userCreating = ref(false)
+const userCreateError = ref("")
+const passwordChanging = ref<Record<string, boolean>>({})
+
+const USERNAME_RE = /^[A-Za-z0-9]+$/
+
+function passwordStrengthOk(value: string): boolean {
+  let categories = 0
+  if (/[A-Za-z]/.test(value)) categories++
+  if (/\d/.test(value)) categories++
+  if (value.includes("_")) categories++
+  if (/[^A-Za-z0-9_]/.test(value)) categories++
+  return categories >= 2
+}
 
 const approvals = ref<any[]>([])
 const approvalError = ref("")
@@ -766,6 +783,87 @@ const approvalReviewing = ref<Record<string, boolean>>({})
 async function loadUsers() {
   userError.value = ""
   try { users.value = await api.get<any[]>("/admin/users") } catch (e) { userError.value = e instanceof Error ? e.message : i18n.t('admin_failed') }
+}
+
+async function loadRegistrationApproval() {
+  try {
+    const res = await api.get<any>("/admin/settings/registration-approval")
+    registrationApprovalEnabled.value = res.enabled
+  } catch {
+    registrationApprovalEnabled.value = false
+  }
+}
+
+async function toggleRegistrationApproval() {
+  try {
+    const res = await api.put<any>("/admin/settings/registration-approval", {
+      enabled: !registrationApprovalEnabled.value,
+    })
+    registrationApprovalEnabled.value = res.enabled
+  } catch (e) {
+    alert(e instanceof Error ? e.message : i18n.t('admin_failed'))
+  }
+}
+
+async function createUser() {
+  userCreateError.value = ""
+  if (!userCreateForm.value.username.trim() || !userCreateForm.value.password) {
+    userCreateError.value = i18n.t('admin_create_user_required')
+    return
+  }
+  if (!USERNAME_RE.test(userCreateForm.value.username.trim())) {
+    userCreateError.value = i18n.t('admin_username_invalid')
+    return
+  }
+  if (!passwordStrengthOk(userCreateForm.value.password)) {
+    userCreateError.value = i18n.t('admin_password_weak')
+    return
+  }
+  userCreating.value = true
+  try {
+    const body: any = {
+      username: userCreateForm.value.username.trim(),
+      password: userCreateForm.value.password,
+      role: userCreateForm.value.role,
+    }
+    if (userCreateForm.value.email.trim()) {
+      body.email = userCreateForm.value.email.trim()
+    }
+    await api.post("/admin/users", body)
+    await loadUsers()
+    userCreateForm.value = { username: "", email: "", password: "", role: "user" }
+  } catch (e) {
+    userCreateError.value = e instanceof Error ? e.message : i18n.t('admin_failed')
+  } finally {
+    userCreating.value = false
+  }
+}
+
+async function approveUser(id: string) {
+  try {
+    await api.put("/admin/users/" + id + "/approve")
+    await loadUsers()
+  } catch (e) {
+    alert(e instanceof Error ? e.message : i18n.t('admin_failed'))
+  }
+}
+
+async function changeUserPassword(u: any) {
+  const pwd = prompt(i18n.t('admin_password_prompt'))
+  if (!pwd) return
+  if (!passwordStrengthOk(pwd)) {
+    alert(i18n.t('admin_password_weak'))
+    return
+  }
+  passwordChanging.value[u.id] = true
+  try {
+    await api.put("/admin/users/" + u.id + "/password", { password: pwd })
+    alert(i18n.t('admin_password_changed'))
+  } catch (e) {
+    alert(e instanceof Error ? e.message : i18n.t('admin_failed'))
+  } finally {
+    passwordChanging.value[u.id] = false
+  }
 }
 
 async function deleteUser(id: string, username: string) {
@@ -810,6 +908,7 @@ onMounted(async () => {
   await loadStatus()
   await loadIndexStats()
   await loadUsers()
+  await loadRegistrationApproval()
   await loadApprovals()
   await loadLogs()
   if (crawlStore.activeTask?.id && !["completed", "failed", "cancelled", "completed_with_errors"].includes(crawlStore.activeTask.status)) {
@@ -1363,15 +1462,73 @@ onUnmounted(() => {
       <section v-if="tab === 'users'" class="space-y-6">
         <div class="flex items-center justify-between mb-4">
           <h2 class="text-lg font-semibold">{{ i18n.t('admin_user_management') }}</h2>
-          <button @click="loadUsers" class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm hover:bg-surface transition-colors">{{ i18n.t('admin_refresh') }}</button>
+          <div class="flex items-center gap-2">
+            <button
+              @click="showUserCreate = !showUserCreate"
+              class="px-4 py-2 rounded bg-accent text-white text-sm hover:opacity-90 transition-opacity"
+            >{{ i18n.t('admin_create_user') }}</button>
+            <button @click="loadUsers" class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm hover:bg-surface transition-colors">{{ i18n.t('admin_refresh') }}</button>
+          </div>
         </div>
         <p v-if="userError" class="text-sm text-red-600 mb-3">{{ userError }}</p>
+        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
+          <div class="flex items-center justify-between flex-wrap gap-3">
+            <div>
+              <h3 class="text-sm font-semibold mb-1">{{ i18n.t('admin_registration_approval') }}</h3>
+              <p class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_registration_approval_hint') }}</p>
+            </div>
+            <button
+              @click="toggleRegistrationApproval"
+              class="text-xs px-3 py-1.5 rounded border"
+              :class="registrationApprovalEnabled ? 'bg-green-100 text-green-700 border-green-400 dark:bg-green-900 dark:text-green-300' : 'border-border dark:border-gray-700 text-muted dark:text-gray-400'"
+            >{{ registrationApprovalEnabled ? i18n.t('admin_enabled') : i18n.t('admin_disabled') }}</button>
+          </div>
+        </div>
+
+        <div v-if="showUserCreate" class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
+          <h3 class="text-sm font-semibold mb-3">{{ i18n.t('admin_create_user') }}</h3>
+          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+            <input
+              v-model="userCreateForm.username"
+              :placeholder="i18n.t('admin_username_placeholder')"
+              class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
+            />
+            <input
+              v-model="userCreateForm.email"
+              type="email"
+              :placeholder="i18n.t('admin_email_placeholder')"
+              class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
+            />
+            <input
+              v-model="userCreateForm.password"
+              type="password"
+              :placeholder="i18n.t('admin_password_placeholder')"
+              class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
+            />
+            <select
+              v-model="userCreateForm.role"
+              class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
+            >
+              <option value="user">{{ i18n.t('admin_role_user') }}</option>
+              <option value="admin">{{ i18n.t('admin_role_admin') }}</option>
+              <option value="super_admin">{{ i18n.t('admin_role_super_admin') }}</option>
+            </select>
+          </div>
+          <p v-if="userCreateError" class="text-sm text-red-600 mt-2">{{ userCreateError }}</p>
+          <button
+            @click="createUser"
+            :disabled="userCreating"
+            class="mt-3 px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50"
+          >{{ userCreating ? i18n.t('admin_saving') : i18n.t('admin_create_user') }}</button>
+        </div>
+
         <div class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900">
           <div v-for="u in users" :key="u.id" class="px-4 py-3 flex items-center justify-between flex-wrap gap-2">
             <div>
               <span class="text-sm font-medium">{{ u.username }}</span>
               <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ u.email || '' }}</span>
               <span class="text-xs px-1.5 py-0.5 rounded-full ml-2" :class="u.role === 'super_admin' ? 'bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-300' : u.role === 'admin' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300' : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400'">{{ u.role === 'super_admin' ? i18n.t('admin_role_super_admin') : u.role === 'admin' ? i18n.t('admin_role_admin') : i18n.t('admin_role_user') }}</span>
+              <span v-if="!u.approved" class="text-xs px-1.5 py-0.5 rounded-full ml-2 bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-300">{{ i18n.t('admin_pending') }}</span>
             </div>
             <div class="flex items-center gap-2">
               <button @click="toggleUserVisibility(u, 'r18_enabled')" class="text-xs px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5" :class="u.r18_enabled ? 'text-purple-700 dark:text-purple-300 border-purple-500' : ''">
@@ -1383,13 +1540,19 @@ onUnmounted(() => {
               <button @click="toggleUserVisibility(u, 'can_manage_visibility')" class="text-xs px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5" :class="u.can_manage_visibility ? 'text-blue-700 dark:text-blue-300 border-blue-500' : ''">
                 {{ u.can_manage_visibility ? i18n.t('admin_controls_on') : i18n.t('admin_controls_off') }}
               </button>
+              <button v-if="!u.approved" @click="approveUser(u.id)" class="text-xs px-2 py-1 rounded border border-green-500 text-green-600 hover:bg-green-50 dark:hover:bg-green-950">
+                {{ i18n.t('admin_approve_user') }}
+              </button>
+              <button v-if="auth.isSuperAdmin" @click="changeUserPassword(u)" :disabled="passwordChanging[u.id]" class="text-xs px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5 disabled:opacity-50">
+                {{ i18n.t('admin_change_password') }}
+              </button>
               <select @change="(e: any) => changeUserRole(u.id, e.target.value)" class="text-xs px-2 py-1 rounded border border-border dark:border-gray-700 bg-paper dark:bg-gray-800">
                 <option value="" disabled selected>{{ i18n.t('admin_change_role') }}</option>
                 <option value="user">{{ i18n.t('admin_role_user') }}</option>
                 <option value="admin">{{ i18n.t('admin_role_admin') }}</option>
                 <option value="super_admin">{{ i18n.t('admin_role_super_admin') }}</option>
               </select>
-              <button @click="deleteUser(u.id, u.username)" class="text-xs text-red-500 hover:text-red-700">{{ i18n.t('admin_delete') }}</button>
+              <button @click="deleteUser(u.id, u.username)" class="text-xs text-red-500 hover:text-red-700">{{ u.approved ? i18n.t('admin_delete') : i18n.t('admin_reject_user') }}</button>
             </div>
           </div>
           <p v-if="users.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">{{ i18n.t('admin_no_users') }}</p>

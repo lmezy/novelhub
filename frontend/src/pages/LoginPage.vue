@@ -14,18 +14,49 @@ const username = ref("")
 const password = ref("")
 const email = ref("")
 const error = ref("")
+const notice = ref("")
 const loading = ref(false)
+
+const USERNAME_RE = /^[A-Za-z0-9]+$/
+
+function passwordStrengthOk(value: string): boolean {
+  let categories = 0
+  if (/[A-Za-z]/.test(value)) categories++
+  if (/\d/.test(value)) categories++
+  if (value.includes("_")) categories++
+  if (/[^A-Za-z0-9_]/.test(value)) categories++
+  return categories >= 2
+}
 
 async function submit() {
   if (!username.value || !password.value) {
     error.value = i18n.t('login_required')
     return
   }
+  if (isRegister.value) {
+    if (!USERNAME_RE.test(username.value)) {
+      error.value = i18n.t('login_username_invalid')
+      return
+    }
+    if (!passwordStrengthOk(password.value)) {
+      error.value = i18n.t('login_password_weak')
+      return
+    }
+  }
   loading.value = true
   error.value = ""
+  notice.value = ""
   try {
     if (isRegister.value) {
-      await auth.register(username.value, password.value, email.value || undefined)
+      const res = await auth.register(username.value, password.value, email.value || undefined)
+      if (res.status === "pending") {
+        notice.value = i18n.t('login_pending_approval')
+        isRegister.value = false
+        username.value = ""
+        password.value = ""
+        email.value = ""
+        return
+      }
     } else {
       await auth.login(username.value, password.value)
     }
@@ -77,6 +108,7 @@ async function submit() {
         </div>
 
         <p v-if="error" class="text-sm text-red-600">{{ error }}</p>
+        <p v-if="notice" class="text-sm text-green-600">{{ notice }}</p>
 
         <button
           type="submit"
@@ -88,7 +120,7 @@ async function submit() {
       <p class="text-sm text-muted dark:text-gray-400 text-center mt-6">
         {{ isRegister ? i18n.t('login_have_account') : i18n.t('login_no_account') }}
         <button
-          @click="isRegister = !isRegister; error = ''"
+          @click="isRegister = !isRegister; error = ''; notice = ''"
           class="text-accent hover:underline"
         >{{ isRegister ? i18n.t('login_login') : i18n.t('login_register') }}</button>
       </p>

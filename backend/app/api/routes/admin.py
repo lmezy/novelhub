@@ -1,3 +1,5 @@
+from uuid import uuid4
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -7,12 +9,20 @@ from app.core.database import get_db
 from app.models import User, Source, SourceChange
 from app.schemas.user import UserOut
 from app.schemas.admin import (
+    AdminUserCreate,
+    RegistrationApprovalUpdate,
     UserContentVisibilityUpdate,
+    UserPasswordUpdate,
     UserRoleUpdate,
     UserR18Update,
 )
 from app.services.auth import get_current_user, require_admin, require_super_admin
 from app.services.proxy_config import get_proxy_config, ProxyConfig, set_proxy_config
+from app.services.security import hash_password
+from app.services.settings import (
+    get_registration_approval_enabled,
+    set_registration_approval_enabled,
+)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -24,6 +34,72 @@ async def list_users(
 ):
     result = await db.scalars(select(User).order_by(User.created_at.desc()))
     return list(result)
+
+
+@router.post("/users", response_model=UserOut, status_code=201)
+async def create_user(
+    payload: AdminUserCreate,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    if payload.role not in ("user", "admin", "super_admin"):
+        raise HTTPException(status_code=400, detail="Invalid role")
+    if payload.role != "user" and current_user.role != "super_admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Only super admin can create admin users",
+        )
+    existing = await db.scalar(
+        select(User).where(User.username == payload.username)
+    )
+    if existing:
+        raise HTTPException(status_code=409, detail="Username already exists")
+    if payload.email:
+        existing_email = await db.scalar(
+            select(User).where(User.email == payload.email)
+        )
+        if existing_email:
+            raise HTTPException(status_code=409, detail="Email already exists")
+
+    user = User(
+        id=str(uuid4()),
+        username=payload.username,
+        email=payload.email,
+        password_hash=hash_password(payload.password),
+        role=payload.role,
+        approved=True,
+        r18_enabled=False,
+        non_r18_enabled=True,
+        can_manage_visibility=False,
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    return user
+
+
+@router.get("/settings/registration-approval")
+async def get_registration_approval(
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    return {
+        "enabled": await get_registration_approval_enabled(db),
+    }
+
+
+@router.put("/settings/registration-approval")
+async def update_registration_approval(
+    payload: RegistrationApprovalUpdate,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    return {
+        "enabled": await set_registration_approval_enabled(
+            db,
+            payload.enabled,
+        ),
+    }
 
 
 @router.delete("/users/{user_id}", status_code=200)
@@ -60,6 +136,37 @@ async def update_user_role(
     if target.id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot change your own role")
     target.role = payload.role
+    await db.commit()
+    await db.refresh(target)
+    return target
+
+
+@router.put("/users/{user_id}/approve", response_model=UserOut)
+async def approve_user(
+    user_id: str,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    target = await db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    target.approved = True
+    await db.commit()
+    await db.refresh(target)
+    return target
+
+
+@router.put("/users/{user_id}/password", response_model=UserOut)
+async def update_user_password(
+    user_id: str,
+    payload: UserPasswordUpdate,
+    current_user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    target = await db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    target.password_hash = hash_password(payload.password)
     await db.commit()
     await db.refresh(target)
     return target

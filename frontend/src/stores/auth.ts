@@ -10,6 +10,7 @@ export interface User {
   r18_enabled: boolean
   non_r18_enabled: boolean
   can_manage_visibility: boolean
+  approved: boolean
 }
 
 export const useAuthStore = defineStore("auth", () => {
@@ -38,14 +39,21 @@ function toggleDark() {
   }
 
   async function register(username: string, password: string, email?: string) {
-    const res = await api.post<{ access_token: string; user: User }>("/auth/register", {
+    const res = await api.post<{
+      status?: "approved" | "pending"
+      access_token?: string
+      user: User
+    }>("/auth/register", {
       username,
       password,
       email,
     })
-    token.value = res.access_token
-    user.value = res.user
-    localStorage.setItem("novelhub_token", res.access_token)
+    if (res.access_token) {
+      token.value = res.access_token
+      user.value = res.user
+      localStorage.setItem("novelhub_token", res.access_token)
+    }
+    return res
   }
 
   async function fetchMe() {
