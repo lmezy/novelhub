@@ -4,10 +4,12 @@ import { useRouter } from "vue-router"
 import { api } from "../api/client"
 import { useI18nStore } from "../stores/i18n"
 import { useCrawlStore } from "../stores/crawl"
+import { useAuthStore } from "../stores/auth"
 import NavBar from "../components/NavBar.vue"
 
 const i18n = useI18nStore()
 const crawlStore = useCrawlStore()
+const auth = useAuthStore()
 const router = useRouter()
 
 interface Source {
