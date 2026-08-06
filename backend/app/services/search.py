@@ -499,6 +499,12 @@ class SearchService:
         book_id = str(doc.get("id") or "")
         description = doc.get("description") or ""
         values = [cond["value"] for cond in active]
+        matched_fields = self._book_matched_fields(
+            book_id,
+            active,
+            book_cond_maps,
+            chapter_cond_maps,
+        )
         matched_chapter = entity.get("matched_chapter")
         matched_chapter_payload = None
         if matched_chapter:
@@ -526,13 +532,12 @@ class SearchService:
             "status": doc.get("status") or "",
             "is_r18": bool(doc.get("is_r18", False)),
             "score": entity["score"],
-            "matched_fields": self._book_matched_fields(
-                book_id,
-                active,
-                book_cond_maps,
-                chapter_cond_maps,
+            "matched_fields": matched_fields,
+            "snippet": (
+                self._snippet(description or doc.get("title") or "", values)
+                if any(field in ("description", "content") for field in matched_fields)
+                else ""
             ),
-            "snippet": self._snippet(description or doc.get("title") or "", values),
             "matched_chapter": matched_chapter_payload,
         }
 
@@ -621,6 +626,18 @@ class SearchService:
                     }
             return {"hits": [], "total": 0, "offset": offset, "limit": limit}
 
+        effective_scope = scope
+        if scope == "all":
+            # Metadata searches (title/author/tags/description/category) should
+            # return books only; chapter-title/content searches should return
+            # chapters only. This avoids showing every chapter for an author or
+            # tag query, and avoids duplicate book+chapter results for content.
+            effective_scope = (
+                "chapters"
+                if any(cond["field"] in self.CHAPTER_FIELD_ATTRS for cond in active)
+                else "books"
+            )
+
         filters = self._combined_filter(allow_r18, allow_all_ages, tag)
         book_cond_maps: dict[int, dict[str, tuple[int, dict]]] = {}
         chapter_cond_maps: dict[int, dict[str, tuple[int, dict]]] = {}
@@ -651,7 +668,7 @@ class SearchService:
                 )
 
         entities: list[dict] = []
-        if scope in ("all", "books"):
+        if effective_scope in ("all", "books"):
             entities.extend(
                 self._build_book_entities(
                     active,
@@ -660,7 +677,7 @@ class SearchService:
                     match,
                 ).values()
             )
-        if scope in ("all", "chapters"):
+        if effective_scope in ("all", "chapters"):
             entities.extend(
                 self._build_chapter_entities(active, chapter_cond_maps, match).values()
             )

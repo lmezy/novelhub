@@ -137,9 +137,120 @@ def test_advanced_search_books_scope_and_requires_all_conditions():
     assert result["total"] == 1
     assert result["hits"][0]["type"] == "book"
     assert result["hits"][0]["title"] == "西游记"
+    assert result["hits"][0]["snippet"] == ""
     assert result["hits"][0]["matched_fields"] == ["title", "chapter_title"]
     assert result["hits"][0]["matched_chapter"]["title"] == "三打白骨精"
     assert "老鸡婆" in result["hits"][0]["matched_chapter"]["snippet"]
+
+
+def test_advanced_search_author_scope_all_returns_books_only():
+    service, books_index, chapters_index = _service_with_indexes()
+    books_index.search.return_value = {
+        "hits": [{
+            "id": "book-1",
+            "title": "西游记",
+            "author": "吴承恩",
+            "description": "",
+            "tags": [],
+            "is_r18": False,
+        }]
+    }
+    chapters_index.search.return_value = {
+        "hits": [{
+            "id": "chapter-1",
+            "book_id": "book-1",
+            "title": "第一回",
+            "book_title": "西游记",
+            "book_author": "吴承恩",
+            "book_description": "",
+            "content": "",
+            "is_r18": False,
+        }]
+    }
+
+    result = service.advanced_search(
+        [{"field": "author", "mode": "exact", "value": "吴承恩"}],
+        match="and",
+        scope="all",
+    )
+
+    assert result["total"] == 1
+    assert result["hits"][0]["type"] == "book"
+    assert result["hits"][0]["title"] == "西游记"
+
+
+def test_advanced_search_tags_scope_all_returns_books_only():
+    service, books_index, chapters_index = _service_with_indexes()
+    books_index.search.return_value = {
+        "hits": [{
+            "id": "book-1",
+            "title": "西游记",
+            "author": "吴承恩",
+            "description": "",
+            "tags": ["仙侠"],
+            "is_r18": False,
+        }]
+    }
+    chapters_index.search.return_value = {
+        "hits": [{
+            "id": "chapter-1",
+            "book_id": "book-1",
+            "title": "第一回",
+            "book_title": "西游记",
+            "book_author": "吴承恩",
+            "book_description": "",
+            "content": "",
+            "tags": ["仙侠"],
+            "is_r18": False,
+        }]
+    }
+
+    result = service.advanced_search(
+        [{"field": "tags", "mode": "exact", "value": "仙侠"}],
+        match="and",
+        scope="all",
+    )
+
+    assert result["total"] == 1
+    assert result["hits"][0]["type"] == "book"
+    assert result["hits"][0]["matched_fields"] == ["tags"]
+    assert result["hits"][0]["snippet"] == ""
+
+
+def test_advanced_search_content_scope_all_returns_chapters_only():
+    service, books_index, chapters_index = _service_with_indexes()
+    books_index.search.return_value = {
+        "hits": [{
+            "id": "book-1",
+            "title": "1983",
+            "author": "",
+            "description": "笔没墨水",
+            "tags": [],
+            "is_r18": False,
+        }]
+    }
+    chapters_index.search.return_value = {
+        "hits": [{
+            "id": "chapter-1",
+            "book_id": "book-1",
+            "title": "第171章",
+            "book_title": "1983",
+            "book_author": "",
+            "book_description": "",
+            "content": "笔没墨水，画像师继续画。",
+            "is_r18": False,
+        }]
+    }
+
+    result = service.advanced_search(
+        [{"field": "content", "mode": "exact", "value": "笔"}],
+        match="and",
+        scope="all",
+    )
+
+    assert result["total"] == 1
+    assert result["hits"][0]["type"] == "chapter"
+    assert result["hits"][0]["book_title"] == "1983"
 
 
 def test_advanced_search_chapters_fuzzy_rank():

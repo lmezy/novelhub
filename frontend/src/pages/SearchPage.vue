@@ -251,6 +251,11 @@ onMounted(async () => {
                 {{ hit.type === 'book' ? i18n.t('search_books') : i18n.t('search_chapters') }}
               </span>
               <h3 class="text-sm font-medium">{{ hit.type === 'book' ? hit.title : hit.book_title }}</h3>
+              <span
+                v-for="field in hit.matched_fields || []"
+                :key="field"
+                class="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-900/60 text-amber-700 dark:text-amber-300"
+              >{{ i18n.t('search_field_' + field) }}</span>
             </div>
             <p v-if="hit.type === 'chapter' && hit.title" class="text-xs font-medium mb-0.5">
               <span class="text-muted dark:text-gray-400">{{ i18n.t('search_field_chapter_title') }}:</span>
@@ -273,10 +278,6 @@ onMounted(async () => {
                 {{ hit.matched_chapter.snippet }}
               </p>
             </div>
-            <p v-if="hit.matched_fields?.length" class="text-[11px] text-accent mt-1">
-              {{ i18n.t('search_matched_fields') }}:
-              {{ hit.matched_fields.map((f) => i18n.t('search_field_' + f)).join('、') }}
-            </p>
           </div>
         </div>
       </template>
