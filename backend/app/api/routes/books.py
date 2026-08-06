@@ -59,6 +59,14 @@ def _serialize_book(
     shelf_group_ids: dict[str, list[str]] | None = None,
 ) -> BookOut:
     is_admin = user.role in ("admin", "super_admin")
+    if can_view_r18(user):
+        category_names = [bc.category.name for bc in book.categories if bc.category]
+    else:
+        category_names = [
+            bc.category.name
+            for bc in book.categories
+            if bc.category and not bc.category.is_r18
+        ]
     return BookOut(
         id=book.id,
         title=book.title,
@@ -73,7 +81,7 @@ def _serialize_book(
         created_at=book.created_at,
         updated_at=book.updated_at,
         tag_names=visible_tags(user, book.tag_names),
-        category_names=book.category_names,
+        category_names=category_names,
         author_name=book.author_name,
         custom_tags=(custom_tags or {}).get(book.id, []),
         shelf_group_ids=(shelf_group_ids or {}).get(book.id, []),

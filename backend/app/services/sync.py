@@ -125,6 +125,18 @@ class SyncService:
         return [name for (name,) in rows.all()]
 
     @staticmethod
+    def _book_custom_tag_names(book) -> list[str]:
+        """Load user custom tag names for search indexing."""
+        try:
+            return [
+                bct.custom_tag.name
+                for bct in book.custom_tags
+                if bct.custom_tag
+            ]
+        except Exception:
+            return []
+
+    @staticmethod
     def _is_book_r18(source: Source, remote_book) -> bool:
         return detect_r18(
             source_is_r18=getattr(source, "is_r18", False),
@@ -226,16 +238,28 @@ class SyncService:
         )
 
         book_tags = await self._book_tag_names(book.id)
+        book_custom_tags = self._book_custom_tag_names(book)
+        index_tags = list(dict.fromkeys([*book_tags, *book_custom_tags]))
+        try:
+            from app.services.auto_categorize import AutoCategorizationService
+            book_category_names = await AutoCategorizationService.categorize_book(
+                self.db,
+                book.id,
+            )
+        except Exception:
+            await self.db.rollback()
+            book_category_names = []
         search_service.index_book({
             "id": book.id,
             "title": book.title,
-            "author": book.author_name or "",
+            "author": author_name,
             "description": book.description or "",
             "status": book.status or "",
             "source_id": book.source_id or "",
             "author_id": book.author_id or "",
             "is_r18": book.is_r18,
-            "tags": book_tags,
+            "tags": index_tags,
+            "category_names": book_category_names,
         })
 
         if is_new:
@@ -246,7 +270,7 @@ class SyncService:
         book_id = book.id
         book_title = book.title
         book_is_r18 = book.is_r18
-        book_author = book.author_name or ""
+        book_author = author_name
         book_description = (book.description or "")[:2000]
         book_values = {
             "source_id": book.source_id,
@@ -373,7 +397,8 @@ class SyncService:
                         "book_title": book_title,
                         "book_author": book_author,
                         "book_description": book_description,
-                        "tags": book_tags,
+                        "tags": index_tags,
+                        "category_names": book_category_names,
                         "is_r18": book_is_r18,
                     })
 
@@ -435,13 +460,6 @@ class SyncService:
             skipped,
             len(failed_chapters),
         )
-
-        # Auto-categorize after sync (if new book or new tags)
-        try:
-            from app.services.auto_categorize import AutoCategorizationService
-            await AutoCategorizationService.categorize_book(self.db, book_id)
-        except Exception:
-            await self.db.rollback()
 
         return {
             "book_id": book_id,
@@ -666,9 +684,12 @@ class SyncService:
         content = await self._fetch_chapter_with_retry(plugin, remote_chapter)
         book_id = book.id
         book_is_r18 = book.is_r18
-        book_author = book.author_name or ""
+        book_author = book.author_name or "Unknown"
         book_description = (book.description or "")[:2000]
         book_tags = list(book.tag_names)
+        book_custom_tags = self._book_custom_tag_names(book)
+        index_tags = list(dict.fromkeys([*book_tags, *book_custom_tags]))
+        book_category_names = list(book.category_names)
         author_name = book.author_name or "Unknown"
         content_path, content_hash = self.storage.write_chapter(
             author_name,
@@ -694,7 +715,8 @@ class SyncService:
             "book_title": book.title,
             "book_author": book_author,
             "book_description": book_description,
-            "tags": book_tags,
+            "tags": index_tags,
+            "category_names": book_category_names,
             "is_r18": book_is_r18,
         })
         emit(

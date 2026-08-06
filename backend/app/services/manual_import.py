@@ -60,6 +60,16 @@ class ManualImportService:
 
         classification_tag = "r18" if is_r18 else "all-ages"
         await self._save_tags(book.id, [*tags, classification_tag])
+        try:
+            from app.services.auto_categorize import AutoCategorizationService
+            matched = await AutoCategorizationService.categorize_book(self.db, book.id)
+        except Exception:
+            await self.db.rollback()
+            matched = []
+        book_tags = [name.strip().lower() for name in tags if name.strip()]
+        if classification_tag not in book_tags:
+            book_tags.append(classification_tag)
+        book_category_names = list(matched) if isinstance(matched, list) else []
 
         self.storage.write_metadata(
             author_name,
@@ -78,13 +88,14 @@ class ManualImportService:
         search_service.index_book({
             "id": book.id,
             "title": book.title,
-            "author": book.author_name or "",
+            "author": author_name,
             "description": book.description or "",
             "status": book.status or "",
             "source_id": "",
             "author_id": book.author_id or "",
             "is_r18": book.is_r18,
-            "tags": book.tag_names,
+            "tags": book_tags,
+            "category_names": book_category_names,
         })
 
         created = 0
@@ -118,18 +129,13 @@ class ManualImportService:
                 "book_title": title,
                 "book_author": author_name,
                 "book_description": (book.description or "")[: search_service.DESCRIPTION_INDEX_LIMIT],
-                "tags": book.tag_names,
+                "tags": book_tags,
+                "category_names": book_category_names,
                 "is_r18": book.is_r18,
             })
             created += 1
 
         await self.db.commit()
-
-        try:
-            from app.services.auto_categorize import AutoCategorizationService
-            await AutoCategorizationService.categorize_book(self.db, book.id)
-        except Exception:
-            await self.db.rollback()
 
         return {"book_id": book.id, "created_chapters": created}
 

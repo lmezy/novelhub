@@ -19,18 +19,27 @@ class SearchService:
         "author": "author",
         "description": "description",
         "tags": "tags",
+        "category": "category_names",
     }
     CHAPTER_BOOK_FIELD_ATTRS = {
         "title": "book_title",
         "author": "book_author",
         "description": "book_description",
         "tags": "tags",
+        "category": "category_names",
     }
     CHAPTER_FIELD_ATTRS = {
         "chapter_title": "title",
         "content": "content",
     }
-    SEARCHABLE_BOOKS = ["title", "author", "description", "status", "tags"]
+    SEARCHABLE_BOOKS = [
+        "title",
+        "author",
+        "description",
+        "status",
+        "tags",
+        "category_names",
+    ]
     SEARCHABLE_CHAPTERS = [
         "title",
         "book_title",
@@ -38,6 +47,7 @@ class SearchService:
         "book_description",
         "content",
         "tags",
+        "category_names",
     ]
     FILTERABLE_ATTRIBUTES = ["source_id", "book_id", "author_id", "is_r18", "tags"]
 
@@ -74,6 +84,16 @@ class SearchService:
         self._ensure_index(self.INDEX_CHAPTERS)
         self.client.index(self.INDEX_CHAPTERS).add_documents([chapter])
         logger.debug("Indexed chapter {}", chapter.get("id"))
+
+    def update_book_tags(self, book_id: str, tags: list[str]) -> None:
+        self._ensure_index(self.INDEX_BOOKS)
+        self.client.index(self.INDEX_BOOKS).add_documents([{"id": book_id, "tags": tags}])
+
+    def update_chapter_tags(self, chapter_id: str, tags: list[str]) -> None:
+        self._ensure_index(self.INDEX_CHAPTERS)
+        self.client.index(self.INDEX_CHAPTERS).add_documents([
+            {"id": chapter_id, "tags": tags}
+        ])
 
     def buffer_chapter(self, chapter: dict) -> None:
         """Queue a chapter for batched indexing, flushing in chunks."""
@@ -141,7 +161,13 @@ class SearchService:
         options = {
             "offset": offset,
             "limit": limit,
-            "attributesToSearchOn": ["title", "author", "description", "tags"],
+            "attributesToSearchOn": [
+                "title",
+                "author",
+                "description",
+                "tags",
+                "category_names",
+            ],
         }
         filters = self._combined_filter(allow_r18, allow_all_ages, tag)
         if filters:
@@ -174,6 +200,7 @@ class SearchService:
                 "book_description",
                 "content",
                 "tags",
+                "category_names",
             ],
         }
         filters = self._combined_filter(allow_r18, allow_all_ages, tag)
@@ -366,6 +393,8 @@ class SearchService:
 
             per_cond_max = {i: 0 for i in chapter_field_indices}
             and_chapter_totals: list[int] = []
+            best_chapter_id: str | None = None
+            best_chapter_score = 0
             for chapter_id in chapters_by_book.get(book_id, set()):
                 row: dict[int, int] = {}
                 for i in chapter_field_indices:
@@ -374,9 +403,17 @@ class SearchService:
                     per_cond_max[i] = max(per_cond_max[i], row[i])
                 if match == "and":
                     if all(row[i] > 0 for i in chapter_field_indices):
-                        and_chapter_totals.append(sum(row[i] for i in chapter_field_indices))
+                        chapter_total = sum(row[i] for i in chapter_field_indices)
+                        and_chapter_totals.append(chapter_total)
+                        if chapter_total > best_chapter_score:
+                            best_chapter_score = chapter_total
+                            best_chapter_id = chapter_id
                 else:
-                    and_chapter_totals.append(sum(v for v in row.values() if v > 0))
+                    chapter_total = sum(v for v in row.values() if v > 0)
+                    and_chapter_totals.append(chapter_total)
+                    if chapter_total > best_chapter_score:
+                        best_chapter_score = chapter_total
+                        best_chapter_id = chapter_id
 
             if match == "and":
                 book_level_ok = all(
@@ -426,6 +463,9 @@ class SearchService:
                 "doc": doc,
                 "score": total,
                 "scores": direct_scores,
+                "matched_chapter": (
+                    chapter_docs.get(best_chapter_id) if best_chapter_id else None
+                ),
             }
         return entities
 
@@ -459,6 +499,21 @@ class SearchService:
         book_id = str(doc.get("id") or "")
         description = doc.get("description") or ""
         values = [cond["value"] for cond in active]
+        matched_chapter = entity.get("matched_chapter")
+        matched_chapter_payload = None
+        if matched_chapter:
+            chapter_content = matched_chapter.get("content") or ""
+            matched_chapter_payload = {
+                "id": str(matched_chapter.get("id") or ""),
+                "book_id": str(matched_chapter.get("book_id") or book_id),
+                "title": matched_chapter.get("title") or "",
+                "chapter_number": matched_chapter.get("chapter_number"),
+                "content": chapter_content[:500],
+                "snippet": self._snippet(
+                    chapter_content or matched_chapter.get("title") or "",
+                    values,
+                ),
+            }
         return {
             "type": "book",
             "id": book_id,
@@ -467,6 +522,7 @@ class SearchService:
             "author": doc.get("author") or "",
             "description": description[: self.DESCRIPTION_INDEX_LIMIT],
             "tags": doc.get("tags") or [],
+            "category_names": doc.get("category_names") or [],
             "status": doc.get("status") or "",
             "is_r18": bool(doc.get("is_r18", False)),
             "score": entity["score"],
@@ -477,6 +533,7 @@ class SearchService:
                 chapter_cond_maps,
             ),
             "snippet": self._snippet(description or doc.get("title") or "", values),
+            "matched_chapter": matched_chapter_payload,
         }
 
     def _serialize_chapter(self, entity: dict, active: list[dict]) -> dict:
@@ -491,6 +548,7 @@ class SearchService:
             "title": doc.get("title") or "",
             "book_title": doc.get("book_title") or "",
             "author": doc.get("book_author") or "",
+            "category_names": doc.get("category_names") or [],
             "chapter_number": doc.get("chapter_number"),
             "content": content[:500],
             "snippet": self._snippet(content or doc.get("title") or "", values),
@@ -675,7 +733,7 @@ class SearchService:
 
         async def _rebuild():
             from app.core.database import SessionLocal
-            from app.models import Book, Chapter
+            from app.models import Book, BookCustomTag, Chapter, CustomTag
             from app.services.storage import BookStorage
             from sqlalchemy import select
 
@@ -691,8 +749,20 @@ class SearchService:
                 self._ensure_index(self.INDEX_CHAPTERS)
 
                 books = (await db.scalars(select(Book))).unique().all()
+                custom_rows = await db.execute(
+                    select(BookCustomTag.book_id, CustomTag.name)
+                    .join(CustomTag, BookCustomTag.custom_tag_id == CustomTag.id)
+                )
+                custom_tag_map: dict[str, list[str]] = {}
+                for book_id, name in custom_rows.all():
+                    custom_tag_map.setdefault(str(book_id), []).append(name)
                 book_meta: dict[str, dict] = {}
                 for book in books:
+                    tags = list(
+                        dict.fromkeys(
+                            [*book.tag_names, *custom_tag_map.get(book.id, [])]
+                        )
+                    )
                     doc = {
                         "id": book.id,
                         "title": book.title,
@@ -702,7 +772,8 @@ class SearchService:
                         "source_id": book.source_id or "",
                         "author_id": book.author_id or "",
                         "is_r18": book.is_r18,
-                        "tags": book.tag_names,
+                        "tags": tags,
+                        "category_names": book.category_names,
                     }
                     book_meta[book.id] = doc
                     self.index_book(doc)
@@ -731,6 +802,7 @@ class SearchService:
                         "content": content[: self.CONTENT_INDEX_LIMIT],
                         "is_r18": bool(meta.get("is_r18", False)),
                         "tags": meta.get("tags") or [],
+                        "category_names": meta.get("category_names") or [],
                     })
                     if len(batch) >= self.CHAPTER_BUFFER_SIZE:
                         self.client.index(self.INDEX_CHAPTERS).add_documents(batch)

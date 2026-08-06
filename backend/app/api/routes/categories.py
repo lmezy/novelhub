@@ -6,7 +6,7 @@ from app.models import Book, User
 from app.repositories.category import CategoryRepository
 from app.schemas.category import BookCategoryAssign, CategoryCreate, CategoryOut
 from app.services.auth import get_current_user, require_admin
-from app.services.visibility import ensure_book_visible
+from app.services.visibility import can_view_r18, ensure_book_visible
 
 router = APIRouter(prefix="/categories", tags=["categories"])
 
@@ -14,7 +14,7 @@ router = APIRouter(prefix="/categories", tags=["categories"])
 @router.get("", response_model=list[CategoryOut])
 async def list_categories(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     repo = CategoryRepository(db)
-    return await repo.list_all()
+    return await repo.list_all(include_r18=can_view_r18(user))
 
 
 @router.post("", response_model=CategoryOut, status_code=201, dependencies=[Depends(require_admin)])
@@ -23,7 +23,12 @@ async def create_category(payload: CategoryCreate, db: AsyncSession = Depends(ge
     existing = await repo.get_by_name(payload.name)
     if existing:
         raise HTTPException(status_code=409, detail="Category already exists")
-    return await repo.create(name=payload.name, description=payload.description, color=payload.color)
+    return await repo.create(
+        name=payload.name,
+        description=payload.description,
+        color=payload.color,
+        is_r18=payload.is_r18,
+    )
 
 
 @router.delete("/{category_id}", status_code=204, dependencies=[Depends(require_admin)])
@@ -39,7 +44,7 @@ async def get_book_categories(book_id: str, user: User = Depends(get_current_use
     if not ensure_book_visible(user, book):
         raise HTTPException(status_code=404, detail="Book not found")
     repo = CategoryRepository(db)
-    return await repo.get_book_categories(book_id)
+    return await repo.get_book_categories(book_id, include_r18=can_view_r18(user))
 
 
 @router.put("/book/{book_id}", response_model=list[CategoryOut])
@@ -48,8 +53,13 @@ async def set_book_categories(book_id: str, payload: BookCategoryAssign, user: U
     if not ensure_book_visible(user, book):
         raise HTTPException(status_code=404, detail="Book not found")
     repo = CategoryRepository(db)
-    await repo.set_book_categories(book_id, payload.category_ids)
-    return await repo.get_book_categories(book_id)
+    allowed_ids = []
+    for category_id in payload.category_ids:
+        cat = await repo.get(category_id)
+        if cat and (book.is_r18 or not cat.is_r18):
+            allowed_ids.append(category_id)
+    await repo.set_book_categories(book_id, allowed_ids)
+    return await repo.get_book_categories(book_id, include_r18=can_view_r18(user))
 
 
 @router.post("/auto", status_code=200, dependencies=[Depends(require_admin)])

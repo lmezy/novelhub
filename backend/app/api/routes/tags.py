@@ -9,7 +9,7 @@ from app.models import Tag, User
 from app.repositories.tag import TagRepository
 from app.schemas.tag import TagCreate, TagOut
 from app.services.auth import get_current_user, require_admin
-from app.services.visibility import R18_TAGS
+from app.services.visibility import CLASSIFICATION_TAGS, R18_TAGS, can_view_r18
 
 router = APIRouter(prefix="/tags", tags=["tags"])
 
@@ -24,6 +24,8 @@ async def list_tags(
     repo = TagRepository(db)
     tags = await repo.list(offset=offset, limit=limit)
     if user.role not in ("admin", "super_admin"):
+        tags = [tag for tag in tags if tag.name not in CLASSIFICATION_TAGS]
+    if not can_view_r18(user):
         tags = [tag for tag in tags if tag.name not in R18_TAGS]
     return tags
 

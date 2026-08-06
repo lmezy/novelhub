@@ -8,6 +8,7 @@ import { useI18nStore } from "../stores/i18n"
 
 type SearchField = "title" | "author" | "chapter_title" | "description" | "content"
   | "tags"
+  | "category"
 type MatchMode = "exact" | "fuzzy"
 
 interface Condition {
@@ -28,19 +29,25 @@ interface SearchHit {
   description?: string
   snippet?: string
   matched_fields?: string[]
+  matched_chapter?: {
+    id: string
+    book_id: string
+    title: string
+    chapter_number?: number
+    content?: string
+    snippet?: string
+  }
 }
 
 const router = useRouter()
 const auth = useAuthStore()
 const i18n = useI18nStore()
 
-const scope = ref<"books" | "chapters">("books")
 const match = ref<"and" | "or">("and")
 const conditions = ref<Condition[]>([
   { enabled: true, field: "title", mode: "exact", value: "" },
 ])
 const tags = ref<{ id: string; name: string }[]>([])
-const selectedTag = ref("")
 const results = ref<SearchHit[]>([])
 const total = ref(0)
 const searching = ref(false)
@@ -56,6 +63,7 @@ const fieldOptions: { value: SearchField; labelKey: string }[] = [
   { value: "description", labelKey: "search_field_description" },
   { value: "content", labelKey: "search_field_content" },
   { value: "tags", labelKey: "search_field_tags" },
+  { value: "category", labelKey: "search_field_category" },
 ]
 
 function activeConditions() {
@@ -66,7 +74,7 @@ function activeConditions() {
 
 async function loadTags() {
   try {
-    tags.value = await api.get<{ id: string; name: string }[]>("/tags?limit=100")
+    tags.value = await api.get<{ id: string; name: string }[]>("/tags?limit=200")
   } catch {
     tags.value = []
   }
@@ -74,8 +82,7 @@ async function loadTags() {
 
 function doSearch() {
   const conds = activeConditions()
-  const hasTag = !!selectedTag.value
-  if (conds.length === 0 && !hasTag) {
+  if (conds.length === 0) {
     searched.value = false
     results.value = []
     total.value = 0
@@ -92,8 +99,7 @@ function doSearch() {
         {
           conditions: conds,
           match: match.value,
-          scope: scope.value,
-          tag: selectedTag.value || undefined,
+          scope: "all",
           offset: 0,
           limit: 30,
         },
@@ -108,7 +114,7 @@ function doSearch() {
   }, 250)
 }
 
-watch([conditions, match, scope, selectedTag], () => doSearch(), { deep: true })
+watch([conditions, match], () => doSearch(), { deep: true })
 
 function addCondition() {
   conditions.value.push({ enabled: true, field: "title", mode: "exact", value: "" })
@@ -121,7 +127,9 @@ function removeCondition(index: number) {
 }
 
 function goToHit(hit: SearchHit) {
-  if (hit.type === "book") {
+  if (hit.type === "book" && hit.matched_chapter) {
+    router.push("/books/" + hit.matched_chapter.book_id + "/chapters/" + hit.matched_chapter.id)
+  } else if (hit.type === "book") {
     router.push("/books/" + hit.id)
   } else if (hit.book_id) {
     router.push("/books/" + hit.book_id + "/chapters/" + hit.id)
@@ -142,18 +150,6 @@ onMounted(async () => {
       <h1 class="text-2xl font-bold mb-6">{{ i18n.t('search_title') }}</h1>
 
       <div class="mb-4 flex flex-wrap items-center gap-2">
-        <div class="flex rounded-lg border border-border dark:border-gray-700 overflow-hidden">
-          <button
-            v-for="s in (['books', 'chapters'] as const)"
-            :key="s"
-            @click="scope = s"
-            class="text-xs px-3 py-2 transition-colors"
-            :class="scope === s
-              ? 'bg-accent text-white'
-              : 'bg-surface dark:bg-gray-900 text-muted dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'"
-          >{{ s === 'books' ? i18n.t('search_books') : i18n.t('search_chapters') }}</button>
-        </div>
-
         <div class="flex rounded-lg border border-border dark:border-gray-700 overflow-hidden">
           <button
             @click="match = 'and'"
@@ -200,6 +196,7 @@ onMounted(async () => {
           <input
             v-model="c.value"
             type="search"
+            :list="c.field === 'tags' ? 'search-tag-options' : undefined"
             :placeholder="i18n.t('search_condition_placeholder')"
             class="flex-1 min-w-[180px] px-3 py-1.5 rounded-md border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-sm focus:outline-none focus:ring-2 focus:ring-accent/30"
             @keydown.enter="doSearch"
@@ -212,6 +209,10 @@ onMounted(async () => {
         </div>
       </div>
 
+      <datalist id="search-tag-options">
+        <option v-for="t in tags" :key="t.id" :value="t.name">{{ t.name }}</option>
+      </datalist>
+
       <div class="flex flex-wrap items-center gap-3 mb-6">
         <button
           @click="addCondition"
@@ -221,16 +222,6 @@ onMounted(async () => {
           @click="doSearch"
           class="text-xs px-4 py-2 rounded-lg bg-accent text-white hover:opacity-90 transition-opacity"
         >{{ i18n.t('search_button') }}</button>
-        <label class="flex items-center gap-2 text-xs text-muted dark:text-gray-400">
-          {{ i18n.t('search_tag_label') }}
-          <select
-            v-model="selectedTag"
-            class="px-2 py-1.5 rounded-md border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-xs focus:outline-none"
-          >
-            <option value="">{{ i18n.t('search_all_tags') }}</option>
-            <option v-for="t in tags" :key="t.id" :value="t.name">{{ t.name }}</option>
-          </select>
-        </label>
       </div>
 
       <p v-if="error" class="text-sm text-red-600 mb-4">{{ error }}</p>
@@ -262,12 +253,26 @@ onMounted(async () => {
               <h3 class="text-sm font-medium">{{ hit.type === 'book' ? hit.title : hit.book_title }}</h3>
             </div>
             <p v-if="hit.type === 'chapter' && hit.title" class="text-xs font-medium mb-0.5">
+              <span class="text-muted dark:text-gray-400">{{ i18n.t('search_field_chapter_title') }}:</span>
               {{ hit.title }}
             </p>
             <p v-if="hit.author" class="text-xs text-muted dark:text-gray-400">{{ hit.author }}</p>
             <p v-if="hit.snippet" class="text-xs text-muted dark:text-gray-400 mt-1 line-clamp-2">
               {{ hit.snippet }}
             </p>
+            <div
+              v-if="hit.matched_chapter"
+              class="mt-2 px-2.5 py-2 rounded bg-accent/5 border border-accent/10"
+            >
+              <p class="text-xs font-medium mb-0.5">
+                <span class="text-muted dark:text-gray-400">{{ i18n.t('search_field_chapter_title') }}:</span>
+                {{ hit.matched_chapter.title }}
+              </p>
+              <p v-if="hit.matched_chapter.snippet" class="text-xs text-muted dark:text-gray-400 line-clamp-2">
+                <span class="text-muted dark:text-gray-400">{{ i18n.t('search_field_content') }}:</span>
+                {{ hit.matched_chapter.snippet }}
+              </p>
+            </div>
             <p v-if="hit.matched_fields?.length" class="text-[11px] text-accent mt-1">
               {{ i18n.t('search_matched_fields') }}:
               {{ hit.matched_fields.map((f) => i18n.t('search_field_' + f)).join('、') }}

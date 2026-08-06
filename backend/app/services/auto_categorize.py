@@ -26,7 +26,26 @@ DEFAULT_CATEGORY_RULES: dict[str, list[str]] = {
     "游戏": ["游戏", "网游", "电竞", "虚拟", "全息", "竞技"],
     "轻小说": ["轻小说", "二次元", "动漫", "同人", "综漫", "穿越"],
     "奇幻": ["奇幻", "魔幻", "西幻", "领主", "种田", "冒险"],
+    "调教": ["调教", "训诫", "调校"],
+    "反差": ["反差", "反差萌", "白丝", "黑丝"],
+    "凌辱": ["凌辱", "羞辱", "侮辱"],
+    "乱伦": ["乱伦", "母子", "父女", "兄妹", "姐弟"],
+    "母系": ["母系", "母亲", "妈妈", "熟女"],
+    "肉文": ["肉文", "黄文", "色文", "H文", "肉戏"],
+    "露出": ["露出", "暴露"],
+    "绿帽": ["绿帽", "NTR", "ntr", "出轨"],
     "其他": [],
+}
+
+R18_CATEGORY_NAMES = {
+    "调教",
+    "反差",
+    "凌辱",
+    "乱伦",
+    "母系",
+    "肉文",
+    "露出",
+    "绿帽",
 }
 
 
@@ -42,11 +61,19 @@ class AutoCategorizationService:
             "科幻": "#00008B", "历史": "#8B4513", "悬疑": "#4B0082",
             "武侠": "#B8860B", "游戏": "#008080", "轻小说": "#FF4500",
             "奇幻": "#2E8B57", "其他": "#808080",
+            "调教": "#8B0000", "反差": "#C71585", "凌辱": "#800000",
+            "乱伦": "#A52A2A", "母系": "#D2691E", "肉文": "#B22222",
+            "露出": "#DC143C", "绿帽": "#006400",
         }
         for name in DEFAULT_CATEGORY_RULES:
             existing = await repo.get_by_name(name)
             if existing is None:
-                await repo.create(name=name, description=f"Auto-generated: {name} novels", color=colors.get(name))
+                await repo.create(
+                    name=name,
+                    description=f"Auto-generated: {name} novels",
+                    color=colors.get(name),
+                    is_r18=name in R18_CATEGORY_NAMES,
+                )
 
     @staticmethod
     async def categorize_book(db: AsyncSession, book_id: str) -> list[str]:
@@ -69,6 +96,8 @@ class AutoCategorizationService:
 
         matched_categories = []
         for cat_name, keywords in DEFAULT_CATEGORY_RULES.items():
+            if cat_name in R18_CATEGORY_NAMES and not book.is_r18:
+                continue
             for kw in keywords:
                 if kw.lower() in combined:
                     matched_categories.append(cat_name)

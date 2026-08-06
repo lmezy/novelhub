@@ -3,7 +3,31 @@
 from app.models import Book, User
 
 
-R18_TAGS = {"r18", "all-ages"}
+CLASSIFICATION_TAGS = {"r18", "all-ages"}
+R18_TAGS = {
+    "调教",
+    "反差",
+    "凌辱",
+    "乱伦",
+    "母系",
+    "肉文",
+    "露出",
+    "绿帽",
+    "ntr",
+    "NTR",
+    "色情",
+    "黄文",
+    "色文",
+    "h文",
+    "H文",
+    "肉戏",
+    "sm",
+    "SM",
+    "羞辱",
+    "侮辱",
+    "熟女",
+    "出轨",
+}
 
 
 def can_view_r18(user: User) -> bool:
@@ -24,5 +48,9 @@ def ensure_book_visible(user: User, book: Book | None) -> bool:
 
 def visible_tags(user: User, tag_names: list[str]) -> list[str]:
     if user.role in ("admin", "super_admin"):
-        return list(tag_names)
-    return [name for name in tag_names if name not in R18_TAGS]
+        visible = list(tag_names)
+    else:
+        visible = [name for name in tag_names if name not in CLASSIFICATION_TAGS]
+    if not can_view_r18(user):
+        visible = [name for name in visible if name not in R18_TAGS]
+    return visible

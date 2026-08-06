@@ -24,6 +24,7 @@ class Book(Base):
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
     tags = relationship("BookTag", lazy="joined")
     categories = relationship("BookCategory", lazy="selectin")
+    custom_tags = relationship("BookCustomTag", lazy="selectin")
 
     @property
     def tag_names(self) -> list[str]:
@@ -31,7 +32,15 @@ class Book(Base):
 
     @property
     def category_names(self) -> list[str]:
-        return [bc.category.name for bc in self.categories if bc.category]
+        return [
+            bc.category.name
+            for bc in self.categories
+            if bc.category and (self.is_r18 or not bc.category.is_r18)
+        ]
+
+    @property
+    def custom_tag_names(self) -> list[str]:
+        return [bct.custom_tag.name for bct in self.custom_tags if bct.custom_tag]
 
     author = relationship("Author", lazy="joined")
     @property

@@ -38,7 +38,13 @@ def test_search_books_restricts_attributes():
     service.search_books("西游记")
 
     options = index.search.call_args.args[1]
-    assert options["attributesToSearchOn"] == ["title", "author", "description", "tags"]
+    assert options["attributesToSearchOn"] == [
+        "title",
+        "author",
+        "description",
+        "tags",
+        "category_names",
+    ]
 
 
 def test_chapter_buffer_flushes_in_batches():
@@ -132,6 +138,8 @@ def test_advanced_search_books_scope_and_requires_all_conditions():
     assert result["hits"][0]["type"] == "book"
     assert result["hits"][0]["title"] == "西游记"
     assert result["hits"][0]["matched_fields"] == ["title", "chapter_title"]
+    assert result["hits"][0]["matched_chapter"]["title"] == "三打白骨精"
+    assert "老鸡婆" in result["hits"][0]["matched_chapter"]["snippet"]
 
 
 def test_advanced_search_chapters_fuzzy_rank():
@@ -255,3 +263,28 @@ def test_advanced_search_tags_condition_matches_book_tags():
 
     assert result["total"] == 1
     assert result["hits"][0]["matched_fields"] == ["tags"]
+
+
+def test_advanced_search_category_condition_matches_book_categories():
+    service, books_index, chapters_index = _service_with_indexes()
+    books_index.search.return_value = {
+        "hits": [{
+            "id": "book-1",
+            "title": "仙侠录",
+            "author": "",
+            "description": "",
+            "tags": [],
+            "category_names": ["玄幻", "武侠"],
+            "is_r18": False,
+        }]
+    }
+
+    result = service.advanced_search(
+        [{"field": "category", "mode": "exact", "value": "玄幻"}],
+        match="and",
+        scope="books",
+    )
+
+    assert result["total"] == 1
+    assert result["hits"][0]["category_names"] == ["玄幻", "武侠"]
+    assert result["hits"][0]["matched_fields"] == ["category"]

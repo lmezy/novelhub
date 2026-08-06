@@ -9,8 +9,11 @@ class CategoryRepository:
     def __init__(self, db: AsyncSession):
         self.db = db
 
-    async def list_all(self) -> list[Category]:
-        result = await self.db.scalars(select(Category).order_by(Category.name))
+    async def list_all(self, include_r18: bool = True) -> list[Category]:
+        query = select(Category).order_by(Category.name)
+        if not include_r18:
+            query = query.where(Category.is_r18 == False)
+        result = await self.db.scalars(query)
         return list(result)
 
     async def get(self, category_id: str) -> Category | None:
@@ -19,8 +22,20 @@ class CategoryRepository:
     async def get_by_name(self, name: str) -> Category | None:
         return await self.db.scalar(select(Category).where(Category.name == name))
 
-    async def create(self, name: str, description: str | None = None, color: str | None = None) -> Category:
-        cat = Category(id=str(uuid4()), name=name, description=description, color=color)
+    async def create(
+        self,
+        name: str,
+        description: str | None = None,
+        color: str | None = None,
+        is_r18: bool = False,
+    ) -> Category:
+        cat = Category(
+            id=str(uuid4()),
+            name=name,
+            description=description,
+            color=color,
+            is_r18=is_r18,
+        )
         self.db.add(cat)
         await self.db.commit()
         await self.db.refresh(cat)
@@ -34,13 +49,20 @@ class CategoryRepository:
         await self.db.commit()
         return True
 
-    async def get_book_categories(self, book_id: str) -> list[Category]:
-        result = await self.db.scalars(
+    async def get_book_categories(
+        self,
+        book_id: str,
+        include_r18: bool = True,
+    ) -> list[Category]:
+        query = (
             select(Category)
             .join(BookCategory, BookCategory.category_id == Category.id)
             .where(BookCategory.book_id == book_id)
             .order_by(Category.name)
         )
+        if not include_r18:
+            query = query.where(Category.is_r18 == False)
+        result = await self.db.scalars(query)
         return list(result)
 
     async def set_book_categories(self, book_id: str, category_ids: list[str]) -> None:

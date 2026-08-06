@@ -23,6 +23,7 @@ class SearchCondition(BaseModel):
         "description",
         "content",
         "tags",
+        "category",
     ]
     mode: Literal["exact", "fuzzy"] = "exact"
     value: str = ""

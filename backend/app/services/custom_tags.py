@@ -7,7 +7,7 @@ from uuid import uuid4
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Book, BookCustomTag, CustomTag, User
+from app.models import Book, BookCustomTag, Chapter, CustomTag, User
 from app.services.visibility import ensure_book_visible
 
 
@@ -80,6 +80,28 @@ async def list_book_custom_tags(
     if not ensure_book_visible(user, book):
         raise ValueError("Book not found")
     return (await list_book_custom_tags_map(db, [book_id], user)).get(book_id, [])
+
+
+async def refresh_book_search_tags(db: AsyncSession, book_id: str) -> None:
+    """Update the search index with a book's imported and custom tag names."""
+    from app.services.search import search_service
+
+    book = await db.get(Book, book_id)
+    if book is None:
+        return
+    rows = await db.execute(
+        select(CustomTag.name)
+        .join(BookCustomTag, BookCustomTag.custom_tag_id == CustomTag.id)
+        .where(BookCustomTag.book_id == book_id)
+    )
+    custom_names = [name for (name,) in rows.all()]
+    tags = list(dict.fromkeys([*book.tag_names, *custom_names]))
+    search_service.update_book_tags(book_id, tags)
+    chapter_ids = await db.scalars(
+        select(Chapter.id).where(Chapter.book_id == book_id)
+    )
+    for chapter_id in chapter_ids:
+        search_service.update_chapter_tags(str(chapter_id), tags)
 
 
 async def apply_custom_tag(
