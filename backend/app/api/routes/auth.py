@@ -1,7 +1,7 @@
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -17,6 +17,7 @@ from app.services.auth import get_current_user
 from app.services.jwt import create_token
 from app.services.security import hash_password, verify_password
 from app.services.settings import get_registration_approval_enabled
+from app.services.account import email_available, username_available
 
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -24,15 +25,12 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 @router.post("/register", response_model=RegisterResult, status_code=201)
 async def register(payload: UserCreate, db: AsyncSession = Depends(get_db)):
-    existing = await db.scalar(select(User).where(User.username == payload.username))
-    if existing:
-        raise HTTPException(status_code=409, detail="Username already exists")
-    if payload.email:
-        existing_email = await db.scalar(
-            select(User).where(User.email == payload.email)
-        )
-        if existing_email:
-            raise HTTPException(status_code=409, detail="Email already exists")
+    username_error = await username_available(db, payload.username)
+    if username_error:
+        raise HTTPException(status_code=409, detail=username_error)
+    email_error = await email_available(db, payload.email)
+    if email_error:
+        raise HTTPException(status_code=409, detail=email_error)
 
     approval_enabled = await get_registration_approval_enabled(db)
     user = User(
@@ -60,7 +58,15 @@ async def register(payload: UserCreate, db: AsyncSession = Depends(get_db)):
 
 @router.post("/login", response_model=TokenOut)
 async def login(payload: UserLogin, db: AsyncSession = Depends(get_db)):
-    user = await db.scalar(select(User).where(User.username == payload.username))
+    identifier = (payload.username or "").strip()
+    user = await db.scalar(
+        select(User).where(
+            or_(
+                User.username == identifier,
+                func.lower(User.email) == identifier.lower(),
+            )
+        )
+    )
     if user is None or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid username or password")
     if not user.approved and user.role not in ("admin", "super_admin"):

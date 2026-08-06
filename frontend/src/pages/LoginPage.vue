@@ -80,12 +80,12 @@ async function submit() {
 
       <form @submit.prevent="submit" class="space-y-4">
         <div>
-          <label class="block text-sm text-muted dark:text-gray-400 mb-1">{{ i18n.t('login_username') }}</label>
+          <label class="block text-sm text-muted dark:text-gray-400 mb-1">{{ isRegister ? i18n.t('login_username') : i18n.t('login_username_or_email') }}</label>
           <input
             v-model="username"
             type="text"
             class="w-full px-3 py-2 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-ink placeholder:text-muted dark:text-gray-400 focus:outline-none focus:ring-2 focus:ring-accent/30 text-sm"
-            :placeholder="i18n.t('login_username_placeholder')"
+            :placeholder="isRegister ? i18n.t('login_username_placeholder') : i18n.t('login_username_or_email_placeholder')"
           />
         </div>
         <div v-if="isRegister">

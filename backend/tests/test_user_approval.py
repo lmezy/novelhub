@@ -8,11 +8,18 @@ from app.core.database import get_db
 from app.main import app
 from app.services.auth import get_current_user, require_admin
 from app.services.security import hash_password, verify_password
+from app.services.account import username_available
 
 
 def _db_with_scalar(value=None):
     db = AsyncMock()
     db.scalar = AsyncMock(return_value=value)
+    return db
+
+
+def _db_with_scalar_sequence(values):
+    db = AsyncMock()
+    db.scalar = AsyncMock(side_effect=values)
     return db
 
 
@@ -152,6 +159,79 @@ async def test_pending_user_cannot_login():
         app.dependency_overrides.clear()
 
     assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_login_by_email():
+    user = SimpleNamespace(
+        id="user-1",
+        username="reader",
+        role="user",
+        approved=True,
+        password_hash=hash_password("secret1"),
+    )
+    db = _db_with_scalar(user)
+    app.dependency_overrides[get_db] = lambda: db
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/api/auth/login",
+                json={"username": "reader@example.com", "password": "secret1"},
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    assert resp.json()["access_token"]
+
+
+@pytest.mark.asyncio
+async def test_register_duplicate_username_rejected():
+    db = _db_with_scalar_sequence([object()])
+    app.dependency_overrides[get_db] = lambda: db
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/api/auth/register",
+                json={"username": "taken", "password": "secret1"},
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_register_duplicate_email_rejected():
+    db = _db_with_scalar_sequence([None, object()])
+    app.dependency_overrides[get_db] = lambda: db
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/api/auth/register",
+                json={
+                    "username": "newuser",
+                    "email": "taken@example.com",
+                    "password": "secret1",
+                },
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_username_reserved_by_recent_deleted_account():
+    db = AsyncMock()
+    db.scalar = AsyncMock(side_effect=[None, object()])
+
+    error = await username_available(db, "taken")
+
+    assert error is not None
 
 
 @pytest.mark.asyncio

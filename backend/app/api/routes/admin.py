@@ -23,6 +23,11 @@ from app.services.settings import (
     get_registration_approval_enabled,
     set_registration_approval_enabled,
 )
+from app.services.account import (
+    email_available,
+    reserve_deleted_account,
+    username_available,
+)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -49,17 +54,12 @@ async def create_user(
             status_code=403,
             detail="Only super admin can create admin users",
         )
-    existing = await db.scalar(
-        select(User).where(User.username == payload.username)
-    )
-    if existing:
-        raise HTTPException(status_code=409, detail="Username already exists")
-    if payload.email:
-        existing_email = await db.scalar(
-            select(User).where(User.email == payload.email)
-        )
-        if existing_email:
-            raise HTTPException(status_code=409, detail="Email already exists")
+    username_error = await username_available(db, payload.username)
+    if username_error:
+        raise HTTPException(status_code=409, detail=username_error)
+    email_error = await email_available(db, payload.email)
+    if email_error:
+        raise HTTPException(status_code=409, detail=email_error)
 
     user = User(
         id=str(uuid4()),
@@ -116,6 +116,7 @@ async def delete_user(
     if target.id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
 
+    reserve_deleted_account(db, target.username, target.email)
     await db.delete(target)
     await db.commit()
     return {"status": "ok", "deleted": user_id}

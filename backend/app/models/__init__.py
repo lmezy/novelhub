@@ -26,6 +26,7 @@ from .reading_progress import ReadingProgress
 from .book_version import BookVersion
 from .source_change import SourceChange
 from .app_setting import AppSetting
+from .deleted_account import DeletedAccount
 
 
 
@@ -58,6 +59,7 @@ __all__=[
     "BookVersion",
 
     "AppSetting",
+    "DeletedAccount",
 ]
 
 from .chapter_embedding import ChapterEmbedding  # noqa: F401
