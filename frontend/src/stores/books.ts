@@ -15,6 +15,7 @@ export interface Book {
   created_at: string
   updated_at: string
   tag_names: string[]
+  category_names: string[]
   author_name: string | null
   custom_tags?: CustomTagOnBook[]
   shelf_group_ids?: string[]

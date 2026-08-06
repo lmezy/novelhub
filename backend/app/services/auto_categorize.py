@@ -26,6 +26,7 @@ DEFAULT_CATEGORY_RULES: dict[str, list[str]] = {
     "游戏": ["游戏", "网游", "电竞", "虚拟", "全息", "竞技"],
     "轻小说": ["轻小说", "二次元", "动漫", "同人", "综漫", "穿越"],
     "奇幻": ["奇幻", "魔幻", "西幻", "领主", "种田", "冒险"],
+    "其他": [],
 }
 
 
@@ -40,7 +41,7 @@ class AutoCategorizationService:
             "玄幻": "#8B0000", "都市": "#006400", "言情": "#FF69B4",
             "科幻": "#00008B", "历史": "#8B4513", "悬疑": "#4B0082",
             "武侠": "#B8860B", "游戏": "#008080", "轻小说": "#FF4500",
-            "奇幻": "#2E8B57",
+            "奇幻": "#2E8B57", "其他": "#808080",
         }
         for name in DEFAULT_CATEGORY_RULES:
             existing = await repo.get_by_name(name)
@@ -58,13 +59,13 @@ class AutoCategorizationService:
             select(Tag).join(BookTag).where(BookTag.book_id == book_id)
         )
         tag_texts = [t.name.lower() for t in tags]
-        if not tag_texts:
-            logger.debug("No tags for book {}, skipping auto-categorization", book_id)
-            return []
         # Also check title and description
         title_lower = (book.title or "").lower()
         desc_lower = (book.description or "").lower()
         combined = " ".join(tag_texts) + " " + title_lower + " " + desc_lower
+        if not combined.strip():
+            logger.debug("No text for book {}, skipping auto-categorization", book_id)
+            return []
 
         matched_categories = []
         for cat_name, keywords in DEFAULT_CATEGORY_RULES.items():
@@ -72,6 +73,9 @@ class AutoCategorizationService:
                 if kw.lower() in combined:
                     matched_categories.append(cat_name)
                     break
+
+        if not matched_categories:
+            matched_categories = ["其他"]
 
         if matched_categories:
             repo = CategoryRepository(db)

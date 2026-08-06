@@ -78,11 +78,13 @@ class ManualImportService:
         search_service.index_book({
             "id": book.id,
             "title": book.title,
+            "author": book.author_name or "",
             "description": book.description or "",
             "status": book.status or "",
             "source_id": "",
             "author_id": book.author_id or "",
             "is_r18": book.is_r18,
+            "tags": book.tag_names,
         })
 
         created = 0
@@ -112,7 +114,11 @@ class ManualImportService:
                 "book_id": book.id,
                 "title": chapter_title,
                 "chapter_number": index,
-                "content": content[:5000],
+                "content": content[: search_service.CONTENT_INDEX_LIMIT],
+                "book_title": title,
+                "book_author": author_name,
+                "book_description": (book.description or "")[: search_service.DESCRIPTION_INDEX_LIMIT],
+                "tags": book.tag_names,
                 "is_r18": book.is_r18,
             })
             created += 1

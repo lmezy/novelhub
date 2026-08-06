@@ -12,9 +12,18 @@ const i18n = useI18nStore()
 const selectedIds = ref<string[]>([])
 const batchDeleting = ref(false)
 const batchFavoriting = ref(false)
+const autoCategorizing = ref(false)
+const categories = ref<{ id: string; name: string; color?: string | null }[]>([])
+const selectedCategory = ref("")
+
+const filteredBooks = computed(() => {
+  if (!selectedCategory.value) return store.books
+  return store.books.filter((book) => book.category_names?.includes(selectedCategory.value))
+})
 
 const allSelected = computed(() =>
-  store.books.length > 0 && selectedIds.value.length === store.books.length
+  filteredBooks.value.length > 0 &&
+  filteredBooks.value.every((book) => selectedIds.value.includes(book.id))
 )
 
 function toggleSelect(id: string) {
@@ -24,12 +33,12 @@ function toggleSelect(id: string) {
 }
 
 function selectAll() {
-  selectedIds.value = store.books.map((book) => book.id)
+  selectedIds.value = filteredBooks.value.map((book) => book.id)
 }
 
 function invertSelection() {
   const selected = new Set(selectedIds.value)
-  selectedIds.value = store.books
+  selectedIds.value = filteredBooks.value
     .filter((book) => !selected.has(book.id))
     .map((book) => book.id)
 }
@@ -83,7 +92,30 @@ async function batchAddShelf() {
   }
 }
 
+async function autoCategorizeAll() {
+  if (!confirm(i18n.t('books_auto_category_confirm'))) return
+  autoCategorizing.value = true
+  try {
+    const res = await api.post<{ total: number; categorized: number }>("/categories/auto")
+    alert(i18n.t('books_auto_category_done', { total: res.total, categorized: res.categorized }))
+    await store.fetchBooks()
+  } catch (e) {
+    alert(e instanceof Error ? e.message : i18n.t('books_auto_category_failed'))
+  } finally {
+    autoCategorizing.value = false
+  }
+}
+
+async function loadCategories() {
+  try {
+    categories.value = await api.get<{ id: string; name: string; color?: string | null }[]>("/categories")
+  } catch {
+    categories.value = []
+  }
+}
+
 onMounted(async () => {
+  await loadCategories()
   await store.fetchBooks()
 })
 </script>
@@ -100,7 +132,13 @@ onMounted(async () => {
             <p class="text-sm text-muted dark:text-gray-400 mt-1">{{ i18n.t('books_subtitle') }}</p>
           </div>
           <div class="flex items-center gap-3">
-            <span class="text-sm text-muted dark:text-gray-400">{{ i18n.t('home_books_count', { n: store.books.length }) }}</span>
+            <span class="text-sm text-muted dark:text-gray-400">{{ i18n.t('home_books_count', { n: filteredBooks.length }) }}</span>
+            <button
+              v-if="auth.isAdmin"
+              @click="autoCategorizeAll"
+              :disabled="autoCategorizing"
+              class="text-xs px-3 py-1.5 rounded border border-accent/40 text-accent hover:bg-accent/5 disabled:opacity-50"
+            >{{ autoCategorizing ? i18n.t('books_auto_category_running') : i18n.t('books_auto_category') }}</button>
             <button
               v-if="selectedIds.length"
               @click="batchAddShelf"
@@ -127,6 +165,16 @@ onMounted(async () => {
         <template v-else>
           <div class="mb-3 flex flex-wrap items-center gap-2 text-xs">
             <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
+              <span>{{ i18n.t('books_category_label') }}</span>
+              <select
+                v-model="selectedCategory"
+                class="px-2 py-1 rounded border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-xs focus:outline-none"
+              >
+                <option value="">{{ i18n.t('books_all_categories') }}</option>
+                <option v-for="cat in categories" :key="cat.id" :value="cat.name">{{ cat.name }}</option>
+              </select>
+            </label>
+            <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
               <input
                 type="checkbox"
                 :checked="allSelected"
@@ -148,9 +196,13 @@ onMounted(async () => {
             <span class="text-muted dark:text-gray-400">{{ i18n.t('books_selected_count', { n: selectedIds.length }) }}</span>
           </div>
 
+          <p v-if="filteredBooks.length === 0" class="text-muted dark:text-gray-400 text-center py-10">
+            {{ i18n.t('books_category_empty') }}
+          </p>
+
           <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
           <router-link
-            v-for="book in store.books"
+            v-for="book in filteredBooks"
             :key="book.id"
             :to="'/books/' + book.id"
             class="relative group block p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 hover:shadow-md hover:border-accent/30 transition-all duration-200 no-underline"
@@ -169,6 +221,13 @@ onMounted(async () => {
             >{{ book.is_favorite ? '★' : '☆' }}</button>
             <h3 class="font-semibold text-ink mb-1 truncate pr-6">{{ book.title }}</h3>
             <p v-if="book.author_name" class="text-xs text-muted dark:text-gray-400 mb-1">{{ book.author_name }}</p>
+            <div v-if="book.category_names?.length" class="flex flex-wrap gap-1 mb-1">
+              <span
+                v-for="cat in book.category_names"
+                :key="cat"
+                class="text-xs px-2 py-0.5 rounded bg-accent/10 text-accent"
+              >{{ cat }}</span>
+            </div>
             <div v-if="book.tag_names?.length || book.custom_tags?.length" class="flex flex-wrap gap-1 mb-2">
               <span
                 v-for="tag in book.tag_names"

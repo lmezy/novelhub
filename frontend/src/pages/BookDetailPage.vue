@@ -33,6 +33,11 @@ const shelfGroups = ref<ShelfGroup[]>([])
 const bookGroupIds = ref<string[]>([])
 const groupSaving = ref(false)
 const groupError = ref("")
+const allCategories = ref<{ id: string; name: string; color?: string | null }[]>([])
+const selectedCategoryIds = ref<string[]>([])
+const categorySaving = ref(false)
+const autoCategorizing = ref(false)
+const categoryError = ref("")
 
 async function toggleFavorite() {
   if (!book.value) return
@@ -46,6 +51,57 @@ async function loadCustomTags() {
     customTags.value = await api.get<CustomTagOnBook[]>("/custom-tags/books/" + book.value.id)
   } catch {
     customTags.value = []
+  }
+}
+
+async function loadCategories() {
+  try {
+    allCategories.value = await api.get<{ id: string; name: string; color?: string | null }[]>("/categories")
+  } catch {
+    allCategories.value = []
+  }
+}
+
+function initCategorySelection() {
+  if (!book.value) return
+  const names = new Set(book.value.category_names || [])
+  selectedCategoryIds.value = allCategories.value
+    .filter((cat) => names.has(cat.name))
+    .map((cat) => cat.id)
+}
+
+async function saveCategories() {
+  if (!book.value) return
+  categorySaving.value = true
+  categoryError.value = ""
+  try {
+    const res = await api.put<{ id: string; name: string }[]>("/categories/book/" + book.value.id, {
+      book_id: book.value.id,
+      category_ids: selectedCategoryIds.value,
+    })
+    book.value.category_names = res.map((cat) => cat.name)
+    alert(i18n.t('book_category_saved'))
+  } catch (e) {
+    categoryError.value = e instanceof Error ? e.message : i18n.t('book_category_failed')
+  } finally {
+    categorySaving.value = false
+  }
+}
+
+async function autoCategorizeBook() {
+  if (!book.value) return
+  autoCategorizing.value = true
+  categoryError.value = ""
+  try {
+    const res = await api.post<{ book_id: string; categories: string[] }>(
+      "/categories/auto/" + book.value.id,
+    )
+    book.value.category_names = res.categories || []
+    initCategorySelection()
+  } catch (e) {
+    categoryError.value = e instanceof Error ? e.message : i18n.t('book_category_failed')
+  } finally {
+    autoCategorizing.value = false
   }
 }
 
@@ -162,6 +218,8 @@ onMounted(async () => {
     favorite.value = book.value.is_favorite || false
     chapters.value = await store.fetchChapters(route.params.id as string)
     await loadCustomTags()
+    await loadCategories()
+    initCategorySelection()
     await loadShelfGroups()
     await loadBookGroups()
     await loadAlternates()
@@ -209,6 +267,13 @@ onMounted(async () => {
               :key="tag"
               class="text-xs px-2 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-muted dark:text-gray-400"
             >{{ tag }}</span>
+          </div>
+          <div v-if="book.category_names?.length" class="flex flex-wrap gap-1 mb-2">
+            <span
+              v-for="cat in book.category_names"
+              :key="cat"
+              class="text-xs px-2 py-0.5 rounded bg-accent/10 text-accent"
+            >{{ cat }}</span>
           </div>
           <p v-if="book.description" class="text-muted dark:text-gray-400 mb-3">{{ book.description }}</p>
           <div class="flex items-center gap-3">
@@ -271,6 +336,32 @@ onMounted(async () => {
             >{{ syncing ? i18n.t('book_syncing') : i18n.t('book_resync') }}</button>
           </div>
         </header>
+
+        <section v-if="auth.isAdmin" class="mb-8">
+          <h2 class="text-lg font-semibold mb-3">{{ i18n.t('book_category_manage') }}</h2>
+          <div v-if="allCategories.length" class="flex flex-wrap gap-3 mb-3">
+            <label
+              v-for="cat in allCategories"
+              :key="cat.id"
+              class="inline-flex items-center gap-1.5 text-sm cursor-pointer"
+            >
+              <input type="checkbox" :value="cat.id" v-model="selectedCategoryIds" class="rounded" />
+              <span>{{ cat.name }}</span>
+            </label>
+          </div>
+          <p v-else class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('book_category_empty') }}</p>
+          <button
+            @click="saveCategories"
+            :disabled="categorySaving"
+            class="px-3 py-1.5 rounded bg-accent text-white text-xs font-medium hover:opacity-90 disabled:opacity-50"
+          >{{ i18n.t('book_category_save') }}</button>
+          <button
+            @click="autoCategorizeBook"
+            :disabled="autoCategorizing"
+            class="px-3 py-1.5 rounded border border-accent/40 text-accent text-xs font-medium hover:bg-accent/5 disabled:opacity-50"
+          >{{ autoCategorizing ? i18n.t('book_category_auto_running') : i18n.t('book_category_auto') }}</button>
+          <p v-if="categoryError" class="text-xs text-red-600 mt-2">{{ categoryError }}</p>
+        </section>
 
         <section class="mb-8">
           <h2 class="text-lg font-semibold mb-3">{{ i18n.t('book_custom_tags') }}</h2>

@@ -23,9 +23,16 @@ class Book(Base):
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
     tags = relationship("BookTag", lazy="joined")
+    categories = relationship("BookCategory", lazy="selectin")
+
     @property
     def tag_names(self) -> list[str]:
         return [bt.tag.name for bt in self.tags if bt.tag]
+
+    @property
+    def category_names(self) -> list[str]:
+        return [bc.category.name for bc in self.categories if bc.category]
+
     author = relationship("Author", lazy="joined")
     @property
     def author_name(self) -> str | None:

@@ -65,6 +65,8 @@ async def seed_default_super_admin():
             logger.info("Default super admin created: admin / admin")
         else:
             logger.info("Super admin already exists, skipping seed.")
+        from app.services.auto_categorize import AutoCategorizationService
+        await AutoCategorizationService.ensure_default_categories(db)
 
 
 @app.get("/")

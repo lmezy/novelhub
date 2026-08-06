@@ -67,6 +67,7 @@ class BookOut(BaseModel):
     class Config:
         from_attributes = True
     tag_names: list[str] = []
+    category_names: list[str] = []
     author_name: str | None = None
     custom_tags: list[CustomTagOnBookOut] = []
     shelf_group_ids: list[str] = []

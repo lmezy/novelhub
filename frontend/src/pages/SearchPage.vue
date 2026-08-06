@@ -6,158 +6,231 @@ import { useRouter } from "vue-router"
 import { useAuthStore } from "../stores/auth"
 import { useI18nStore } from "../stores/i18n"
 
-type SearchMode = "library" | "sources"
+type SearchField = "title" | "author" | "chapter_title" | "description" | "content"
+  | "tags"
+type MatchMode = "exact" | "fuzzy"
+
+interface Condition {
+  enabled: boolean
+  field: SearchField
+  mode: MatchMode
+  value: string
+}
+
+interface SearchHit {
+  type: "book" | "chapter"
+  id: string
+  book_id?: string
+  title: string
+  book_title?: string
+  author?: string
+  chapter_number?: number
+  description?: string
+  snippet?: string
+  matched_fields?: string[]
+}
 
 const router = useRouter()
 const auth = useAuthStore()
 const i18n = useI18nStore()
-const mode = ref<SearchMode>("library")
-const query = ref("")
+
 const scope = ref<"books" | "chapters">("books")
-const sources = ref<{ id: string; name: string }[]>([])
-const sourceId = ref("")
-const results = ref<any[]>([])
-const remoteResults = ref<any[]>([])
+const match = ref<"and" | "or">("and")
+const conditions = ref<Condition[]>([
+  { enabled: true, field: "title", mode: "exact", value: "" },
+])
+const tags = ref<{ id: string; name: string }[]>([])
+const selectedTag = ref("")
+const results = ref<SearchHit[]>([])
 const total = ref(0)
-const remoteTotal = ref(0)
 const searching = ref(false)
 const searched = ref(false)
 const error = ref("")
-const syncingUrl = ref("")
 
 let timer: ReturnType<typeof setTimeout>
 
-async function loadSources() {
+const fieldOptions: { value: SearchField; labelKey: string }[] = [
+  { value: "title", labelKey: "search_field_title" },
+  { value: "author", labelKey: "search_field_author" },
+  { value: "chapter_title", labelKey: "search_field_chapter_title" },
+  { value: "description", labelKey: "search_field_description" },
+  { value: "content", labelKey: "search_field_content" },
+  { value: "tags", labelKey: "search_field_tags" },
+]
+
+function activeConditions() {
+  return conditions.value
+    .filter((c) => c.enabled && c.value.trim())
+    .map((c) => ({ field: c.field, mode: c.mode, value: c.value.trim() }))
+}
+
+async function loadTags() {
   try {
-    sources.value = await api.get<{ id: string; name: string }[]>("/sources")
-    if (!sourceId.value && sources.value.length) {
-      sourceId.value = sources.value[0].id
-    }
-  } catch (e) {
-    error.value = e instanceof Error ? e.message : i18n.t('search_failed_load_sources')
+    tags.value = await api.get<{ id: string; name: string }[]>("/tags?limit=100")
+  } catch {
+    tags.value = []
   }
 }
 
 function doSearch() {
-  if (!query.value.trim()) return
+  const conds = activeConditions()
+  const hasTag = !!selectedTag.value
+  if (conds.length === 0 && !hasTag) {
+    searched.value = false
+    results.value = []
+    total.value = 0
+    return
+  }
   searching.value = true
   searched.value = true
   error.value = ""
   clearTimeout(timer)
   timer = setTimeout(async () => {
     try {
-      const q = encodeURIComponent(query.value.trim())
-      if (mode.value === "library") {
-        const res = await api.get<{ hits: any[]; total: number }>(
-          "/search?q=" + q + "&scope=" + scope.value + "&limit=30",
-        )
-        results.value = res.hits
-        total.value = res.total
-      } else {
-        if (!sourceId.value) {
-          error.value = i18n.t('search_select_source')
-          return
-        }
-        const res = await api.get<{ results: any[]; total: number }>(
-          "/sources/" + encodeURIComponent(sourceId.value) + "/search?q=" + q + "&page=1&limit=30",
-        )
-        remoteResults.value = res.results
-        remoteTotal.value = res.total
-      }
+      const res = await api.post<{ hits: SearchHit[]; total: number }>(
+        "/search/advanced",
+        {
+          conditions: conds,
+          match: match.value,
+          scope: scope.value,
+          tag: selectedTag.value || undefined,
+          offset: 0,
+          limit: 30,
+        },
+      )
+      results.value = res.hits
+      total.value = res.total
     } catch (e) {
-      error.value = e instanceof Error ? e.message : i18n.t('search_failed')
+      error.value = e instanceof Error ? e.message : i18n.t("search_failed")
     } finally {
       searching.value = false
     }
-  }, 300)
+  }, 250)
 }
 
-async function syncRemote(item: any) {
-  if (syncingUrl.value) return
-  syncingUrl.value = item.url
-  try {
-    const res = await api.post<{ book_id: string }>("/sync/book", {
-      source_id: item.source_id,
-      url: item.url,
-    })
-    router.push("/books/" + res.book_id)
-  } catch (e) {
-    alert(e instanceof Error ? e.message : i18n.t('search_sync_failed'))
-  } finally {
-    syncingUrl.value = ""
+watch([conditions, match, scope, selectedTag], () => doSearch(), { deep: true })
+
+function addCondition() {
+  conditions.value.push({ enabled: true, field: "title", mode: "exact", value: "" })
+  doSearch()
+}
+
+function removeCondition(index: number) {
+  conditions.value.splice(index, 1)
+  doSearch()
+}
+
+function goToHit(hit: SearchHit) {
+  if (hit.type === "book") {
+    router.push("/books/" + hit.id)
+  } else if (hit.book_id) {
+    router.push("/books/" + hit.book_id + "/chapters/" + hit.id)
   }
 }
 
-watch(query, () => {
-  if (query.value.trim().length >= 2) doSearch()
-})
-watch(mode, () => {
-  results.value = []
-  remoteResults.value = []
-  if (query.value.trim().length >= 2) doSearch()
-})
-watch(scope, () => {
-  if (mode.value === "library" && query.value.trim().length >= 2) doSearch()
-})
-watch(sourceId, () => {
-  if (mode.value === "sources" && query.value.trim().length >= 2) doSearch()
-})
-
 onMounted(async () => {
   await auth.fetchMe()
-  await loadSources()
+  await loadTags()
 })
 </script>
 
 <template>
-  <div class="min-h-screen bg-paper dark:bg-gray-800 dark:bg-gray-950 dark:text-gray-100">
+  <div class="min-h-screen bg-paper dark:bg-gray-950 dark:text-gray-100">
     <NavBar />
 
     <main class="max-w-3xl mx-auto px-4 py-8">
       <h1 class="text-2xl font-bold mb-6">{{ i18n.t('search_title') }}</h1>
 
-      <div class="flex gap-2 mb-4">
-        <button
-          v-for="m in (['library', 'sources'] as const)"
-          :key="m"
-          @click="mode = m"
-          class="text-xs px-3 py-1 rounded-full transition-colors"
-          :class="mode === m ? 'bg-accent text-white' : 'bg-gray-100 dark:bg-gray-700 text-muted dark:text-gray-400 hover:bg-gray-200'"
-        >{{ m === 'library' ? i18n.t('search_library') : i18n.t('search_book_sources') }}</button>
+      <div class="mb-4 flex flex-wrap items-center gap-2">
+        <div class="flex rounded-lg border border-border dark:border-gray-700 overflow-hidden">
+          <button
+            v-for="s in (['books', 'chapters'] as const)"
+            :key="s"
+            @click="scope = s"
+            class="text-xs px-3 py-2 transition-colors"
+            :class="scope === s
+              ? 'bg-accent text-white'
+              : 'bg-surface dark:bg-gray-900 text-muted dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'"
+          >{{ s === 'books' ? i18n.t('search_books') : i18n.t('search_chapters') }}</button>
+        </div>
+
+        <div class="flex rounded-lg border border-border dark:border-gray-700 overflow-hidden">
+          <button
+            @click="match = 'and'"
+            class="text-xs px-3 py-2 transition-colors"
+            :class="match === 'and'
+              ? 'bg-accent text-white'
+              : 'bg-surface dark:bg-gray-900 text-muted dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'"
+          >{{ i18n.t('search_match_and') }}</button>
+          <button
+            @click="match = 'or'"
+            class="text-xs px-3 py-2 transition-colors"
+            :class="match === 'or'
+              ? 'bg-accent text-white'
+              : 'bg-surface dark:bg-gray-900 text-muted dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'"
+          >{{ i18n.t('search_match_or') }}</button>
+        </div>
       </div>
 
-      <div class="flex gap-2 mb-4">
-        <input
-          v-model="query"
-          type="search"
-          :placeholder="i18n.t('search_placeholder')"
-          class="flex-1 px-4 py-2.5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-ink placeholder:text-muted dark:text-gray-400 focus:outline-none focus:ring-2 focus:ring-accent/30 text-sm"
-          @keydown.enter="doSearch"
-        />
+      <div class="space-y-3 mb-3">
+        <div
+          v-for="(c, i) in conditions"
+          :key="i"
+          class="flex flex-wrap items-center gap-2 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 px-3 py-2"
+        >
+          <label class="flex items-center gap-1.5 text-xs text-muted dark:text-gray-400 cursor-pointer">
+            <input v-model="c.enabled" type="checkbox" class="accent-accent h-4 w-4" />
+            {{ i18n.t('search_condition') }} {{ i + 1 }}
+          </label>
+          <select
+            v-model="c.field"
+            class="px-2 py-1.5 rounded-md border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-xs focus:outline-none"
+          >
+            <option v-for="f in fieldOptions" :key="f.value" :value="f.value">
+              {{ i18n.t(f.labelKey) }}
+            </option>
+          </select>
+          <select
+            v-model="c.mode"
+            class="px-2 py-1.5 rounded-md border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-xs focus:outline-none"
+          >
+            <option value="exact">{{ i18n.t('search_mode_exact') }}</option>
+            <option value="fuzzy">{{ i18n.t('search_mode_fuzzy') }}</option>
+          </select>
+          <input
+            v-model="c.value"
+            type="search"
+            :placeholder="i18n.t('search_condition_placeholder')"
+            class="flex-1 min-w-[180px] px-3 py-1.5 rounded-md border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-sm focus:outline-none focus:ring-2 focus:ring-accent/30"
+            @keydown.enter="doSearch"
+          />
+          <button
+            v-if="conditions.length > 1"
+            @click="removeCondition(i)"
+            class="text-xs px-2 py-1.5 rounded-md text-muted dark:text-gray-400 hover:bg-red-50 dark:hover:bg-red-950 hover:text-red-600 transition-colors"
+          >{{ i18n.t('search_condition_remove') }}</button>
+        </div>
+      </div>
+
+      <div class="flex flex-wrap items-center gap-3 mb-6">
+        <button
+          @click="addCondition"
+          class="text-xs px-3 py-2 rounded-lg border border-accent/40 text-accent hover:bg-accent/5 transition-colors"
+        >{{ i18n.t('search_conditions_add') }}</button>
         <button
           @click="doSearch"
-          class="px-5 py-2.5 rounded-lg bg-accent text-white text-sm font-medium hover:opacity-90 transition-opacity"
+          class="text-xs px-4 py-2 rounded-lg bg-accent text-white hover:opacity-90 transition-opacity"
         >{{ i18n.t('search_button') }}</button>
-      </div>
-
-      <div v-if="mode === 'sources'" class="mb-4">
-        <label class="block text-xs font-medium text-muted dark:text-gray-400 mb-1.5">{{ i18n.t('search_source') }}</label>
-        <select
-          v-model="sourceId"
-          class="w-full px-3 py-2 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-sm"
-        >
-          <option v-for="s in sources" :key="s.id" :value="s.id">{{ s.name }}</option>
-        </select>
-      </div>
-
-      <div v-else class="flex gap-3 mb-6">
-        <button
-          v-for="s in (['books', 'chapters'] as const)"
-          :key="s"
-          @click="scope = s"
-          class="text-xs px-3 py-1 rounded-full transition-colors"
-          :class="scope === s ? 'bg-accent text-white' : 'bg-gray-100 dark:bg-gray-700 text-muted dark:text-gray-400 hover:bg-gray-200'"
-        >{{ s === 'books' ? i18n.t('search_books') : i18n.t('search_chapters') }}</button>
+        <label class="flex items-center gap-2 text-xs text-muted dark:text-gray-400">
+          {{ i18n.t('search_tag_label') }}
+          <select
+            v-model="selectedTag"
+            class="px-2 py-1.5 rounded-md border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-xs focus:outline-none"
+          >
+            <option value="">{{ i18n.t('search_all_tags') }}</option>
+            <option v-for="t in tags" :key="t.id" :value="t.name">{{ t.name }}</option>
+          </select>
+        </label>
       </div>
 
       <p v-if="error" class="text-sm text-red-600 mb-4">{{ error }}</p>
@@ -165,62 +238,40 @@ onMounted(async () => {
 
       <template v-else-if="searched">
         <p class="text-sm text-muted dark:text-gray-400 mb-4">
-          {{ i18n.t('search_results_for', { n: mode === 'library' ? total : remoteTotal, q: query }) }}
+          {{ i18n.t('search_results_count', { n: total }) }}
         </p>
 
-        <p v-if="(mode === 'library' ? results : remoteResults).length === 0" class="text-muted dark:text-gray-400">
+        <p v-if="results.length === 0" class="text-muted dark:text-gray-400">
           {{ i18n.t('search_no_results') }}
         </p>
 
         <div
-          v-if="mode === 'library' && results.length"
-          class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900"
+          v-if="results.length"
+          class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900 overflow-hidden"
         >
           <div
             v-for="hit in results"
-            :key="hit.id"
+            :key="hit.type + '-' + hit.id"
+            @click="goToHit(hit)"
             class="px-4 py-3 hover:bg-accent/5 cursor-pointer transition-colors"
-            @click="
-              scope === 'books'
-                ? router.push('/books/' + hit.id)
-                : router.push('/books/' + hit.book_id + '/chapters/' + hit.id)
-            "
           >
-            <h3 class="text-sm font-medium mb-0.5">{{ hit.title }}</h3>
-            <p v-if="hit.author" class="text-xs text-muted dark:text-gray-400">{{ hit.author }}</p>
-            <p v-if="hit.content" class="text-xs text-muted dark:text-gray-400 mt-1 line-clamp-2">
-              {{ hit.content.slice(0, 200) }}
-            </p>
-          </div>
-        </div>
-
-        <div
-          v-if="mode === 'sources' && remoteResults.length"
-          class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900"
-        >
-          <div v-for="item in remoteResults" :key="item.url" class="px-4 py-3">
-            <div class="flex items-start justify-between gap-3">
-              <div class="min-w-0">
-                <h3 class="text-sm font-medium mb-0.5 truncate">{{ item.name }}</h3>
-                <p class="text-xs text-muted dark:text-gray-400">
-                  {{ item.author }}{{ item.latest_chapter ? ' - ' + item.latest_chapter : '' }}
-                </p>
-                <p v-if="item.intro" class="text-xs text-muted dark:text-gray-400 mt-1 line-clamp-2">
-                  {{ item.intro }}
-                </p>
-              </div>
-              <button
-                v-if="item.in_library"
-                @click="router.push('/books/' + item.book_id)"
-                class="shrink-0 px-3 py-1.5 rounded border border-accent text-accent text-xs hover:bg-accent/10"
-              >{{ i18n.t('search_open') }}</button>
-              <button
-                v-else-if="auth.isAdmin"
-                @click="syncRemote(item)"
-                :disabled="syncingUrl === item.url"
-                class="shrink-0 px-3 py-1.5 rounded bg-accent text-white text-xs hover:opacity-90 disabled:opacity-50"
-              >{{ syncingUrl === item.url ? i18n.t('search_syncing') : i18n.t('search_sync') }}</button>
+            <div class="flex items-center gap-2 mb-1">
+              <span class="text-[10px] px-1.5 py-0.5 rounded bg-accent/10 text-accent">
+                {{ hit.type === 'book' ? i18n.t('search_books') : i18n.t('search_chapters') }}
+              </span>
+              <h3 class="text-sm font-medium">{{ hit.type === 'book' ? hit.title : hit.book_title }}</h3>
             </div>
+            <p v-if="hit.type === 'chapter' && hit.title" class="text-xs font-medium mb-0.5">
+              {{ hit.title }}
+            </p>
+            <p v-if="hit.author" class="text-xs text-muted dark:text-gray-400">{{ hit.author }}</p>
+            <p v-if="hit.snippet" class="text-xs text-muted dark:text-gray-400 mt-1 line-clamp-2">
+              {{ hit.snippet }}
+            </p>
+            <p v-if="hit.matched_fields?.length" class="text-[11px] text-accent mt-1">
+              {{ i18n.t('search_matched_fields') }}:
+              {{ hit.matched_fields.map((f) => i18n.t('search_field_' + f)).join('、') }}
+            </p>
           </div>
         </div>
       </template>

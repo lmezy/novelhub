@@ -1,3 +1,5 @@
+import re
+
 import meilisearch
 from loguru import logger
 
@@ -8,6 +10,36 @@ class SearchService:
     INDEX_BOOKS = "books"
     INDEX_CHAPTERS = "chapters"
     CHAPTER_BUFFER_SIZE = 100
+    CANDIDATE_LIMIT = 5000
+    CONTENT_INDEX_LIMIT = 100_000
+    DESCRIPTION_INDEX_LIMIT = 2000
+
+    BOOK_FIELD_ATTRS = {
+        "title": "title",
+        "author": "author",
+        "description": "description",
+        "tags": "tags",
+    }
+    CHAPTER_BOOK_FIELD_ATTRS = {
+        "title": "book_title",
+        "author": "book_author",
+        "description": "book_description",
+        "tags": "tags",
+    }
+    CHAPTER_FIELD_ATTRS = {
+        "chapter_title": "title",
+        "content": "content",
+    }
+    SEARCHABLE_BOOKS = ["title", "author", "description", "status", "tags"]
+    SEARCHABLE_CHAPTERS = [
+        "title",
+        "book_title",
+        "book_author",
+        "book_description",
+        "content",
+        "tags",
+    ]
+    FILTERABLE_ATTRIBUTES = ["source_id", "book_id", "author_id", "is_r18", "tags"]
 
     def __init__(self):
         self.client = meilisearch.Client(settings.MEILI_HOST, settings.MEILI_KEY)
@@ -21,9 +53,16 @@ class SearchService:
             self.client.get_index(name)
         except meilisearch.errors.MeilisearchApiError:
             self.client.create_index(name, {"primaryKey": primary_key})
-        self.client.index(name).update_filterable_attributes(
-            ["source_id", "book_id", "author_id", "is_r18"]
-        )
+        index = self.client.index(name)
+        index.update_filterable_attributes(self.FILTERABLE_ATTRIBUTES)
+        if name == self.INDEX_BOOKS:
+            index.update_searchable_attributes(self.SEARCHABLE_BOOKS)
+        else:
+            index.update_searchable_attributes(self.SEARCHABLE_CHAPTERS)
+        try:
+            index.update_pagination_settings({"maxTotalHits": 10000})
+        except Exception:
+            pass
         self._ensured.add(name)
 
     def index_book(self, book: dict) -> None:
@@ -65,6 +104,28 @@ class SearchService:
             return "is_r18 = false"
         return "is_r18 = true AND is_r18 = false"
 
+    @staticmethod
+    def _tag_filter(tag: str | None) -> str | None:
+        if not tag:
+            return None
+        safe_tag = tag.replace('"', '\\"')
+        return f'tags = "{safe_tag}"'
+
+    def _combined_filter(
+        self,
+        allow_r18: bool,
+        allow_all_ages: bool,
+        tag: str | None,
+    ) -> str | None:
+        parts = []
+        r18_filter = self._visibility_filter(allow_r18, allow_all_ages)
+        if r18_filter:
+            parts.append(r18_filter)
+        tag_part = self._tag_filter(tag)
+        if tag_part:
+            parts.append(tag_part)
+        return " AND ".join(parts) if parts else None
+
     def search_books(
         self,
         query: str,
@@ -73,12 +134,23 @@ class SearchService:
         limit: int = 20,
         allow_r18: bool = True,
         allow_all_ages: bool = True,
+        tag: str | None = None,
     ) -> dict:
-        options = {"offset": offset, "limit": limit}
-        r18_filter = self._visibility_filter(allow_r18, allow_all_ages)
-        if r18_filter:
-            options["filter"] = r18_filter
-        return self.client.index(self.INDEX_BOOKS).search(query, options)
+        self._ensure_index(self.INDEX_BOOKS)
+        self._ensure_index(self.INDEX_CHAPTERS)
+        options = {
+            "offset": offset,
+            "limit": limit,
+            "attributesToSearchOn": ["title", "author", "description", "tags"],
+        }
+        filters = self._combined_filter(allow_r18, allow_all_ages, tag)
+        if filters:
+            options["filter"] = filters
+        try:
+            return self.client.index(self.INDEX_BOOKS).search(query, options)
+        except meilisearch.errors.MeilisearchApiError:
+            options.pop("attributesToSearchOn", None)
+            return self.client.index(self.INDEX_BOOKS).search(query, options)
 
     def search_chapters(
         self,
@@ -88,12 +160,475 @@ class SearchService:
         limit: int = 20,
         allow_r18: bool = True,
         allow_all_ages: bool = True,
+        tag: str | None = None,
     ) -> dict:
-        options = {"offset": offset, "limit": limit}
-        r18_filter = self._visibility_filter(allow_r18, allow_all_ages)
-        if r18_filter:
-            options["filter"] = r18_filter
-        return self.client.index(self.INDEX_CHAPTERS).search(query, options)
+        self._ensure_index(self.INDEX_BOOKS)
+        self._ensure_index(self.INDEX_CHAPTERS)
+        options = {
+            "offset": offset,
+            "limit": limit,
+            "attributesToSearchOn": [
+                "title",
+                "book_title",
+                "book_author",
+                "book_description",
+                "content",
+                "tags",
+            ],
+        }
+        filters = self._combined_filter(allow_r18, allow_all_ages, tag)
+        if filters:
+            options["filter"] = filters
+        try:
+            return self.client.index(self.INDEX_CHAPTERS).search(query, options)
+        except meilisearch.errors.MeilisearchApiError:
+            options.pop("attributesToSearchOn", None)
+            return self.client.index(self.INDEX_CHAPTERS).search(query, options)
+
+    @staticmethod
+    def _condition_score(
+        value: str,
+        text: str,
+        mode: str,
+        ranking_score: float = 0.0,
+    ) -> int:
+        """Score one field condition. Exact requires the whole string to appear.
+
+        Fuzzy counts how many distinct characters from the query appear in the
+        field, so 白骨精 ranks above 白龙精 (2/3 chars) and 白毛鼠 (1/3 chars).
+        """
+        if isinstance(text, (list, tuple)):
+            text = " ".join(str(item) for item in text)
+        needle = value.strip().lower()
+        haystack = (text or "").lower()
+        if not needle or not haystack:
+            return 0
+        tie = int(max(0.0, min(float(ranking_score or 0.0), 1.0)) * 1000)
+        if mode == "exact":
+            return 1_000_000 + tie if needle in haystack else 0
+
+        chars = list(dict.fromkeys(ch for ch in value if not ch.isspace()))
+        matched = sum(1 for ch in chars if ch.lower() in haystack)
+        if matched == 0:
+            return 0
+        full_bonus = 1000 if needle in haystack else 0
+        return matched * 10_000 + full_bonus + tie
+
+    def _search_field(
+        self,
+        index_name: str,
+        attr: str,
+        value: str,
+        filters: str | None,
+    ) -> dict:
+        options = {
+            "limit": self.CANDIDATE_LIMIT,
+            "offset": 0,
+            "attributesToSearchOn": [attr],
+            "showRankingScore": True,
+        }
+        if filters:
+            options["filter"] = filters
+        try:
+            return self.client.index(index_name).search(value, options)
+        except meilisearch.errors.MeilisearchApiError:
+            # Older indexes may not expose the new fields yet; fall back to a
+            # broader candidate fetch and rely on post-filtering/scoring.
+            options.pop("attributesToSearchOn", None)
+            return self.client.index(index_name).search(value, options)
+
+    def _search_all_with_filter(self, index_name: str, filters: str | None) -> dict:
+        options = {
+            "limit": self.CANDIDATE_LIMIT,
+            "offset": 0,
+        }
+        if filters:
+            options["filter"] = filters
+        return self.client.index(index_name).search("", options)
+
+    def _collect_condition(
+        self,
+        index_name: str,
+        attr: str,
+        value: str,
+        mode: str,
+        filters: str | None,
+    ) -> dict[str, tuple[int, dict]]:
+        result = self._search_field(index_name, attr, value, filters)
+        candidates: dict[str, tuple[int, dict]] = {}
+        for hit in result.get("hits", []):
+            text = hit.get(attr) or ""
+            score = self._condition_score(
+                value,
+                text,
+                mode,
+                hit.get("_rankingScore", 0),
+            )
+            if score > 0:
+                candidates[str(hit.get("id"))] = (score, hit)
+        return candidates
+
+    @staticmethod
+    def _snippet(text: str, values: list[str], radius: int = 80) -> str:
+        clean = re.sub(r"\s+", " ", text or "").strip()
+        if not clean:
+            return ""
+        lowered = clean.lower()
+        for value in values:
+            needle = value.strip().lower()
+            if not needle:
+                continue
+            idx = lowered.find(needle)
+            if idx >= 0:
+                start = max(0, idx - radius)
+                end = min(len(clean), idx + len(needle) + radius)
+                prefix = "..." if start > 0 else ""
+                suffix = "..." if end < len(clean) else ""
+                return f"{prefix}{clean[start:end]}{suffix}"
+        for value in values:
+            for ch in value:
+                if not ch.isspace():
+                    idx = lowered.find(ch.lower())
+                    if idx >= 0:
+                        start = max(0, idx - radius)
+                        end = min(len(clean), idx + 1 + radius)
+                        prefix = "..." if start > 0 else ""
+                        suffix = "..." if end < len(clean) else ""
+                        return f"{prefix}{clean[start:end]}{suffix}"
+        return clean[: radius * 2]
+
+    def _build_chapter_entities(
+        self,
+        active: list[dict],
+        chapter_cond_maps: dict[int, dict[str, tuple[int, dict]]],
+        match: str,
+    ) -> dict[str, dict]:
+        all_ids: set[str] = set()
+        for mapping in chapter_cond_maps.values():
+            all_ids.update(mapping.keys())
+        entities: dict[str, dict] = {}
+        for chapter_id in all_ids:
+            doc = None
+            scores: dict[int, int] = {}
+            for i in range(len(active)):
+                entry = chapter_cond_maps.get(i, {}).get(chapter_id)
+                if entry is not None:
+                    scores[i] = entry[0]
+                    doc = doc or entry[1]
+                else:
+                    scores[i] = 0
+            if doc is None:
+                continue
+            if match == "and" and not all(scores[i] > 0 for i in range(len(active))):
+                continue
+            if match == "or" and not any(scores[i] > 0 for i in range(len(active))):
+                continue
+            entities[chapter_id] = {
+                "kind": "chapter",
+                "doc": doc,
+                "score": sum(scores.values()),
+                "scores": scores,
+            }
+        return entities
+
+    def _build_book_entities(
+        self,
+        active: list[dict],
+        book_cond_maps: dict[int, dict[str, tuple[int, dict]]],
+        chapter_cond_maps: dict[int, dict[str, tuple[int, dict]]],
+        match: str,
+    ) -> dict[str, dict]:
+        chapter_field_indices = [
+            i for i, cond in enumerate(active) if cond["field"] in self.CHAPTER_FIELD_ATTRS
+        ]
+        book_ids: set[str] = set()
+        for mapping in book_cond_maps.values():
+            book_ids.update(mapping.keys())
+
+        chapters_by_book: dict[str, set[str]] = {}
+        chapter_docs: dict[str, dict] = {}
+        for i in chapter_field_indices:
+            mapping = chapter_cond_maps.get(i, {})
+            for chapter_id, (_, doc) in mapping.items():
+                book_id = str(doc.get("book_id") or "")
+                if not book_id:
+                    continue
+                book_ids.add(book_id)
+                chapters_by_book.setdefault(book_id, set()).add(chapter_id)
+                chapter_docs[chapter_id] = doc
+
+        entities: dict[str, dict] = {}
+        for book_id in book_ids:
+            direct_scores: dict[int, int] = {}
+            for i in range(len(active)):
+                entry = book_cond_maps.get(i, {}).get(book_id)
+                direct_scores[i] = entry[0] if entry is not None else 0
+
+            per_cond_max = {i: 0 for i in chapter_field_indices}
+            and_chapter_totals: list[int] = []
+            for chapter_id in chapters_by_book.get(book_id, set()):
+                row: dict[int, int] = {}
+                for i in chapter_field_indices:
+                    entry = chapter_cond_maps.get(i, {}).get(chapter_id)
+                    row[i] = entry[0] if entry is not None else 0
+                    per_cond_max[i] = max(per_cond_max[i], row[i])
+                if match == "and":
+                    if all(row[i] > 0 for i in chapter_field_indices):
+                        and_chapter_totals.append(sum(row[i] for i in chapter_field_indices))
+                else:
+                    and_chapter_totals.append(sum(v for v in row.values() if v > 0))
+
+            if match == "and":
+                book_level_ok = all(
+                    direct_scores[i] > 0 for i in book_cond_maps
+                )
+                chapter_level_ok = (
+                    not chapter_field_indices
+                    or any(total > 0 for total in and_chapter_totals)
+                )
+                if not (book_level_ok and chapter_level_ok):
+                    continue
+                chapter_score = max(and_chapter_totals) if and_chapter_totals else 0
+                total = sum(direct_scores.values()) + chapter_score
+            else:
+                positives = [score for score in direct_scores.values() if score > 0]
+                positives.extend(
+                    per_cond_max[i] for i in chapter_field_indices if per_cond_max[i] > 0
+                )
+                if not positives:
+                    continue
+                total = sum(positives)
+
+            entry = next(
+                (
+                    book_cond_maps[i].get(book_id)
+                    for i in book_cond_maps
+                    if book_id in book_cond_maps[i]
+                ),
+                None,
+            )
+            if entry is not None:
+                doc = entry[1]
+            else:
+                first_chapter = next(iter(chapters_by_book.get(book_id, set())), None)
+                chapter_doc = chapter_docs.get(first_chapter) or {}
+                doc = {
+                    "id": book_id,
+                    "title": chapter_doc.get("book_title") or "",
+                    "author": chapter_doc.get("book_author") or "",
+                    "description": chapter_doc.get("book_description") or "",
+                    "status": "",
+                    "tags": chapter_doc.get("tags") or [],
+                    "is_r18": bool(chapter_doc.get("is_r18", False)),
+                }
+            entities[book_id] = {
+                "kind": "book",
+                "doc": doc,
+                "score": total,
+                "scores": direct_scores,
+            }
+        return entities
+
+    def _book_matched_fields(
+        self,
+        book_id: str,
+        active: list[dict],
+        book_cond_maps: dict[int, dict[str, tuple[int, dict]]],
+        chapter_cond_maps: dict[int, dict[str, tuple[int, dict]]],
+    ) -> list[str]:
+        matched: list[str] = []
+        for i, cond in enumerate(active):
+            entry = book_cond_maps.get(i, {}).get(book_id)
+            if entry is not None and entry[0] > 0:
+                matched.append(cond["field"])
+            if cond["field"] in self.CHAPTER_FIELD_ATTRS:
+                for chapter_id, (score, doc) in chapter_cond_maps.get(i, {}).items():
+                    if score > 0 and str(doc.get("book_id")) == book_id:
+                        matched.append(cond["field"])
+                        break
+        return matched
+
+    def _serialize_book(
+        self,
+        entity: dict,
+        active: list[dict],
+        book_cond_maps: dict[int, dict[str, tuple[int, dict]]],
+        chapter_cond_maps: dict[int, dict[str, tuple[int, dict]]],
+    ) -> dict:
+        doc = entity["doc"]
+        book_id = str(doc.get("id") or "")
+        description = doc.get("description") or ""
+        values = [cond["value"] for cond in active]
+        return {
+            "type": "book",
+            "id": book_id,
+            "book_id": book_id,
+            "title": doc.get("title") or "",
+            "author": doc.get("author") or "",
+            "description": description[: self.DESCRIPTION_INDEX_LIMIT],
+            "tags": doc.get("tags") or [],
+            "status": doc.get("status") or "",
+            "is_r18": bool(doc.get("is_r18", False)),
+            "score": entity["score"],
+            "matched_fields": self._book_matched_fields(
+                book_id,
+                active,
+                book_cond_maps,
+                chapter_cond_maps,
+            ),
+            "snippet": self._snippet(description or doc.get("title") or "", values),
+        }
+
+    def _serialize_chapter(self, entity: dict, active: list[dict]) -> dict:
+        doc = entity["doc"]
+        content = doc.get("content") or ""
+        values = [cond["value"] for cond in active]
+        return {
+            "type": "chapter",
+            "id": str(doc.get("id") or ""),
+            "chapter_id": str(doc.get("id") or ""),
+            "book_id": str(doc.get("book_id") or ""),
+            "title": doc.get("title") or "",
+            "book_title": doc.get("book_title") or "",
+            "author": doc.get("book_author") or "",
+            "chapter_number": doc.get("chapter_number"),
+            "content": content[:500],
+            "snippet": self._snippet(content or doc.get("title") or "", values),
+            "score": entity["score"],
+            "matched_fields": [
+                active[i]["field"]
+                for i, score in entity["scores"].items()
+                if score > 0
+            ],
+        }
+
+    def advanced_search(
+        self,
+        conditions: list[dict],
+        *,
+        match: str = "and",
+        scope: str = "all",
+        tag: str | None = None,
+        offset: int = 0,
+        limit: int = 20,
+        allow_r18: bool = True,
+        allow_all_ages: bool = True,
+    ) -> dict:
+        self._ensure_index(self.INDEX_BOOKS)
+        self._ensure_index(self.INDEX_CHAPTERS)
+        active: list[dict] = []
+        valid_fields = set(self.BOOK_FIELD_ATTRS) | set(self.CHAPTER_FIELD_ATTRS)
+        for cond in conditions:
+            field = cond.get("field") or ""
+            mode = cond.get("mode") or "exact"
+            value = (cond.get("value") or "").strip()
+            if value and field in valid_fields and mode in ("exact", "fuzzy"):
+                active.append({"field": field, "mode": mode, "value": value})
+        if not active:
+            if tag:
+                filters = self._combined_filter(allow_r18, allow_all_ages, tag)
+                if scope in ("all", "books"):
+                    result = self._search_all_with_filter(self.INDEX_BOOKS, filters)
+                    hits = [
+                        self._serialize_book(
+                            {"kind": "book", "doc": hit, "score": 0, "scores": {}},
+                            [],
+                            {},
+                            {},
+                        )
+                        for hit in result.get("hits", [])
+                    ]
+                    hits.sort(key=lambda hit: hit["title"].lower())
+                    return {
+                        "hits": hits[offset : offset + limit],
+                        "total": len(hits),
+                        "offset": offset,
+                        "limit": limit,
+                    }
+                if scope == "chapters":
+                    result = self._search_all_with_filter(self.INDEX_CHAPTERS, filters)
+                    hits = [
+                        self._serialize_chapter(
+                            {"kind": "chapter", "doc": hit, "score": 0, "scores": {}},
+                            [],
+                        )
+                        for hit in result.get("hits", [])
+                    ]
+                    hits.sort(key=lambda hit: hit["title"].lower())
+                    return {
+                        "hits": hits[offset : offset + limit],
+                        "total": len(hits),
+                        "offset": offset,
+                        "limit": limit,
+                    }
+            return {"hits": [], "total": 0, "offset": offset, "limit": limit}
+
+        filters = self._combined_filter(allow_r18, allow_all_ages, tag)
+        book_cond_maps: dict[int, dict[str, tuple[int, dict]]] = {}
+        chapter_cond_maps: dict[int, dict[str, tuple[int, dict]]] = {}
+        for i, cond in enumerate(active):
+            field = cond["field"]
+            if field in self.BOOK_FIELD_ATTRS:
+                book_cond_maps[i] = self._collect_condition(
+                    self.INDEX_BOOKS,
+                    self.BOOK_FIELD_ATTRS[field],
+                    cond["value"],
+                    cond["mode"],
+                    filters,
+                )
+                chapter_cond_maps[i] = self._collect_condition(
+                    self.INDEX_CHAPTERS,
+                    self.CHAPTER_BOOK_FIELD_ATTRS[field],
+                    cond["value"],
+                    cond["mode"],
+                    filters,
+                )
+            else:
+                chapter_cond_maps[i] = self._collect_condition(
+                    self.INDEX_CHAPTERS,
+                    self.CHAPTER_FIELD_ATTRS[field],
+                    cond["value"],
+                    cond["mode"],
+                    filters,
+                )
+
+        entities: list[dict] = []
+        if scope in ("all", "books"):
+            entities.extend(
+                self._build_book_entities(
+                    active,
+                    book_cond_maps,
+                    chapter_cond_maps,
+                    match,
+                ).values()
+            )
+        if scope in ("all", "chapters"):
+            entities.extend(
+                self._build_chapter_entities(active, chapter_cond_maps, match).values()
+            )
+
+        entities.sort(
+            key=lambda entity: (
+                -entity["score"],
+                (entity["doc"].get("title") or "").lower(),
+            )
+        )
+        total = len(entities)
+        page = entities[offset : offset + limit]
+        hits = []
+        for entity in page:
+            if entity["kind"] == "book":
+                hits.append(
+                    self._serialize_book(
+                        entity,
+                        active,
+                        book_cond_maps,
+                        chapter_cond_maps,
+                    )
+                )
+            else:
+                hits.append(self._serialize_chapter(entity, active))
+        return {"hits": hits, "total": total, "offset": offset, "limit": limit}
 
     def delete_book(self, book_id: str) -> None:
         try:
@@ -133,67 +668,77 @@ class SearchService:
         return result
 
     def rebuild_index(self) -> dict:
-        """Rebuild both indexes from database records."""
+        """Rebuild both indexes from database and storage records."""
         import asyncio
+
         result = {"books": 0, "chapters": 0}
 
         async def _rebuild():
             from app.core.database import SessionLocal
             from app.models import Book, Chapter
+            from app.services.storage import BookStorage
             from sqlalchemy import select
 
+            storage = BookStorage()
             async with SessionLocal() as db:
-                # Delete and recreate indexes
-                try:
-                    self.client.delete_index(self.INDEX_BOOKS)
-                except Exception:
-                    pass
-                try:
-                    self.client.delete_index(self.INDEX_CHAPTERS)
-                except Exception:
-                    pass
+                for idx_name in [self.INDEX_BOOKS, self.INDEX_CHAPTERS]:
+                    try:
+                        self.client.delete_index(idx_name)
+                    except Exception:
+                        pass
                 self._ensured.clear()
                 self._ensure_index(self.INDEX_BOOKS)
                 self._ensure_index(self.INDEX_CHAPTERS)
 
-                # Reindex books
-                book_list = (await db.scalars(select(Book))).unique().all()
-                for b in book_list:
-                    self.index_book({
-                        "id": b.id,
-                        "title": b.title,
-                        "description": b.description or "",
-                        "status": b.status or "",
-                        "source_id": b.source_id or "",
-                        "author_id": b.author_id or "",
-                        "is_r18": b.is_r18,
-                    })
-                result["books"] = len(book_list)
+                books = (await db.scalars(select(Book))).unique().all()
+                book_meta: dict[str, dict] = {}
+                for book in books:
+                    doc = {
+                        "id": book.id,
+                        "title": book.title,
+                        "author": book.author_name or "",
+                        "description": book.description or "",
+                        "status": book.status or "",
+                        "source_id": book.source_id or "",
+                        "author_id": book.author_id or "",
+                        "is_r18": book.is_r18,
+                        "tags": book.tag_names,
+                    }
+                    book_meta[book.id] = doc
+                    self.index_book(doc)
+                result["books"] = len(books)
 
-                # Reindex chapters (batched to avoid memory issues)
-                chapters = await db.scalars(
-                    select(Chapter).limit(5000)
-                )
-                chapter_list = list(chapters)
-                book_ids = {ch.book_id for ch in chapter_list if ch.book_id}
-                book_r18: dict[str, bool] = {}
-                if book_ids:
-                    book_rows = await db.execute(
-                        select(Book.id, Book.is_r18).where(Book.id.in_(book_ids))
-                    )
-                    book_r18 = {book_id: bool(is_r18) for book_id, is_r18 in book_rows}
-                batch = []
-                for ch in chapter_list:
+                chapters = (await db.scalars(select(Chapter))).unique().all()
+                batch: list[dict] = []
+                for chapter in chapters:
+                    meta = book_meta.get(chapter.book_id) or {}
+                    content = ""
+                    if chapter.content_path:
+                        try:
+                            content = storage.read_chapter(chapter.content_path)
+                        except Exception:
+                            content = ""
                     batch.append({
-                        "id": ch.id,
-                        "book_id": ch.book_id,
-                        "title": ch.title or "",
-                        "chapter_number": ch.chapter_number or 0,
-                        "is_r18": book_r18.get(ch.book_id, False),
+                        "id": chapter.id,
+                        "book_id": chapter.book_id,
+                        "title": chapter.title or "",
+                        "chapter_number": chapter.chapter_number or 0,
+                        "book_title": meta.get("title", ""),
+                        "book_author": meta.get("author", ""),
+                        "book_description": (meta.get("description") or "")[
+                            : self.DESCRIPTION_INDEX_LIMIT
+                        ],
+                        "content": content[: self.CONTENT_INDEX_LIMIT],
+                        "is_r18": bool(meta.get("is_r18", False)),
+                        "tags": meta.get("tags") or [],
                     })
+                    if len(batch) >= self.CHAPTER_BUFFER_SIZE:
+                        self.client.index(self.INDEX_CHAPTERS).add_documents(batch)
+                        result["chapters"] += len(batch)
+                        batch = []
                 if batch:
                     self.client.index(self.INDEX_CHAPTERS).add_documents(batch)
-                result["chapters"] = len(batch)
+                    result["chapters"] += len(batch)
 
         asyncio.run(_rebuild())
         return result
@@ -204,5 +749,6 @@ class SearchService:
             logger.debug("Deleted book {} from search index", book_id)
         except Exception:
             pass
+
 
 search_service = SearchService()

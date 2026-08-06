@@ -73,6 +73,7 @@ def _serialize_book(
         created_at=book.created_at,
         updated_at=book.updated_at,
         tag_names=visible_tags(user, book.tag_names),
+        category_names=book.category_names,
         author_name=book.author_name,
         custom_tags=(custom_tags or {}).get(book.id, []),
         shelf_group_ids=(shelf_group_ids or {}).get(book.id, []),

@@ -20,6 +20,27 @@ def test_ensure_index_is_cached():
     assert client.index.call_count == 1
 
 
+def test_ensure_index_updates_settings():
+    service, client = _make_service()
+    index = client.index.return_value
+
+    service._ensure_index("books")
+
+    index.update_filterable_attributes.assert_called_once()
+    index.update_searchable_attributes.assert_called_once()
+    index.update_pagination_settings.assert_called_once_with({"maxTotalHits": 10000})
+
+
+def test_search_books_restricts_attributes():
+    service, client = _make_service()
+    index = client.index.return_value
+
+    service.search_books("西游记")
+
+    options = index.search.call_args.args[1]
+    assert options["attributesToSearchOn"] == ["title", "author", "description", "tags"]
+
+
 def test_chapter_buffer_flushes_in_batches():
     service, client = _make_service()
     index = client.index.return_value
@@ -32,3 +53,205 @@ def test_chapter_buffer_flushes_in_batches():
     service.flush_chapters()
 
     assert index.add_documents.call_count == 2
+
+
+def test_search_books_applies_tag_filter():
+    service, client = _make_service()
+    index = client.index.return_value
+
+    service.search_books("test", tag="wuxia")
+
+    options = index.search.call_args.args[1]
+    assert options["filter"] == 'tags = "wuxia"'
+
+
+def _service_with_indexes():
+    client = MagicMock()
+    books_index = MagicMock()
+    chapters_index = MagicMock()
+    client.index.side_effect = lambda name: (
+        books_index if name == "books" else chapters_index
+    )
+    with patch("app.services.search.meilisearch.Client", return_value=client):
+        service = SearchService()
+    return service, books_index, chapters_index
+
+
+def test_condition_score_exact_requires_substring():
+    assert (
+        SearchService._condition_score("白骨精", "第1章 三打白骨精", "exact")
+        >= 1_000_000
+    )
+    assert SearchService._condition_score("白骨精", "白龙精", "exact") == 0
+
+
+def test_condition_score_fuzzy_ranks_by_matched_chars():
+    full = SearchService._condition_score("白骨精", "三打白骨精", "fuzzy")
+    two = SearchService._condition_score("白骨精", "白龙精", "fuzzy")
+    one = SearchService._condition_score("白骨精", "白毛鼠", "fuzzy")
+
+    assert full > two > one > 0
+    assert SearchService._condition_score("白骨精", "毛鼠", "fuzzy") == 0
+
+
+def test_advanced_search_books_scope_and_requires_all_conditions():
+    service, books_index, chapters_index = _service_with_indexes()
+    books_index.search.return_value = {
+        "hits": [{
+            "id": "book-1",
+            "title": "西游记",
+            "author": "吴承恩",
+            "description": "古典名著",
+            "tags": [],
+            "is_r18": False,
+        }]
+    }
+    chapters_index.search.return_value = {
+        "hits": [{
+            "id": "chapter-1",
+            "book_id": "book-1",
+            "title": "三打白骨精",
+            "book_title": "西游记",
+            "book_author": "吴承恩",
+            "book_description": "古典名著",
+            "content": "老鸡婆",
+            "is_r18": False,
+        }]
+    }
+
+    result = service.advanced_search(
+        [
+            {"field": "title", "mode": "exact", "value": "西游记"},
+            {"field": "chapter_title", "mode": "exact", "value": "白骨精"},
+        ],
+        match="and",
+        scope="books",
+    )
+
+    assert result["total"] == 1
+    assert result["hits"][0]["type"] == "book"
+    assert result["hits"][0]["title"] == "西游记"
+    assert result["hits"][0]["matched_fields"] == ["title", "chapter_title"]
+
+
+def test_advanced_search_chapters_fuzzy_rank():
+    service, _, chapters_index = _service_with_indexes()
+    chapters_index.search.return_value = {
+        "hits": [
+            {
+                "id": "c-full",
+                "book_id": "b1",
+                "title": "三打白骨精",
+                "book_title": "西游记",
+                "content": "",
+                "is_r18": False,
+            },
+            {
+                "id": "c-two",
+                "book_id": "b2",
+                "title": "白龙精",
+                "book_title": "另一本书",
+                "content": "",
+                "is_r18": False,
+            },
+            {
+                "id": "c-one",
+                "book_id": "b3",
+                "title": "白毛鼠",
+                "book_title": "再一本书",
+                "content": "",
+                "is_r18": False,
+            },
+        ]
+    }
+
+    result = service.advanced_search(
+        [{"field": "chapter_title", "mode": "fuzzy", "value": "白骨精"}],
+        match="or",
+        scope="chapters",
+    )
+
+    assert result["total"] == 3
+    assert [hit["title"] for hit in result["hits"]] == [
+        "三打白骨精",
+        "白龙精",
+        "白毛鼠",
+    ]
+
+
+def test_advanced_search_or_returns_any_matching_book():
+    service, books_index, chapters_index = _service_with_indexes()
+    books_index.search.side_effect = [
+        {"hits": [{
+            "id": "book-1",
+            "title": "西游记",
+            "author": "吴承恩",
+            "description": "",
+            "tags": [],
+            "is_r18": False,
+        }]},
+        {"hits": [{
+            "id": "book-2",
+            "title": "红楼梦",
+            "author": "曹雪芹",
+            "description": "",
+            "tags": [],
+            "is_r18": False,
+        }]},
+    ]
+    chapters_index.search.return_value = {"hits": []}
+
+    result = service.advanced_search(
+        [
+            {"field": "title", "mode": "exact", "value": "西游记"},
+            {"field": "author", "mode": "exact", "value": "曹雪芹"},
+        ],
+        match="or",
+        scope="books",
+    )
+
+    assert result["total"] == 2
+    assert {hit["title"] for hit in result["hits"]} == {"西游记", "红楼梦"}
+
+
+def test_advanced_search_tag_only_returns_books():
+    service, books_index, chapters_index = _service_with_indexes()
+    books_index.search.return_value = {
+        "hits": [{
+            "id": "book-1",
+            "title": "西游记",
+            "author": "吴承恩",
+            "description": "",
+            "tags": ["wuxia"],
+            "is_r18": False,
+        }]
+    }
+
+    result = service.advanced_search([], scope="books", tag="wuxia")
+
+    assert result["total"] == 1
+    assert result["hits"][0]["type"] == "book"
+    assert result["hits"][0]["title"] == "西游记"
+
+
+def test_advanced_search_tags_condition_matches_book_tags():
+    service, books_index, chapters_index = _service_with_indexes()
+    books_index.search.return_value = {
+        "hits": [{
+            "id": "book-1",
+            "title": "西游记",
+            "author": "吴承恩",
+            "description": "",
+            "tags": ["仙侠", "古典"],
+            "is_r18": False,
+        }]
+    }
+
+    result = service.advanced_search(
+        [{"field": "tags", "mode": "exact", "value": "仙侠"}],
+        match="and",
+        scope="books",
+    )
+
+    assert result["total"] == 1
+    assert result["hits"][0]["matched_fields"] == ["tags"]

@@ -225,14 +225,17 @@ class SyncService:
             },
         )
 
+        book_tags = await self._book_tag_names(book.id)
         search_service.index_book({
             "id": book.id,
             "title": book.title,
+            "author": book.author_name or "",
             "description": book.description or "",
             "status": book.status or "",
             "source_id": book.source_id or "",
             "author_id": book.author_id or "",
             "is_r18": book.is_r18,
+            "tags": book_tags,
         })
 
         if is_new:
@@ -243,6 +246,8 @@ class SyncService:
         book_id = book.id
         book_title = book.title
         book_is_r18 = book.is_r18
+        book_author = book.author_name or ""
+        book_description = (book.description or "")[:2000]
         book_values = {
             "source_id": book.source_id,
             "author_id": book.author_id,
@@ -364,7 +369,11 @@ class SyncService:
                         "book_id": book_id,
                         "title": chapter.title or "",
                         "chapter_number": chapter.chapter_number,
-                        "content": content[:5000],
+                        "content": content[: search_service.CONTENT_INDEX_LIMIT],
+                        "book_title": book_title,
+                        "book_author": book_author,
+                        "book_description": book_description,
+                        "tags": book_tags,
                         "is_r18": book_is_r18,
                     })
 
@@ -657,6 +666,9 @@ class SyncService:
         content = await self._fetch_chapter_with_retry(plugin, remote_chapter)
         book_id = book.id
         book_is_r18 = book.is_r18
+        book_author = book.author_name or ""
+        book_description = (book.description or "")[:2000]
+        book_tags = list(book.tag_names)
         author_name = book.author_name or "Unknown"
         content_path, content_hash = self.storage.write_chapter(
             author_name,
@@ -678,7 +690,11 @@ class SyncService:
             "book_id": book_id,
             "title": chapter.title or "",
             "chapter_number": chapter.chapter_number,
-            "content": content[:5000],
+            "content": content[: search_service.CONTENT_INDEX_LIMIT],
+            "book_title": book.title,
+            "book_author": book_author,
+            "book_description": book_description,
+            "tags": book_tags,
             "is_r18": book_is_r18,
         })
         emit(
