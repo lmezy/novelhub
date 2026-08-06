@@ -23,13 +23,12 @@ router = APIRouter(prefix="/sources", tags=["sources"])
 @router.get("", response_model=list[SourceOut])
 async def list_sources(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     query = select(Source).order_by(Source.name.asc())
-    if user.role not in ("admin", "super_admin"):
-        conditions = []
-        if can_view_all_ages(user):
-            conditions.append(Source.is_r18 == False)
-        if can_view_r18(user):
-            conditions.append(Source.is_r18 == True)
-        query = query.where(or_(*conditions)) if conditions else query.where(Source.id == "__none__")
+    conditions = []
+    if can_view_all_ages(user):
+        conditions.append(Source.is_r18 == False)
+    if can_view_r18(user):
+        conditions.append(Source.is_r18 == True)
+    query = query.where(or_(*conditions)) if conditions else query.where(Source.id == "__none__")
     result = await db.scalars(query)
     return list(result)
 

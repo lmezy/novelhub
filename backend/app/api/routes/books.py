@@ -82,13 +82,12 @@ def _serialize_book(
 @router.get("", response_model=list[BookOut])
 async def list_books(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     query = select(Book).options(selectinload(Book.tags)).order_by(Book.updated_at.desc())
-    if user.role not in ("admin", "super_admin"):
-        conditions = []
-        if can_view_all_ages(user):
-            conditions.append(Book.is_r18 == False)
-        if can_view_r18(user):
-            conditions.append(Book.is_r18 == True)
-        query = query.where(or_(*conditions)) if conditions else query.where(Book.id == "__none__")
+    conditions = []
+    if can_view_all_ages(user):
+        conditions.append(Book.is_r18 == False)
+    if can_view_r18(user):
+        conditions.append(Book.is_r18 == True)
+    query = query.where(or_(*conditions)) if conditions else query.where(Book.id == "__none__")
     result = await db.scalars(query)
     books = list(result)
     favorite_ids = set(
@@ -222,13 +221,12 @@ async def list_favorite_books(
             BookFavoriteGroup,
             BookFavoriteGroup.favorite_id == BookFavorite.id,
         ).where(BookFavoriteGroup.group_id == group_id)
-    if user.role not in ("admin", "super_admin"):
-        conditions = []
-        if can_view_all_ages(user):
-            conditions.append(Book.is_r18 == False)
-        if can_view_r18(user):
-            conditions.append(Book.is_r18 == True)
-        query = query.where(or_(*conditions)) if conditions else query.where(Book.id == "__none__")
+    conditions = []
+    if can_view_all_ages(user):
+        conditions.append(Book.is_r18 == False)
+    if can_view_r18(user):
+        conditions.append(Book.is_r18 == True)
+    query = query.where(or_(*conditions)) if conditions else query.where(Book.id == "__none__")
     result = await db.scalars(query)
     books = list(result)
     custom_tags = await list_book_custom_tags_map(
@@ -316,13 +314,12 @@ async def list_book_sources(
         raise HTTPException(status_code=404, detail="Book not found")
 
     query = select(Book).options(selectinload(Book.author)).where(Book.id != book_id)
-    if user.role not in ("admin", "super_admin"):
-        conditions = []
-        if can_view_all_ages(user):
-            conditions.append(Book.is_r18 == False)
-        if can_view_r18(user):
-            conditions.append(Book.is_r18 == True)
-        query = query.where(or_(*conditions)) if conditions else query.where(Book.id == "__none__")
+    conditions = []
+    if can_view_all_ages(user):
+        conditions.append(Book.is_r18 == False)
+    if can_view_r18(user):
+        conditions.append(Book.is_r18 == True)
+    query = query.where(or_(*conditions)) if conditions else query.where(Book.id == "__none__")
 
     normalized = _normalize_book_title(book.title)
     candidates = [

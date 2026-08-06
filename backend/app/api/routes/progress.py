@@ -51,13 +51,12 @@ async def list_progress(
         .order_by(ReadingProgress.updated_at.desc())
         .limit(20)
     )
-    if user.role not in ("admin", "super_admin"):
-        conditions = []
-        if can_view_all_ages(user):
-            conditions.append(Book.is_r18 == False)
-        if can_view_r18(user):
-            conditions.append(Book.is_r18 == True)
-        query = query.where(or_(*conditions)) if conditions else query.where(Book.id == "__none__")
+    conditions = []
+    if can_view_all_ages(user):
+        conditions.append(Book.is_r18 == False)
+    if can_view_r18(user):
+        conditions.append(Book.is_r18 == True)
+    query = query.where(or_(*conditions)) if conditions else query.where(Book.id == "__none__")
     result = await db.scalars(query)
     return list(result)
 

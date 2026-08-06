@@ -7,15 +7,11 @@ R18_TAGS = {"r18", "all-ages"}
 
 
 def can_view_r18(user: User) -> bool:
-    return user.role in ("admin", "super_admin") or bool(
-        getattr(user, "r18_enabled", False)
-    )
+    return bool(getattr(user, "r18_enabled", False))
 
 
 def can_view_all_ages(user: User) -> bool:
-    return user.role in ("admin", "super_admin") or bool(
-        getattr(user, "non_r18_enabled", True)
-    )
+    return bool(getattr(user, "non_r18_enabled", True))
 
 
 def ensure_book_visible(user: User, book: Book | None) -> bool:

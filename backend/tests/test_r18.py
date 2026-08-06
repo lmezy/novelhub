@@ -1,11 +1,12 @@
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.core.database import get_db
 from app.main import app
+from app.api.routes.books import list_books
 from app.services.auth import get_current_user, require_admin
 from app.services.r18 import detect_r18
 from app.services.visibility import (
@@ -27,23 +28,25 @@ def test_detect_r18_from_metadata():
 
 
 def test_can_view_r18():
-    admin = SimpleNamespace(role="admin", r18_enabled=False)
-    super_admin = SimpleNamespace(role="super_admin", r18_enabled=False)
+    admin_off = SimpleNamespace(role="admin", r18_enabled=False)
+    super_admin_on = SimpleNamespace(role="super_admin", r18_enabled=True)
     enabled_user = SimpleNamespace(role="user", r18_enabled=True)
     normal_user = SimpleNamespace(role="user", r18_enabled=False)
 
-    assert can_view_r18(admin) is True
-    assert can_view_r18(super_admin) is True
+    assert can_view_r18(admin_off) is False
+    assert can_view_r18(super_admin_on) is True
     assert can_view_r18(enabled_user) is True
     assert can_view_r18(normal_user) is False
 
 
 def test_can_view_all_ages():
-    admin = SimpleNamespace(role="admin", non_r18_enabled=False)
+    admin_off = SimpleNamespace(role="admin", non_r18_enabled=False)
+    super_admin_on = SimpleNamespace(role="super_admin", non_r18_enabled=True)
     enabled_user = SimpleNamespace(role="user", non_r18_enabled=True)
     disabled_user = SimpleNamespace(role="user", non_r18_enabled=False)
 
-    assert can_view_all_ages(admin) is True
+    assert can_view_all_ages(admin_off) is False
+    assert can_view_all_ages(super_admin_on) is True
     assert can_view_all_ages(enabled_user) is True
     assert can_view_all_ages(disabled_user) is False
 
@@ -55,6 +58,8 @@ def test_book_visibility_matrix():
     r18_only = SimpleNamespace(role="user", r18_enabled=True, non_r18_enabled=False)
     all_ages_only = SimpleNamespace(role="user", r18_enabled=False, non_r18_enabled=True)
     all = SimpleNamespace(role="user", r18_enabled=True, non_r18_enabled=True)
+    admin_r18_only = SimpleNamespace(role="admin", r18_enabled=True, non_r18_enabled=False)
+    admin_all_off = SimpleNamespace(role="super_admin", r18_enabled=False, non_r18_enabled=False)
 
     assert ensure_book_visible(off, r18_book) is False
     assert ensure_book_visible(off, normal_book) is False
@@ -64,6 +69,10 @@ def test_book_visibility_matrix():
     assert ensure_book_visible(all_ages_only, normal_book) is True
     assert ensure_book_visible(all, r18_book) is True
     assert ensure_book_visible(all, normal_book) is True
+    assert ensure_book_visible(admin_r18_only, r18_book) is True
+    assert ensure_book_visible(admin_r18_only, normal_book) is False
+    assert ensure_book_visible(admin_all_off, r18_book) is False
+    assert ensure_book_visible(admin_all_off, normal_book) is False
 
 
 def test_classification_tags_admin_only():
@@ -73,6 +82,25 @@ def test_classification_tags_admin_only():
 
     assert visible_tags(admin, tags) == tags
     assert visible_tags(user, tags) == ["fantasy"]
+
+
+@pytest.mark.asyncio
+async def test_admin_book_list_respects_visibility_switches():
+    admin = SimpleNamespace(
+        id="admin-1",
+        role="super_admin",
+        r18_enabled=False,
+        non_r18_enabled=False,
+    )
+    db = AsyncMock()
+    db.scalars.side_effect = [[], []]
+
+    with patch("app.api.routes.books.list_book_custom_tags_map", new=AsyncMock(return_value={})):
+        result = await list_books(admin, db)
+
+    assert result == []
+    query = db.scalars.call_args_list[0].args[0]
+    assert len(query._where_criteria) > 0
 
 
 @pytest.mark.asyncio

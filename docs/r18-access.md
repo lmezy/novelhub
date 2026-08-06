@@ -31,9 +31,13 @@ relying on tags.
   - `non_r18_enabled`: controls non-R18 books
 - Both on: user sees all books. Both off: user sees no books.
 - `can_manage_visibility`: admin-granted permission that shows the R18 and
-  All-Ages buttons to a normal user. When off, the user cannot see or change
-  these switches.
-- Only admins can toggle these switches:
+  All-Ages buttons on the Home page. When off, a normal user cannot see or
+  change these switches. Admins can always change any account's switches from
+  Admin > User Management.
+- The switches apply to every account, including `admin` and `super_admin`.
+  Admins are not automatically granted full visibility; set both switches to
+  on to see all books.
+- Only admins can toggle another user's switches:
 
 ```bash
 curl -X PUT http://localhost:8088/api/admin/users/<user_id>/visibility \
