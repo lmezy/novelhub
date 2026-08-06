@@ -108,7 +108,7 @@ async def index_stats(user: User = Depends(get_current_user)):
 async def rebuild_index(user: User = Depends(get_current_user)):
     """Rebuild search indexes from database."""
     try:
-        result = search_service.rebuild_index()
+        result = await search_service.rebuild_index()
         return {"status": "ok", **result}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc

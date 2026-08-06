@@ -725,10 +725,8 @@ class SearchService:
                 result[idx_name] = {"documents": 0, "is_indexing": False, "last_update": None}
         return result
 
-    def rebuild_index(self) -> dict:
+    async def rebuild_index(self) -> dict:
         """Rebuild both indexes from database and storage records."""
-        import asyncio
-
         result = {"books": 0, "chapters": 0}
 
         async def _rebuild():
@@ -812,7 +810,7 @@ class SearchService:
                     self.client.index(self.INDEX_CHAPTERS).add_documents(batch)
                     result["chapters"] += len(batch)
 
-        asyncio.run(_rebuild())
+        await _rebuild()
         return result
 
     def delete_book_from_index(self, book_id: str) -> None:
