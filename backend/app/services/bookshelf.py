@@ -27,15 +27,19 @@ async def _favorite_for_user(
 
 
 async def list_user_groups(db: AsyncSession, user: User) -> list[dict]:
+    counts = (
+        select(
+            BookFavoriteGroup.group_id,
+            func.count().label("count"),
+        )
+        .group_by(BookFavoriteGroup.group_id)
+        .subquery()
+    )
     rows = (
         await db.execute(
-            select(BookshelfGroup, func.count(BookFavoriteGroup.favorite_id))
-            .outerjoin(
-                BookFavoriteGroup,
-                BookFavoriteGroup.group_id == BookshelfGroup.id,
-            )
+            select(BookshelfGroup, counts.c.count)
+            .outerjoin(counts, counts.c.group_id == BookshelfGroup.id)
             .where(BookshelfGroup.user_id == user.id)
-            .group_by(BookshelfGroup.id)
             .order_by(BookshelfGroup.order, BookshelfGroup.created_at)
         )
     ).all()

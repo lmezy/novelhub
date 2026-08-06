@@ -3,7 +3,7 @@ from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Author, Book, BookTag, Chapter, Tag
+from app.models import Author, Book, BookTag, Chapter
 from app.repositories.tag import TagRepository
 from app.services.search import search_service
 from app.services.storage import BookStorage
@@ -135,10 +135,6 @@ class ManualImportService:
             if not name or name in seen:
                 continue
             seen.add(name)
-            tag = await repo.get_by_name(name)
-            if tag is None:
-                tag = Tag(id=str(uuid4()), name=name)
-                self.db.add(tag)
-                await self.db.flush()
+            tag = await repo.get_or_create(name)
             self.db.add(BookTag(book_id=book_id, tag_id=tag.id))
         await self.db.flush()

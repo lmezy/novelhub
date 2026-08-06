@@ -621,11 +621,7 @@ class SyncService:
             name = name.strip().lower()
             if not name:
                 continue
-            tag = await tag_repo.get_by_name(name)
-            if tag is None:
-                tag = Tag(id=str(uuid4()), name=name)
-                self.db.add(tag)
-                await self.db.flush()
+            tag = await tag_repo.get_or_create(name)
             bt = BookTag(book_id=book_id, tag_id=tag.id)
             self.db.add(bt)
         await self.db.flush()
