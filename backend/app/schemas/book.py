@@ -80,6 +80,7 @@ class BookSourceAlternate(BaseModel):
     source_book_id: str | None = None
     title: str
     author_name: str | None = None
+    cover: str | None = None
     status: str | None = None
     chapter_count: int = 0
     updated_at: datetime | None = None

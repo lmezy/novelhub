@@ -18,6 +18,7 @@ class Book(Base):
     title = Column(String(255), nullable=False)
     is_r18 = Column(Boolean, default=False, nullable=False)
     cover = Column(String(255))
+    display_cover = Column(String(255))
     description = Column(Text)
     status = Column(String(32))
     created_at = Column(DateTime, server_default=func.now())

@@ -44,6 +44,18 @@ class BookStorage:
         path.write_bytes(data)
         return path.relative_to(self.root.parent).as_posix()
 
+    def save_display_cover(self, book_id: str, data: bytes) -> str:
+        """Save a user-selected cover without overwriting the source cover."""
+        directory = self.cover_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        extension = self._image_extension(data)
+        safe_id = safe_segment(book_id)
+        for old in directory.glob(f"{safe_id}_display.*"):
+            old.unlink(missing_ok=True)
+        path = directory / f"{safe_id}_display.{extension}"
+        path.write_bytes(data)
+        return path.relative_to(self.root.parent).as_posix()
+
     def write_metadata(self, author: str, title: str, metadata: dict) -> Path:
         path = self.book_dir(author, title)
         path.mkdir(parents=True, exist_ok=True)

@@ -29,6 +29,8 @@ const newTagPublic = ref(false)
 const newTagShowUser = ref(true)
 const tagSaving = ref(false)
 const tagError = ref("")
+const coverPickerOpen = ref(false)
+const coverError = ref("")
 const shelfGroups = ref<ShelfGroup[]>([])
 const bookGroupIds = ref<string[]>([])
 const groupSaving = ref(false)
@@ -142,6 +144,36 @@ async function removeSourceTag(tag: string) {
     book.value.tag_names = (book.value.tag_names || []).filter((t) => t !== tag)
   } catch (e) {
     tagError.value = e instanceof Error ? e.message : i18n.t('book_tag_failed')
+  }
+}
+
+async function chooseCover(alt: any) {
+  if (!book.value) return
+  coverError.value = ""
+  try {
+    const res = await api.put<{ cover: string | null }>(
+      "/books/" + book.value.id + "/cover",
+      { source_book_id: alt.id },
+    )
+    book.value.cover = res.cover
+    coverPickerOpen.value = false
+  } catch (e) {
+    coverError.value = e instanceof Error ? e.message : i18n.t('book_cover_failed')
+  }
+}
+
+async function resetCover() {
+  if (!book.value) return
+  coverError.value = ""
+  try {
+    const res = await api.put<{ cover: string | null }>(
+      "/books/" + book.value.id + "/cover",
+      {},
+    )
+    book.value.cover = res.cover
+    coverPickerOpen.value = false
+  } catch (e) {
+    coverError.value = e instanceof Error ? e.message : i18n.t('book_cover_failed')
   }
 }
 
@@ -270,12 +302,20 @@ onMounted(async () => {
         >{{ i18n.t('book_continue') }} &rarr;</router-link>
 
         <header class="mb-8">
-          <img
-            v-if="book.cover"
-            :src="book.cover"
-            :alt="book.title"
-            class="w-40 h-56 object-cover rounded-lg border border-border dark:border-gray-700 mb-4"
-          />
+          <div class="mb-4">
+            <img
+              v-if="book.cover"
+              :src="book.cover"
+              :alt="book.title"
+              class="w-40 h-56 object-cover rounded-lg border border-border dark:border-gray-700"
+            />
+            <button
+              v-if="alternates.length > 1"
+              @click="coverPickerOpen = true"
+              class="mt-2 px-3 py-1 text-xs border border-border dark:border-gray-700 rounded hover:bg-accent/5 transition-colors"
+            >{{ i18n.t('book_cover_select') }}</button>
+            <p v-if="coverError" class="text-xs text-red-600 mt-1">{{ coverError }}</p>
+          </div>
           <h1 class="text-3xl font-bold mb-2">{{ book.title }}</h1>
           <p v-if="book.author_name" class="text-muted dark:text-gray-400 mb-1">{{ book.author_name }}</p>
           <div v-if="book.tag_names?.length" class="flex flex-wrap gap-1 mb-2">
@@ -473,6 +513,44 @@ onMounted(async () => {
           </div>
         </section>
       </template>
+
+      <div v-if="coverPickerOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" @click.self="coverPickerOpen = false">
+        <div class="w-full max-w-lg rounded-lg border border-border dark:border-gray-700 bg-white dark:bg-gray-900 p-4">
+          <h3 class="text-sm font-semibold mb-3">{{ i18n.t('book_cover_choose') }}</h3>
+          <div class="grid grid-cols-3 gap-3">
+            <button
+              v-for="alt in alternates"
+              :key="alt.id"
+              @click="chooseCover(alt)"
+              class="flex flex-col items-center gap-1 p-2 rounded border border-border dark:border-gray-700 hover:border-accent/40 hover:bg-accent/5 transition-colors"
+            >
+              <img
+                v-if="alt.cover"
+                :src="alt.cover"
+                :alt="alt.title"
+                class="h-32 w-24 object-cover rounded border border-border dark:border-gray-700"
+              />
+              <span
+                v-else
+                class="h-32 w-24 flex items-center justify-center text-xs text-muted dark:text-gray-400 rounded border border-border dark:border-gray-700"
+              >{{ i18n.t('book_cover_none') }}</span>
+              <span class="text-xs text-muted dark:text-gray-400 truncate w-full text-center">
+                {{ alt.source_name || alt.id }}<template v-if="alt.is_current"> · {{ i18n.t('book_cover_current') }}</template>
+              </span>
+            </button>
+          </div>
+          <div class="mt-4 flex items-center gap-2">
+            <button
+              @click="resetCover"
+              class="px-3 py-1.5 rounded border border-border dark:border-gray-700 text-xs"
+            >{{ i18n.t('book_cover_reset') }}</button>
+            <button
+              @click="coverPickerOpen = false"
+              class="px-3 py-1.5 rounded border border-border dark:border-gray-700 text-xs"
+            >{{ i18n.t('home_close') }}</button>
+          </div>
+        </div>
+      </div>
 
       <div v-if="tagDetail" class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" @click.self="tagDetail = null">
         <div class="w-full max-w-sm rounded-lg border border-border dark:border-gray-700 bg-white dark:bg-gray-900 p-4">

@@ -18,6 +18,7 @@ from app.services.bookshelf import favorite_group_ids_by_book
 from app.services.custom_tags import list_book_custom_tags_map
 from app.services.epub import EpubService
 from app.services.search import search_service
+from app.services.storage import BookStorage
 from app.services.sync import SyncService
 from app.services.visibility import (
     can_view_r18,
@@ -46,12 +47,27 @@ class BatchFavoriteRequest(BaseModel):
     ids: list[str]
 
 
+class SetBookCoverRequest(BaseModel):
+    source_book_id: str | None = None
+    cover: str | None = None
+
+
 def _normalize_book_title(title: str) -> str:
     return re.sub(
         r"[\s《》「」『』〈〉（）【】\[\]\"'“”‘’]+",
         "",
         title or "",
     ).lower()
+
+
+def _book_cover_value(book: Book) -> str | None:
+    """Return the display cover, preferring the user-selected cover."""
+    cover = getattr(book, "display_cover", None) or getattr(book, "cover", None)
+    if not cover:
+        return None
+    if cover.startswith(("http://", "https://", "data:", "/api/books/")):
+        return cover
+    return f"/api/books/{book.id}/cover"
 
 
 def _serialize_book(
@@ -62,9 +78,7 @@ def _serialize_book(
     shelf_group_ids: dict[str, list[str]] | None = None,
 ) -> BookOut:
     is_admin = user.role in ("admin", "super_admin")
-    cover = book.cover
-    if cover and not cover.startswith(("http://", "https://", "data:")):
-        cover = f"/api/books/{book.id}/cover"
+    cover = _book_cover_value(book)
     if can_view_r18(user):
         category_names = [bc.category.name for bc in book.categories if bc.category]
     else:
@@ -264,14 +278,61 @@ async def list_favorite_books(
 async def get_book_cover(book_id: str, db: AsyncSession = Depends(get_db)):
     """Serve a locally stored cover image, or redirect to the remote URL."""
     book = await db.get(Book, book_id)
-    if book is None or not book.cover:
+    if book is None:
         raise HTTPException(status_code=404, detail="Cover not found")
-    if book.cover.startswith(("http://", "https://")):
-        return RedirectResponse(book.cover)
-    cover_path = Path(settings.STORAGE_PATH).parent / book.cover
+    cover_value = book.display_cover or book.cover
+    if not cover_value:
+        raise HTTPException(status_code=404, detail="Cover not found")
+    if cover_value.startswith(("http://", "https://")):
+        return RedirectResponse(cover_value)
+    cover_path = Path(settings.STORAGE_PATH).parent / cover_value
     if not cover_path.is_file():
         raise HTTPException(status_code=404, detail="Cover not found")
     return FileResponse(cover_path)
+
+
+@router.put("/{book_id}/cover")
+async def set_book_cover(
+    book_id: str,
+    payload: SetBookCoverRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Choose a cover from another source book or a direct cover URL."""
+    book = await db.get(Book, book_id)
+    if not ensure_book_visible(user, book):
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    if payload.cover is not None:
+        cover = str(payload.cover).strip()
+        book.display_cover = cover or None
+    elif payload.source_book_id:
+        source_book = await db.get(Book, payload.source_book_id)
+        if source_book is None or not ensure_book_visible(user, source_book):
+            raise HTTPException(status_code=404, detail="Source book not found")
+        source_cover = source_book.display_cover or source_book.cover
+        if not source_cover:
+            raise HTTPException(status_code=400, detail="Source book has no cover")
+        if source_cover.startswith(("http://", "https://", "data:")):
+            book.display_cover = source_cover
+        else:
+            source_path = Path(settings.STORAGE_PATH).parent / source_cover
+            if not source_path.is_file():
+                raise HTTPException(status_code=400, detail="Source cover file not found")
+            book.display_cover = BookStorage().save_display_cover(
+                book.id,
+                source_path.read_bytes(),
+            )
+    else:
+        # Empty payload resets to the source cover.
+        book.display_cover = None
+
+    await db.commit()
+    return {
+        "book_id": book.id,
+        "cover": _book_cover_value(book),
+        "display_cover": book.display_cover,
+    }
 
 
 @router.delete("/{book_id}/tags", status_code=204, dependencies=[Depends(require_admin)])
@@ -430,6 +491,7 @@ async def list_book_sources(
             source_book_id=b.source_book_id,
             title=b.title,
             author_name=b.author_name,
+            cover=_book_cover_value(b),
             status=b.status,
             chapter_count=chapter_counts.get(b.id, 0),
             updated_at=b.updated_at,

@@ -4,7 +4,14 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from types import SimpleNamespace
 
-from app.api.routes.books import _normalize_book_title, list_book_sources, remove_book_tag
+from app.api.routes.books import (
+    SetBookCoverRequest,
+    _book_cover_value,
+    _normalize_book_title,
+    list_book_sources,
+    remove_book_tag,
+    set_book_cover,
+)
 
 
 def test_normalize_book_title():
@@ -85,6 +92,41 @@ async def test_remove_book_tag_deletes_association_and_reindexes():
     db.delete.assert_any_call(book_tag)
     db.delete.assert_any_call(tag)
     search.update_book_tags.assert_called_once_with("book-1", ["穿越"])
+
+
+def test_book_cover_value_prefers_display_cover():
+    book = SimpleNamespace(id="b1", display_cover="covers/b1_display.jpg", cover="covers/b1.jpg")
+
+    assert _book_cover_value(book) == "/api/books/b1/cover"
+
+    book.display_cover = "https://example.com/display.jpg"
+    assert _book_cover_value(book) == "https://example.com/display.jpg"
+
+
+@pytest.mark.asyncio
+async def test_set_book_cover_from_remote_source_cover():
+    db = AsyncMock()
+    current = SimpleNamespace(id="book-1", display_cover=None, cover="covers/book-1.jpg")
+    source = SimpleNamespace(
+        id="book-2",
+        display_cover=None,
+        cover="https://example.com/source-cover.jpg",
+    )
+    db.get = AsyncMock(side_effect=lambda model, book_id: source if book_id == "book-2" else current)
+    db.commit = AsyncMock()
+    user = SimpleNamespace(role="super_admin")
+
+    with patch("app.api.routes.books.ensure_book_visible", return_value=True):
+        result = await set_book_cover(
+            "book-1",
+            SetBookCoverRequest(source_book_id="book-2"),
+            user,
+            db,
+        )
+
+    assert current.display_cover == "https://example.com/source-cover.jpg"
+    assert result["cover"] == "https://example.com/source-cover.jpg"
+    db.commit.assert_awaited_once()
 
 
 @pytest.mark.asyncio
