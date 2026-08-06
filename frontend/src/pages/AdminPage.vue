@@ -1140,6 +1140,39 @@ onUnmounted(() => {
         </div>
       </section>
 
+      <section v-if="tab === 'index'" class="space-y-6">
+        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
+          <h2 class="text-sm font-semibold mb-2">{{ i18n.t('admin_index_title') }}</h2>
+          <p class="text-xs text-muted dark:text-gray-400 mb-4">{{ i18n.t('admin_index_hint') }}</p>
+          <p v-if="indexError" class="text-sm text-red-600 mb-3">{{ indexError }}</p>
+          <div v-if="indexStats" class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+            <div class="p-4 rounded-lg border border-border dark:border-gray-700">
+              <p class="text-xs font-medium text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_index_books') }}</p>
+              <p class="text-lg font-semibold">{{ indexStats.books?.documents ?? '0' }}</p>
+              <p class="text-xs text-muted dark:text-gray-400 mt-1">
+                {{ indexStats.books?.is_indexing
+                  ? i18n.t('admin_index_indexing')
+                  : i18n.t('admin_index_last_update') + ': ' + (indexStats.books?.last_update ? new Date(indexStats.books.last_update).toLocaleString() : i18n.t('admin_index_unknown')) }}
+              </p>
+            </div>
+            <div class="p-4 rounded-lg border border-border dark:border-gray-700">
+              <p class="text-xs font-medium text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_index_chapters') }}</p>
+              <p class="text-lg font-semibold">{{ indexStats.chapters?.documents ?? '0' }}</p>
+              <p class="text-xs text-muted dark:text-gray-400 mt-1">
+                {{ indexStats.chapters?.is_indexing
+                  ? i18n.t('admin_index_indexing')
+                  : i18n.t('admin_index_last_update') + ': ' + (indexStats.chapters?.last_update ? new Date(indexStats.chapters.last_update).toLocaleString() : i18n.t('admin_index_unknown')) }}
+              </p>
+            </div>
+          </div>
+          <button
+            @click="rebuildIndex"
+            :disabled="indexRebuilding"
+            class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50"
+          >{{ indexRebuilding ? i18n.t('admin_index_rebuilding') : i18n.t('admin_index_rebuild') }}</button>
+        </div>
+      </section>
+
       <section v-if="tab === 'status'" class="space-y-4">
         <button @click="loadStatus" class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm hover:bg-surface dark:bg-gray-900 transition-colors mb-4">{{ i18n.t('admin_refresh') }}</button>
         <div v-if="healthStatus" class="grid grid-cols-1 sm:grid-cols-2 gap-4">
