@@ -28,6 +28,7 @@ from app.services.account import (
     reserve_deleted_account,
     username_available,
 )
+from app.services.invite import generate_invite_code
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -68,6 +69,7 @@ async def create_user(
         password_hash=hash_password(payload.password),
         role=payload.role,
         approved=True,
+        invite_code=generate_invite_code(),
         r18_enabled=False,
         non_r18_enabled=True,
         can_manage_visibility=False,

@@ -1,8 +1,10 @@
-from sqlalchemy import Boolean, Column, String, DateTime
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, String
 
 from sqlalchemy.sql import func
 
 from .base import Base
+
+from app.services.invite import generate_invite_code
 
 
 
@@ -66,6 +68,19 @@ class User(Base):
         Boolean,
         nullable=False,
         default=True
+    )
+
+    invite_code=Column(
+        String(64),
+        unique=True,
+        nullable=False,
+        default=generate_invite_code
+    )
+
+    invited_by_id=Column(
+        String,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True
     )
 
 

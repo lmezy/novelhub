@@ -18,6 +18,7 @@ from app.services.jwt import create_token
 from app.services.security import hash_password, verify_password
 from app.services.settings import get_registration_approval_enabled
 from app.services.account import email_available, username_available
+from app.services.invite import generate_invite_code
 
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -25,6 +26,13 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 @router.post("/register", response_model=RegisterResult, status_code=201)
 async def register(payload: UserCreate, db: AsyncSession = Depends(get_db)):
+    if not payload.invite_code:
+        raise HTTPException(status_code=400, detail="Invite code is required")
+    inviter = await db.scalar(
+        select(User).where(User.invite_code == payload.invite_code)
+    )
+    if inviter is None:
+        raise HTTPException(status_code=400, detail="Invalid invite code")
     username_error = await username_available(db, payload.username)
     if username_error:
         raise HTTPException(status_code=409, detail=username_error)
@@ -40,6 +48,8 @@ async def register(payload: UserCreate, db: AsyncSession = Depends(get_db)):
         password_hash=hash_password(payload.password),
         role="user",
         approved=not approval_enabled,
+        invite_code=generate_invite_code(),
+        invited_by_id=inviter.id,
         r18_enabled=False,
         non_r18_enabled=True,
         can_manage_visibility=False,

@@ -11,6 +11,8 @@ export interface User {
   non_r18_enabled: boolean
   can_manage_visibility: boolean
   approved: boolean
+  invite_code: string
+  invited_by_id: string | null
 }
 
 export const useAuthStore = defineStore("auth", () => {
@@ -38,7 +40,7 @@ function toggleDark() {
     localStorage.setItem("novelhub_token", res.access_token)
   }
 
-  async function register(username: string, password: string, email?: string) {
+  async function register(username: string, password: string, email?: string, inviteCode?: string) {
     const res = await api.post<{
       status?: "approved" | "pending"
       access_token?: string
@@ -47,6 +49,7 @@ function toggleDark() {
       username,
       password,
       email,
+      invite_code: inviteCode,
     })
     if (res.access_token) {
       token.value = res.access_token

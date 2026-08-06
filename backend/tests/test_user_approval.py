@@ -25,7 +25,7 @@ def _db_with_scalar_sequence(values):
 
 @pytest.mark.asyncio
 async def test_register_pending_when_approval_enabled():
-    db = _db_with_scalar(None)
+    db = _db_with_scalar_sequence([SimpleNamespace(id="inviter-1"), None, None, None, None])
     app.dependency_overrides[get_db] = lambda: db
     try:
         transport = ASGITransport(app=app)
@@ -40,6 +40,7 @@ async def test_register_pending_when_approval_enabled():
                         "username": "pendinguser",
                         "email": "pending@example.com",
                         "password": "secret1",
+                        "invite_code": "invite123",
                     },
                 )
     finally:
@@ -54,7 +55,7 @@ async def test_register_pending_when_approval_enabled():
 
 @pytest.mark.asyncio
 async def test_register_approved_when_approval_disabled():
-    db = _db_with_scalar(None)
+    db = _db_with_scalar_sequence([SimpleNamespace(id="inviter-1"), None, None, None, None])
     app.dependency_overrides[get_db] = lambda: db
     try:
         transport = ASGITransport(app=app)
@@ -69,6 +70,7 @@ async def test_register_approved_when_approval_disabled():
                         "username": "approveduser",
                         "email": "approved@example.com",
                         "password": "secret1",
+                        "invite_code": "invite123",
                     },
                 )
     finally:
@@ -83,7 +85,7 @@ async def test_register_approved_when_approval_disabled():
 
 @pytest.mark.asyncio
 async def test_register_without_email_succeeds():
-    db = _db_with_scalar(None)
+    db = _db_with_scalar_sequence([SimpleNamespace(id="inviter-1"), None, None])
     app.dependency_overrides[get_db] = lambda: db
     try:
         transport = ASGITransport(app=app)
@@ -94,13 +96,55 @@ async def test_register_without_email_succeeds():
             ):
                 resp = await client.post(
                     "/api/auth/register",
-                    json={"username": "noemail", "password": "secret1"},
+                    json={
+                        "username": "noemail",
+                        "password": "secret1",
+                        "invite_code": "invite123",
+                    },
                 )
     finally:
         app.dependency_overrides.clear()
 
     assert resp.status_code == 201
     assert resp.json()["user"]["email"] is None
+
+
+@pytest.mark.asyncio
+async def test_register_requires_invite_code():
+    db = _db_with_scalar(None)
+    app.dependency_overrides[get_db] = lambda: db
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/api/auth/register",
+                json={"username": "noinvite", "password": "secret1"},
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_register_rejects_invalid_invite_code():
+    db = _db_with_scalar(None)
+    app.dependency_overrides[get_db] = lambda: db
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/api/auth/register",
+                json={
+                    "username": "badinvite",
+                    "password": "secret1",
+                    "invite_code": "not-exist",
+                },
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 400
 
 
 @pytest.mark.asyncio
@@ -188,14 +232,18 @@ async def test_login_by_email():
 
 @pytest.mark.asyncio
 async def test_register_duplicate_username_rejected():
-    db = _db_with_scalar_sequence([object()])
+    db = _db_with_scalar_sequence([SimpleNamespace(id="inviter-1"), object()])
     app.dependency_overrides[get_db] = lambda: db
     try:
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.post(
                 "/api/auth/register",
-                json={"username": "taken", "password": "secret1"},
+                json={
+                    "username": "taken",
+                    "password": "secret1",
+                    "invite_code": "invite123",
+                },
             )
     finally:
         app.dependency_overrides.clear()
@@ -205,7 +253,7 @@ async def test_register_duplicate_username_rejected():
 
 @pytest.mark.asyncio
 async def test_register_duplicate_email_rejected():
-    db = _db_with_scalar_sequence([None, object()])
+    db = _db_with_scalar_sequence([SimpleNamespace(id="inviter-1"), None, None, object()])
     app.dependency_overrides[get_db] = lambda: db
     try:
         transport = ASGITransport(app=app)
@@ -216,6 +264,7 @@ async def test_register_duplicate_email_rejected():
                     "username": "newuser",
                     "email": "taken@example.com",
                     "password": "secret1",
+                    "invite_code": "invite123",
                 },
             )
     finally:

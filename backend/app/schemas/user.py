@@ -12,6 +12,8 @@ class UserCreate(BaseModel):
 
     password:str
 
+    invite_code: str | None = None
+
     @field_validator("username")
     @classmethod
     def _validate_username(cls, value: str) -> str:
@@ -52,6 +54,8 @@ class UserOut(BaseModel):
     non_r18_enabled: bool = True
     can_manage_visibility: bool = False
     approved: bool = True
+    invite_code: str = ""
+    invited_by_id: str | None = None
 
     class Config:
         from_attributes = True

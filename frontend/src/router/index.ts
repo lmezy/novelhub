@@ -1,4 +1,5 @@
 import { createRouter, createWebHistory } from "vue-router"
+import { useAuthStore } from "../stores/auth"
 
 const router = createRouter({
   history: createWebHistory(),
@@ -42,18 +43,28 @@ const router = createRouter({
       path: "/admin",
       name: "admin",
       component: () => import("../pages/AdminPage.vue"),
-      meta: { requiresAuth: true },
+      meta: { requiresAuth: true, requiresAdmin: true },
     },
   ],
 })
 
-router.beforeEach((to, _from, next) => {
+router.beforeEach(async (to, _from, next) => {
+  const auth = useAuthStore()
   const token = localStorage.getItem("novelhub_token")
   if (to.name === "login" && token) {
     next({ name: "home" })
   } else if (to.name !== "login" && !token) {
     next({ name: "login" })
   } else {
+    if (to.meta.requiresAdmin) {
+      if (!auth.user) {
+        await auth.fetchMe()
+      }
+      if (!auth.isAdmin) {
+        next({ name: "home" })
+        return
+      }
+    }
     next()
   }
 })

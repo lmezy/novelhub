@@ -46,7 +46,7 @@ function closeMenu() {
         <router-link to="/search" class="text-sm text-muted hover:text-ink no-underline transition-colors">{{ i18n.t('nav_search') }}</router-link>
         <template v-if="auth.user">
           <router-link v-if="auth.isAdmin" to="/sync" class="text-sm text-muted hover:text-ink no-underline transition-colors">{{ i18n.t('nav_sync') }}</router-link>
-          <router-link v-if="auth.user" to="/admin" class="text-sm text-muted hover:text-ink no-underline transition-colors">{{ i18n.t('nav_admin') }}</router-link>
+          <router-link v-if="auth.isAdmin" to="/admin" class="text-sm text-muted hover:text-ink no-underline transition-colors">{{ i18n.t('nav_admin') }}</router-link>
           <button @click="logout" class="text-sm text-muted hover:text-ink transition-colors">{{ i18n.t('nav_logout') }}</button>
         </template>
         <template v-else>
@@ -68,7 +68,7 @@ function closeMenu() {
       <router-link to="/search" @click="closeMenu" class="block text-sm text-muted hover:text-ink no-underline py-1">{{ i18n.t('nav_search') }}</router-link>
       <template v-if="auth.user">
         <router-link v-if="auth.isAdmin" to="/sync" @click="closeMenu" class="block text-sm text-muted hover:text-ink no-underline py-1">{{ i18n.t('nav_sync') }}</router-link>
-        <router-link v-if="auth.user" to="/admin" @click="closeMenu" class="block text-sm text-muted hover:text-ink no-underline py-1">{{ i18n.t('nav_admin') }}</router-link>
+        <router-link v-if="auth.isAdmin" to="/admin" @click="closeMenu" class="block text-sm text-muted hover:text-ink no-underline py-1">{{ i18n.t('nav_admin') }}</router-link>
         <button @click="logout" class="block text-sm text-muted hover:text-ink py-1 w-full text-left">{{ i18n.t('nav_logout') }}</button>
       </template>
       <template v-else>

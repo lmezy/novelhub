@@ -25,6 +25,7 @@ const managingGroups = ref(false)
 const moveOpen = ref(false)
 const moveGroupIds = ref<string[]>([])
 const groupForm = ref<Record<string, { name: string; show: boolean }>>({})
+const inviteCopied = ref(false)
 
 const allSelected = computed(() =>
   favoriteBooks.value.length > 0 &&
@@ -34,6 +35,18 @@ const allSelected = computed(() =>
 const groupNameMap = computed(() =>
   Object.fromEntries(groups.value.map((g) => [g.id, g.name]))
 )
+
+function copyInviteLink() {
+  const code = auth.user?.invite_code
+  if (!code) return
+  const link = window.location.origin + "/login?invite=" + encodeURIComponent(code)
+  navigator.clipboard?.writeText(link).then(() => {
+    inviteCopied.value = true
+    setTimeout(() => {
+      inviteCopied.value = false
+    }, 2000)
+  }).catch(() => {})
+}
 
 async function loadGroups() {
   try {
@@ -245,6 +258,19 @@ onMounted(async () => {
     <NavBar />
 
     <main class="max-w-5xl mx-auto px-4 py-8">
+      <section v-if="auth.user?.invite_code" class="mb-8 p-4 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
+        <div class="flex items-center justify-between flex-wrap gap-3">
+          <div>
+            <p class="text-sm font-medium">{{ i18n.t('home_invite_title') }}</p>
+            <p class="text-xs text-muted dark:text-gray-400 mt-1">{{ i18n.t('home_invite_hint') }}</p>
+          </div>
+          <button
+            @click="copyInviteLink"
+            class="text-xs px-3 py-1.5 rounded border border-accent text-accent hover:bg-accent/10"
+          >{{ inviteCopied ? i18n.t('home_invite_copied') : i18n.t('home_invite_copy') }}</button>
+        </div>
+      </section>
+
       <section v-if="recentReads.length > 0" class="mb-10">
         <h2 class="text-lg font-semibold mb-3">{{ i18n.t('home_continue') }}</h2>
         <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">

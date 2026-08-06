@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { ref } from "vue"
-import { useRouter } from "vue-router"
+import { onMounted, ref } from "vue"
+import { useRoute, useRouter } from "vue-router"
 import { useAuthStore } from "../stores/auth"
 import { useI18nStore } from "../stores/i18n"
 import NavBar from "../components/NavBar.vue"
@@ -8,11 +8,13 @@ import NavBar from "../components/NavBar.vue"
 const auth = useAuthStore()
 const i18n = useI18nStore()
 const router = useRouter()
+const route = useRoute()
 
 const isRegister = ref(false)
 const username = ref("")
 const password = ref("")
 const email = ref("")
+const inviteCode = ref("")
 const error = ref("")
 const notice = ref("")
 const loading = ref(false)
@@ -34,6 +36,10 @@ async function submit() {
     return
   }
   if (isRegister.value) {
+    if (!inviteCode.value.trim()) {
+      error.value = i18n.t('login_invite_required')
+      return
+    }
     if (!USERNAME_RE.test(username.value)) {
       error.value = i18n.t('login_username_invalid')
       return
@@ -48,13 +54,19 @@ async function submit() {
   notice.value = ""
   try {
     if (isRegister.value) {
-      const res = await auth.register(username.value, password.value, email.value || undefined)
+      const res = await auth.register(
+        username.value,
+        password.value,
+        email.value || undefined,
+        inviteCode.value.trim(),
+      )
       if (res.status === "pending") {
         notice.value = i18n.t('login_pending_approval')
         isRegister.value = false
         username.value = ""
         password.value = ""
         email.value = ""
+        inviteCode.value = ""
         return
       }
     } else {
@@ -67,6 +79,14 @@ async function submit() {
     loading.value = false
   }
 }
+
+onMounted(() => {
+  const invite = route.query.invite
+  if (typeof invite === "string" && invite) {
+    inviteCode.value = invite
+    isRegister.value = true
+  }
+})
 </script>
 
 <template>
@@ -95,6 +115,15 @@ async function submit() {
             type="email"
             class="w-full px-3 py-2 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-ink placeholder:text-muted dark:text-gray-400 focus:outline-none focus:ring-2 focus:ring-accent/30 text-sm"
             :placeholder="i18n.t('login_email_placeholder')"
+          />
+        </div>
+        <div v-if="isRegister">
+          <label class="block text-sm text-muted dark:text-gray-400 mb-1">{{ i18n.t('login_invite_code') }}</label>
+          <input
+            v-model="inviteCode"
+            type="text"
+            class="w-full px-3 py-2 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-ink placeholder:text-muted dark:text-gray-400 focus:outline-none focus:ring-2 focus:ring-accent/30 text-sm"
+            :placeholder="i18n.t('login_invite_placeholder')"
           />
         </div>
         <div>
