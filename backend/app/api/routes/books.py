@@ -1,13 +1,15 @@
 import re
 from uuid import uuid4
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, RedirectResponse, Response
 from pydantic import BaseModel
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.models import Book, BookFavorite, BookFavoriteGroup, Chapter, Source, User
 from app.services.auth import get_current_user, require_admin
@@ -59,6 +61,9 @@ def _serialize_book(
     shelf_group_ids: dict[str, list[str]] | None = None,
 ) -> BookOut:
     is_admin = user.role in ("admin", "super_admin")
+    cover = book.cover
+    if cover and not cover.startswith(("http://", "https://", "data:")):
+        cover = f"/api/books/{book.id}/cover"
     if can_view_r18(user):
         category_names = [bc.category.name for bc in book.categories if bc.category]
     else:
@@ -73,7 +78,7 @@ def _serialize_book(
         author_id=book.author_id,
         source_id=book.source_id,
         source_book_id=book.source_book_id,
-        cover=book.cover,
+        cover=cover,
         description=book.description,
         status=book.status,
         is_r18=book.is_r18 if is_admin else False,
@@ -252,6 +257,20 @@ async def list_favorite_books(
         _serialize_book(book, user, True, custom_tags, shelf_groups)
         for book in books
     ]
+
+
+@router.get("/{book_id}/cover")
+async def get_book_cover(book_id: str, db: AsyncSession = Depends(get_db)):
+    """Serve a locally stored cover image, or redirect to the remote URL."""
+    book = await db.get(Book, book_id)
+    if book is None or not book.cover:
+        raise HTTPException(status_code=404, detail="Cover not found")
+    if book.cover.startswith(("http://", "https://")):
+        return RedirectResponse(book.cover)
+    cover_path = Path(settings.STORAGE_PATH).parent / book.cover
+    if not cover_path.is_file():
+        raise HTTPException(status_code=404, detail="Cover not found")
+    return FileResponse(cover_path)
 
 
 @router.post("/{book_id}/favorite")

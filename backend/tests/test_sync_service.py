@@ -35,6 +35,13 @@ def test_normalize_title_for_match():
     assert SyncService._normalize_title_for_match(" 剑来 ") == "剑来"
 
 
+def test_is_metadata_noise_tag_filters_title_author_and_site():
+    assert SyncService._is_metadata_noise_tag("紫影玉茗", "紫影玉茗", "lisianthus") is True
+    assert SyncService._is_metadata_noise_tag("lisianthus", "紫影玉茗", "lisianthus") is True
+    assert SyncService._is_metadata_noise_tag("爱丽丝书屋", "紫影玉茗", "lisianthus") is True
+    assert SyncService._is_metadata_noise_tag("重口", "紫影玉茗", "lisianthus") is False
+
+
 def test_chapter_concurrency_uses_env_override():
     from app.core.config import settings
 
@@ -87,6 +94,43 @@ async def test_sync_book_rejects_empty_remote_book():
         service = SyncService(db)
         with pytest.raises(ValueError, match="no usable metadata/chapters"):
             await service.sync_book("src1", "https://example.com/novel/33927.html")
+
+
+@pytest.mark.asyncio
+async def test_persist_cover_downloads_and_saves_local_file():
+    db = _mock_db()
+    service = SyncService(db)
+    service.storage = MagicMock()
+    service.storage.save_cover.return_value = "covers/book-1.jpg"
+    book = Book(id="book-1")
+    plugin = SimpleNamespace(
+        fetch_cover=AsyncMock(return_value=(b"\xff\xd8\xff\xe0", "image/jpeg"))
+    )
+    remote_book = SimpleNamespace(cover_url="https://example.com/cover.jpg")
+
+    remote_url = await service._persist_cover(book, plugin, remote_book)
+
+    assert remote_url == "https://example.com/cover.jpg"
+    assert book.cover == "covers/book-1.jpg"
+    plugin.fetch_cover.assert_awaited_once_with("https://example.com/cover.jpg")
+    service.storage.save_cover.assert_called_once_with("book-1", b"\xff\xd8\xff\xe0")
+
+
+@pytest.mark.asyncio
+async def test_persist_cover_falls_back_to_remote_url_when_fetch_fails():
+    db = _mock_db()
+    service = SyncService(db)
+    service.storage = MagicMock()
+    book = Book(id="book-1")
+    plugin = SimpleNamespace(
+        fetch_cover=AsyncMock(side_effect=RuntimeError("network down"))
+    )
+    remote_book = SimpleNamespace(cover_url="https://example.com/cover.jpg")
+
+    remote_url = await service._persist_cover(book, plugin, remote_book)
+
+    assert remote_url == "https://example.com/cover.jpg"
+    assert book.cover == "https://example.com/cover.jpg"
 
 
 @pytest.mark.asyncio

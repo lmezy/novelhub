@@ -144,6 +144,21 @@ GENERIC_CHAPTER_SELECTORS = [
     "#catalog a",
 ]
 
+GENERIC_BOOK_COVER_SELECTORS = [
+    "meta[property='og:image']",
+    "meta[name='og:image']",
+    "meta[itemprop='image']",
+    "img.book-cover",
+    ".book-cover img",
+    ".novel-cover img",
+    ".book_info img",
+    ".book-info img",
+    ".bookinfo img",
+    "#cover img",
+    "img.cover",
+    "img[class*='cover']",
+]
+
 
 class YueduPlugin:
     """A NovelSourcePlugin implementation driven by a YueDu book source JSON."""
@@ -293,6 +308,8 @@ class YueduPlugin:
             info["intro"] = generic["description"]
         if not info.get("status"):
             info["status"] = generic["status"]
+        if not str(info.get("coverUrl") or "").strip():
+            info["coverUrl"] = generic.get("cover") or ""
         generic_tags = generic.get("tags") or []
         raw_kind = info.get("kind") or ""
         if isinstance(raw_kind, list):
@@ -304,7 +321,12 @@ class YueduPlugin:
                 if tag.strip()
             ]
         tags = list(dict.fromkeys([*kind_tags, *generic_tags]))
+        book_title = self._clean_book_title(str(info.get("name") or "").strip()) or "Unknown"
+        author = self._clean_author(str(info.get("author") or "").strip()) or "Unknown"
+        tags = self._clean_tags(tags, book_title, author)
         info["kind"] = ",".join(tags)
+        info["name"] = book_title
+        info["author"] = author
 
         chapters: list[RemoteChapter] = []
         chapter_num = 0
@@ -330,10 +352,9 @@ class YueduPlugin:
             if not self._is_chapter_url(ch_url, url):
                 continue
             title = str(title or "").strip() or f"Chapter {chapter_num + 1}"
-            book_name = str(info.get("name") or "").strip()
             if (
                 title in ("目录", "简介", "上一章", "下一章", "返回目录", "首页", "开始阅读")
-                or (book_name and title == book_name)
+                or title == book_title
             ):
                 continue
             if ch_url in seen_chapter_urls:
@@ -351,8 +372,11 @@ class YueduPlugin:
             chapters = generic["chapters"]
         chapters = self._attach_next_urls(chapters)
 
-        book_title = str(info.get("name") or "").strip() or "Unknown"
-        author = str(info.get("author") or "").strip() or "Unknown"
+        cover_url = str(info.get("coverUrl") or "").strip()
+        if cover_url:
+            cover_url = self._make_absolute(cover_url, url)
+            if self._looks_like_placeholder_cover(cover_url):
+                cover_url = ""
         description = info.get("intro", "")
         status = info.get("status", "")
 
@@ -364,6 +388,7 @@ class YueduPlugin:
             status=status if status else None,
             chapters=chapters,
             tags=tags,
+            cover_url=cover_url or None,
         )
 
     def _parse_book_generic(
@@ -393,7 +418,7 @@ class YueduPlugin:
             if title_tag:
                 title = title_tag.get_text(" ", strip=True)
                 title = re.split(r"\s+[-_|]\s+", title, maxsplit=1)[0].strip()
-        title = re.sub(r"^《(.+)》$", r"\1", title).strip()
+        title = self._clean_book_title(title)
 
         author = ""
         for selector in GENERIC_BOOK_AUTHOR_SELECTORS:
@@ -404,6 +429,9 @@ class YueduPlugin:
             if value:
                 author = str(value).strip()
                 break
+        if not author:
+            author = self._extract_author_from_text(soup)
+        author = self._clean_author(author)
 
         description = ""
         for selector in GENERIC_BOOK_DESC_SELECTORS:
@@ -414,6 +442,28 @@ class YueduPlugin:
             if value:
                 description = str(value).strip()
                 break
+
+        cover = ""
+        for selector in GENERIC_BOOK_COVER_SELECTORS:
+            el = soup.select_one(selector)
+            if el is None:
+                continue
+            value = el.get("content") if el.name == "meta" else el.get("src") or el.get("data-src")
+            if value:
+                cover = str(value).strip()
+                break
+        if not cover:
+            for img in soup.select("img[src]"):
+                src = str(img.get("src") or "").strip()
+                if not src or src.startswith("data:"):
+                    continue
+                abs_src = self._make_absolute(src, url)
+                path = urlparse(abs_src).path.lower()
+                if any(key in path for key in ("cover", "book", "novel")) and "favicon" not in path:
+                    cover = src
+                    break
+        if cover:
+            cover = self._make_absolute(cover, url)
 
         status = ""
         page_text = soup.get_text(" ", strip=True)
@@ -514,10 +564,148 @@ class YueduPlugin:
             "title": title,
             "author": author,
             "description": description,
+            "cover": cover,
             "status": status,
-            "tags": tags,
+            "tags": self._clean_tags(tags, title, author),
             "chapters": chapters,
         }
+
+    def _site_markers(self) -> list[str]:
+        """Return source/site names that commonly pollute scraped metadata."""
+        markers = [str(self.display_name or "").strip()]
+        host = urlparse(self.base_url).netloc or ""
+        if host:
+            markers.append(host)
+            if host.lower().startswith("www."):
+                markers.append(host[4:])
+        markers = [m for m in markers if len(m) >= 2]
+        return sorted(set(markers), key=len, reverse=True)
+
+    def _clean_book_title(self, title: str | None) -> str:
+        title = str(title or "").strip().strip("《》").strip()
+        if not title:
+            return ""
+        for marker in self._site_markers():
+            match = re.search(
+                rf"[-_|\s(]*[^\-_|\n)]*{re.escape(marker)}[^\-_|\n)]*\)?$",
+                title,
+                re.IGNORECASE,
+            )
+            if not match or match.start() <= 0:
+                continue
+            cleaned = title[: match.start()].strip(" -_|")
+            cleaned = re.sub(r"[-_|][^-_|]+$", "", cleaned).strip()
+            if cleaned:
+                title = cleaned
+                break
+        title = re.sub(
+            r"[-_|]\s*(?:最新章节|全文阅读|免费阅读|小说|最新更新)\s*$",
+            "",
+            title,
+            flags=re.IGNORECASE,
+        ).strip()
+        return title
+
+    @staticmethod
+    def _extract_author_from_text(soup: BeautifulSoup) -> str:
+        """Fallback author extraction from visible `作者：xxx` text."""
+        for node in soup.find_all(string=True):
+            if node.parent is not None and node.parent.name in ("script", "style"):
+                continue
+            text = str(node).strip()
+            if not text or len(text) > 80:
+                continue
+            match = re.search(
+                r"(?:作\s*者|作者|著者|author)\s*[:：]\s*([^\n<]{1,60})",
+                text,
+                re.IGNORECASE,
+            )
+            if match:
+                return match.group(1).strip()
+        return ""
+
+    def _clean_author(self, author: str | None) -> str:
+        text = str(author or "").strip()
+        if not text:
+            return ""
+        text = re.sub(r"\r?\n+", " ", text).strip()
+        text = re.sub(
+            r"^(?:作\s*者|作者|著者|author)\s*[:：]\s*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip()
+        text = re.sub(r"\s+", " ", text).strip(" -_|")
+        for marker in self._site_markers():
+            text = re.sub(
+                rf"\s*[-_|]?\s*{re.escape(marker)}.*$",
+                "",
+                text,
+                flags=re.IGNORECASE,
+            ).strip()
+        if text.lower() in ("unknown", "未知", "暂无", "无"):
+            return ""
+        return text[:120]
+
+    def _clean_tags(
+        self,
+        tags: list[str],
+        title: str = "",
+        author: str = "",
+    ) -> list[str]:
+        """Drop title/author/site noise that generic parsers add as tags."""
+        def _normalize(value: str) -> str:
+            return re.sub(
+                r"[\s《》「」『』〈〉（）【】\[\]\"'“”‘’]+",
+                "",
+                value,
+            ).lower()
+
+        title_norm = _normalize(title)
+        author_norm = _normalize(author)
+        markers = self._site_markers()
+        noise = {
+            "tags", "tag", "标签", "分类", "类别", "类型",
+            "最新章节", "最新章节列表", "全文阅读", "免费阅读", "阅读更多",
+            "书友正在看", "大家都在看", "上一章", "下一章", "目录",
+            "返回目录", "首页", "开始阅读", "小说", "本站",
+        }
+        result: list[str] = []
+        for tag in tags:
+            tag = str(tag or "").strip().strip("#").strip()
+            if not tag:
+                continue
+            normalized = _normalize(tag)
+            if not normalized:
+                continue
+            if title_norm and (
+                normalized == title_norm
+                or (title_norm in normalized and "最新章节" in normalized)
+            ):
+                continue
+            if author_norm and normalized == author_norm:
+                continue
+            if tag.lower() in noise:
+                continue
+            if any(marker and marker.lower() in tag.lower() for marker in markers):
+                continue
+            if len(tag) > 20:
+                continue
+            result.append(tag)
+        return list(dict.fromkeys(result))
+
+    @staticmethod
+    def _looks_like_placeholder_cover(url: str) -> bool:
+        path = urlparse(url).path.lower()
+        name = path.rsplit("/", 1)[-1]
+        return (
+            "favicon" in path
+            or name in (
+                "logo.png", "logo.svg", "logo.jpg", "logo.webp",
+                "default.jpg", "default.png", "nopic.jpg",
+                "no-cover.jpg", "no-cover.png",
+            )
+        )
 
     # ---- Required: fetch_chapter_content ----
 
@@ -764,7 +952,7 @@ class YueduPlugin:
             for sel in SHELF_AUTHOR_SELECTORS:
                 author_el = item.select_one(sel)
                 if author_el:
-                    author = author_el.get_text(strip=True)
+                    author = self._clean_author(author_el.get_text(strip=True)) or "Unknown"
                     break
 
             # Try to find latest chapter title
@@ -887,7 +1075,9 @@ class YueduPlugin:
                 for sel in SHELF_AUTHOR_SELECTORS:
                     author_el = a_tag.parent.select_one(sel)
                     if author_el:
-                        author = author_el.get_text(" ", strip=True) or "Unknown"
+                        author = self._clean_author(
+                            author_el.get_text(" ", strip=True)
+                        ) or "Unknown"
                         break
 
             seen_urls.add(full_url)
@@ -1184,7 +1374,7 @@ class YueduPlugin:
             {
                 "bookUrl": book.url,
                 "name": book.title,
-                "author": book.author,
+                "author": self._clean_author(book.author) or "Unknown",
                 "latestChapterTitle": book.latest_chapter_title,
             }
             for book in shelf_books
@@ -1232,7 +1422,7 @@ class YueduPlugin:
             books.append(RemoteShelfBook(
                 source_book_id=self._book_id_from_url(full_url),
                 title=str(item.get("name") or item.get("title") or book_url).strip() or "Unknown",
-                author=str(item.get("author") or "").strip() or "Unknown",
+                author=self._clean_author(str(item.get("author") or "").strip()) or "Unknown",
                 url=full_url,
                 latest_chapter_title=item.get("latestChapterTitle"),
             ))
@@ -1307,7 +1497,7 @@ class YueduPlugin:
             seen.add(key)
             results.append({
                 "name": name,
-                "author": str(item.get("author") or "").strip() or "Unknown",
+                "author": self._clean_author(str(item.get("author") or "").strip()) or "Unknown",
                 "bookUrl": full_url,
                 "coverUrl": str(item.get("coverUrl") or "").strip() or None,
                 "intro": str(item.get("intro") or "").strip() or None,
@@ -1330,7 +1520,7 @@ class YueduPlugin:
         return [
             {
                 "name": book.title,
-                "author": book.author,
+                "author": self._clean_author(book.author) or "Unknown",
                 "bookUrl": book.url,
                 "lastChapter": book.latest_chapter_title,
             }
@@ -1852,6 +2042,90 @@ class YueduPlugin:
         if last_error is not None:
             raise last_error
         raise RuntimeError(f"Request failed after retries: {url}")
+
+    async def fetch_cover(self, url: str) -> tuple[bytes, str] | None:
+        """Fetch a cover image, applying coverDecodeJs when configured."""
+        import asyncio
+        import httpx
+
+        if not url.startswith(("http://", "https://")):
+            return None
+        await self._sleep_rate_limit()
+        headers = self._build_headers({
+            "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+        })
+
+        proxy_url = None
+        try:
+            from app.services.proxy_config import get_proxy_config
+            cfg = get_proxy_config()
+            if cfg.enabled:
+                proxy_url = cfg.https_proxy or cfg.http_proxy
+        except Exception:
+            pass
+
+        async def _request(proxy: str | None) -> tuple[bytes, str]:
+            nonlocal headers
+            last_error: httpx.HTTPError | None = None
+            for attempt in range(3):
+                try:
+                    client = await self._get_http_client(proxy)
+                    resp = await client.get(url, headers=headers)
+                    if resp.status_code == 403 and attempt == 0:
+                        headers = self._with_403_fallback(headers)
+                        await asyncio.sleep(1.0 + random.uniform(0.5, 1.0))
+                        continue
+                    if resp.status_code in (429, 500, 502, 503, 504):
+                        retry_after = resp.headers.get("Retry-After", "")
+                        wait = (
+                            float(retry_after)
+                            if retry_after and retry_after.replace(".", "", 1).isdigit()
+                            else 2 ** attempt
+                        )
+                        await asyncio.sleep(wait + random.uniform(0.5, 1.5))
+                        continue
+                    resp.raise_for_status()
+                    self._capture_cookie_jar(resp)
+                    return resp.content, resp.headers.get("content-type", "")
+                except httpx.HTTPError as exc:
+                    last_error = exc
+                    if attempt < 2:
+                        await asyncio.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError(f"Request failed after retries: {url}")
+
+        proxies: list[str | None] = [None]
+        if proxy_url:
+            proxies.insert(0, proxy_url)
+
+        last_error: Exception | None = None
+        for proxy in proxies:
+            try:
+                data, content_type = await _request(proxy)
+                if not data or len(data) < 128:
+                    return None
+                if self.engine:
+                    decoded = self.engine.decode_cover(data)
+                    if decoded:
+                        data = decoded
+                return data, content_type
+            except httpx.RequestError as exc:
+                last_error = exc
+                if proxy is None:
+                    break
+                logger.warning(
+                    "Configured proxy %s unreachable for cover (%s); retrying direct",
+                    proxy_url,
+                    exc,
+                )
+            except Exception as exc:
+                last_error = exc
+                break
+        if last_error is not None:
+            logger.warning("Failed to fetch cover {}: {}", url, last_error)
+        return None
+
     def get_search_check_keyword(self, default: str = "\u6211\u7684") -> str:
         """Get the check keyword for search validation.
 

@@ -556,6 +556,11 @@ class YueduRuleEngine:
         before = before.strip()
         if before in ("children", "children."):
             return [c for c in getattr(el, "children", []) if isinstance(c, Tag)]
+        if re.search(r"[\u4e00-\u9fff]", before) and not re.match(
+            r"^(?:tag|class|id|text|children)\.",
+            before,
+        ):
+            return YueduRuleEngine._text_matching_elements(el, before)
         parts = before.split(".", 1)
         if len(parts) == 2:
             kind, value = parts
@@ -570,7 +575,38 @@ class YueduRuleEngine:
                     node.parent for node in el.find_all(string=True)
                     if node.parent is not None and value in str(node)
                 ]
-        return el.select(before)
+        try:
+            return el.select(before)
+        except Exception:
+            # Legacy text rules such as `作者：@text` use a plain label as the
+            # selector. Jsoup/Legado treat that as a text search, so fall back
+            # to elements whose own text contains the label.
+            return YueduRuleEngine._text_matching_elements(el, before)
+
+    @staticmethod
+    def _text_matching_elements(el: Tag, needle: str) -> list[Tag]:
+        """Find elements containing a plain-text label like `作者：`."""
+        needle = needle.strip()
+        if not needle:
+            return []
+
+        matches: list[Tag] = []
+        for descendant in el.find_all(True):
+            own_text = "".join(
+                str(child)
+                for child in descendant.children
+                if isinstance(child, str)
+            )
+            if needle in own_text:
+                matches.append(descendant)
+
+        if matches:
+            return matches
+
+        for descendant in el.find_all(True):
+            if needle in descendant.get_text(" ", strip=False):
+                matches.append(descendant)
+        return matches
 
     @staticmethod
     def _apply_legado_indexes(
@@ -769,6 +805,16 @@ class YueduRuleEngine:
     def _eval_css_single(self, soup: BeautifulSoup | Tag, rule: str) -> list[str] | None:
         if not rule:
             return [soup.get_text("\n", strip=True)]
+        # Legacy text/regex rules like `作者：(.*?)\s` have no @attr suffix.
+        # Try them as regexes against the visible text before treating the
+        # string as a CSS selector.
+        if "@" not in rule and re.search(r"\([^()]*[.+*?][^()]*\)", rule):
+            try:
+                match = re.search(rule, soup.get_text(" ", strip=True))
+                if match:
+                    return [match.group(1) if match.lastindex else match.group(0)]
+            except re.error:
+                pass
         parts = rule.split("@")
         elements: list[Tag] = [soup]
         attr_suffix = "text"

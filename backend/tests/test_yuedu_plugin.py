@@ -107,6 +107,56 @@ def test_parse_book_generic_fills_metadata_and_chapters():
     assert parsed["chapters"][0].url == "https://example.com/novel/123/1.html"
 
 
+def test_text_label_rule_extracts_element_text():
+    plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
+    html = '<html><body><p>作 者：lisianthus</p></body></html>'
+
+    assert plugin.engine._eval_rule_str(html, "作 者：@text") == "作 者：lisianthus"
+
+
+def test_legacy_regex_rule_extracts_author():
+    plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
+    html = '<html><body><p>作者：lisianthus 完结</p></body></html>'
+
+    assert plugin.engine._eval_rule_str(html, r"作者：(.*?)\s") == "lisianthus"
+
+
+@pytest.mark.asyncio
+async def test_fetch_book_cleans_alice_metadata_and_extracts_cover():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.alicesw.com",
+        "bookUrlPattern": r"https?://www\.alicesw\.com/novel/\d+\.html",
+        "ruleBookInfo": {
+            "name": "h1@text",
+            "author": "作 者：@text|作者：(.*?)\\s",
+            "coverUrl": "img.book-cover@src",
+        },
+        "ruleToc": {},
+        "concurrentRate": "0",
+    })
+    html = """
+    <html><head>
+      <title>紫影玉茗-重口-爱丽丝书屋 (ALICESW.COM)</title>
+      <meta name="keywords" content="紫影玉茗,lisianthus,重口,痴女,反差,紫影玉茗最新章节">
+    </head><body>
+      <h1>紫影玉茗-重口-爱丽丝书屋 (ALICESW.COM)</h1>
+      <p>作 者：lisianthus</p>
+      <img class="book-cover" src="/cover/52311.jpg">
+    </body></html>
+    """
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        book = await plugin.fetch_book("https://www.alicesw.com/novel/52311.html")
+
+    assert book.title == "紫影玉茗"
+    assert book.author == "lisianthus"
+    assert book.cover_url == "https://www.alicesw.com/cover/52311.jpg"
+    assert "紫影玉茗" not in book.tags
+    assert "lisianthus" not in book.tags
+    assert "紫影玉茗最新章节" not in book.tags
+    assert "重口" in book.tags
+
+
 def test_build_book_url_uses_configured_detail_prefix():
     plugin = YueduPlugin({
         "bookSourceUrl": "https://example.com",

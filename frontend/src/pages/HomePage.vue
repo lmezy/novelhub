@@ -416,6 +416,12 @@ onMounted(async () => {
               class="absolute top-2 right-10 text-xs text-red-400 hover:text-red-600 opacity-0 group-hover:opacity-100 transition-opacity"
               :title="i18n.t('home_delete_title')"
             >&times;</button>
+            <img
+              v-if="book.cover"
+              :src="book.cover"
+              :alt="book.title"
+              class="w-full h-44 object-cover rounded-md mb-3 border border-border dark:border-gray-700"
+            />
             <h3 class="font-semibold text-ink mb-1 truncate">{{ book.title }}</h3>
             <p v-if="book.author_name" class="text-xs text-muted dark:text-gray-400 mb-1">{{ book.author_name }}</p>
             <p v-if="book.shelf_group_ids?.length" class="text-xs text-accent/80 dark:text-accent/70 mb-1">

@@ -98,6 +98,33 @@ class SyncService:
             title or "",
         ).lower()
 
+    @staticmethod
+    def _is_metadata_noise_tag(tag: str, title: str, author: str) -> bool:
+        """Filter old title/author/site noise that leaked into tag tables."""
+        normalized = re.sub(
+            r"[\s《》「」『』〈〉（）【】\[\]\"'“”‘’]+",
+            "",
+            tag or "",
+        ).lower()
+        title_norm = SyncService._normalize_title_for_match(title)
+        author_norm = SyncService._normalize_title_for_match(author)
+        if normalized == title_norm or normalized == author_norm:
+            return True
+        if title_norm and title_norm in normalized and "最新章节" in normalized:
+            return True
+        noise = {
+            "tags", "tag", "标签", "分类", "类别", "类型",
+            "最新章节", "最新章节列表", "全文阅读", "免费阅读", "阅读更多",
+            "书友正在看", "大家都在看", "上一章", "下一章", "目录",
+            "返回目录", "首页", "开始阅读", "小说", "本站",
+        }
+        if normalized in noise:
+            return True
+        lowered = tag.lower()
+        if "alicesw" in lowered or "爱丽丝书屋" in tag:
+            return True
+        return len(tag) > 20
+
     async def _find_same_title_books(self, book: Book) -> list[Book]:
         """Find other source books with the same normalized title."""
         normalized = self._normalize_title_for_match(book.title)
@@ -193,6 +220,7 @@ class SyncService:
         book, is_new = await self._get_or_create_book(
             source.id, author.id, remote_book, is_r18=is_r18
         )
+        remote_cover_url = await self._persist_cover(book, plugin, remote_book)
 
         # Save remote tags plus the admin-only classification tag. Tags from
         # other sources that carry the same title are merged in as well.
@@ -202,11 +230,23 @@ class SyncService:
         for candidate in [book, *same_title_books]:
             for tag in await self._book_tag_names(candidate.id):
                 tag = tag.strip().lower()
-                if tag and tag not in ("all-ages", "r18"):
+                if (
+                    tag
+                    and tag not in ("all-ages", "r18")
+                    and not self._is_metadata_noise_tag(
+                        tag,
+                        book_title,
+                        author_name,
+                    )
+                ):
                     source_tags.add(tag)
         for tag in remote_book.tags:
             tag = str(tag).strip().lower()
-            if tag:
+            if tag and not self._is_metadata_noise_tag(
+                tag,
+                book_title,
+                author_name,
+            ):
                 source_tags.add(tag)
         await self._save_tags(
             book.id,
@@ -234,6 +274,8 @@ class SyncService:
                 "status": remote_book.status,
                 "is_r18": is_r18,
                 "tags": remote_book.tags,
+                "cover": book.cover,
+                "cover_url": remote_cover_url,
             },
         )
 
@@ -277,6 +319,7 @@ class SyncService:
             "author_id": book.author_id,
             "source_book_id": book.source_book_id,
             "title": book_title,
+            "cover": book.cover,
             "description": book.description,
             "status": book.status,
             "is_r18": book_is_r18,
@@ -478,6 +521,39 @@ class SyncService:
         self.db.add(author)
         await self.db.flush()
         return author
+
+    async def _persist_cover(self, book, plugin, remote_book) -> str | None:
+        """Download a remote cover, save it locally, and update book.cover."""
+        cover_url = str(getattr(remote_book, "cover_url", "") or "").strip()
+        if not cover_url or not self._is_http_url(cover_url):
+            return None
+
+        fetch = getattr(plugin, "fetch_cover", None)
+        if not callable(fetch):
+            book.cover = cover_url
+            return cover_url
+
+        try:
+            result = await fetch(cover_url)
+            data = result[0] if isinstance(result, tuple) else result
+        except Exception as exc:
+            logger.warning("Failed to fetch cover {}: {}", cover_url, exc)
+            book.cover = cover_url
+            return cover_url
+
+        if not data:
+            book.cover = cover_url
+            return cover_url
+
+        try:
+            local_path = self.storage.save_cover(book.id, data)
+        except Exception as exc:
+            logger.warning("Failed to save cover for {}: {}", book.id, exc)
+            book.cover = cover_url
+            return cover_url
+
+        book.cover = local_path
+        return cover_url
 
     async def _get_or_create_book(
         self,

@@ -219,6 +219,12 @@ onMounted(async () => {
               :class="book.is_favorite ? 'text-amber-500' : 'text-muted hover:text-amber-500'"
               :title="book.is_favorite ? i18n.t('books_favorite_on') : i18n.t('books_favorite_off')"
             >{{ book.is_favorite ? '★' : '☆' }}</button>
+            <img
+              v-if="book.cover"
+              :src="book.cover"
+              :alt="book.title"
+              class="w-full h-44 object-cover rounded-md mb-3 border border-border dark:border-gray-700"
+            />
             <h3 class="font-semibold text-ink mb-1 truncate pr-6">{{ book.title }}</h3>
             <p v-if="book.author_name" class="text-xs text-muted dark:text-gray-400 mb-1">{{ book.author_name }}</p>
             <div v-if="book.category_names?.length" class="flex flex-wrap gap-1 mb-1">

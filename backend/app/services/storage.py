@@ -18,6 +18,32 @@ class BookStorage:
     def book_dir(self, author: str, title: str) -> Path:
         return self.root / safe_segment(author) / safe_segment(title)
 
+    def cover_dir(self) -> Path:
+        return self.root.parent / "covers"
+
+    @staticmethod
+    def _image_extension(data: bytes) -> str:
+        if data.startswith(b"\xff\xd8\xff"):
+            return "jpg"
+        if data.startswith(b"\x89PNG"):
+            return "png"
+        if data.startswith(b"GIF8"):
+            return "gif"
+        if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+            return "webp"
+        if data.lstrip().startswith(b"<svg"):
+            return "svg"
+        return "jpg"
+
+    def save_cover(self, book_id: str, data: bytes) -> str:
+        """Save cover bytes and return a storage-relative path."""
+        directory = self.cover_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        extension = self._image_extension(data)
+        path = directory / f"{safe_segment(book_id)}.{extension}"
+        path.write_bytes(data)
+        return path.relative_to(self.root.parent).as_posix()
+
     def write_metadata(self, author: str, title: str, metadata: dict) -> Path:
         path = self.book_dir(author, title)
         path.mkdir(parents=True, exist_ok=True)

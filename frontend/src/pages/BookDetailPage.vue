@@ -259,6 +259,12 @@ onMounted(async () => {
         >{{ i18n.t('book_continue') }} &rarr;</router-link>
 
         <header class="mb-8">
+          <img
+            v-if="book.cover"
+            :src="book.cover"
+            :alt="book.title"
+            class="w-40 h-56 object-cover rounded-lg border border-border dark:border-gray-700 mb-4"
+          />
           <h1 class="text-3xl font-bold mb-2">{{ book.title }}</h1>
           <p v-if="book.author_name" class="text-muted dark:text-gray-400 mb-1">{{ book.author_name }}</p>
           <div v-if="book.tag_names?.length" class="flex flex-wrap gap-1 mb-2">
