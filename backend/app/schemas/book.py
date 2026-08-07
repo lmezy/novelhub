@@ -35,6 +35,22 @@ class ManualBookCreate(BaseModel):
     chapters: list[ManualChapterIn]
 
 
+class ManualAnalyzeRequest(BaseModel):
+    text: str
+    filename: str | None = None
+
+
+class ManualAnalyzeResult(BaseModel):
+    title: str = ""
+    author: str = "未知作者"
+    description: str | None = None
+    status: str | None = None
+    tags: list[str] = []
+    categories: list[str] = []
+    is_r18: bool = False
+    chapter_count: int = 0
+
+
 class CustomTagUserOut(BaseModel):
     id: str
     username: str

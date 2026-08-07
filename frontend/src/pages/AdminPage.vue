@@ -379,6 +379,8 @@ const manualDescription = ref("")
 const manualTags = ref("")
 const manualChaptersText = ref("")
 const manualImporting = ref(false)
+const manualAnalyzing = ref(false)
+const manualAnalyzeResult = ref<any>(null)
 const manualResult = ref<any>(null)
 const manualError = ref("")
 
@@ -759,13 +761,43 @@ async function directLocalSelected() {
   }
 }
 
-function onManualFile(e: Event) {
+async function onManualFile(e: Event) {
   const input = e.target as HTMLInputElement
   const file = input.files?.[0]
   if (!file) return
-  file.text().then((text) => {
-    manualChaptersText.value = text
-  })
+  const text = await file.text()
+  manualChaptersText.value = text
+  await analyzeManualText(text, file.name)
+}
+
+async function analyzeManualText(sourceText?: string, filename?: string) {
+  const text = (sourceText ?? manualChaptersText.value).trim()
+  if (!text) {
+    manualError.value = ""
+    manualAnalyzeResult.value = null
+    return
+  }
+  manualAnalyzing.value = true
+  manualError.value = ""
+  manualAnalyzeResult.value = null
+  try {
+    const res = await api.post<any>("/books/manual/analyze", {
+      text,
+      filename: filename || null,
+    })
+    manualAnalyzeResult.value = res
+    if (res.title) manualTitle.value = res.title
+    if (res.author && res.author !== i18n.t('admin_unknown_author')) {
+      manualAuthor.value = res.author
+    }
+    if (res.description) manualDescription.value = res.description
+    if (res.status) manualStatus.value = res.status
+    if (res.tags?.length) manualTags.value = res.tags.join(", ")
+  } catch (e) {
+    manualError.value = e instanceof Error ? e.message : i18n.t('admin_manual_analyze_failed')
+  } finally {
+    manualAnalyzing.value = false
+  }
 }
 
 function parseManualChapters() {
@@ -824,6 +856,7 @@ async function submitManualBook() {
     manualTags.value = ""
     manualChaptersText.value = ""
     manualStatus.value = "ongoing"
+    manualAnalyzeResult.value = null
   } catch (e) {
     manualError.value = e instanceof Error ? e.message : i18n.t('admin_manual_upload_failed')
   } finally {
@@ -1785,7 +1818,12 @@ onUnmounted(() => {
               />
               <span class="min-w-0">
                 <span class="block text-sm font-medium truncate">{{ book.title }}</span>
-                <span class="block text-xs text-muted dark:text-gray-400 truncate">{{ book.author }} · {{ book.chapter_count }} chapters · {{ book.format }}</span>
+                <span class="block text-xs text-muted dark:text-gray-400 truncate">
+                  {{ book.author }} · {{ book.chapter_count }} chapters · {{ book.format }}
+                  <span v-if="book.is_r18" class="ml-1 px-1.5 py-0.5 rounded bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300">R18</span>
+                  <span v-if="book.categories?.length" class="ml-1">{{ book.categories.join(' / ') }}</span>
+                  <span v-if="book.tags?.length" class="ml-1">{{ book.tags.slice(0, 6).join(', ') }}</span>
+                </span>
                 <span class="block text-xs text-muted dark:text-gray-400 truncate">{{ book.path }}</span>
               </span>
             </label>
@@ -1816,6 +1854,9 @@ onUnmounted(() => {
           <div v-if="localDirectResult" class="mt-3 p-3 rounded bg-blue-50 dark:bg-blue-950 text-sm">
             <p v-for="book in localDirectResult.books || []" :key="book.path">
               {{ book.title }} · {{ book.chapter_count }} chapters · {{ book.path }}
+              <span v-if="book.is_r18" class="ml-1 px-1.5 py-0.5 rounded bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300">R18</span>
+              <span v-if="book.categories?.length" class="ml-1">{{ book.categories.join(' / ') }}</span>
+              <span v-if="book.tags?.length" class="ml-1">{{ book.tags.slice(0, 6).join(', ') }}</span>
             </p>
           </div>
         </div>
@@ -1849,11 +1890,30 @@ onUnmounted(() => {
           ></textarea>
 
           <div class="flex items-center gap-3 mb-3">
+            <button
+              type="button"
+              @click="analyzeManualText()"
+              :disabled="manualAnalyzing || !manualChaptersText.trim()"
+              class="px-3 py-2 rounded border border-accent text-accent text-sm hover:bg-accent/10 disabled:opacity-50"
+            >{{ manualAnalyzing ? i18n.t('admin_manual_analyzing') : i18n.t('admin_manual_auto_analyze') }}</button>
             <label class="inline-flex px-3 py-2 rounded border border-border dark:border-gray-700 text-sm cursor-pointer hover:bg-accent/5">
               {{ i18n.t('admin_manual_pick_file') }}
               <input type="file" accept=".txt,.md,text/plain,text/markdown" class="hidden" @change="onManualFile" />
             </label>
             <span class="text-xs text-muted dark:text-gray-400" v-html="i18n.t('admin_manual_chapter_hint')"></span>
+          </div>
+          <div v-if="manualAnalyzeResult" class="mb-3 p-3 rounded bg-blue-50 dark:bg-blue-950 text-sm flex flex-wrap items-center gap-2">
+            <span
+              :class="manualAnalyzeResult.is_r18
+                ? 'px-1.5 py-0.5 rounded bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300'
+                : 'px-1.5 py-0.5 rounded bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300'"
+            >{{ manualAnalyzeResult.is_r18 ? 'R18' : 'All-Ages' }}</span>
+            <span v-if="manualAnalyzeResult.categories?.length" class="text-muted dark:text-gray-400">
+              {{ manualAnalyzeResult.categories.join(' / ') }}
+            </span>
+            <span v-if="manualAnalyzeResult.tags?.length" class="text-muted dark:text-gray-400">
+              {{ manualAnalyzeResult.tags.slice(0, 8).join(', ') }}
+            </span>
           </div>
 
           <p v-if="manualError" class="text-sm text-red-600 mb-2">{{ manualError }}</p>
@@ -1865,6 +1925,13 @@ onUnmounted(() => {
           <div v-if="manualResult" class="mt-3 p-3 rounded bg-green-50 dark:bg-green-950 text-sm">
             <p>{{ i18n.t('admin_book_id') }}: {{ manualResult.book_id }}</p>
             <p>{{ i18n.t('admin_created_chapters_label') }}: {{ manualResult.created_chapters }}</p>
+            <p v-if="manualResult.is_r18" class="mt-1 px-1.5 py-0.5 inline-block rounded bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300">R18</p>
+            <p v-if="manualResult.category_names?.length" class="mt-1 text-muted dark:text-gray-400">
+              {{ manualResult.category_names.join(' / ') }}
+            </p>
+            <p v-if="manualResult.tags?.length" class="mt-1 text-muted dark:text-gray-400">
+              {{ manualResult.tags.slice(0, 8).join(', ') }}
+            </p>
           </div>
         </div>
 

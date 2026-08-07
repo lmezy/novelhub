@@ -10,6 +10,7 @@ from app.services.local_file_parser import (
     is_supported_file,
     parse_local_file,
 )
+from app.services.book_enrichment import enrich_book_metadata
 
 
 def _read_metadata(book_dir: Path) -> dict:
@@ -56,13 +57,22 @@ def parse_local_book(path: str | Path) -> dict:
             }
             for index, (title, _content) in enumerate(chapters, start=1)
         ]
+        enriched = enrich_book_metadata(
+            meta=meta,
+            chapters=chapters,
+            filename=book_dir.name,
+            fallback_title=book_dir.stem,
+            fallback_author="Unknown",
+        )
         return {
             "path": str(book_dir),
-            "title": str(meta.get("title") or book_dir.stem),
-            "author": str(meta.get("author") or "Unknown"),
-            "description": None,
-            "status": None,
-            "tags": [],
+            "title": enriched["title"],
+            "author": enriched["author"],
+            "description": enriched["description"],
+            "status": enriched["status"],
+            "tags": enriched["tags"],
+            "is_r18": enriched["is_r18"],
+            "categories": enriched["categories"],
             "chapter_count": len(chapter_refs),
             "has_metadata": False,
             "format": book_dir.suffix.lower().lstrip("."),
@@ -77,20 +87,38 @@ def parse_local_book(path: str | Path) -> dict:
         raise ValueError(f"No markdown chapters found: {path}")
 
     chapter_refs = []
+    content_pairs: list[tuple[str, str]] = []
+    sample_size = 0
     for index, chapter_path in enumerate(chapters, start=1):
+        try:
+            content = chapter_path.read_text(encoding="utf-8")
+        except OSError:
+            content = ""
+        if sample_size < 300_000 and content:
+            content_pairs.append((_chapter_title(chapter_path), content))
+            sample_size += len(content)
         chapter_refs.append({
             "title": _chapter_title(chapter_path),
             "path": str(chapter_path),
             "chapter_number": index,
         })
 
+    enriched = enrich_book_metadata(
+        meta=meta,
+        chapters=content_pairs,
+        filename=book_dir.name,
+        fallback_title=book_dir.name,
+        fallback_author=book_dir.parent.name,
+    )
     return {
         "path": str(book_dir),
-        "title": str(meta.get("title") or book_dir.name),
-        "author": str(meta.get("author") or book_dir.parent.name),
-        "description": meta.get("description"),
-        "status": meta.get("status"),
-        "tags": list(meta.get("tags") or []),
+        "title": enriched["title"],
+        "author": enriched["author"],
+        "description": enriched["description"],
+        "status": enriched["status"],
+        "tags": enriched["tags"],
+        "is_r18": enriched["is_r18"],
+        "categories": enriched["categories"],
         "chapter_count": len(chapter_refs),
         "has_metadata": bool(meta),
         "format": "markdown",
@@ -132,6 +160,8 @@ def scan_local_library(root: str, max_depth: int = 3) -> list[dict]:
                 "description": info["description"],
                 "status": info["status"],
                 "tags": info["tags"],
+                "is_r18": info["is_r18"],
+                "categories": info["categories"],
                 "chapter_count": info["chapter_count"],
                 "has_metadata": info["has_metadata"],
                 "format": info.get("format", "markdown"),
@@ -162,6 +192,8 @@ def scan_local_library(root: str, max_depth: int = 3) -> list[dict]:
                 "description": info["description"],
                 "status": info["status"],
                 "tags": info["tags"],
+                "is_r18": info["is_r18"],
+                "categories": info["categories"],
                 "chapter_count": info["chapter_count"],
                 "has_metadata": info["has_metadata"],
                 "format": info.get("format", "markdown"),

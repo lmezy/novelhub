@@ -5,9 +5,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Author, Book, BookTag, Chapter
 from app.repositories.tag import TagRepository
+from app.services.book_enrichment import enrich_book_metadata
 from app.services.search import search_service
 from app.services.storage import BookStorage
-from app.services.r18 import detect_r18
 
 
 class ManualImportService:
@@ -27,12 +27,35 @@ class ManualImportService:
         chapters: list[dict],
     ) -> dict:
         title = (title or "").strip()
-        if not title:
-            raise ValueError("Book title is required")
         if not chapters:
             raise ValueError("At least one chapter is required")
 
-        author_name = (author or "").strip() or "未知作者"
+        chapter_pairs = [
+            (
+                str(chapter.get("title") or ""),
+                str(chapter.get("content") or ""),
+            )
+            for chapter in chapters
+        ]
+        enriched = enrich_book_metadata(
+            meta={
+                "title": title,
+                "author": author,
+                "description": description,
+                "tags": tags,
+            },
+            chapters=chapter_pairs,
+            fallback_author="未知作者",
+        )
+        title = enriched["title"]
+        if not title:
+            raise ValueError("Book title is required")
+        author_name = enriched["author"] or "未知作者"
+        description = enriched["description"]
+        status = enriched["status"] or status or "ongoing"
+        tags = enriched["tags"]
+        is_r18 = enriched["is_r18"]
+
         db_author = await self.db.scalar(
             select(Author).where(Author.name == author_name)
         )
@@ -41,12 +64,6 @@ class ManualImportService:
             self.db.add(db_author)
             await self.db.flush()
 
-        is_r18 = detect_r18(
-            title=title,
-            author=author_name,
-            description=description,
-            tags=tags,
-        )
         book = Book(
             id=str(uuid4()),
             author_id=db_author.id,
@@ -60,6 +77,7 @@ class ManualImportService:
 
         classification_tag = "r18" if is_r18 else "all-ages"
         await self._save_tags(book.id, [*tags, classification_tag])
+        await self.db.commit()
         try:
             from app.services.auto_categorize import AutoCategorizationService
             matched = await AutoCategorizationService.categorize_book(self.db, book.id)
@@ -137,7 +155,15 @@ class ManualImportService:
 
         await self.db.commit()
 
-        return {"book_id": book.id, "created_chapters": created}
+        return {
+            "book_id": book.id,
+            "created_chapters": created,
+            "title": book.title,
+            "author": author_name,
+            "is_r18": book.is_r18,
+            "tags": book_tags,
+            "category_names": book_category_names,
+        }
 
     async def _save_tags(self, book_id: str, tag_names: list[str]) -> None:
         repo = TagRepository(self.db)

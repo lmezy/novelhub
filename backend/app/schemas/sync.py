@@ -50,6 +50,8 @@ class LocalBookCandidate(BaseModel):
     description: str | None = None
     status: str | None = None
     tags: list[str] = []
+    is_r18: bool = False
+    categories: list[str] = []
     chapter_count: int
     has_metadata: bool = False
 
@@ -78,6 +80,8 @@ class LocalBookDetail(BaseModel):
     description: str | None = None
     status: str | None = None
     tags: list[str] = []
+    is_r18: bool = False
+    categories: list[str] = []
     chapter_count: int
     has_metadata: bool
     chapters: list[LocalChapterRef]

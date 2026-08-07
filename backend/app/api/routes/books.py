@@ -12,11 +12,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.database import get_db
 from app.models import Book, BookFavorite, BookFavoriteGroup, BookTag, Chapter, Source, Tag, User
+from app.services.book_enrichment import analyze_book_text
 from app.services.auth import get_current_user, require_admin
 from app.services.book_cleanup import delete_books
 from app.services.bookshelf import favorite_group_ids_by_book
 from app.services.custom_tags import list_book_custom_tags_map
 from app.services.epub import EpubService
+from app.services.local_file_parser import split_text_chapters
 from app.services.search import search_service
 from app.services.storage import BookStorage
 from app.services.sync import SyncService
@@ -31,6 +33,8 @@ from app.schemas.book import (
     BookOut,
     BookSourceAlternate,
     BookSourceAlternatesOut,
+    ManualAnalyzeRequest,
+    ManualAnalyzeResult,
     ManualBookCreate,
 )
 from app.services.manual_import import ManualImportService
@@ -238,6 +242,22 @@ async def create_manual_book(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/manual/analyze",
+    response_model=ManualAnalyzeResult,
+    dependencies=[Depends(require_admin)],
+)
+async def analyze_manual_book(payload: ManualAnalyzeRequest):
+    text = (payload.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text is required")
+    result = analyze_book_text(text, payload.filename)
+    return ManualAnalyzeResult(
+        **result,
+        chapter_count=len(split_text_chapters(text)),
+    )
 
 
 @router.post("", response_model=BookOut, status_code=201)

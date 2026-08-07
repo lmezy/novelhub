@@ -48,3 +48,19 @@ async def test_local_markdown_accepts_non_numbered_chapter_files(tmp_path):
 
     assert len(book.chapters) == 1
     assert book.chapters[0].title == "Chapter One"
+
+
+@pytest.mark.asyncio
+async def test_local_markdown_detects_r18_and_tags_from_content(tmp_path):
+    book_dir = tmp_path / "book"
+    book_dir.mkdir()
+    (book_dir / "000001.md").write_text(
+        "# 第一章\n\n主角在都市里修炼，正文包含色情内容\n",
+        encoding="utf-8",
+    )
+
+    plugin = LocalMarkdownPlugin()
+    book = await plugin.fetch_book(f"file://{book_dir.as_posix()}")
+
+    assert book.is_r18 is True
+    assert "都市" in book.tags

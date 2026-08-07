@@ -280,12 +280,15 @@ class SyncService:
 
     @staticmethod
     def _is_book_r18(source: Source, remote_book) -> bool:
-        return detect_r18(
-            source_is_r18=getattr(source, "is_r18", False),
-            title=remote_book.title,
-            author=remote_book.author,
-            description=remote_book.description,
-            tags=getattr(remote_book, "tags", []) or [],
+        return (
+            bool(getattr(remote_book, "is_r18", False))
+            or detect_r18(
+                source_is_r18=getattr(source, "is_r18", False),
+                title=remote_book.title,
+                author=remote_book.author,
+                description=remote_book.description,
+                tags=getattr(remote_book, "tags", []) or [],
+            )
         )
 
     async def sync_book(

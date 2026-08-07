@@ -21,6 +21,7 @@ class RemoteBook:
     chapters: list[RemoteChapter]
     tags: list[str] = field(default_factory=list)
     cover_url: str | None = None
+    is_r18: bool = False
 
 
 @dataclass(frozen=True)

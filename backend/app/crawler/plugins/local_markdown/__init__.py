@@ -10,6 +10,7 @@ import re
 from pathlib import Path
 
 from app.crawler.base import RemoteBook, RemoteChapter, RemoteShelfBook
+from app.services.book_enrichment import enrich_book_metadata
 from app.services.local_file_parser import parse_local_file
 
 
@@ -48,26 +49,43 @@ class LocalMarkdownPlugin:
         md_files = sorted(book_dir.glob("[0-9]*.md"))
         if not md_files:
             md_files = sorted(book_dir.glob("*.md"))
+        content_pairs: list[tuple[str, str]] = []
+        sample_size = 0
         for md_file in md_files:
             match = re.match(r"^(\d+)", md_file.stem)
             num = int(match.group(1)) if match else len(chapters) + 1
-            first_line = md_file.read_text(encoding="utf-8").split("\n")[0]
-            ch_title = first_line.lstrip("#").strip() or f"Chapter {num}"
+            try:
+                text = md_file.read_text(encoding="utf-8")
+            except OSError:
+                text = ""
+            lines = text.split("\n")
+            ch_title = (lines[0] if lines else "").lstrip("#").strip() or f"Chapter {num}"
             chapters.append(RemoteChapter(
                 source_chapter_id=str(num),
                 title=ch_title,
                 url=str(md_file),
                 chapter_number=num,
             ))
+            if sample_size < 300_000 and text:
+                content_pairs.append((ch_title, text))
+                sample_size += len(text)
 
+        enriched = enrich_book_metadata(
+            meta=meta,
+            chapters=content_pairs,
+            filename=book_dir.name,
+            fallback_title=title,
+            fallback_author=author,
+        )
         return RemoteBook(
             source_book_id=book_dir.name,
-            title=title,
-            author=author,
-            description=meta.get("description"),
-            status=meta.get("status"),
+            title=enriched["title"],
+            author=enriched["author"],
+            description=enriched["description"],
+            status=enriched["status"],
             chapters=chapters,
-            tags=meta.get("tags", []),
+            tags=enriched["tags"],
+            is_r18=enriched["is_r18"],
         )
 
     def _load_file_cache(self, path: Path):
@@ -91,6 +109,13 @@ class LocalMarkdownPlugin:
 
     def _fetch_book_file(self, path: Path) -> RemoteBook:
         meta, chapters = self._load_file_cache(path)
+        enriched = enrich_book_metadata(
+            meta=meta,
+            chapters=chapters,
+            filename=path.name,
+            fallback_title=path.stem,
+            fallback_author="Unknown",
+        )
         remote_chapters = []
         for index, (title, _content) in enumerate(chapters, start=1):
             remote_chapters.append(RemoteChapter(
@@ -101,12 +126,13 @@ class LocalMarkdownPlugin:
             ))
         return RemoteBook(
             source_book_id=f"local:{path}",
-            title=str(meta.get("title") or path.stem),
-            author=str(meta.get("author") or "Unknown"),
-            description=None,
-            status=None,
+            title=enriched["title"],
+            author=enriched["author"],
+            description=enriched["description"],
+            status=enriched["status"],
             chapters=remote_chapters,
-            tags=[],
+            tags=enriched["tags"],
+            is_r18=enriched["is_r18"],
         )
 
     async def fetch_chapter_content(self, chapter: RemoteChapter) -> str:

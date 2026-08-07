@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.core.database import get_db
-from app.models import Source, Cookie
+from app.models import Source, Cookie, User
 from app.models.source_credential import SourceCredential
 from app.services.cookie_crypto import encrypt_cookie, decrypt_cookie
 from app.services.auth import get_current_user
