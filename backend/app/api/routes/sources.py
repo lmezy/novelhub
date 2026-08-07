@@ -1,6 +1,7 @@
 ﻿from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.database import get_db
 from app.crawler.registry import get_plugin
@@ -11,9 +12,11 @@ from app.schemas.source import (
     RemoteBookSearchResult,
     SourceCreate,
     SourceOut,
+    SourceUpdate,
 )
 from app.services.auth import get_current_user, require_admin
 from app.services.book_cleanup import delete_books
+from app.services.search import search_service
 from app.services.visibility import can_view_all_ages, can_view_r18
 
 
@@ -41,6 +44,61 @@ async def create_source(payload: SourceCreate, db: AsyncSession = Depends(get_db
     db.add(source)
     await db.commit()
     await db.refresh(source)
+    return source
+
+
+@router.put("/{source_id}", response_model=SourceOut, dependencies=[Depends(require_admin)])
+async def update_source(
+    source_id: str,
+    payload: SourceUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    source = await db.get(Source, source_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    old_is_r18 = source.is_r18
+    data = payload.model_dump(exclude_unset=True)
+    for key, value in data.items():
+        if value is None and key in ("enabled", "is_r18", "name", "plugin_name"):
+            continue
+        setattr(source, key, value)
+
+    if data.get("is_r18") is not None and data["is_r18"] != old_is_r18:
+        await db.execute(
+            update(Book)
+            .where(Book.source_id == source_id)
+            .values(is_r18=data["is_r18"])
+        )
+
+    await db.commit()
+    await db.refresh(source)
+
+    if data.get("is_r18") is not None and data["is_r18"] != old_is_r18:
+        books = (
+            await db.scalars(
+                select(Book)
+                .options(selectinload(Book.tags), selectinload(Book.author))
+                .where(Book.source_id == source_id)
+            )
+        ).unique().all()
+        for book in books:
+            try:
+                search_service.index_book({
+                    "id": book.id,
+                    "title": book.title,
+                    "author": book.author_name or "",
+                    "description": book.description or "",
+                    "status": book.status or "",
+                    "source_id": book.source_id or "",
+                    "author_id": book.author_id or "",
+                    "is_r18": book.is_r18,
+                    "tags": list(book.tag_names),
+                    "category_names": list(book.category_names),
+                })
+            except Exception:
+                continue
+
     return source
 
 

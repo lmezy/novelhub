@@ -66,10 +66,11 @@ async def update_cookie(cookie_id: str, payload: CookieUpdate, db: AsyncSession 
     cookie = await repo.get(cookie_id)
     if cookie is None:
         raise HTTPException(status_code=404, detail="Cookie not found")
-    if payload.cookie_data is not None:
-        cookie.cookie_data = encrypt_cookie(payload.cookie_data)
-    if payload.expired_at is not None:
-        cookie.expired_at = payload.expired_at
+    data = payload.model_dump(exclude_unset=True)
+    if "cookie_data" in data and data["cookie_data"] is not None:
+        cookie.cookie_data = encrypt_cookie(data["cookie_data"])
+    if "expired_at" in data:
+        cookie.expired_at = data["expired_at"]
     await db.flush()
     return cookie
 

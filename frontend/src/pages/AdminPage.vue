@@ -19,6 +19,7 @@ interface Source {
   plugin_name: string
   enabled: boolean
   is_r18: boolean
+  config?: any
 }
 
 interface CookieItem {
@@ -31,7 +32,9 @@ interface CookieItem {
 const tab = ref<"sources" | "cookies" | "sync" | "logs" | "tokens" | "index" | "status" | "yuedu" | "add" | "creds" | "users" | "approvals" | "proxy">("yuedu")
 
 const sources = ref<Source[]>([])
-const sourceForm = ref({ id: "", name: "", url: "", plugin_name: "alicesw", is_r18: false })
+const sourceForm = ref({ id: "", name: "", url: "", plugin_name: "yuedu", enabled: true, is_r18: false })
+const sourceConfigText = ref("")
+const sourceEditingId = ref("")
 const sourceError = ref("")
 
 async function loadSources() {
@@ -50,17 +53,56 @@ async function deleteSource(id: string) {
 }
 async function createSource() {
   sourceError.value = ""
+  let config: any = null
+  if (sourceConfigText.value.trim()) {
+    try {
+      config = JSON.parse(sourceConfigText.value)
+    } catch {
+      sourceError.value = i18n.t('admin_config_json_invalid')
+      return
+    }
+  }
   try {
-    await api.post("/sources", sourceForm.value)
+    const body: any = {
+      ...sourceForm.value,
+      url: sourceForm.value.url || null,
+      config,
+    }
+    if (sourceEditingId.value) {
+      await api.put("/sources/" + sourceEditingId.value, body)
+    } else {
+      await api.post("/sources", body)
+    }
     await loadSources()
-    sourceForm.value = { id: "", name: "", url: "", plugin_name: "alicesw", is_r18: false }
+    resetSourceForm()
   } catch (e) {
     sourceError.value = e instanceof Error ? e.message : i18n.t('admin_failed')
   }
 }
 
+function editSource(s: Source) {
+  sourceEditingId.value = s.id
+  sourceForm.value = {
+    id: s.id,
+    name: s.name,
+    url: s.url || "",
+    plugin_name: s.plugin_name || "yuedu",
+    enabled: s.enabled,
+    is_r18: s.is_r18,
+  }
+  sourceConfigText.value = s.config ? JSON.stringify(s.config, null, 2) : ""
+  window.scrollTo({ top: 0, behavior: "smooth" })
+}
+
+function resetSourceForm() {
+  sourceEditingId.value = ""
+  sourceForm.value = { id: "", name: "", url: "", plugin_name: "yuedu", enabled: true, is_r18: false }
+  sourceConfigText.value = ""
+}
+
 const cookies = ref<CookieItem[]>([])
 const cookieForm = ref({ source: "", cookie_data: "", expired_at: "" })
+const cookieEditingId = ref("")
 const cookieError = ref("")
 const cookieTesting = ref(false)
 const cookieTestResult = ref<any>(null)
@@ -91,12 +133,33 @@ async function createCookie() {
   try {
     const body: any = { source: cookieForm.value.source, cookie_data: cookieForm.value.cookie_data }
     if (cookieForm.value.expired_at) body.expired_at = cookieForm.value.expired_at
-    await api.post("/cookies", body)
+    if (cookieEditingId.value) {
+      const updateBody: any = {
+        expired_at: cookieForm.value.expired_at || null,
+      }
+      if (cookieForm.value.cookie_data.trim()) {
+        updateBody.cookie_data = cookieForm.value.cookie_data
+      }
+      await api.put("/cookies/" + cookieEditingId.value, updateBody)
+    } else {
+      await api.post("/cookies", body)
+    }
     await loadCookies()
+    cookieEditingId.value = ""
     cookieForm.value = { source: "", cookie_data: "", expired_at: "" }
   } catch (e) {
     cookieError.value = e instanceof Error ? e.message : i18n.t('admin_failed')
   }
+}
+
+function editCookie(c: CookieItem) {
+  cookieEditingId.value = c.id
+  cookieForm.value = {
+    source: c.source,
+    cookie_data: "",
+    expired_at: c.expired_at || "",
+  }
+  window.scrollTo({ top: 0, behavior: "smooth" })
 }
 
 async function deleteCookie(id: string) {
@@ -947,17 +1010,34 @@ onUnmounted(() => {
         <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
           <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_add_source') }}</h2>
           <div class="grid grid-cols-2 gap-3 mb-3">
-            <input v-model="sourceForm.id" :placeholder="i18n.t('admin_placeholder_id')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            <input v-model="sourceForm.id" :disabled="!!sourceEditingId" :placeholder="i18n.t('admin_placeholder_id')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 disabled:opacity-60" />
             <input v-model="sourceForm.name" :placeholder="i18n.t('admin_placeholder_name')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
             <input v-model="sourceForm.url" :placeholder="i18n.t('admin_placeholder_url')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
             <input v-model="sourceForm.plugin_name" :placeholder="i18n.t('admin_placeholder_plugin')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
           </div>
-          <div class="flex items-center gap-2 mb-3">
-            <input type="checkbox" id="source-r18" v-model="sourceForm.is_r18" class="rounded" />
-            <label for="source-r18" class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_r18_label') }}</label>
+          <div class="flex flex-wrap items-center gap-4 mb-3">
+            <label class="inline-flex items-center gap-2 text-xs text-muted dark:text-gray-400 cursor-pointer">
+              <input type="checkbox" v-model="sourceForm.enabled" class="rounded" />
+              {{ i18n.t('admin_source_enabled') }}
+            </label>
+            <label class="inline-flex items-center gap-2 text-xs text-muted dark:text-gray-400 cursor-pointer">
+              <input type="checkbox" v-model="sourceForm.is_r18" class="rounded" />
+              {{ i18n.t('admin_r18_label') }}
+            </label>
           </div>
+          <textarea
+            v-model="sourceConfigText"
+            :placeholder="i18n.t('admin_source_config_placeholder')"
+            rows="6"
+            class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-xs font-mono bg-paper dark:bg-gray-800 resize-y mb-3"
+          />
           <p v-if="sourceError" class="text-sm text-red-600 mb-2">{{ sourceError }}</p>
-          <button @click="createSource" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90">{{ i18n.t('admin_create_source') }}</button>
+          <div class="flex items-center gap-2">
+            <button @click="createSource" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90">
+              {{ sourceEditingId ? i18n.t('admin_save') : i18n.t('admin_create_source') }}
+            </button>
+            <button v-if="sourceEditingId" @click="resetSourceForm" class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm hover:bg-accent/5">{{ i18n.t('admin_cancel') }}</button>
+          </div>
         </div>
 
         <div class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900">
@@ -967,7 +1047,11 @@ onUnmounted(() => {
               <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ s.id }} ({{ s.plugin_name }})</span>
               <span v-if="s.is_r18" class="text-xs px-1.5 py-0.5 rounded ml-2 bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-300">R18</span>
             </div>
-            <div class="flex items-center gap-3"><span class="text-xs" :class="s.enabled ? 'text-green-600' : 'text-red-500'">{{ s.enabled ? i18n.t('admin_enabled') : i18n.t('admin_disabled') }}</span><button @click="deleteSource(s.id)" class="text-xs text-red-500 hover:text-red-700">{{ i18n.t('admin_delete') }}</button></div>
+            <div class="flex items-center gap-3">
+              <span class="text-xs" :class="s.enabled ? 'text-green-600' : 'text-red-500'">{{ s.enabled ? i18n.t('admin_enabled') : i18n.t('admin_disabled') }}</span>
+              <button @click="editSource(s)" class="text-xs text-accent hover:underline">{{ i18n.t('admin_edit') }}</button>
+              <button @click="deleteSource(s.id)" class="text-xs text-red-500 hover:text-red-700">{{ i18n.t('admin_delete') }}</button>
+            </div>
           </div>
           <p v-if="sources.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">{{ i18n.t('admin_no_sources') }}</p>
         </div>
@@ -994,11 +1078,12 @@ onUnmounted(() => {
             <textarea v-model="cookieForm.cookie_data" :placeholder="i18n.t('admin_placeholder_cookie')" rows="3" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 resize-y" />
           </div>
           <p v-if="cookieError" class="text-sm text-red-600 mb-2">{{ cookieError }}</p>
-                    <div class="flex gap-3">
+          <div class="flex gap-3">
             <button @click="createCookie" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90">{{ i18n.t('admin_save_cookie') }}</button>
             <button @click="testCookie" :disabled="cookieTesting" class="px-4 py-2 rounded border border-accent text-accent text-sm font-medium hover:bg-accent/10 disabled:opacity-50">
               {{ cookieTesting ? i18n.t('admin_testing') : i18n.t('admin_test_cookie') }}
             </button>
+            <button v-if="cookieEditingId" @click="cookieEditingId = ''; cookieForm = { source: '', cookie_data: '', expired_at: '' }" class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm hover:bg-accent/5">{{ i18n.t('admin_cancel') }}</button>
           </div>
           <div v-if="cookieTestResult" class="mt-3 p-3 rounded bg-green-50 dark:bg-green-950 text-sm">
             <p class="font-medium text-green-700 dark:text-green-400">{{ cookieTestResult.message }}</p>
@@ -1017,7 +1102,10 @@ onUnmounted(() => {
                 {{ new Date(c.expired_at) < new Date() ? i18n.t('admin_cookie_expired') : new Date(c.expired_at) < new Date(Date.now() + 3*86400000) ? i18n.t('admin_cookie_expiring') : i18n.t('admin_cookie_valid') }}
               </span>
             </div>
-            <button @click="deleteCookie(c.id)" class="text-xs text-red-500 hover:text-red-700">{{ i18n.t('admin_delete') }}</button>
+            <div class="flex items-center gap-3">
+              <button @click="editCookie(c)" class="text-xs text-accent hover:underline">{{ i18n.t('admin_edit') }}</button>
+              <button @click="deleteCookie(c.id)" class="text-xs text-red-500 hover:text-red-700">{{ i18n.t('admin_delete') }}</button>
+            </div>
           </div>
           <p v-if="cookies.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">{{ i18n.t('admin_no_cookies') }}</p>
         </div>
