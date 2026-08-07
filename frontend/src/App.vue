@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue"
+import { onMounted, onUnmounted, ref } from "vue"
 import { useRouter } from "vue-router"
 import { useAuthStore } from "./stores/auth"
 import { useI18nStore } from "./stores/i18n"
@@ -9,13 +9,31 @@ const i18n = useI18nStore()
 const router = useRouter()
 const notice = ref("")
 
+const onUnauthorized = () => {
+  auth.logout()
+  notice.value = i18n.t('auth_required')
+  router.push("/login")
+}
+
+const onAuthenticated = () => {
+  notice.value = ""
+}
+
 onMounted(async () => {
-  await auth.fetchMe()
-  window.addEventListener("novelhub:unauthorized", () => {
-    auth.logout()
-    notice.value = i18n.t('auth_required')
-    router.push("/login")
-  })
+  window.addEventListener("novelhub:unauthorized", onUnauthorized)
+  window.addEventListener("novelhub:authenticated", onAuthenticated)
+  if (auth.token) {
+    const ok = await auth.fetchMe()
+    if (!ok) {
+      notice.value = i18n.t('auth_required')
+      router.push("/login")
+    }
+  }
+})
+
+onUnmounted(() => {
+  window.removeEventListener("novelhub:unauthorized", onUnauthorized)
+  window.removeEventListener("novelhub:authenticated", onAuthenticated)
 })
 </script>
 

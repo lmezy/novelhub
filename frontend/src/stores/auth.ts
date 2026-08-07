@@ -41,6 +41,10 @@ function applyUserSettings(u: User) {
   else if (u.settings?.theme === "light") setDark(false)
 }
 
+function emitAuthenticated() {
+  window.dispatchEvent(new CustomEvent("novelhub:authenticated"))
+}
+
   async function login(username: string, password: string) {
     const res = await api.post<{ access_token: string; user: User }>("/auth/login", {
       username,
@@ -50,6 +54,7 @@ function applyUserSettings(u: User) {
     user.value = res.user
     localStorage.setItem("novelhub_token", res.access_token)
     applyUserSettings(res.user)
+    emitAuthenticated()
   }
 
   async function register(username: string, password: string, email?: string, inviteCode?: string) {
@@ -67,6 +72,7 @@ function applyUserSettings(u: User) {
       token.value = res.access_token
       user.value = res.user
       localStorage.setItem("novelhub_token", res.access_token)
+      emitAuthenticated()
     }
     if (res.user) applyUserSettings(res.user)
     return res
@@ -77,6 +83,7 @@ function applyUserSettings(u: User) {
     try {
       user.value = await api.get<User>("/auth/me")
       applyUserSettings(user.value)
+      emitAuthenticated()
       return true
     } catch {
       logout()
