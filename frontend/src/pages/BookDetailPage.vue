@@ -41,6 +41,15 @@ const categorySaving = ref(false)
 const autoCategorizing = ref(false)
 const categoryError = ref("")
 
+function goBack() {
+  const back = (window.history.state as { back?: string | null } | null)?.back
+  if (back) {
+    router.back()
+  } else {
+    router.push("/books")
+  }
+}
+
 async function toggleFavorite() {
   if (!book.value) return
   favorite.value = await store.toggleFavorite(book.value)
@@ -287,7 +296,7 @@ onMounted(async () => {
 
     <main class="max-w-3xl mx-auto px-4 py-8">
       <button
-        @click="router.back()"
+        @click="goBack"
         class="text-sm text-muted dark:text-gray-400 hover:text-ink mb-6 inline-flex items-center gap-1 transition-colors"
       >&larr; {{ i18n.t('book_back') }}</button>
 

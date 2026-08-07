@@ -22,3 +22,10 @@
     @apply mb-4;
   }
 }
+
+html.reader-locked,
+html.reader-locked body {
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
