@@ -75,6 +75,7 @@
 15. 手动上传支持自动识别书名、作者、简介、状态、标签和 R18，保存时再次校验并自动分类。
 16. 前端本地扫描/直接读取和手动上传结果展示 R18、分类、标签。
 17. 修复后端应用加载、迁移 ID 长度和本地测试基线，完整 `pytest` 已跑通。
+18. 本地 Markdown 导入支持配置的服务器目录挂载，并提供前端目录浏览/选择。
 
 ## 3. 已修改文件及主要变化
 
@@ -147,8 +148,12 @@
 | `backend/app/services/manual_import.py` | 保存时合并自动识别结果，内容参与 R18 检测并自动分类。 |
 | `backend/app/crawler/plugins/local_markdown/__init__.py` | 目录和单文件导入均使用自动补全并返回 `is_r18`。 |
 | `backend/app/api/routes/books.py` | 新增 `POST /api/books/manual/analyze`。 |
+| `backend/app/api/routes/sync.py` | 新增 `/sync/local/roots` 和 `/sync/local/list` 目录选择接口。 |
+| `backend/app/core/config.py` | 新增 `LOCAL_IMPORT_ROOTS`。 |
+| `docker-compose.yml` | 将 `${LOCAL_IMPORT_VOLUME:-./data/imports}` 挂载到 `/imports:ro`。 |
 | `frontend/src/pages/AdminPage.vue` | 本地扫描/手动上传展示 R18、分类、标签，并支持自动识别。 |
 | `docker-compose.yml` | backend/crawler/scheduler 从 `MEILI_MASTER_KEY` 注入 `MEILI_KEY`。 |
+| `.env.example` | 新增 `LOCAL_IMPORT_VOLUME` 和 `LOCAL_IMPORT_ROOTS`。 |
 
 ## 4. 当前 Git 状态
 
@@ -185,7 +190,7 @@ d3927d3 update_backend   # README 更新
 | Playwright：手机分页 `tap-next-ok`、`tap-prev-ok`、`swipe-next-ok`、`menu-ok` | 通过 |
 | Playwright：书源导入/同步页 `admin-flow-ok`、`sync-flow-ok` | 通过 |
 | Playwright：个人书籍公开/取消公开 `publish-flow-ok` | 通过 |
-| 完整 `pytest` | 通过，213 passed |
+| 完整 `pytest` | 通过，216 passed |
 | `npm run typecheck` | 通过 |
 | `npm run build` | 通过 |
 

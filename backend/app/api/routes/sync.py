@@ -9,9 +9,12 @@ from app.schemas.sync import (
     BookshelfSyncResult,
     DiscoverRequest,
     DiscoverResult,
+    LocalBrowseRequest,
+    LocalBrowseResult,
     LocalContentRequest,
     LocalContentResult,
     LocalDirectResult,
+    LocalImportRoot,
     LocalImportRequest,
     LocalImportResult,
     LocalScanRequest,
@@ -20,7 +23,12 @@ from app.schemas.sync import (
     SyncResult,
 )
 from app.services.auth import get_current_user, require_admin
-from app.services.local_library import parse_local_book, scan_local_library
+from app.services.local_library import (
+    list_local_directories,
+    list_local_import_roots,
+    parse_local_book,
+    scan_local_library,
+)
 from app.services.sync import SyncService
 
 router = APIRouter(prefix="/sync", tags=["sync"])
@@ -73,6 +81,19 @@ async def scan_local_library_endpoint(payload: LocalScanRequest):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return LocalScanResult(root=payload.path, books=books)
+
+
+@router.get("/local/roots", response_model=list[LocalImportRoot], dependencies=[Depends(require_admin)])
+async def local_import_roots_endpoint():
+    return list_local_import_roots()
+
+
+@router.post("/local/list", response_model=LocalBrowseResult, dependencies=[Depends(require_admin)])
+async def list_local_directories_endpoint(payload: LocalBrowseRequest):
+    try:
+        return list_local_directories(payload.path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/local/direct", response_model=LocalDirectResult, dependencies=[Depends(require_admin)])

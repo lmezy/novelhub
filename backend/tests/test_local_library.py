@@ -4,7 +4,12 @@ import pytest
 
 from app.main import app
 from app.services.auth import require_admin
-from app.services.local_library import parse_local_book, scan_local_library
+from app.services.local_library import (
+    list_local_directories,
+    list_local_import_roots,
+    parse_local_book,
+    scan_local_library,
+)
 
 
 def _book_dir(root, author, title, metadata=None):
@@ -73,6 +78,38 @@ def test_parse_local_book_returns_chapter_refs(tmp_path):
     assert info["chapters"][0]["title"] == "Chapter 1"
 
 
+def test_list_local_import_roots_and_directories(tmp_path, monkeypatch):
+    root = tmp_path / "books"
+    child = root / "demo"
+    child.mkdir(parents=True)
+    monkeypatch.setattr(
+        "app.services.local_library.settings.LOCAL_IMPORT_ROOTS",
+        str(root),
+    )
+
+    roots = list_local_import_roots()
+    assert roots[0]["path"] == str(root.resolve())
+
+    result = list_local_directories(str(child))
+    assert result["path"] == str(child.resolve())
+    assert result["parent"] == str(root.resolve())
+    assert list_local_directories(str(root))["parent"] is None
+
+
+def test_list_local_directories_rejects_outside_roots(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    other = tmp_path / "other"
+    root.mkdir()
+    other.mkdir()
+    monkeypatch.setattr(
+        "app.services.local_library.settings.LOCAL_IMPORT_ROOTS",
+        str(root),
+    )
+
+    with pytest.raises(ValueError):
+        list_local_directories(str(other))
+
+
 @pytest.mark.asyncio
 async def test_scan_endpoint_returns_books(tmp_path, client):
     _book_dir(tmp_path, "Alice", "Book One")
@@ -90,6 +127,23 @@ async def test_scan_endpoint_returns_books(tmp_path, client):
     body = resp.json()
     assert body["books"][0]["title"] == "Book One"
     assert body["books"][0]["chapter_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_local_roots_endpoint(tmp_path, client, monkeypatch):
+    monkeypatch.setattr(
+        "app.services.local_library.settings.LOCAL_IMPORT_ROOTS",
+        str(tmp_path),
+    )
+
+    app.dependency_overrides[require_admin] = lambda: None
+    try:
+        resp = await client.get("/api/sync/local/roots")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    assert resp.json()[0]["path"] == str(tmp_path.resolve())
 
 
 @pytest.mark.asyncio

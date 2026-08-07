@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 
+from app.core.config import settings
 from app.services.local_file_parser import (
     is_supported_file,
     parse_local_file,
@@ -201,3 +202,48 @@ def scan_local_library(root: str, max_depth: int = 3) -> list[dict]:
             added_paths.add(key)
 
     return books
+
+
+def list_local_import_roots() -> list[dict]:
+    """Return configured, currently visible import roots."""
+    roots: list[dict] = []
+    for raw in (settings.LOCAL_IMPORT_ROOTS or "").split(","):
+        value = (raw or "").strip()
+        if not value:
+            continue
+        path = Path(value).expanduser().resolve()
+        if path.is_dir():
+            roots.append({
+                "path": str(path),
+                "name": path.name or str(path),
+            })
+    return roots
+
+
+def list_local_directories(path: str) -> dict:
+    """List subdirectories under one of the configured import roots."""
+    target = Path(path).expanduser().resolve()
+    roots = [
+        Path(value).expanduser().resolve()
+        for value in (settings.LOCAL_IMPORT_ROOTS or "").split(",")
+        if (value or "").strip()
+    ]
+    if not any(target == root or root in target.parents for root in roots):
+        raise ValueError(f"Path is outside configured import roots: {path}")
+    if not target.is_dir():
+        raise ValueError(f"Not a directory: {path}")
+
+    directories = []
+    for child in sorted(target.iterdir(), key=lambda item: item.name.lower()):
+        if child.is_dir():
+            directories.append({
+                "path": str(child),
+                "name": child.name,
+            })
+
+    return {
+        "path": str(target),
+        "name": target.name or str(target),
+        "parent": str(target.parent) if target not in roots else None,
+        "directories": directories,
+    }

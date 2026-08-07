@@ -371,6 +371,13 @@ const localScanRoot = ref("")
 const localSelected = ref<string[]>([])
 const localScanning = ref(false)
 const localDirectResult = ref<any>(null)
+const localRoots = ref<any[]>([])
+const localBrowserOpen = ref(false)
+const localBrowserPath = ref("")
+const localBrowserName = ref("")
+const localBrowserParent = ref<string | null>(null)
+const localBrowserDirs = ref<any[]>([])
+const localBrowsing = ref(false)
 
 const manualTitle = ref("")
 const manualAuthor = ref("")
@@ -639,6 +646,49 @@ async function importLocal() {
   } finally {
     localImporting.value = false
   }
+}
+
+async function loadLocalRoots() {
+  try {
+    localRoots.value = await api.get<any[]>("/sync/local/roots")
+  } catch {}
+}
+
+async function openLocalBrowser(root?: any) {
+  localBrowserOpen.value = true
+  localError.value = ""
+  if (root) {
+    await browseLocalDirectory(root.path)
+  } else if (localRoots.value.length) {
+    await browseLocalDirectory(localRoots.value[0].path)
+  } else {
+    localBrowserPath.value = ""
+    localBrowserName.value = ""
+    localBrowserParent.value = null
+    localBrowserDirs.value = []
+  }
+}
+
+async function browseLocalDirectory(path: string) {
+  localBrowsing.value = true
+  localError.value = ""
+  try {
+    const res = await api.post<any>("/sync/local/list", { path })
+    localBrowserPath.value = res.path
+    localBrowserName.value = res.name
+    localBrowserParent.value = res.parent
+    localBrowserDirs.value = res.directories || []
+  } catch (e) {
+    localError.value = e instanceof Error ? e.message : i18n.t('admin_local_browse_failed')
+  } finally {
+    localBrowsing.value = false
+  }
+}
+
+function chooseLocalDirectory(path: string) {
+  if (!path) return
+  localPath.value = path
+  localBrowserOpen.value = false
 }
 
 async function scanLocal() {
@@ -1174,6 +1224,7 @@ onMounted(async () => {
     await loadUsers()
     await loadRegistrationApproval()
     await loadApprovals()
+    await loadLocalRoots()
     loadProxyConfig()
   }
   await loadTokens()
@@ -1761,11 +1812,22 @@ onUnmounted(() => {
         <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 max-w-3xl">
           <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_local_markdown') }}</h2>
           <p class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('admin_local_hint') }}</p>
-          <input
-            v-model="localPath"
-            :placeholder="i18n.t('admin_local_path_placeholder')"
-            class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
-          />
+          <div class="flex flex-col sm:flex-row gap-2">
+            <input
+              v-model="localPath"
+              :placeholder="i18n.t('admin_local_path_placeholder')"
+              list="local-import-roots"
+              class="flex-1 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
+            />
+            <datalist id="local-import-roots">
+              <option v-for="root in localRoots" :key="root.path" :value="root.path">{{ root.name }}</option>
+            </datalist>
+            <button
+              type="button"
+              @click="openLocalBrowser()"
+              class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm hover:bg-accent/5"
+            >{{ i18n.t('admin_local_choose_dir') }}</button>
+          </div>
           <p v-if="localError" class="text-sm text-red-600 mt-2">{{ localError }}</p>
           <div class="mt-3 flex flex-wrap gap-2">
             <button
@@ -1858,6 +1920,58 @@ onUnmounted(() => {
               <span v-if="book.categories?.length" class="ml-1">{{ book.categories.join(' / ') }}</span>
               <span v-if="book.tags?.length" class="ml-1">{{ book.tags.slice(0, 6).join(', ') }}</span>
             </p>
+          </div>
+        </div>
+
+        <div v-if="localBrowserOpen" class="fixed inset-0 z-[90] bg-black/50 flex items-center justify-center p-4" @click.self="localBrowserOpen = false">
+          <div class="w-full max-w-lg rounded-lg border border-border bg-surface dark:bg-gray-900 p-4 shadow-xl">
+            <div class="flex items-center justify-between gap-3 mb-3">
+              <span class="text-sm font-medium truncate">{{ localBrowserName || localBrowserPath || i18n.t('admin_local_browse_title') }}</span>
+              <button
+                type="button"
+                class="w-8 h-8 shrink-0 flex items-center justify-center rounded hover:bg-black/10 dark:hover:bg-white/10"
+                @click="localBrowserOpen = false"
+              >×</button>
+            </div>
+            <div class="flex flex-wrap items-center gap-2 mb-3">
+              <button
+                v-for="root in localRoots"
+                :key="root.path"
+                type="button"
+                class="px-2 py-1 rounded border border-border dark:border-gray-700 text-xs hover:bg-accent/5"
+                @click="browseLocalDirectory(root.path)"
+              >{{ root.name }}</button>
+              <button
+                v-if="localBrowserParent"
+                type="button"
+                class="px-2 py-1 rounded border border-border dark:border-gray-700 text-xs hover:bg-accent/5"
+                @click="browseLocalDirectory(localBrowserParent)"
+              >{{ i18n.t('admin_local_browse_up') }}</button>
+              <button
+                v-if="localBrowserPath"
+                type="button"
+                class="px-2 py-1 rounded bg-accent text-white text-xs hover:opacity-90"
+                @click="chooseLocalDirectory(localBrowserPath)"
+              >{{ i18n.t('admin_local_browse_choose') }}</button>
+            </div>
+            <div class="max-h-64 overflow-y-auto divide-y divide-border border border-border dark:border-gray-700 rounded">
+              <button
+                v-for="dir in localBrowserDirs"
+                :key="dir.path"
+                type="button"
+                class="w-full text-left px-3 py-2 hover:bg-accent/5"
+                @click="browseLocalDirectory(dir.path)"
+              >
+                <span class="block text-sm font-medium truncate">{{ dir.name }}</span>
+                <span class="block text-xs text-muted dark:text-gray-400 truncate">{{ dir.path }}</span>
+              </button>
+              <p v-if="!localBrowsing && localBrowserDirs.length === 0" class="px-3 py-4 text-sm text-muted dark:text-gray-400">
+                {{ i18n.t('admin_local_browse_empty') }}
+              </p>
+              <p v-if="localBrowsing" class="px-3 py-4 text-sm text-muted dark:text-gray-400">
+                {{ i18n.t('admin_local_browse_loading') }}
+              </p>
+            </div>
           </div>
         </div>
 

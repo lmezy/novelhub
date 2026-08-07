@@ -42,6 +42,27 @@ class LocalScanRequest(BaseModel):
     max_depth: int = 3
 
 
+class LocalImportRoot(BaseModel):
+    path: str
+    name: str
+
+
+class LocalBrowseRequest(BaseModel):
+    path: str
+
+
+class LocalDirectoryEntry(BaseModel):
+    path: str
+    name: str
+
+
+class LocalBrowseResult(BaseModel):
+    path: str
+    name: str
+    parent: str | None = None
+    directories: list[LocalDirectoryEntry]
+
+
 class LocalBookCandidate(BaseModel):
     path: str
     title: str

@@ -106,8 +106,24 @@ Cookie 获取方法见 [Cookie 获取指南](docs/cookie-guide.md)。
 “设置 -> 本地 / 手动 -> 本地 Markdown 导入”：
 
 1. 在服务器上准备书籍目录，章节为 `.md` 文件，可附带 `metadata.json`；
-2. 输入服务器上的根目录路径，点击“扫描目录”；
+2. 点击“选择目录”浏览已配置的导入根目录，或手动输入容器内可见的路径；
 3. 勾选书籍后点击“批量导入所选”，或点击“导入全部”。
+
+容器部署时，服务器上的书籍目录需要挂载到容器内才能被读取。默认会把
+`./data/imports` 挂载到 `/imports`。如果书籍在服务器其他目录，修改 `.env`：
+
+```dotenv
+LOCAL_IMPORT_VOLUME=/mnt/books
+LOCAL_IMPORT_ROOTS=/imports,/app/storage/imports,/library
+```
+
+然后重建后端和爬虫容器：
+
+```bash
+docker compose up -d --build backend crawler
+```
+
+`LOCAL_IMPORT_ROOTS` 中列出的目录会显示在“选择目录”弹窗中，未列出的已挂载目录仍可手动输入路径。
 
 目录格式示例：
 

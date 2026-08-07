@@ -44,6 +44,7 @@ class Settings(BaseSettings):
 
 
     STORAGE_PATH:str="/app/storage/books"
+    LOCAL_IMPORT_ROOTS:str="/app/storage/imports,/imports,/library"
 
 
 
