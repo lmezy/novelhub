@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -11,21 +12,39 @@ from app.services.security import hash_password, verify_password
 from app.services.account import username_available
 
 
+def _configure_db(db):
+    async def _refresh(obj):
+        if not hasattr(obj, "settings") or obj.settings is None:
+            obj.settings = {}
+    db.refresh = AsyncMock(side_effect=_refresh)
+    return db
+
+
+def _valid_invite():
+    return SimpleNamespace(
+        id="invite-1",
+        created_by="inviter-1",
+        used_by=None,
+        expires_at=datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=1),
+    )
+
+
 def _db_with_scalar(value=None):
     db = AsyncMock()
     db.scalar = AsyncMock(return_value=value)
-    return db
+    return _configure_db(db)
 
 
 def _db_with_scalar_sequence(values):
     db = AsyncMock()
     db.scalar = AsyncMock(side_effect=values)
-    return db
+    return _configure_db(db)
 
 
 @pytest.mark.asyncio
 async def test_register_pending_when_approval_enabled():
-    db = _db_with_scalar_sequence([SimpleNamespace(id="inviter-1"), None, None, None, None])
+    db = _db_with_scalar_sequence([_valid_invite(), None, None, None, None])
+    db.get = AsyncMock(return_value=SimpleNamespace(id="inviter-1", username="inviter"))
     app.dependency_overrides[get_db] = lambda: db
     try:
         transport = ASGITransport(app=app)
@@ -55,7 +74,8 @@ async def test_register_pending_when_approval_enabled():
 
 @pytest.mark.asyncio
 async def test_register_approved_when_approval_disabled():
-    db = _db_with_scalar_sequence([SimpleNamespace(id="inviter-1"), None, None, None, None])
+    db = _db_with_scalar_sequence([_valid_invite(), None, None, None, None])
+    db.get = AsyncMock(return_value=SimpleNamespace(id="inviter-1", username="inviter"))
     app.dependency_overrides[get_db] = lambda: db
     try:
         transport = ASGITransport(app=app)
@@ -85,7 +105,8 @@ async def test_register_approved_when_approval_disabled():
 
 @pytest.mark.asyncio
 async def test_register_without_email_succeeds():
-    db = _db_with_scalar_sequence([SimpleNamespace(id="inviter-1"), None, None])
+    db = _db_with_scalar_sequence([_valid_invite(), None, None])
+    db.get = AsyncMock(return_value=SimpleNamespace(id="inviter-1", username="inviter"))
     app.dependency_overrides[get_db] = lambda: db
     try:
         transport = ASGITransport(app=app)
@@ -232,7 +253,8 @@ async def test_login_by_email():
 
 @pytest.mark.asyncio
 async def test_register_duplicate_username_rejected():
-    db = _db_with_scalar_sequence([SimpleNamespace(id="inviter-1"), object()])
+    db = _db_with_scalar_sequence([_valid_invite(), object()])
+    db.get = AsyncMock(return_value=SimpleNamespace(id="inviter-1", username="inviter"))
     app.dependency_overrides[get_db] = lambda: db
     try:
         transport = ASGITransport(app=app)
@@ -253,7 +275,8 @@ async def test_register_duplicate_username_rejected():
 
 @pytest.mark.asyncio
 async def test_register_duplicate_email_rejected():
-    db = _db_with_scalar_sequence([SimpleNamespace(id="inviter-1"), None, None, object()])
+    db = _db_with_scalar_sequence([_valid_invite(), None, None, object()])
+    db.get = AsyncMock(return_value=SimpleNamespace(id="inviter-1", username="inviter"))
     app.dependency_overrides[get_db] = lambda: db
     try:
         transport = ASGITransport(app=app)

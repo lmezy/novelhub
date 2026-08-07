@@ -52,8 +52,8 @@ def test_can_view_all_ages():
 
 
 def test_book_visibility_matrix():
-    r18_book = SimpleNamespace(is_r18=True)
-    normal_book = SimpleNamespace(is_r18=False)
+    r18_book = SimpleNamespace(is_r18=True, owner_id=None, is_public=False)
+    normal_book = SimpleNamespace(is_r18=False, owner_id=None, is_public=False)
     off = SimpleNamespace(role="user", r18_enabled=False, non_r18_enabled=False)
     r18_only = SimpleNamespace(role="user", r18_enabled=True, non_r18_enabled=False)
     all_ages_only = SimpleNamespace(role="user", r18_enabled=False, non_r18_enabled=True)

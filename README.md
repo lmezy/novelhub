@@ -119,7 +119,9 @@ storage/imports/
     000002.md
 ```
 
-`metadata.json` 可包含 `title`、`author`、`description`、`status`、`tags`。未提供时自动从目录名和父目录名推断。
+`metadata.json` 可包含 `title`、`author`、`description`、`status`、`tags`。未提供时自动从目录名、父目录名和正文样本推断。
+
+本地扫描和导入会自动补全简介、状态、标签和分类，并对书名、作者、简介、标签及正文样本做 R18 检测；扫描列表会显示 R18、分类和标签。
 
 也可以通过 API 导入单个目录：
 
@@ -129,7 +131,15 @@ curl -X POST http://localhost:8088/api/sync/book \
   -d '{"source_id":"local_markdown","url":"file:///app/storage/imports/demo-book"}'
 ```
 
-### 8. 阅读
+### 8. 手动上传
+
+“设置 -> 本地 / 手动 -> 手动上传”中可以粘贴章节文本，或选择 `.txt / .md` 文件读取。
+
+- 选择文件后会自动识别书名、作者、简介、状态、标签和 R18 结果；
+- 也可以粘贴文本后点击“自动识别”；
+- 保存时后端会再次执行 R18 校验与自动分类，即使没有预览也会补全书籍信息和标签。
+
+### 9. 阅读
 
 桌面端阅读器支持字号、字体、主题、目录、AI 侧栏和进度保存。
 
@@ -141,7 +151,7 @@ curl -X POST http://localhost:8088/api/sync/book \
 - 章节末尾继续翻页会进入下一章；
 - 阅读器内切换章节不会堆积历史记录，返回书籍后可以正常回到书库。
 
-### 9. 搜索与 AI
+### 10. 搜索与 AI
 
 - 搜索页支持书籍、章节全文搜索；
 - 配置 AI 后，阅读器侧栏可使用 AI 问答、章节摘要和 RAG 语义检索。

@@ -1,6 +1,6 @@
 """add book ownership and source contributor metadata
 
-Revision ID: 0027_book_owner_source_contributor
+Revision ID: 0027_book_owner_source
 Revises: 0026_user_nickname
 Create Date: 2026-08-07
 """
@@ -9,7 +9,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "0027_book_owner_source_contributor"
+revision = "0027_book_owner_source"
 down_revision = "0026_user_nickname"
 branch_labels = None
 depends_on = None

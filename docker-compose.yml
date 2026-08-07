@@ -69,6 +69,8 @@
     restart: always
     env_file:
       - .env
+    environment:
+      MEILI_KEY: ${MEILI_MASTER_KEY}
 
     depends_on:
       postgres:
@@ -104,6 +106,8 @@
     restart: always
     env_file:
       - .env
+    environment:
+      MEILI_KEY: ${MEILI_MASTER_KEY}
     depends_on:
       postgres:
         condition: service_healthy
@@ -124,6 +128,8 @@
     restart: always
     env_file:
       - .env
+    environment:
+      MEILI_KEY: ${MEILI_MASTER_KEY}
 
   frontend:
     build:

@@ -228,14 +228,15 @@ async def test_import_and_sync_all_runs_all_sources(mock_db):
         patch(
             "app.api.routes.yuedu.import_yuedu_sources",
             AsyncMock(
-                return_value=SimpleNamespace(
-                    total=2,
-                    imported=2,
-                    skipped=0,
-                    updated=0,
-                    sources=source_infos,
-                )
-            ),
+                    return_value=SimpleNamespace(
+                        total=2,
+                        imported=2,
+                        skipped=0,
+                        updated=0,
+                        status="imported",
+                        sources=source_infos,
+                    )
+                ),
         ),
         patch("app.core.database.SessionLocal", return_value=session),
         patch.object(
@@ -281,6 +282,7 @@ async def test_import_yuedu_sources_updates_newer_existing_source(mock_db):
         config={"lastUpdateTime": "100"},
         is_r18=False,
         owner_id="u1",
+        submitter_id=None,
     )
     mock_db.get = AsyncMock(return_value=existing)
 

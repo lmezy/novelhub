@@ -1,7 +1,7 @@
 """add public and all-ages confirmation flags to books
 
 Revision ID: 0028_book_public_all_ages
-Revises: 0027_book_owner_source_contributor
+Revises: 0027_book_owner_source
 Create Date: 2026-08-07
 """
 
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 
 revision = "0028_book_public_all_ages"
-down_revision = "0027_book_owner_source_contributor"
+down_revision = "0027_book_owner_source"
 branch_labels = None
 depends_on = None
 

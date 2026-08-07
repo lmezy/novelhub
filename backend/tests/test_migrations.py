@@ -43,7 +43,7 @@ def test_migration_chain_is_linear_and_ends_at_head():
         for _, module in migrations
         if module.revision not in by_down_revision
     ]
-    assert heads == ["0026_user_nickname"]
+    assert heads == ["0028_book_public_all_ages"]
 
     visited = []
     node = by_down_revision[None]

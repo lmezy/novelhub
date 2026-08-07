@@ -2,7 +2,10 @@
 
 import pytest
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+from app.core.database import get_db
+from app.main import app
 from app.schemas.auth import TokenOut
 from app.schemas.user import UserOut
 
@@ -24,10 +27,16 @@ def test_token_out_accepts_user_attributes():
 
 @pytest.mark.asyncio
 async def test_login_invalid(client):
-    resp = await client.post("/api/auth/login", json={
-        "username": "nonexistent_user_xyz",
-        "password": "wrong",
-    })
+    db = AsyncMock()
+    db.scalar = AsyncMock(return_value=None)
+    app.dependency_overrides[get_db] = lambda: db
+    try:
+        resp = await client.post("/api/auth/login", json={
+            "username": "nonexistent_user_xyz",
+            "password": "wrong",
+        })
+    finally:
+        app.dependency_overrides.clear()
     assert resp.status_code == 401
 
 

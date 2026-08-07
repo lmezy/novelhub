@@ -1,9 +1,9 @@
 # NovelHub 完整交接记录
 
-> 最后更新：2026-08-07  
-> 状态：当前任务暂停，业务代码不再继续修改  
-> 分支：`develop`  
-> HEAD：`d3927d3`
+> 最后更新：2026-08-07
+> 状态：本地代码已完成本轮增强，待提交
+> 分支：`develop`
+> HEAD：以 git log 为准
 
 ## 1. 原始需求
 
@@ -71,6 +71,10 @@
     - 自动同步和每日同步只处理全站书源。
 12. 重写 `README.md` 使用说明。
 13. 生成 `docs/codex-handoff.md` 交接记录。
+14. 本地 Markdown 导入自动补全书籍信息、分类和标签，并从正文样本执行 R18 检测。
+15. 手动上传支持自动识别书名、作者、简介、状态、标签和 R18，保存时再次校验并自动分类。
+16. 前端本地扫描/直接读取和手动上传结果展示 R18、分类、标签。
+17. 修复后端应用加载、迁移 ID 长度和本地测试基线，完整 `pytest` 已跑通。
 
 ## 3. 已修改文件及主要变化
 
@@ -134,6 +138,18 @@
 | `README.md` | 按新流程重写使用说明。 |
 | `docs/codex-handoff.md` | 本次交接记录。 |
 
+### 3.7 本轮本地增强
+
+| 文件 | 主要变化 |
+|------|----------|
+| `backend/app/services/book_enrichment.py` | 新增本地/手动导入的元数据提取、标签/分类建议和正文 R18 检测。 |
+| `backend/app/services/local_library.py` | 扫描和直接读取返回 `is_r18`、`categories` 及补全后的书籍信息。 |
+| `backend/app/services/manual_import.py` | 保存时合并自动识别结果，内容参与 R18 检测并自动分类。 |
+| `backend/app/crawler/plugins/local_markdown/__init__.py` | 目录和单文件导入均使用自动补全并返回 `is_r18`。 |
+| `backend/app/api/routes/books.py` | 新增 `POST /api/books/manual/analyze`。 |
+| `frontend/src/pages/AdminPage.vue` | 本地扫描/手动上传展示 R18、分类、标签，并支持自动识别。 |
+| `docker-compose.yml` | backend/crawler/scheduler 从 `MEILI_MASTER_KEY` 注入 `MEILI_KEY`。 |
+
 ## 4. 当前 Git 状态
 
 ```text
@@ -144,6 +160,7 @@ HEAD：d3927d3
 最近提交：
 
 ```text
+4b8cdf9 update_backend   # 本地导入/手动上传自动补全与 R18
 d3927d3 update_backend   # README 更新
 1ea1d21 update_backend   # 书源/权限/R18/公开/迁移等主要功能
 29177fb update_backend   # 手机阅读器与返回修复
@@ -152,10 +169,10 @@ d3927d3 update_backend   # README 更新
 当前工作区：
 
 ```text
-?? docs/codex-handoff.md
+本轮业务代码、测试和文档已修改，待提交
 ```
 
-除本交接文档外，业务代码均已提交，工作区干净。
+除本交接文档外，上一阶段业务代码均已提交；本轮本地增强尚未提交。
 
 ## 5. 已运行的测试及结果
 
@@ -168,11 +185,13 @@ d3927d3 update_backend   # README 更新
 | Playwright：手机分页 `tap-next-ok`、`tap-prev-ok`、`swipe-next-ok`、`menu-ok` | 通过 |
 | Playwright：书源导入/同步页 `admin-flow-ok`、`sync-flow-ok` | 通过 |
 | Playwright：个人书籍公开/取消公开 `publish-flow-ok` | 通过 |
-| 完整 `pytest` | 未跑通，原因见“尚未解决的问题” |
+| 完整 `pytest` | 通过，213 passed |
+| `npm run typecheck` | 通过 |
+| `npm run build` | 通过 |
 
 ## 6. 尚未解决的问题
 
-1. 本机 `.env` 仍包含旧变量名，与 `backend/app/core/config.py` 的 `Settings` 不匹配，导致完整 `pytest` 无法在本机直接启动。
+1. 本机 `.env` 仍缺 `MEILI_KEY`；已通过 `docker-compose.yml` 为 backend/crawler/scheduler 注入 `MEILI_MASTER_KEY`，本机直接运行 `pytest` 时仍需临时设置 `MEILI_KEY` 等环境变量。
 2. 远程 `192.168.48.76` 上的容器仍是旧构建，未执行 `0027`、`0028` 迁移。
 3. 搜索接口按可见性过滤后，`total` 当前按过滤后的当前页结果计算，不等于 Meilisearch 的真实总量。
 4. `GET /api/books/{book_id}/cover` 没有用户权限校验，封面 URL 被猜到时仍可访问。
@@ -202,6 +221,7 @@ docker compose exec backend alembic upgrade head
 6. 评估并修复搜索 `total` 精度。
 7. 评估封面接口权限，同时保证 `<img>` 正常加载。
 8. 根据验证结果补充自动化测试。
+9. 在具备 PostgreSQL/Redis/Meilisearch 的本地或容器环境启动完整服务，验证本地导入和手动上传页面流程。
 
 ## 8. 不能修改的内容
 
@@ -213,7 +233,7 @@ docker compose exec backend alembic upgrade head
 - 禁止新增大量重复 Crawler 或为单一网站写死逻辑。
 - 禁止在未确认用户意图的情况下回滚已提交代码。
 - 禁止在未执行迁移前重启新的后端容器。
-- 当前任务暂停期间，禁止继续修改业务代码。
+- 在用户确认前不进行远程部署或数据库迁移。
 
 ## 9. 新会话开始时需要优先读取的文件
 

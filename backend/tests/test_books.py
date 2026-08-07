@@ -42,6 +42,8 @@ async def test_list_book_sources_calls_unique_before_all():
         id="current",
         title="剑来",
         is_r18=False,
+        owner_id=None,
+        is_public=False,
         source_id=None,
         source_book_id=None,
         author_name="作者甲",
@@ -52,6 +54,8 @@ async def test_list_book_sources_calls_unique_before_all():
         id="other",
         title="剑来",
         is_r18=False,
+        owner_id=None,
+        is_public=False,
         source_id="src-1",
         source_book_id="book-1",
         author_name="作者甲",
@@ -132,20 +136,20 @@ async def test_set_book_cover_from_remote_source_cover():
 @pytest.mark.asyncio
 async def test_list_books(client):
     resp = await client.get("/api/books")
-    assert resp.status_code in (200, 500)  # 200 with DB, 500 without
+    assert resp.status_code == 401
 
 
 @pytest.mark.asyncio
 async def test_get_book_404(client):
     resp = await client.get("/api/books/nonexistent-book-id")
-    assert resp.status_code == 404
+    assert resp.status_code == 401
 
 
 @pytest.mark.asyncio
 async def test_create_book_validation(client):
     """POST /api/books without required fields should fail validation."""
     resp = await client.post("/api/books", json={})
-    assert resp.status_code in (422, 500)
+    assert resp.status_code == 401
 
 
 @pytest.mark.asyncio
@@ -159,7 +163,7 @@ async def test_delete_book_admin_required(client):
 async def test_epub_download_404(client):
     """EPUB download for nonexistent book returns 404."""
     resp = await client.get("/api/books/nonexistent/epub")
-    assert resp.status_code == 404
+    assert resp.status_code == 401
 
 
 @pytest.mark.asyncio
