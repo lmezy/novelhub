@@ -242,9 +242,13 @@ async def _worker_loop() -> None:
             await asyncio.sleep(2)
             continue
 
+        # Poll for newly created tasks even while existing tasks are running.
+        # Without the timeout, a source created right after the initial fill
+        # waits until an active task finishes before being picked up.
         done, _ = await asyncio.wait(
             active.keys(),
             return_when=asyncio.FIRST_COMPLETED,
+            timeout=1.0,
         )
         for finished in done:
             task_id = active.pop(finished)

@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -5,11 +6,16 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.exc import MissingGreenlet
 
-from app.services.crawl_runner import _next_pending_task_ids, run_crawl_task_async
+from app.services.crawl_runner import (
+    _next_pending_task_ids,
+    _worker_loop,
+    run_crawl_task_async,
+)
 from app.core.database import get_db
 from app.main import app
 from app.services.auth import require_admin
 from app.services.sync import SyncPaused
+from app.core.config import settings
 
 
 def _task(**overrides):
@@ -221,3 +227,55 @@ async def test_run_crawl_task_async_marks_paused_when_checkpoint_raises():
 
     assert result == {"status": "paused", "task_id": "task-1"}
     assert task.status == "paused"
+
+
+@pytest.mark.asyncio
+async def test_worker_loop_picks_up_new_task_while_another_is_running():
+    calls = 0
+    started_tasks: set[str] = set()
+    release_a = asyncio.Event()
+    all_started = asyncio.Event()
+
+    async def fake_next(limit: int) -> list[str]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ["task-a"]
+        if calls == 2:
+            return []
+        if calls == 3:
+            return ["task-b"]
+        return []
+
+    async def fake_run(task_id: str) -> dict:
+        started_tasks.add(task_id)
+        if len(started_tasks) >= 2:
+            all_started.set()
+        if task_id == "task-a":
+            await release_a.wait()
+        return {"status": "completed", "task_id": task_id}
+
+    with (
+        patch.object(settings, "SYNC_WORKER_CONCURRENCY", 2),
+        patch("app.services.crawl_runner.sync_thread_count", return_value=9),
+        patch(
+            "app.services.crawl_runner._next_pending_task_ids",
+            side_effect=fake_next,
+        ),
+        patch(
+            "app.services.crawl_runner.run_crawl_task_async",
+            side_effect=fake_run,
+        ),
+    ):
+        worker = asyncio.create_task(_worker_loop())
+        try:
+            await asyncio.wait_for(all_started.wait(), timeout=5)
+        finally:
+            release_a.set()
+            worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
+
+    assert started_tasks == {"task-a", "task-b"}
