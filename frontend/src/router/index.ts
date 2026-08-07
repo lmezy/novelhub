@@ -63,7 +63,11 @@ router.beforeEach(async (to, _from, next) => {
     next({ name: "login" })
   } else {
     if (to.name !== "login" && token && !auth.user) {
-      await auth.fetchMe()
+      const ok = await auth.fetchMe()
+      if (!ok) {
+        next({ name: "login", query: { redirect: to.fullPath } })
+        return
+      }
     }
     next()
   }

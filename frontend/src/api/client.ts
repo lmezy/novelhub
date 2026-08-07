@@ -17,6 +17,10 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const res = await fetch(`${BASE}${path}`, { ...options, headers })
   if (!res.ok) {
     const body = await res.json().catch(() => ({}))
+    if (res.status === 401 && path !== "/auth/login" && t) {
+      localStorage.removeItem("novelhub_token")
+      window.dispatchEvent(new CustomEvent("novelhub:unauthorized"))
+    }
     let msg: string
     if (Array.isArray(body.detail)) {
       msg = body.detail.map((e: any) => `${e.loc?.join(".") || ""}: ${e.msg}`).join("; ")

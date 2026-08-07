@@ -1574,7 +1574,7 @@ onUnmounted(() => {
               <input v-model="accountForm.new_password" type="password" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
             </label>
           </div>
-          <button @click="changePassword" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90">{{ i18n.t('admin_change_password') }}</button>
+          <button @click="changePassword" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90">{{ i18n.t('admin_my_change_password') }}</button>
 
           <div class="mt-4 pt-4 border-t border-border dark:border-gray-700">
             <label class="block mb-2">

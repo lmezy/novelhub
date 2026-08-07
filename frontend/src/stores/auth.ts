@@ -71,13 +71,15 @@ function applyUserSettings(u: User) {
     return res
   }
 
-  async function fetchMe() {
-    if (!token.value) return
+  async function fetchMe(): Promise<boolean> {
+    if (!token.value) return false
     try {
       user.value = await api.get<User>("/auth/me")
       applyUserSettings(user.value)
+      return true
     } catch {
       logout()
+      return false
     }
   }
 
