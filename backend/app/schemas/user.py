@@ -56,6 +56,7 @@ class UserOut(BaseModel):
     approved: bool = True
     invite_code: str = ""
     invited_by_id: str | None = None
+    settings: dict = {}
 
     class Config:
         from_attributes = True
@@ -69,4 +70,20 @@ class UserSelfVisibilityUpdate(BaseModel):
     class Config:
 
         from_attributes=True
+
+
+class UserSettingsUpdate(BaseModel):
+    font: str | None = None
+    font_size: int | None = None
+    language: str | None = None
+    theme: str | None = None
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class UpdateEmailRequest(BaseModel):
+    email: EmailStr
 

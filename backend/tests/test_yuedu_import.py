@@ -203,6 +203,7 @@ async def test_import_yuedu_sources_imports_yckceo_listing(mock_db):
             YueduImportRequest(
                 url="https://www.yckceo.com/yuedu/shuyuan/index.html"
             ),
+            SimpleNamespace(id="u1", role="user"),
             mock_db,
         )
 
@@ -256,6 +257,7 @@ async def test_import_and_sync_all_runs_all_sources(mock_db):
     ):
         result = await import_and_sync_all(
             YueduImportSyncRequest(url="https://repo.example/json", discover=True),
+            SimpleNamespace(id="u1", role="user"),
             mock_db,
         )
 
@@ -273,11 +275,12 @@ async def test_import_yuedu_sources_updates_newer_existing_source(mock_db):
         "lastUpdateTime": "200",
     }
     existing = SimpleNamespace(
-        id=_make_source_id("New", "https://new.com"),
+        id=_make_source_id("New", "https://new.com", "u1"),
         name="Old",
         url="https://old.com",
         config={"lastUpdateTime": "100"},
         is_r18=False,
+        owner_id="u1",
     )
     mock_db.get = AsyncMock(return_value=existing)
 
@@ -287,6 +290,7 @@ async def test_import_yuedu_sources_updates_newer_existing_source(mock_db):
     ):
         result = await import_yuedu_sources(
             YueduImportRequest(url="https://repo.example/json"),
+            SimpleNamespace(id="u1", role="user"),
             mock_db,
         )
 

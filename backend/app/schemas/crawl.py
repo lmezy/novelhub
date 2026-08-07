@@ -17,6 +17,7 @@ class CrawlTaskOut(BaseModel):
     result: dict[str, Any] | None = None
     progress: dict[str, Any] | None = None
     created_at: datetime | None = None
+    user_id: str | None = None
 
     class Config:
         from_attributes = True

@@ -9,6 +9,7 @@ class SourceCreate(BaseModel):
     enabled: bool = True
     is_r18: bool = False
     config: dict | None = None
+    scope: str = "personal"
 
 
 class SourceUpdate(BaseModel):
@@ -28,6 +29,7 @@ class SourceOut(BaseModel):
     enabled: bool
     is_r18: bool = False
     config: dict | None = None
+    owner_id: str | None = None
 
     class Config:
         from_attributes = True

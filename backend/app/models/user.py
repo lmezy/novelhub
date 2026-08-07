@@ -1,4 +1,5 @@
 from sqlalchemy import Boolean, Column, DateTime, ForeignKey, String
+from sqlalchemy.dialects.postgresql import JSONB
 
 from sqlalchemy.sql import func
 
@@ -81,6 +82,12 @@ class User(Base):
         String,
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True
+    )
+
+    settings = Column(
+        JSONB,
+        nullable=False,
+        default=dict
     )
 
 

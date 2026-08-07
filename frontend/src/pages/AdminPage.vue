@@ -20,6 +20,7 @@ interface Source {
   enabled: boolean
   is_r18: boolean
   config?: any
+  owner_id?: string | null
 }
 
 interface CookieItem {
@@ -29,13 +30,94 @@ interface CookieItem {
   expired_at: string | null
 }
 
-const tab = ref<"sources" | "cookies" | "sync" | "logs" | "tokens" | "index" | "status" | "yuedu" | "add" | "creds" | "users" | "approvals" | "proxy">("yuedu")
+const tab = ref<"sources" | "cookies" | "sync" | "logs" | "tokens" | "index" | "status" | "yuedu" | "add" | "creds" | "users" | "approvals" | "proxy" | "prefs">("yuedu")
+
+const availableTabs = computed(() => {
+  const common = ["yuedu", "sources", "sync", "logs", "tokens", "cookies", "prefs"] as const
+  if (!auth.isAdmin) return common
+  return [
+    ...common,
+    "add",
+    "creds",
+    "users",
+    "approvals",
+    "index",
+    "status",
+    "proxy",
+  ] as const
+})
 
 const sources = ref<Source[]>([])
-const sourceForm = ref({ id: "", name: "", url: "", plugin_name: "yuedu", enabled: true, is_r18: false })
+const sourceForm = ref({ id: "", name: "", url: "", plugin_name: "yuedu", enabled: true, is_r18: false, scope: "personal" })
 const sourceConfigText = ref("")
 const sourceEditingId = ref("")
 const sourceError = ref("")
+
+const prefs = ref({ font: "sans", font_size: 16, language: "zh", theme: "light" })
+const prefsSaving = ref(false)
+const prefsError = ref("")
+const prefsSaved = ref(false)
+
+async function loadPrefs() {
+  if (auth.user?.settings) {
+    prefs.value = { ...prefs.value, ...auth.user.settings }
+  }
+}
+
+async function savePrefs() {
+  prefsSaving.value = true
+  prefsError.value = ""
+  prefsSaved.value = false
+  try {
+    const res = await api.put<any>("/auth/me/settings", prefs.value)
+    auth.user = res
+    if (res.settings?.language) i18n.setLocale(res.settings.language)
+    if (res.settings?.theme === "dark") {
+      auth.setDark(true)
+    } else if (res.settings?.theme === "light") {
+      auth.setDark(false)
+    }
+    prefsSaved.value = true
+  } catch (e) {
+    prefsError.value = e instanceof Error ? e.message : i18n.t('admin_failed')
+  } finally {
+    prefsSaving.value = false
+  }
+}
+
+const accountForm = ref({ current_password: "", new_password: "", email: "" })
+const accountError = ref("")
+const accountMessage = ref("")
+
+async function changePassword() {
+  accountError.value = ""
+  accountMessage.value = ""
+  try {
+    await api.put("/auth/me/password", {
+      current_password: accountForm.value.current_password,
+      new_password: accountForm.value.new_password,
+    })
+    accountMessage.value = i18n.t('admin_password_changed')
+    accountForm.value.current_password = ""
+    accountForm.value.new_password = ""
+  } catch (e) {
+    accountError.value = e instanceof Error ? e.message : i18n.t('admin_failed')
+  }
+}
+
+async function bindEmail() {
+  accountError.value = ""
+  accountMessage.value = ""
+  try {
+    const res = await api.put<any>("/auth/me/email", {
+      email: accountForm.value.email,
+    })
+    auth.user = res
+    accountMessage.value = i18n.t('admin_email_bound')
+  } catch (e) {
+    accountError.value = e instanceof Error ? e.message : i18n.t('admin_failed')
+  }
+}
 
 async function loadSources() {
   sources.value = await api.get<Source[]>("/sources")
@@ -69,7 +151,18 @@ async function createSource() {
       config,
     }
     if (sourceEditingId.value) {
-      await api.put("/sources/" + sourceEditingId.value, body)
+      const current = sources.value.find((s: Source) => s.id === sourceEditingId.value)
+      const isGlobal = current && !current.owner_id
+      const wantGlobal = sourceForm.value.scope === "global"
+      if ((wantGlobal && !isGlobal) || (!wantGlobal && isGlobal)) {
+        await api.post("/sources", {
+          ...body,
+          id: current?.id || sourceForm.value.id,
+          scope: sourceForm.value.scope,
+        })
+      } else {
+        await api.put("/sources/" + sourceEditingId.value, body)
+      }
     } else {
       await api.post("/sources", body)
     }
@@ -89,6 +182,10 @@ function editSource(s: Source) {
     plugin_name: s.plugin_name || "yuedu",
     enabled: s.enabled,
     is_r18: s.is_r18,
+    scope: s.owner_id ? "personal" : "global",
+  }
+  if (!auth.isAdmin && !s.owner_id) {
+    sourceForm.value.scope = "personal"
   }
   sourceConfigText.value = s.config ? JSON.stringify(s.config, null, 2) : ""
   window.scrollTo({ top: 0, behavior: "smooth" })
@@ -96,7 +193,7 @@ function editSource(s: Source) {
 
 function resetSourceForm() {
   sourceEditingId.value = ""
-  sourceForm.value = { id: "", name: "", url: "", plugin_name: "yuedu", enabled: true, is_r18: false }
+  sourceForm.value = { id: "", name: "", url: "", plugin_name: "yuedu", enabled: true, is_r18: false, scope: "personal" }
   sourceConfigText.value = ""
 }
 
@@ -201,6 +298,7 @@ const yueduSyncImporting = ref(false)
 const yueduCookie = ref("")
 const yueduDiscover = ref(true)
 const yueduIsR18 = ref(false)
+const yueduScope = ref("personal")
 const yueduSyncResult = ref<any>(null)
 const yueduSyncError = ref("")
 
@@ -406,6 +504,7 @@ async function yueduImport() {
     if (yueduUrl.value) body.url = yueduUrl.value
     if (yueduJsonText.value) body.json_text = yueduJsonText.value
     body.is_r18 = yueduIsR18.value
+    body.scope = yueduScope.value
     yueduResult.value = await api.post("/yuedu/import", body)
     await loadSources()
     await loadCreds()
@@ -422,6 +521,7 @@ async function yueduImportAndSync() {
   yueduSyncImporting.value = true
   try {
     const body: any = { discover: yueduDiscover.value, is_r18: yueduIsR18.value }
+    body.scope = yueduScope.value
     if (yueduUrl.value) body.url = yueduUrl.value
     if (yueduJsonText.value) body.json_text = yueduJsonText.value
     if (yueduCookie.value.trim()) body.cookie = yueduCookie.value.trim()
@@ -447,6 +547,7 @@ async function yueduPreviewAction() {
     const body: any = {}
     if (yueduUrl.value) body.url = yueduUrl.value
     if (yueduJsonText.value) body.json_text = yueduJsonText.value
+    body.scope = yueduScope.value
     yueduPreview.value = await api.post("/yuedu/preview", body)
   } catch (e) {
     yueduError.value = e instanceof Error ? e.message : i18n.t('admin_preview_failed')
@@ -967,19 +1068,22 @@ async function reviewChange(id: string, action: string) {
 
 onMounted(async () => {
   await loadSources()
+  await loadPrefs()
   await loadCreds()
   await loadCookies()
+  if (auth.isAdmin) {
+    await loadStatus()
+    await loadIndexStats()
+    await loadUsers()
+    await loadRegistrationApproval()
+    await loadApprovals()
+    loadProxyConfig()
+  }
   await loadTokens()
-  await loadStatus()
-  await loadIndexStats()
-  await loadUsers()
-  await loadRegistrationApproval()
-  await loadApprovals()
   await loadLogs()
   if (crawlStore.activeTask?.id && !["completed", "failed", "cancelled", "completed_with_errors"].includes(crawlStore.activeTask.status)) {
     crawlStore.startPolling(crawlStore.activeTask.id)
   }
-  loadProxyConfig()
 })
 
 onUnmounted(() => {
@@ -996,7 +1100,7 @@ onUnmounted(() => {
 
       <div class="flex gap-1 mb-8 border-b border-border flex-wrap">
         <button
-          v-for="t in (['sources', 'cookies', 'sync', 'logs', 'tokens', 'index', 'status', 'yuedu', 'add', 'creds', 'users', 'approvals', 'proxy'] as const)"
+          v-for="t in availableTabs"
           :key="t"
           @click="tab = t"
           class="px-4 py-2 text-sm transition-colors -mb-px"
@@ -1016,6 +1120,13 @@ onUnmounted(() => {
             <input v-model="sourceForm.plugin_name" :placeholder="i18n.t('admin_placeholder_plugin')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
           </div>
           <div class="flex flex-wrap items-center gap-4 mb-3">
+            <label v-if="auth.isAdmin" class="inline-flex items-center gap-2 text-xs text-muted dark:text-gray-400">
+              <span>{{ i18n.t('admin_scope_label') }}</span>
+              <select v-model="sourceForm.scope" class="px-2 py-1 rounded border border-border dark:border-gray-700 text-xs bg-paper dark:bg-gray-800">
+                <option value="personal">{{ i18n.t('admin_source_personal') }}</option>
+                <option value="global">{{ i18n.t('admin_source_global') }}</option>
+              </select>
+            </label>
             <label class="inline-flex items-center gap-2 text-xs text-muted dark:text-gray-400 cursor-pointer">
               <input type="checkbox" v-model="sourceForm.enabled" class="rounded" />
               {{ i18n.t('admin_source_enabled') }}
@@ -1045,6 +1156,8 @@ onUnmounted(() => {
             <div>
               <span class="text-sm font-medium">{{ s.name }}</span>
               <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ s.id }} ({{ s.plugin_name }})</span>
+              <span v-if="s.owner_id" class="text-xs px-1.5 py-0.5 rounded ml-2 bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300">{{ i18n.t('admin_source_personal') }}</span>
+              <span v-else class="text-xs px-1.5 py-0.5 rounded ml-2 bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300">{{ i18n.t('admin_source_global') }}</span>
               <span v-if="s.is_r18" class="text-xs px-1.5 py-0.5 rounded ml-2 bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-300">R18</span>
             </div>
             <div class="flex items-center gap-3">
@@ -1112,7 +1225,7 @@ onUnmounted(() => {
       </section>
 
       <section v-if="tab === 'sync'" class="space-y-6">
-        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
+        <div v-if="auth.isAdmin" class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
           <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_trigger_sync') }}</h2>
           <div class="flex gap-3 mb-3">
             <input v-model="syncSourceId" :placeholder="i18n.t('admin_placeholder_source')" class="flex-1 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
@@ -1128,7 +1241,7 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 mt-4">
+        <div v-if="auth.isAdmin" class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 mt-4">
           <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_bookshelf_sync') }}</h2>
           <p class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('admin_bookshelf_hint') }}</p>
           <div class="flex gap-3 mb-3">
@@ -1150,7 +1263,7 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 mt-4">
+        <div v-if="auth.isAdmin" class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 mt-4">
           <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_full_site_sync') }}</h2>
           <p class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('admin_full_site_hint') }}</p>
           <div class="flex gap-3 mb-3">
@@ -1206,6 +1319,11 @@ onUnmounted(() => {
             }) }}</p>
             <p v-if="crawlStore.activeTask.error" class="text-red-600 mt-1">{{ crawlStore.activeTask.error }}</p>
           </div>
+        </div>
+
+        <div v-else class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
+          <p class="text-sm text-muted dark:text-gray-400">{{ i18n.t('admin_sync_go_page') }}</p>
+          <router-link to="/sync" class="inline-block mt-2 text-sm text-accent hover:underline">{{ i18n.t('nav_sync') }}</router-link>
         </div>
       </section>
 
@@ -1312,7 +1430,44 @@ onUnmounted(() => {
           <p v-if="tokens.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">{{ i18n.t('admin_no_tokens') }}</p>
         </div>
       </section>
-  
+
+      <section v-if="tab === 'prefs'" class="space-y-6">
+        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
+          <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_tab_prefs') }}</h2>
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
+            <label class="block">
+              <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_pref_font') }}</span>
+              <select v-model="prefs.font" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800">
+                <option value="sans">Sans</option>
+                <option value="serif">Serif</option>
+                <option value="mono">Mono</option>
+              </select>
+            </label>
+            <label class="block">
+              <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_pref_font_size') }}</span>
+              <input v-model.number="prefs.font_size" type="number" min="12" max="32" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            </label>
+            <label class="block">
+              <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_pref_language') }}</span>
+              <select v-model="prefs.language" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800">
+                <option value="zh">中文</option>
+                <option value="en">English</option>
+              </select>
+            </label>
+            <label class="block">
+              <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_pref_theme') }}</span>
+              <select v-model="prefs.theme" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800">
+                <option value="light">{{ i18n.t('reader_light_mode') }}</option>
+                <option value="dark">{{ i18n.t('reader_dark_mode') }}</option>
+              </select>
+            </label>
+          </div>
+          <p v-if="prefsError" class="text-sm text-red-600 mb-2">{{ prefsError }}</p>
+          <p v-else-if="prefsSaved" class="text-sm text-green-600 mb-2">{{ i18n.t('admin_pref_saved') }}</p>
+          <button @click="savePrefs" :disabled="prefsSaving" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">{{ prefsSaving ? i18n.t('admin_saving') : i18n.t('admin_pref_save') }}</button>
+        </div>
+      </section>
+
       <section v-if="tab === 'yuedu'" class="space-y-6">
         <div class="p-5 rounded-lg border-2 border-accent/30 dark:border-accent/50 bg-surface dark:bg-gray-900">
           <h2 class="text-base font-bold mb-1">{{ i18n.t('admin_yuedu_title') }}</h2>
@@ -1334,6 +1489,13 @@ onUnmounted(() => {
             <div class="flex items-center gap-2">
               <input type="checkbox" id="yuedu-r18" v-model="yueduIsR18" class="rounded" />
               <label for="yuedu-r18" class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_r18_label') }}</label>
+            </div>
+            <div v-if="auth.isAdmin" class="flex items-center gap-2">
+              <label for="yuedu-scope" class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_scope_label') }}</label>
+              <select id="yuedu-scope" v-model="yueduScope" class="px-2 py-1.5 rounded border border-border dark:border-gray-700 text-xs bg-paper dark:bg-gray-800">
+                <option value="personal">{{ i18n.t('admin_source_personal') }}</option>
+                <option value="global">{{ i18n.t('admin_source_global') }}</option>
+              </select>
             </div>
 
             <p v-if="yueduSyncError" class="text-sm text-red-600">{{ yueduSyncError }}</p>
@@ -1398,6 +1560,31 @@ onUnmounted(() => {
               </div>
             </details>
           </div>
+        </div>
+
+        <div class="mt-6 p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
+          <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_tab_account') }}</h2>
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
+            <label class="block">
+              <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_current_password') }}</span>
+              <input v-model="accountForm.current_password" type="password" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            </label>
+            <label class="block">
+              <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_new_password') }}</span>
+              <input v-model="accountForm.new_password" type="password" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            </label>
+          </div>
+          <button @click="changePassword" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90">{{ i18n.t('admin_change_password') }}</button>
+
+          <div class="mt-4 pt-4 border-t border-border dark:border-gray-700">
+            <label class="block mb-2">
+              <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_bind_email') }}</span>
+              <input v-model="accountForm.email" type="email" :placeholder="auth.user?.email || ''" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            </label>
+            <button @click="bindEmail" class="px-4 py-2 rounded border border-accent text-accent text-sm font-medium hover:bg-accent/10">{{ i18n.t('admin_save_email') }}</button>
+          </div>
+          <p v-if="accountError" class="text-sm text-red-600 mt-3">{{ accountError }}</p>
+          <p v-else-if="accountMessage" class="text-sm text-green-600 mt-3">{{ accountMessage }}</p>
         </div>
       </section>
 
@@ -1544,6 +1731,7 @@ onUnmounted(() => {
             <p>{{ i18n.t('admin_created_chapters_label') }}: {{ manualResult.created_chapters }}</p>
           </div>
         </div>
+
       </section>
 
       <section v-if="tab === 'creds'" class="space-y-6">

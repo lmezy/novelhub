@@ -22,8 +22,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.models import CrawlTask, Source
-from app.services.auth import require_admin
+from app.models import CrawlTask, Source, User
+from app.services.auth import get_current_user
 from app.services.proxy_config import get_proxy_config
 from app.services.task_queue import enqueue_crawl_all
 
@@ -752,6 +752,7 @@ class YueduImportRequest(BaseModel):
     url: str | None = None
     json_text: str | None = None
     is_r18: bool = False
+    scope: str = "personal"
 
 
 class YueduImportResult(BaseModel):
@@ -762,9 +763,17 @@ class YueduImportResult(BaseModel):
     sources: list[dict[str, Any]]
 
 
-@router.post("/import", response_model=YueduImportResult, dependencies=[Depends(require_admin)])
-async def import_yuedu_sources(payload: YueduImportRequest, db: AsyncSession = Depends(get_db)):
+@router.post("/import", response_model=YueduImportResult)
+async def import_yuedu_sources(
+    payload: YueduImportRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """Import YueDu book sources from a URL or raw JSON text."""
+    scope = payload.scope or "personal"
+    if scope == "global" and user.role not in ("admin", "super_admin"):
+        raise HTTPException(status_code=403, detail="Only admins can import global sources")
+    owner_id = None if scope == "global" else user.id
     sources_json: list[dict[str, Any]] = []
 
     if payload.json_text:
@@ -802,7 +811,7 @@ async def import_yuedu_sources(payload: YueduImportRequest, db: AsyncSession = D
     for src in sources_json:
         name = src.get("bookSourceName", "Unknown")
         base_url = src.get("bookSourceUrl", "")
-        source_id = _make_source_id(name, base_url)
+        source_id = _make_source_id(name, base_url, owner_id)
 
         existing = await db.get(Source, source_id)
         if existing:
@@ -813,6 +822,7 @@ async def import_yuedu_sources(payload: YueduImportRequest, db: AsyncSession = D
                 existing.url = base_url
                 existing.config = src
                 existing.is_r18 = payload.is_r18
+                existing.owner_id = owner_id
                 db.add(existing)
                 updated += 1
                 results.append({"id": source_id, "name": name, "status": "updated"})
@@ -829,6 +839,7 @@ async def import_yuedu_sources(payload: YueduImportRequest, db: AsyncSession = D
             enabled=True,
             is_r18=payload.is_r18,
             config=src,
+            owner_id=owner_id,
         )
         db.add(source)
         imported += 1
@@ -854,6 +865,7 @@ class YueduImportSyncRequest(BaseModel):
     cookie: str | None = None
     discover: bool = True
     max_discover_pages: int = 3
+    scope: str = "personal"
 
 
 class YueduImportSyncResult(BaseModel):
@@ -872,9 +884,10 @@ class YueduImportTaskResult(BaseModel):
     tasks: list[dict[str, Any]]
 
 
-@router.post("/import-task", response_model=YueduImportTaskResult, status_code=202, dependencies=[Depends(require_admin)])
+@router.post("/import-task", response_model=YueduImportTaskResult, status_code=202)
 async def import_yuedu_sources_as_tasks(
     payload: YueduImportSyncRequest,
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Import sources and enqueue one crawl task per source for progress tracking."""
@@ -888,7 +901,9 @@ async def import_yuedu_sources_as_tasks(
             url=payload.url,
             json_text=payload.json_text,
             is_r18=payload.is_r18,
+            scope=payload.scope,
         ),
+        user,
         db,
     )
 
@@ -915,6 +930,7 @@ async def import_yuedu_sources_as_tasks(
                 mode="discover_all",
                 max_pages=payload.max_discover_pages,
                 status="pending",
+                user_id=user.id,
             )
             db.add(task)
             await db.flush()
@@ -939,8 +955,12 @@ async def import_yuedu_sources_as_tasks(
     return YueduImportTaskResult(tasks=tasks)
 
 
-@router.post("/import-and-sync", response_model=YueduImportSyncResult, dependencies=[Depends(require_admin)])
-async def import_and_sync_all(payload: YueduImportSyncRequest, db: AsyncSession = Depends(get_db)):
+@router.post("/import-and-sync", response_model=YueduImportSyncResult)
+async def import_and_sync_all(
+    payload: YueduImportSyncRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """Import yuedu sources and immediately sync all discovered books.
 
     This is the primary one-click workflow:
@@ -961,7 +981,9 @@ async def import_and_sync_all(payload: YueduImportSyncRequest, db: AsyncSession 
             url=payload.url,
             json_text=payload.json_text,
             is_r18=payload.is_r18,
+            scope=payload.scope,
         ),
+        user,
         db,
     )
 
@@ -1086,9 +1108,15 @@ async def import_and_sync_all(payload: YueduImportSyncRequest, db: AsyncSession 
     return result
 
 
-@router.post("/preview", dependencies=[Depends(require_admin)])
-async def preview_yuedu_sources(payload: YueduImportRequest):
+@router.post("/preview")
+async def preview_yuedu_sources(
+    payload: YueduImportRequest,
+    user: User = Depends(get_current_user),
+):
     """Preview what sources a URL or JSON text would import without saving."""
+    scope = payload.scope or "personal"
+    if scope == "global" and user.role not in ("admin", "super_admin"):
+        raise HTTPException(status_code=403, detail="Only admins can preview global sources")
     sources_json: list[dict[str, Any]] = []
 
     if payload.json_text:
@@ -1144,10 +1172,11 @@ def _extract_sources(parsed: Any) -> list[dict[str, Any]]:
     return []
 
 
-def _make_source_id(name: str, url: str) -> str:
+def _make_source_id(name: str, url: str, owner_id: str | None = None) -> str:
     """Generate a unique source ID from name and URL."""
-    raw = f"{name}_{url}"
-    return "yuedu_" + hashlib.md5(raw.encode()).hexdigest()[:12]
+    raw = f"{name}_{url}" if not owner_id else f"{owner_id}_{name}_{url}"
+    suffix = hashlib.md5(raw.encode()).hexdigest()[:12]
+    return f"yuedu_{suffix}" if not owner_id else f"user:{owner_id}:yuedu_{suffix}"
 
 
 def _source_type_name(t: int) -> str:

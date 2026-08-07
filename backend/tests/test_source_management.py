@@ -34,6 +34,7 @@ async def test_update_source_changes_metadata_and_book_r18():
         result = await update_source(
             "src-1",
             SourceUpdate(name="New Name", enabled=False, is_r18=False),
+            SimpleNamespace(id="u1", role="admin"),
             db,
         )
 
@@ -52,6 +53,11 @@ async def test_update_source_404_when_missing():
     db.get = AsyncMock(return_value=None)
 
     with pytest.raises(HTTPException) as exc_info:
-        await update_source("missing", SourceUpdate(name="X"), db)
+        await update_source(
+            "missing",
+            SourceUpdate(name="X"),
+            SimpleNamespace(id="u1", role="admin"),
+            db,
+        )
 
     assert exc_info.value.status_code == 404

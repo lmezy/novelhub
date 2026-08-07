@@ -43,7 +43,13 @@ const router = createRouter({
       path: "/admin",
       name: "admin",
       component: () => import("../pages/AdminPage.vue"),
-      meta: { requiresAuth: true, requiresAdmin: true },
+      redirect: "/settings",
+    },
+    {
+      path: "/settings",
+      name: "settings",
+      component: () => import("../pages/AdminPage.vue"),
+      meta: { requiresAuth: true },
     },
   ],
 })
@@ -56,14 +62,8 @@ router.beforeEach(async (to, _from, next) => {
   } else if (to.name !== "login" && !token) {
     next({ name: "login" })
   } else {
-    if (to.meta.requiresAdmin) {
-      if (!auth.user) {
-        await auth.fetchMe()
-      }
-      if (!auth.isAdmin) {
-        next({ name: "home" })
-        return
-      }
+    if (to.name !== "login" && token && !auth.user) {
+      await auth.fetchMe()
     }
     next()
   }

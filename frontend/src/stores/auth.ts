@@ -13,6 +13,7 @@ export interface User {
   approved: boolean
   invite_code: string
   invited_by_id: string | null
+  settings?: any
 }
 
 export const useAuthStore = defineStore("auth", () => {
@@ -25,9 +26,18 @@ const isDark = ref(localStorage.getItem('novelhub_dark') === 'true')
 const isSuperAdmin = computed(() => user.value?.role === "super_admin")
 
 function toggleDark() {
-  isDark.value = !isDark.value
+  setDark(!isDark.value)
+}
+
+function setDark(value: boolean) {
+  isDark.value = value
   localStorage.setItem('novelhub_dark', String(isDark.value))
   document.documentElement.classList.toggle('dark', isDark.value)
+}
+
+function applyUserSettings(u: User) {
+  if (u.settings?.theme === "dark") setDark(true)
+  else if (u.settings?.theme === "light") setDark(false)
 }
 
   async function login(username: string, password: string) {
@@ -38,6 +48,7 @@ function toggleDark() {
     token.value = res.access_token
     user.value = res.user
     localStorage.setItem("novelhub_token", res.access_token)
+    applyUserSettings(res.user)
   }
 
   async function register(username: string, password: string, email?: string, inviteCode?: string) {
@@ -56,6 +67,7 @@ function toggleDark() {
       user.value = res.user
       localStorage.setItem("novelhub_token", res.access_token)
     }
+    if (res.user) applyUserSettings(res.user)
     return res
   }
 
@@ -63,6 +75,7 @@ function toggleDark() {
     if (!token.value) return
     try {
       user.value = await api.get<User>("/auth/me")
+      applyUserSettings(user.value)
     } catch {
       logout()
     }
@@ -81,5 +94,5 @@ function toggleDark() {
     localStorage.removeItem("novelhub_token")
   }
 
- return { user, token, isDark, isAuthenticated, isAdmin, isSuperAdmin, toggleDark, login, register, fetchMe, updateVisibility, logout }
+ return { user, token, isDark, isAuthenticated, isAdmin, isSuperAdmin, toggleDark, setDark, login, register, fetchMe, updateVisibility, logout }
 })

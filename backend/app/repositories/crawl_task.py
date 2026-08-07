@@ -11,10 +11,18 @@ class CrawlTaskRepository(BaseRepository[CrawlTask]):
     def __init__(self, db: AsyncSession):
         super().__init__(db)
 
-    async def list_recent(self, *, offset: int = 0, limit: int = 20) -> list[CrawlTask]:
+    async def list_recent(
+        self,
+        *,
+        offset: int = 0,
+        limit: int = 20,
+        user_id: str | None = None,
+    ) -> list[CrawlTask]:
+        query = select(CrawlTask)
+        if user_id is not None:
+            query = query.where(CrawlTask.user_id == user_id)
         result = await self.db.scalars(
-            select(CrawlTask)
-            .order_by(CrawlTask.created_at.desc())
+            query.order_by(CrawlTask.created_at.desc())
             .offset(offset)
             .limit(limit)
         )

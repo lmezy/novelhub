@@ -8,10 +8,13 @@ from app.core.database import get_db
 from app.models import User
 from app.schemas.auth import RegisterResult, TokenOut
 from app.schemas.user import (
+    ChangePasswordRequest,
     UserCreate,
     UserLogin,
     UserOut,
+    UpdateEmailRequest,
     UserSelfVisibilityUpdate,
+    UserSettingsUpdate,
 )
 from app.services.auth import get_current_user
 from app.services.jwt import create_token
@@ -19,6 +22,7 @@ from app.services.security import hash_password, verify_password
 from app.services.settings import get_registration_approval_enabled
 from app.services.account import email_available, username_available
 from app.services.invite import generate_invite_code
+from app.services.validation import password_error
 
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -108,6 +112,56 @@ async def update_my_visibility(
         current_user.r18_enabled = payload.r18_enabled
     if payload.non_r18_enabled is not None:
         current_user.non_r18_enabled = payload.non_r18_enabled
+    await db.commit()
+    await db.refresh(current_user)
+    return current_user
+
+
+@router.put("/me/settings", response_model=UserOut)
+async def update_my_settings(
+    payload: UserSettingsUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    settings = dict(current_user.settings or {})
+    data = payload.model_dump(exclude_unset=True)
+    for key, value in data.items():
+        if value is not None:
+            settings[key] = value
+    current_user.settings = settings
+    await db.commit()
+    await db.refresh(current_user)
+    return current_user
+
+
+@router.put("/me/password")
+async def change_my_password(
+    payload: ChangePasswordRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if not verify_password(payload.current_password, current_user.password_hash):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    error = password_error(payload.new_password)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    current_user.password_hash = hash_password(payload.new_password)
+    await db.commit()
+    return {"status": "ok"}
+
+
+@router.put("/me/email", response_model=UserOut)
+async def update_my_email(
+    payload: UpdateEmailRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if current_user.email and current_user.email.lower() == payload.email.lower():
+        return current_user
+    error = await email_available(db, payload.email)
+    if error:
+        raise HTTPException(status_code=409, detail=error)
+    current_user.email = payload.email
     await db.commit()
     await db.refresh(current_user)
     return current_user

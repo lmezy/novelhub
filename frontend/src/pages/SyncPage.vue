@@ -223,8 +223,8 @@ onMounted(async () => {
 
       <p v-if="pageError" class="text-sm text-red-600 mb-4">{{ pageError }}</p>
 
-      <section v-if="auth.isAdmin" class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 mb-6">
-        <h2 class="text-sm font-semibold mb-3">{{ i18n.t('sync_start_full') }}</h2>
+      <section v-if="auth.user" class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 mb-6">
+        <h2 class="text-sm font-semibold mb-3">{{ auth.isAdmin ? i18n.t('sync_start_full') : i18n.t('sync_start_my') }}</h2>
 
         <div class="flex flex-wrap items-center gap-2 mb-3 text-xs">
           <button @click="selectAllSources" class="px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5">{{ i18n.t('sync_select_all') }}</button>
@@ -254,7 +254,7 @@ onMounted(async () => {
           </button>
         </div>
 
-        <div class="mt-5 pt-4 border-t border-border dark:border-gray-700">
+        <div v-if="auth.isAdmin" class="mt-5 pt-4 border-t border-border dark:border-gray-700">
           <h3 class="text-sm font-semibold mb-3">{{ i18n.t('sync_auto_title') }}</h3>
           <div class="flex flex-wrap items-center gap-3">
             <label class="inline-flex items-center gap-2 text-sm cursor-pointer">

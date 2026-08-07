@@ -1,5 +1,5 @@
 ﻿from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -23,24 +23,50 @@ from app.services.visibility import can_view_all_ages, can_view_r18
 router = APIRouter(prefix="/sources", tags=["sources"])
 
 
+def _can_view_source(user: User, source: Source) -> bool:
+    if user.role in ("admin", "super_admin"):
+        return True
+    return source.owner_id is not None and source.owner_id == user.id
+
+
+def _can_edit_source(user: User, source: Source) -> bool:
+    if user.role in ("admin", "super_admin"):
+        return True
+    return source.owner_id is not None and source.owner_id == user.id
+
+
 @router.get("", response_model=list[SourceOut])
 async def list_sources(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     query = select(Source).order_by(Source.name.asc())
     conditions = []
+    if user.role not in ("admin", "super_admin"):
+        conditions.append(Source.owner_id == user.id)
     if can_view_all_ages(user):
         conditions.append(Source.is_r18 == False)
     if can_view_r18(user):
         conditions.append(Source.is_r18 == True)
-    query = query.where(or_(*conditions)) if conditions else query.where(Source.id == "__none__")
+    query = query.where(and_(*conditions)) if conditions else query.where(Source.id == "__none__")
     result = await db.scalars(query)
     return list(result)
 
 
-@router.post("", response_model=SourceOut, status_code=201, dependencies=[Depends(require_admin)])
-async def create_source(payload: SourceCreate, db: AsyncSession = Depends(get_db)):
-    if await db.get(Source, payload.id):
+@router.post("", response_model=SourceOut, status_code=201)
+async def create_source(
+    payload: SourceCreate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    scope = payload.scope or "personal"
+    if scope == "global" and user.role not in ("admin", "super_admin"):
+        raise HTTPException(status_code=403, detail="Only admins can create global sources")
+    owner_id = None if scope == "global" else user.id
+    source_id = payload.id
+    if owner_id and await db.get(Source, source_id):
+        source_id = f"user:{user.id}:{source_id}"
+    if await db.get(Source, source_id):
         raise HTTPException(status_code=409, detail="Source already exists")
-    source = Source(**payload.model_dump(mode="json"))
+    data = payload.model_dump(mode="json", exclude={"scope", "id"})
+    source = Source(id=source_id, owner_id=owner_id, **data)
     db.add(source)
     await db.commit()
     await db.refresh(source)
@@ -51,11 +77,14 @@ async def create_source(payload: SourceCreate, db: AsyncSession = Depends(get_db
 async def update_source(
     source_id: str,
     payload: SourceUpdate,
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     source = await db.get(Source, source_id)
     if source is None:
         raise HTTPException(status_code=404, detail="Source not found")
+    if not _can_edit_source(user, source):
+        raise HTTPException(status_code=403, detail="Cannot edit this source")
 
     old_is_r18 = source.is_r18
     data = payload.model_dump(exclude_unset=True)
@@ -118,6 +147,8 @@ async def search_remote_books(
 
     source = await db.get(Source, source_id)
     if source is None or not source.enabled:
+        raise HTTPException(status_code=404, detail="Source not found or disabled")
+    if not _can_view_source(user, source):
         raise HTTPException(status_code=404, detail="Source not found or disabled")
     if (
         (source.is_r18 and not can_view_r18(user))
@@ -193,11 +224,17 @@ async def search_remote_books(
     )
 
 
-@router.delete("/{source_id}", status_code=200, dependencies=[Depends(require_admin)])
-async def delete_source(source_id: str, db: AsyncSession = Depends(get_db)):
+@router.delete("/{source_id}", status_code=200)
+async def delete_source(
+    source_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     source = await db.get(Source, source_id)
     if source is None:
         raise HTTPException(status_code=404, detail="Source not found")
+    if not _can_edit_source(user, source):
+        raise HTTPException(status_code=403, detail="Cannot delete this source")
 
     # Count related books
     book_ids = list(

@@ -3,7 +3,9 @@ from sqlalchemy import (
     String,
     DateTime,
     Integer,
-    Text
+    Text,
+    ForeignKey,
+    Index
 )
 from sqlalchemy.dialects.postgresql import JSONB
 
@@ -87,4 +89,14 @@ class CrawlTask(Base):
     created_at = Column(
         DateTime,
         server_default=func.now()
+    )
+
+    user_id = Column(
+        String,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True
+    )
+
+    __table_args__ = (
+        Index("ix_crawl_tasks_user_id", "user_id"),
     )

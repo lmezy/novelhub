@@ -1,4 +1,4 @@
-﻿from sqlalchemy import Column, String, Boolean
+from sqlalchemy import Column, String, Boolean, ForeignKey, Index
 from sqlalchemy.dialects.postgresql import JSONB
 
 from .base import Base
@@ -40,4 +40,14 @@ class Source(Base):
     config = Column(
         JSONB,
         nullable=True
+    )
+
+    owner_id = Column(
+        String,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=True
+    )
+
+    __table_args__ = (
+        Index("ix_sources_owner_id", "owner_id"),
     )

@@ -13,7 +13,7 @@ from app.services.crawl_runner import (
 )
 from app.core.database import get_db
 from app.main import app
-from app.services.auth import require_admin
+from app.services.auth import get_current_user
 from app.services.sync import SyncPaused
 from app.core.config import settings
 
@@ -45,7 +45,10 @@ async def test_pause_pending_task():
     db.commit = AsyncMock()
 
     app.dependency_overrides[get_db] = lambda: db
-    app.dependency_overrides[require_admin] = lambda: None
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        id="admin",
+        role="admin",
+    )
     try:
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -66,7 +69,10 @@ async def test_move_task_front_sets_priority():
     db.commit = AsyncMock()
 
     app.dependency_overrides[get_db] = lambda: db
-    app.dependency_overrides[require_admin] = lambda: None
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        id="admin",
+        role="admin",
+    )
     try:
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -88,7 +94,10 @@ async def test_resume_paused_task_requeues_it():
     db.commit = AsyncMock()
 
     app.dependency_overrides[get_db] = lambda: db
-    app.dependency_overrides[require_admin] = lambda: None
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        id="admin",
+        role="admin",
+    )
     try:
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
