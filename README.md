@@ -1,6 +1,8 @@
 # NovelHub
 
-Personal Novel Digital Library &mdash; self-hosted on NAS (UGREEN DX4600 Pro)
+Personal Novel Digital Library - self-hosted on NAS (UGREEN DX4600 Pro)
+
+NovelHub 是一个自托管的个人小说数字资产平台：导入阅读（YueDu / Legado）书源，抓取书籍和章节，管理个人书架，并提供网页阅读、全文搜索、AI 辅助阅读等功能。
 
 ## Quick Start
 
@@ -10,40 +12,102 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
+启动后访问 `http://localhost:8088`。
+
+首次启动会自动创建超级管理员账号：
+
+- 账号：`admin@novelhub.local`
+- 默认密码：见 `backend/app/main.py`
+
+请登录后立即在“个人设置”中修改密码。
+
 ## 使用说明
 
-### 1. 启动与登录
+### 1. 导入阅读书源
 
-```bash
-cp .env.example .env
-# 修改 .env 中的数据库密码等配置
-docker compose up -d --build
-```
+NovelHub 内置阅读（Legado / YueDu）书源导入引擎，可以直接使用书源仓库中的链接或 JSON：
 
-启动后访问 `http://localhost:8088`。首次启动会自动创建超级管理员 `admin@novelhub.local`，默认密码见 `backend/app/main.py`，请登录后立即修改。
+1. 打开书源仓库，例如 <https://www.yckceo.com/yuedu/shuyuan/index.html>；
+2. 进入“设置 -> 阅读书源导入”；
+3. 粘贴书源 URL，或直接粘贴书源 JSON；
+4. 选择书源范围并导入。
 
-### 2. 导入阅读（YueDu / Legado）书源
+`yuedu/` 目录保留了开源阅读（Legado）源码，用于规则格式兼容和本地阅读器参考，构建与使用说明见 `yuedu/README.md`。
 
-NovelHub 内置了开源阅读（Legado）书源导入引擎，可以直接使用书源仓库中的链接或 JSON：
+### 2. 个人书源
 
-1. 打开书源仓库，例如 <https://www.yckceo.com/yuedu/shuyuan/index.html>，复制目标书源的导入链接或 JSON；
-2. 进入管理后台 -> “书源导入”；
-3. 粘贴书源 URL 或 JSON；
-4. 如需登录网站，粘贴浏览器 Cookie（可选）；
-5. 勾选“同时从分类/排行榜页面发现小说”，点击“导入并同步全部”；
-6. 也可以在“高级选项”里先“预览”，或仅导入书源、之后再到“同步”页面处理。
+个人书源只负责导入书源，不会立即同步。
 
-`yuedu/` 目录中保留了开源阅读（Legado）3.0 源码，用于规则格式兼容与本地阅读参考，其构建与使用说明见 `yuedu/README.md`。
+导入后请前往“同步”页面：
 
-### 3. 本地书籍批量导入
+- 勾选要处理的书源；
+- 点击“导入书籍”：从书源发现/分类页面抓取书籍；
+- 点击“导入个人书架”：同步当前书源的个人书架，并自动加入自己的书架。
 
-管理后台 -> “本地 / 手动” -> “本地 Markdown 导入”：
+个人书源同步出来的书籍、书架、进度和搜索记录默认只有本人和管理员可见。
+
+个人书籍可以在书籍详情页选择“公开为全年龄书籍”：
+
+- 公开前必须确认该书为全年龄内容；
+- 确认后会标记 `all-ages`，其他用户才能看到；
+- 可以随时“取消公开”。
+
+### 3. 全站书源
+
+普通用户选择“全站书源”时，不会直接创建书源，而是提交给管理员审批。
+
+- 管理员在“设置 -> 待审批”中通过后才会创建全站书源；
+- 管理员批准后会自动触发全站同步；
+- 全站书源会记录提交用户；
+- 提交时可以选择“公开我的贡献标签”或隐藏贡献者信息。
+
+全站同步时，如果同一本书同时存在 R18 和非 R18 全站版本：
+
+- 系统会以 R18 为主，把该组全站书籍标记为 R18；
+- 同时生成“R18 冲突确认”待审批项；
+- 管理员批准则保持 R18，拒绝则恢复冲突前的标记。
+
+### 4. Cookie 与书源账号密码
+
+Cookie 和书源账号密码已经合并到“设置 -> 书源”页面：
+
+1. 在书源列表中找到对应书源；
+2. 点击“Cookie / 账号”展开；
+3. 在 Cookie 区域粘贴浏览器 Cookie 并保存、测试；
+4. 在账号区域填写书源登录用户名和密码，可用于自动登录刷新 Cookie。
+
+Cookie 获取方法见 [Cookie 获取指南](docs/cookie-guide.md)。
+
+### 5. 个人设置
+
+“设置 -> 个人设置”中支持：
+
+- 阅读字体、字号、语言、主题；
+- 昵称；
+- 邮箱；
+- 修改账号密码。
+
+### 6. 同步任务
+
+“同步”页面支持：
+
+- 选择多个书源；
+- 导入书籍或导入个人书架；
+- 查看、暂停、恢复、取消同步任务；
+- 管理员可配置自动同步时间。
+
+更多说明：
+
+- [全站同步](docs/full-site-sync.md)
+- [书源搜索](docs/source-search.md)
+
+### 7. 本地 Markdown 导入
+
+“设置 -> 本地 / 手动 -> 本地 Markdown 导入”：
 
 1. 在服务器上准备书籍目录，章节为 `.md` 文件，可附带 `metadata.json`；
-2. 输入服务器上的根目录路径（例如 `/app/storage/imports`）并点击“扫描目录”；
-3. 扫描结果会列出发现的书目，勾选支持“全选 / 反选 / 清空选择”；
-4. 点击“批量导入所选”写入数据库，或点击“导入全部”直接批量导入本次扫描到的全部书籍；
-5. “仅读取不导入”只解析并预览书籍，不写入数据库。
+2. 输入服务器上的根目录路径，点击“扫描目录”；
+3. 勾选书籍后点击“批量导入所选”，或点击“导入全部”。
 
 目录格式示例：
 
@@ -55,51 +119,32 @@ storage/imports/
     000002.md
 ```
 
-`metadata.json` 可包含 `title`、`author`、`description`、`status`、`tags`。未提供时自动从目录名/父目录名推导。
+`metadata.json` 可包含 `title`、`author`、`description`、`status`、`tags`。未提供时自动从目录名和父目录名推断。
 
-### 4. 书架分组与自定义标签
+也可以通过 API 导入单个目录：
 
-书架（首页）支持类似开源阅读（Legado）的分组管理：
+```bash
+curl -X POST http://localhost:8088/api/sync/book \
+  -H "Content-Type: application/json" \
+  -d '{"source_id":"local_markdown","url":"file:///app/storage/imports/demo-book"}'
+```
 
-1. 顶部“全部 / 分组”页签可快速切换书架分组；
-2. “新建”输入分组名称即可创建，“管理分组”可重命名、显示/隐藏或删除；
-3. 一本书可以同时属于多个分组；
-4. 勾选书籍后可批量“移出书架”或“移动到分组”；
-5. 书籍详情页收藏后，也可以直接勾选该书所属分组并保存；
-6. “全部书籍”页同样支持全选/反选，普通用户也可批量加入书架，不再仅限管理员。
+### 8. 阅读
 
-自定义标签：
+桌面端阅读器支持字号、字体、主题、目录、AI 侧栏和进度保存。
 
-1. 在书籍详情页输入标签名称并点击“添加标签”；
-2. 可勾选“公开标签”让其他用户看到，或保持私有仅自己可见；
-3. 公开标签会显示在书籍卡片和详情页，点击可查看打过此标签的人数；
-4. 勾选“显示贡献者”时，点击标签会列出打标签的用户；不勾选则只显示人数；
-5. 用户可以随时移除自己打的标签。
+手机端会自动进入分页阅读模式：
 
-### 5. 在线书源与同步
+- 点击屏幕左侧或向右滑动：上一页；
+- 点击屏幕右侧或向左滑动：下一页；
+- 点击屏幕中间：呼出阅读菜单；
+- 章节末尾继续翻页会进入下一章；
+- 阅读器内切换章节不会堆积历史记录，返回书籍后可以正常回到书库。
 
-- 在线书源需要先配置 Cookie，详见 [Cookie获取指南](docs/cookie-guide.md)；
-- 管理后台“书源”页可以直接编辑现有书源的名称、URL、启用状态、R18/全年龄和规则 JSON，不再需要删除后重新导入；
-- “Cookie”页支持对已有 Cookie 直接编辑更新，过期后只需粘贴新 Cookie 保存即可；
-- “设置”页对所有用户开放：普通用户可管理自己的书源、Cookie、同步、日志、令牌、账号密码和个人设置；
-- 书源支持“个人书源”和“全站书源”两种范围。普通用户只能看到和编辑自己的书源配置；管理员可看到全部书源，并选择保存为个人设置或全站设置；
-- 用户个人设置支持字体、字号、语言、主题，保存后跟随账号生效；
-- 新用户会获得随机昵称，可在设置页自行修改；昵称不限制字符类型，最长 48 个字符，空值或 `null`/`none`/`undefined` 会被拒绝；
-- 书架页只提供一次性邀请链接/邀请码：每个邀请只能用一次，有效期 1 天，过期后自动清理；原永久邀请码已停用；
-- 通过邀请注册的新用户会记录邀请人标签，该标签仅超级管理员在用户管理中可见；
-- “同步”页面可查看、暂停、继续、取消任务；
-- 同步页面支持勾选多个书源并同时启动同步，也支持全选/反选/清空；
-- 在同步页面开启“自动同步”并设置时间后，系统会每天到点自动为所有启用书源创建同步任务；
-- 全站同步说明见 [全站同步](docs/full-site-sync.md)；
-- 书源搜索与规则说明见 [书源搜索](docs/source-search.md)。
+### 9. 搜索与 AI
 
-### 6. 阅读与检索
-
-- 首页展示书架与最近阅读；
-- 书籍详情页支持章节列表、重新同步、EPUB 导出；
-- 阅读器支持字号、主题、目录、进度保存；
-- 搜索页支持书籍和章节全文搜索；
-- 配置 AI 后，阅读器侧边栏可使用 AI 问答、章节摘要和 RAG 语义检索。
+- 搜索页支持书籍、章节全文搜索；
+- 配置 AI 后，阅读器侧栏可使用 AI 问答、章节摘要和 RAG 语义检索。
 
 ## Services
 
@@ -113,89 +158,18 @@ storage/imports/
 | Redis | 6379 | Cache / queue |
 | Meilisearch | 7700 | Full-text search |
 
-Access via `http://localhost:8088` for the full app.
+## 升级后迁移
 
-## Development Stages
-
-### Stage 0 - Initialization (done)
-Project scaffold, Docker Compose, .env, README.
-
-### Stage 1 - Core Framework (done)
-- **Database** &mdash; 12 models: users, sources, authors, books, chapters, tags, cookies, crawl_tasks, crawl_logs, reading_progress, book_versions, book_tags
-- **API** &mdash; `/api/auth/*`, `/api/books/*`, `/api/chapters/*`, `/api/sources/*`, `/api/sync/*`, `/api/progress/*`, `/api/tags/*`, `/api/cookies/*`, `/api/crawl/*`, `/api/search`
-- **Repositories** &mdash; Typed data access layer for all models
-- **Plugin system** &mdash; `NovelSourcePlugin` protocol with `local_markdown` example plugin
-- **Storage** &mdash; Markdown chapter storage at `storage/books/author/book/*.md`
-- **Event system** &mdash; `BookCreated`, `ChapterUpdated`, `SyncFailed`, `CookieExpired`, etc.
-- **Search** &mdash; Meilisearch integration for books and chapter content
-- **Logging** &mdash; loguru with console + rotating file output
-- **CORS** &mdash; Configured for development
-- **Error handling** &mdash; Global exception handlers
-- **Scheduler** &mdash; Celery + Redis Beat for daily sync
-
-### Stage 2 - AliceSW Plugin (done)
-Cookie login (login.py), HTTP crawler with rate limiting (crawler.py), HTML parsing for bookshelf/book/chapters (parser.py), incremental update detection (updater.py), site configuration (config.py). All five modules integrated via the plugin class.
-
-### Stage 3 - Web System (done)
-**Pages:** Home (library + recent reads), Book Detail (chapters, EPUB export, re-sync, admin delete), Reader (dark mode, font sizing, TOC sidebar, scroll-progress save, chapter nav), Search (books + chapters scope with Meilisearch), Login/Register, Admin (sources/cookies/sync/logs tabs with bookshelf sync).
-
-### Stage 4 - Advanced Features (in progress)
-- **EPUB export** -- done (GET /api/books/{id}/epub)
-- **Backup service** -- done (daily incremental + weekly full, tar.zst compression, restore support, /api/backup/*)
-- **AI assistant** -- done (POST /ai/chat, /ai/summary, /ai/person, /ai/timeline; multi-provider: OpenAI/Claude/Qwen/Ollama/Hermes)
-- **RAG (semantic search)** -- done (chapter chunking, embedding via AI provider, JSONB vector storage, cosine similarity search, /api/rag/*)
-- **AI Chat panel** -- done (reader page sidebar, auto-switches to RAG when indexed)
-- **Celery Beat tasks** -- done (daily sync, daily incremental backup, weekly full backup)
-- **NAS optimization** -- done (PostgreSQL tuned for UGREEN DX4600, resource limits, log rotation)
-- **Storage abstraction** -- done (local filesystem, S3/MinIO, WebDAV; switch via STORAGE_BACKEND env)
-- **Rate limiting** -- done (Redis-based middleware, 10/min/auth, 200/min/api)
-- **Mobile responsive** -- done (NavBar hamburger menu, responsive layout)
-- **API Token UI** -- done (Admin page Tokens tab for create/revoke)
-- **Qidian plugin** -- done (skeleton registered in crawler registry)
-- **Fanqie plugin** -- done (skeleton registered in crawler registry)
-- **System health** -- done (GET /api/health/detailed with PostgreSQL/Redis/Meilisearch/disk checks + Admin Status tab)
-- **Global dark mode** -- done (toggle in NavBar, persisted to localStorage, Tailwind darkMode class)
-- **Docker health checks** -- done (postgres pg_isready, redis-cli ping, backend curl /health)
-- **Security hardening** -- done (bcrypt passwords, AES-GCM cookie encryption, API token auth via X-API-Token header, admin-only routes)
-- **Plugin template** -- done (crawler/plugins/plugin_template.py with documented interface, plus qidian skeleton)
-- **Rate limiting** -- done (Redis-based middleware, 10/min/auth, 200/min/api)
-- **Mobile responsive** -- done (NavBar hamburger menu, responsive layout)
-- **API Token UI** -- done (Admin page Tokens tab for create/revoke)
-- **Plugin template** -- done (`crawler/plugins/plugin_template.py` with documented interface)
-- Playwright infrastructure -- done (shared PlaywrightCrawler base class for any JS-rendered site plugin)
-
-## Local Markdown Import
-
-推荐使用管理后台 -> “本地 / 手动”完成批量导入：
-
-1. 准备书籍目录（章节 `.md` 文件，可选 `metadata.json`）；
-2. 输入服务器目录路径并点击“扫描目录”；
-3. 使用全选/反选快速勾选，点击“批量导入所选”或“导入全部”；
-4. “仅读取不导入”可以只解析预览，不写数据库。
-
-也可以通过 API 导入单个目录：
+如果从旧版本升级，需要先重建服务并执行数据库迁移：
 
 ```bash
-curl -X POST http://localhost:8088/api/sync/book \
-  -H "Content-Type: application/json" \
-  -d '{"source_id":"local_markdown","url":"file:///app/storage/imports/demo-book"}'
+docker compose up -d --build backend crawler scheduler frontend
+docker compose exec backend alembic upgrade head
 ```
-
-## Cookie Setup
-
-Before syncing books from online sources, you need to provide login cookies.
-See the [Cookie获取指南](docs/cookie-guide.md) for step-by-step instructions.
-
-Quick steps:
-1. Log into the novel site in your browser
-2. F12 -> Application -> Cookies -> copy all as `name=value; name2=value2`
-3. Paste into Admin -> Cookies -> Add Cookie
-4. Click "Test Cookie" to verify it works
-5. Save and trigger a sync
 
 ## Storage Layout
 
-```
+```text
 storage/
   books/
     {author}/
