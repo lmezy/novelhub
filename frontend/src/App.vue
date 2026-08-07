@@ -10,10 +10,7 @@ const router = useRouter()
 const notice = ref("")
 
 onMounted(async () => {
-  const ok = await auth.fetchMe()
-  if (!ok) {
-    notice.value = i18n.t('auth_required')
-  }
+  await auth.fetchMe()
   window.addEventListener("novelhub:unauthorized", () => {
     auth.logout()
     notice.value = i18n.t('auth_required')
