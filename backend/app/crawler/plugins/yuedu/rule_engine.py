@@ -369,7 +369,10 @@ class YueduRuleEngine:
             for field in field_names:
                 rule = rules.get(field, "")
                 if rule:
-                    entry[field] = self._eval_field(item, rule)
+                    if field in ("bookUrl", "chapterUrl", "coverUrl"):
+                        entry[field] = self._eval_rule_first(item, rule)
+                    else:
+                        entry[field] = self._eval_field(item, rule)
 
             fmt_js = rules.get("formatJs", "")
             if fmt_js and "chapterName" in entry and entry["chapterName"]:
@@ -393,7 +396,10 @@ class YueduRuleEngine:
         ):
             rule = rules.get(field, "")
             if rule:
-                info[field] = self._eval_field(raw, rule)
+                if field in ("coverUrl", "tocUrl"):
+                    info[field] = self._eval_rule_first(raw, rule)
+                else:
+                    info[field] = self._eval_field(raw, rule)
         return info
 
     def _extract_content(self, raw: str, rules: dict[str, Any]) -> str:
@@ -666,6 +672,24 @@ class YueduRuleEngine:
             return urljoin(base_url or self.base_url, result)
         return result
 
+    def _eval_rule_first(self, raw: Any, rule: str) -> str:
+        """Return only the first matched value for scalar URL fields.
+
+        Legado resolves URL fields with getString0/getString(isUrl=true),
+        which takes the first match. Joining every img@src into one string
+        makes cover/toc URLs unusable and can exceed DB column limits.
+        """
+        result = self._eval_field(raw, rule)
+        if result is None:
+            return ""
+        if isinstance(result, list):
+            values = [str(v).strip() for v in result if str(v).strip()]
+            return values[0] if values else ""
+        return next(
+            (line.strip() for line in str(result).splitlines() if line.strip()),
+            "",
+        )
+
     def _eval_rule_list(
         self,
         raw: str | Any,
@@ -837,7 +861,15 @@ class YueduRuleEngine:
                 val = self._apply_replace_regex(val, raw_attr)
             if val:
                 results.append(val)
-        return results if results else None
+        if not results:
+            return None
+        seen: set[str] = set()
+        unique: list[str] = []
+        for val in results:
+            if val not in seen:
+                seen.add(val)
+                unique.append(val)
+        return unique
 
     @staticmethod
     def _split_css_attr(rule: str) -> tuple[str, str]:

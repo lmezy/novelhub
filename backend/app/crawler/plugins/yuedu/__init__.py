@@ -302,24 +302,21 @@ class YueduPlugin:
         generic = self._parse_book_generic(html, url)
         if not str(info.get("name") or "").strip():
             info["name"] = generic["title"]
-        if not str(info.get("author") or "").strip():
-            info["author"] = generic["author"]
+        rule_author = self._clean_author(str(info.get("author") or "").strip())
+        generic_author = self._clean_author(str(generic.get("author") or "").strip())
+        if not rule_author or self._looks_like_invalid_author(rule_author):
+            info["author"] = generic_author or rule_author
+        else:
+            info["author"] = rule_author
         if not info.get("intro"):
             info["intro"] = generic["description"]
         if not info.get("status"):
             info["status"] = generic["status"]
-        if not str(info.get("coverUrl") or "").strip():
-            info["coverUrl"] = generic.get("cover") or ""
+        if not self._pick_cover_url(info.get("coverUrl"), url):
+            info["coverUrl"] = self._pick_cover_url(generic.get("cover"), url)
         generic_tags = generic.get("tags") or []
         raw_kind = info.get("kind") or ""
-        if isinstance(raw_kind, list):
-            kind_tags = [str(x).strip() for x in raw_kind if str(x).strip()]
-        else:
-            kind_tags = [
-                tag.strip()
-                for tag in str(raw_kind).split(",")
-                if tag.strip()
-            ]
+        kind_tags = self._split_kind_text(raw_kind)
         tags = list(dict.fromkeys([*kind_tags, *generic_tags]))
         book_title = self._clean_book_title(str(info.get("name") or "").strip()) or "Unknown"
         author = self._clean_author(str(info.get("author") or "").strip()) or "Unknown"
@@ -372,11 +369,7 @@ class YueduPlugin:
             chapters = generic["chapters"]
         chapters = self._attach_next_urls(chapters)
 
-        cover_url = str(info.get("coverUrl") or "").strip()
-        if cover_url:
-            cover_url = self._make_absolute(cover_url, url)
-            if self._looks_like_placeholder_cover(cover_url):
-                cover_url = ""
+        cover_url = self._pick_cover_url(info.get("coverUrl"), url)
         description = info.get("intro", "")
         status = info.get("status", "")
 
@@ -608,7 +601,53 @@ class YueduPlugin:
 
     @staticmethod
     def _extract_author_from_text(soup: BeautifulSoup) -> str:
-        """Fallback author extraction from visible `作者：xxx` text."""
+        """Author extraction from structured meta, description, or visible text."""
+        for meta in soup.select(
+            "meta[property='og:novel:author'], "
+            "meta[name='og:novel:author'], "
+            "meta[name='author'], "
+            "meta[property='article:author']"
+        ):
+            content = (meta.get("content") or "").strip()
+            if content:
+                return content.split(",")[0].strip()
+
+        for script in soup.select("script[type='application/ld+json']"):
+            try:
+                data = json.loads(script.get_text(strip=True))
+                author = data.get("author") if isinstance(data, dict) else None
+                if isinstance(author, dict):
+                    author = author.get("name")
+                if author:
+                    return str(author).strip()
+            except (json.JSONDecodeError, AttributeError, ValueError):
+                continue
+
+        description_texts: list[str] = []
+        for meta in soup.select(
+            "meta[name='description'], "
+            "meta[property='og:description'], "
+            "meta[name='keywords']"
+        ):
+            content = (meta.get("content") or "").strip()
+            if content:
+                description_texts.append(content)
+        for text in description_texts:
+            match = re.search(
+                r"由(?:作家|作者|著者)[:：]?\s*([^，。,.、|]{1,60}?)(?:创作|撰写|著|提供|，|。|,|\.|$)",
+                text,
+                re.IGNORECASE,
+            )
+            if match:
+                return match.group(1).strip()
+            match = re.search(
+                r"(?:作者|著者)[:：]\s*([^，。,.、|]{1,60})",
+                text,
+                re.IGNORECASE,
+            )
+            if match:
+                return match.group(1).strip()
+
         for node in soup.find_all(string=True):
             if node.parent is not None and node.parent.name in ("script", "style"):
                 continue
@@ -628,24 +667,88 @@ class YueduPlugin:
         text = str(author or "").strip()
         if not text:
             return ""
-        text = re.sub(r"\r?\n+", " ", text).strip()
-        text = re.sub(
-            r"^(?:作\s*者|作者|著者|author)\s*[:：]\s*",
-            "",
-            text,
-            flags=re.IGNORECASE,
-        ).strip()
-        text = re.sub(r"\s+", " ", text).strip(" -_|")
-        for marker in self._site_markers():
-            text = re.sub(
-                rf"\s*[-_|]?\s*{re.escape(marker)}.*$",
+        candidates: list[str] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            line = re.sub(
+                r"^(?:作\s*者|作者|著者|author)\s*[:：]\s*",
                 "",
-                text,
+                line,
                 flags=re.IGNORECASE,
             ).strip()
-        if text.lower() in ("unknown", "未知", "暂无", "无"):
+            line = re.sub(
+                r"(?:作\s*者|著者|author)\s*[:：]\s*.*$",
+                "",
+                line,
+                flags=re.IGNORECASE,
+            ).strip()
+            line = re.split(
+                r"(?:字\s*数|状\s*态|分\s*类|类\s*别|更\s*新|最新章节|简介)\s*[:：]?",
+                line,
+                maxsplit=1,
+            )[0].strip()
+            line = re.sub(r"\s+", " ", line).strip(" -_|")
+            for marker in self._site_markers():
+                line = re.sub(
+                    rf"\s*[-_|]?\s*{re.escape(marker)}.*$",
+                    "",
+                    line,
+                    flags=re.IGNORECASE,
+                ).strip()
+            if line and not self._looks_like_invalid_author(line):
+                candidates.append(line)
+        if not candidates:
             return ""
-        return text[:120]
+        return min(candidates, key=len)[:120]
+
+    @staticmethod
+    def _looks_like_invalid_author(author: str | None) -> bool:
+        text = str(author or "").strip()
+        if not text or text.lower() in ("unknown", "未知", "暂无", "无"):
+            return True
+        if len(text) < 2:
+            return True
+        if re.fullmatch(r"\d{2,}", text):
+            return True
+        if re.search(r"(?:字数|状态|分类|类别)", text):
+            return True
+        return False
+
+    @staticmethod
+    def _split_kind_text(raw_kind: Any) -> list[str]:
+        """Split a kind rule result into discrete tag candidates.
+
+        Some sources return a whole info line such as
+        `分类：都市 作者：某某 字数：10万`, which must not become one giant
+        tag. Known metadata labels are turned into separators first.
+        """
+        if isinstance(raw_kind, (list, tuple)):
+            parts: list[str] = []
+            for value in raw_kind:
+                parts.extend(YueduPlugin._split_kind_text(value))
+            return parts
+        text = str(raw_kind or "")
+        text = re.sub(
+            r"(?:分\s*类|类\s*别|类\s*型|字\s*数|状\s*态|作\s*者|著\s*者|更新\s*时间|简\s*介|最新章节)\s*[:：]?",
+            "|",
+            text,
+            flags=re.IGNORECASE,
+        )
+        parts = [
+            part.strip().strip("#").strip()
+            for part in re.split(r"[,，、;；\n|]+", text)
+            if part.strip().strip("#").strip()
+        ]
+        cleaned: list[str] = []
+        for part in parts:
+            if re.fullmatch(r"[\d.,]+\s*[万千]?(?:字|万|k|w)?", part, re.IGNORECASE):
+                continue
+            if part in ("未知", "暂无", "连载", "完结"):
+                continue
+            cleaned.append(part)
+        return cleaned
 
     def _clean_tags(
         self,
@@ -661,8 +764,10 @@ class YueduPlugin:
                 value,
             ).lower()
 
-        title_norm = _normalize(title)
-        author_norm = _normalize(author)
+        title_norm = _normalize(title) if title and title.lower() != "unknown" else ""
+        author_norm = (
+            _normalize(author) if author and author.lower() != "unknown" else ""
+        )
         markers = self._site_markers()
         noise = {
             "tags", "tag", "标签", "分类", "类别", "类型",
@@ -670,6 +775,7 @@ class YueduPlugin:
             "书友正在看", "大家都在看", "上一章", "下一章", "目录",
             "返回目录", "首页", "开始阅读", "小说", "本站",
         }
+        title_noise = {"最新章节", "全文", "全文阅读", "免费阅读", "小说", "最新更新"}
         result: list[str] = []
         for tag in tags:
             tag = str(tag or "").strip().strip("#").strip()
@@ -678,13 +784,29 @@ class YueduPlugin:
             normalized = _normalize(tag)
             if not normalized:
                 continue
-            if title_norm and (
-                normalized == title_norm
-                or (title_norm in normalized and "最新章节" in normalized)
-            ):
-                continue
-            if author_norm and normalized == author_norm:
-                continue
+            if title_norm:
+                if normalized == title_norm:
+                    continue
+                if normalized in title_norm and len(normalized) >= 2:
+                    # Keywords commonly include fragments of the book title.
+                    continue
+                if title_norm in normalized:
+                    remainder = _normalize(normalized.replace(title_norm, ""))
+                    if not remainder:
+                        continue
+                    if author_norm and author_norm in remainder:
+                        continue
+                    if remainder in noise or any(
+                        token in remainder for token in title_noise
+                    ):
+                        continue
+            if author_norm:
+                if normalized == author_norm:
+                    continue
+                if normalized in author_norm and len(normalized) >= 2:
+                    continue
+                if author_norm in normalized:
+                    continue
             if tag.lower() in noise:
                 continue
             if any(marker and marker.lower() in tag.lower() for marker in markers):
@@ -694,12 +816,41 @@ class YueduPlugin:
             result.append(tag)
         return list(dict.fromkeys(result))
 
+    def _pick_cover_url(self, value: Any, base_url: str | None = None) -> str:
+        """Pick the first usable cover URL from a rule result.
+
+        Legado sources commonly use `img@src||fallback`, which can match every
+        image on the page. A single scalar field must resolve to one URL, not a
+        newline/concatenated list.
+        """
+        if isinstance(value, (list, tuple)):
+            candidates = [str(v).strip() for v in value if str(v).strip()]
+        else:
+            candidates = [
+                line.strip()
+                for line in str(value or "").splitlines()
+                if line.strip()
+            ]
+        base = base_url or self.base_url
+        for candidate in candidates:
+            if candidate.startswith(("data:", "javascript:", "about:")):
+                continue
+            absolute = self._make_absolute(candidate, base)
+            if not absolute.startswith(("http://", "https://")):
+                continue
+            if self._looks_like_placeholder_cover(absolute):
+                continue
+            return absolute
+        return ""
+
     @staticmethod
     def _looks_like_placeholder_cover(url: str) -> bool:
         path = urlparse(url).path.lower()
         name = path.rsplit("/", 1)[-1]
         return (
             "favicon" in path
+            or path.endswith(".svg")
+            or any(seg in path for seg in ("/template/", "/static/", "/images/", "/img/"))
             or name in (
                 "logo.png", "logo.svg", "logo.jpg", "logo.webp",
                 "default.jpg", "default.png", "nopic.jpg",
@@ -1499,7 +1650,7 @@ class YueduPlugin:
                 "name": name,
                 "author": self._clean_author(str(item.get("author") or "").strip()) or "Unknown",
                 "bookUrl": full_url,
-                "coverUrl": str(item.get("coverUrl") or "").strip() or None,
+                "coverUrl": self._pick_cover_url(item.get("coverUrl"), link_base) or None,
                 "intro": str(item.get("intro") or "").strip() or None,
                 "kind": str(item.get("kind") or "").strip() or None,
                 "lastChapter": (

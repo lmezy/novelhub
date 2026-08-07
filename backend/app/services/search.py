@@ -726,6 +726,45 @@ class SearchService:
         except Exception:
             pass
 
+    def delete_chapters_from_index(self, chapter_ids: list[str]) -> None:
+        """Delete chapter documents in batches.
+
+        Deleting a whole library one document at a time makes the API request
+        block for thousands of HTTP round trips. Meilisearch accepts a list,
+        which turns a library cleanup into a handful of requests.
+        """
+        ids = [str(i) for i in chapter_ids if i]
+        if not ids:
+            return
+        index = self.client.index(self.INDEX_CHAPTERS)
+        for start in range(0, len(ids), 1000):
+            try:
+                index.delete_documents(ids[start : start + 1000])
+            except Exception as exc:
+                logger.warning(
+                    "Failed to delete {} chapters from search index: {}",
+                    len(ids[start : start + 1000]),
+                    exc,
+                )
+                return
+
+    def delete_books_from_index(self, book_ids: list[str]) -> None:
+        """Delete book documents in batches."""
+        ids = [str(i) for i in book_ids if i]
+        if not ids:
+            return
+        index = self.client.index(self.INDEX_BOOKS)
+        for start in range(0, len(ids), 1000):
+            try:
+                index.delete_documents(ids[start : start + 1000])
+            except Exception as exc:
+                logger.warning(
+                    "Failed to delete {} books from search index: {}",
+                    len(ids[start : start + 1000]),
+                    exc,
+                )
+                return
+
     def get_index_stats(self) -> dict:
         """Return document counts for both indexes."""
         result = {}

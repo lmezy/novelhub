@@ -35,6 +35,23 @@ def test_normalize_title_for_match():
     assert SyncService._normalize_title_for_match(" 剑来 ") == "剑来"
 
 
+def test_clean_sync_tags_drops_title_and_author_fragments():
+    tags = {
+        "官路之谁与争锋(卷帘西风666)",
+        "卷帘西风666",
+        "官路之谁与争锋最新章节",
+        "仙侠武侠",
+    }
+
+    result = SyncService._clean_sync_tags(
+        tags,
+        title="官路之谁与争锋",
+        author="卷帘西风666",
+    )
+
+    assert result == ["仙侠武侠"]
+
+
 def test_chapter_concurrency_uses_env_override():
     from app.core.config import settings
 
@@ -256,7 +273,93 @@ async def test_sync_book_loads_existing_tags_without_lazy_load():
         assert result["created_chapters"] == 1
         service._save_tags.assert_awaited_once_with(
             "book-1",
-            ["all-ages", "book", "old", "remote"],
+            ["all-ages", "old", "remote"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_sync_book_does_not_rewrite_other_source_tags():
+    db = _mock_db()
+    db.get.return_value = _source()
+    db.scalar.return_value = None
+    db.rollback = AsyncMock()
+    db.commit = AsyncMock()
+    db.flush = AsyncMock()
+    db.add = MagicMock()
+
+    remote_book = RemoteBook(
+        source_book_id="https://example.com/book/1",
+        title="Book",
+        author="Author",
+        description=None,
+        status=None,
+        chapters=[
+            RemoteChapter(
+                source_chapter_id="1",
+                title="Chapter 1",
+                url="https://example.com/book/1.html",
+                chapter_number=1,
+            ),
+        ],
+        tags=["remote"],
+    )
+    plugin = AsyncMock()
+    plugin.fetch_book.return_value = remote_book
+    plugin.fetch_chapter_content.return_value = "content"
+
+    book = Book(
+        id="book-1",
+        source_id="src1",
+        source_book_id="https://example.com/book/1",
+        title="Book",
+    )
+    other_source_book = Book(
+        id="book-2",
+        source_id="src2",
+        source_book_id="https://example.com/book/2",
+        title="Book",
+        is_r18=False,
+    )
+
+    service = SyncService(db)
+    service.storage = MagicMock()
+    service.storage.write_metadata = MagicMock()
+    service.storage.write_chapter.return_value = ("path", "hash")
+
+    async def fake_book_tag_names(book_id: str) -> list[str]:
+        if book_id == "book-1":
+            return ["Book", "old"]
+        return ["other-old"]
+
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.emit"),
+        patch("app.services.sync.search_service"),
+        patch("app.services.auto_categorize.AutoCategorizationService"),
+        patch.object(
+            service,
+            "_get_or_create_author",
+            AsyncMock(return_value=MagicMock(id="author-1")),
+        ),
+        patch.object(
+            service,
+            "_get_or_create_book",
+            AsyncMock(return_value=(book, True)),
+        ),
+        patch.object(
+            service,
+            "_find_same_title_books",
+            AsyncMock(return_value=[other_source_book]),
+        ),
+        patch.object(service, "_book_tag_names", side_effect=fake_book_tag_names),
+        patch.object(service, "_save_tags", AsyncMock()),
+    ):
+        result = await service.sync_book("src1", "https://example.com/book/1")
+
+        assert result["created_chapters"] == 1
+        service._save_tags.assert_awaited_once_with(
+            "book-1",
+            ["all-ages", "old", "remote"],
         )
 
 

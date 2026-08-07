@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 import json
+from bs4 import BeautifulSoup
 
 from app.crawler.plugins.yuedu import YueduPlugin
 from app.crawler.plugins.yuedu.rule_engine import YueduRuleEngine
@@ -919,3 +920,66 @@ async def test_fetch_book_skips_javascript_chapter_and_extracts_generic_tags():
     assert book.chapters[0].url == "https://example.com/novel/123/1.html"
     assert "都市" in book.tags
     assert "爽文" in book.tags
+
+
+def test_rule_first_cover_url_returns_single_value():
+    engine = YueduRuleEngine({"bookSourceUrl": "https://example.com"})
+    html = (
+        '<html><body>'
+        '<img src="/template/logo.svg">'
+        '<img src="/cover/123.jpg">'
+        '<img src="/cover/banner.jpg">'
+        '</body></html>'
+    )
+
+    assert engine._eval_rule_first(html, "img@src") == "/template/logo.svg"
+
+
+def test_pick_cover_url_skips_placeholders_and_takes_first_real_image():
+    plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
+    value = (
+        "/template/home/diyquge/images/caret-down.svg\n"
+        "https://img.example.com/cover/123.webp\n"
+        "https://img.example.com/banner.webp"
+    )
+
+    assert plugin._pick_cover_url(
+        value,
+        "https://example.com/novel/1.html",
+    ) == "https://img.example.com/cover/123.webp"
+
+
+def test_clean_tags_drops_title_author_fragments():
+    plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
+
+    result = plugin._clean_tags(
+        ["官路之谁与争锋(卷帘西风666)", "卷帘西风666", "仙侠武侠"],
+        title="官路之谁与争锋",
+        author="卷帘西风666",
+    )
+
+    assert result == ["仙侠武侠"]
+
+
+def test_parse_book_generic_extracts_author_from_meta_description():
+    plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
+    html = """
+    <html><head>
+      <meta name="description" content="《债与肉》由作家rizzwhistleblower创作。">
+    </head><body><h1>债与肉</h1></body></html>
+    """
+
+    parsed = plugin._parse_book_generic(
+        html,
+        "https://example.com/novel/1.html",
+    )
+
+    assert parsed["author"] == "rizzwhistleblower"
+
+
+def test_split_kind_text_splits_metadata_labels():
+    plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
+
+    assert plugin._split_kind_text(
+        "分类：都市 作者：张三 字数：10万"
+    ) == ["都市", "张三"]

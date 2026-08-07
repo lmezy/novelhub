@@ -98,6 +98,45 @@ class SyncService:
             title or "",
         ).lower()
 
+    @staticmethod
+    def _clean_sync_tags(
+        tags: list[str] | set[str],
+        title: str,
+        author: str,
+    ) -> list[str]:
+        """Drop title/author fragments that old imports stored as tags."""
+        def _normalize(value: str) -> str:
+            return re.sub(
+                r"[\s《》「」『』〈〉（）【】\[\]\"'“”‘’]+",
+                "",
+                value or "",
+            ).lower()
+
+        title_norm = _normalize(title) if title and title.lower() != "unknown" else ""
+        author_norm = (
+            _normalize(author) if author and author.lower() != "unknown" else ""
+        )
+        cleaned: list[str] = []
+        for tag in tags:
+            tag = str(tag or "").strip().lower()
+            normalized = _normalize(tag)
+            if not normalized:
+                continue
+            if title_norm and (
+                normalized == title_norm
+                or normalized in title_norm
+                or title_norm in normalized
+            ):
+                continue
+            if author_norm and (
+                normalized == author_norm
+                or normalized in author_norm
+                or author_norm in normalized
+            ):
+                continue
+            cleaned.append(tag)
+        return cleaned
+
     async def _find_same_title_books(self, book: Book) -> list[Book]:
         """Find other source books with the same normalized title."""
         normalized = self._normalize_title_for_match(book.title)
@@ -195,30 +234,24 @@ class SyncService:
         )
         remote_cover_url = await self._persist_cover(book, plugin, remote_book)
 
-        # Save remote tags plus the admin-only classification tag. Tags from
-        # other sources that carry the same title are merged in as well.
+        # Keep tags scoped to this source. Same-title books from other sources
+        # may legitimately have different tags, so syncing one source must not
+        # rewrite their stored tags.
         classification_tag = "r18" if is_r18 else "all-ages"
-        same_title_books = await self._find_same_title_books(book)
         source_tags: set[str] = set()
-        for candidate in [book, *same_title_books]:
-            for tag in await self._book_tag_names(candidate.id):
-                tag = tag.strip().lower()
-                if tag and tag not in ("all-ages", "r18"):
-                    source_tags.add(tag)
+        for tag in await self._book_tag_names(book.id):
+            tag = tag.strip().lower()
+            if tag and tag not in ("all-ages", "r18"):
+                source_tags.add(tag)
         for tag in remote_book.tags:
             tag = str(tag).strip().lower()
             if tag:
                 source_tags.add(tag)
+        source_tags = self._clean_sync_tags(source_tags, book_title, author_name)
         await self._save_tags(
             book.id,
             sorted([*source_tags, classification_tag]),
         )
-        for same_title_book in same_title_books:
-            other_classification = "r18" if same_title_book.is_r18 else "all-ages"
-            await self._save_tags(
-                same_title_book.id,
-                sorted([*source_tags, other_classification]),
-            )
         # Persist the book before chapter downloads so a later chapter failure
         # cannot leave chapters pointing at an uncommitted book row.
         await self.db.commit()
@@ -487,6 +520,10 @@ class SyncService:
         """Download a remote cover, save it locally, and update book.cover."""
         cover_url = str(getattr(remote_book, "cover_url", "") or "").strip()
         if not cover_url or not self._is_http_url(cover_url):
+            return None
+        if len(cover_url) > 255 or "\n" in cover_url or " " in cover_url:
+            # A source rule may return several img@src values joined together.
+            # That is not a usable cover and cannot fit the books.cover column.
             return None
 
         fetch = getattr(plugin, "fetch_cover", None)
