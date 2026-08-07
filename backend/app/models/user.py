@@ -84,6 +84,16 @@ class User(Base):
         nullable=True
     )
 
+    invite_tag = Column(
+        String(64),
+        nullable=True
+    )
+
+    nickname = Column(
+        String(48),
+        nullable=True
+    )
+
     settings = Column(
         JSONB,
         nullable=False,

@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -5,7 +6,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.models import User
+from app.models import Invite, User
 from app.schemas.auth import RegisterResult, TokenOut
 from app.schemas.user import (
     ChangePasswordRequest,
@@ -13,6 +14,7 @@ from app.schemas.user import (
     UserLogin,
     UserOut,
     UpdateEmailRequest,
+    UpdateNicknameRequest,
     UserSelfVisibilityUpdate,
     UserSettingsUpdate,
 )
@@ -21,7 +23,7 @@ from app.services.jwt import create_token
 from app.services.security import hash_password, verify_password
 from app.services.settings import get_registration_approval_enabled
 from app.services.account import email_available, username_available
-from app.services.invite import generate_invite_code
+from app.services.invite import generate_invite_code, generate_nickname
 from app.services.validation import password_error
 
 
@@ -32,11 +34,18 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 async def register(payload: UserCreate, db: AsyncSession = Depends(get_db)):
     if not payload.invite_code:
         raise HTTPException(status_code=400, detail="Invite code is required")
-    inviter = await db.scalar(
-        select(User).where(User.invite_code == payload.invite_code)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    invite = await db.scalar(
+        select(Invite).where(Invite.code == payload.invite_code)
     )
+    if invite is None:
+        raise HTTPException(status_code=400, detail="Invalid invite code")
+    if invite.used_by is not None or invite.expires_at <= now:
+        raise HTTPException(status_code=400, detail="Invite code is invalid or expired")
+    inviter = await db.get(User, invite.created_by)
     if inviter is None:
         raise HTTPException(status_code=400, detail="Invalid invite code")
+    inviter_id = inviter.id
     username_error = await username_available(db, payload.username)
     if username_error:
         raise HTTPException(status_code=409, detail=username_error)
@@ -53,12 +62,17 @@ async def register(payload: UserCreate, db: AsyncSession = Depends(get_db)):
         role="user",
         approved=not approval_enabled,
         invite_code=generate_invite_code(),
-        invited_by_id=inviter.id,
+        nickname=generate_nickname(),
+        invited_by_id=inviter_id,
+        invite_tag=inviter.username,
         r18_enabled=False,
         non_r18_enabled=True,
         can_manage_visibility=False,
     )
     db.add(user)
+    if invite is not None:
+        invite.used_by = user.id
+        invite.used_at = now
     await db.commit()
     await db.refresh(user)
     if approval_enabled:
@@ -162,6 +176,29 @@ async def update_my_email(
     if error:
         raise HTTPException(status_code=409, detail=error)
     current_user.email = payload.email
+    await db.commit()
+    await db.refresh(current_user)
+    return current_user
+
+
+@router.put("/me/nickname", response_model=UserOut)
+async def update_my_nickname(
+    payload: UpdateNicknameRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    nickname = (payload.nickname or "").strip()
+    if not nickname or len(nickname) > 48:
+        raise HTTPException(
+            status_code=400,
+            detail="Nickname must be 1-48 characters",
+        )
+    if nickname.lower() in ("null", "none", "undefined"):
+        raise HTTPException(
+            status_code=400,
+            detail="Nickname cannot be null, none, or undefined",
+        )
+    current_user.nickname = nickname
     await db.commit()
     await db.refresh(current_user)
     return current_user

@@ -85,7 +85,7 @@ async function savePrefs() {
   }
 }
 
-const accountForm = ref({ current_password: "", new_password: "", email: "" })
+const accountForm = ref({ current_password: "", new_password: "", email: "", nickname: "" })
 const accountError = ref("")
 const accountMessage = ref("")
 
@@ -114,6 +114,20 @@ async function bindEmail() {
     })
     auth.user = res
     accountMessage.value = i18n.t('admin_email_bound')
+  } catch (e) {
+    accountError.value = e instanceof Error ? e.message : i18n.t('admin_failed')
+  }
+}
+
+async function saveNickname() {
+  accountError.value = ""
+  accountMessage.value = ""
+  try {
+    const res = await api.put<any>("/auth/me/nickname", {
+      nickname: accountForm.value.nickname,
+    })
+    auth.user = res
+    accountMessage.value = i18n.t('admin_nickname_saved')
   } catch (e) {
     accountError.value = e instanceof Error ? e.message : i18n.t('admin_failed')
   }
@@ -1069,6 +1083,7 @@ async function reviewChange(id: string, action: string) {
 onMounted(async () => {
   await loadSources()
   await loadPrefs()
+  accountForm.value.nickname = auth.user?.nickname || ""
   await loadCreds()
   await loadCookies()
   if (auth.isAdmin) {
@@ -1564,6 +1579,13 @@ onUnmounted(() => {
 
         <div class="mt-6 p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
           <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_tab_account') }}</h2>
+          <div class="mb-4">
+            <label class="block mb-2">
+              <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_nickname') }}</span>
+              <input v-model="accountForm.nickname" maxlength="48" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            </label>
+            <button @click="saveNickname" class="px-4 py-2 rounded border border-accent text-accent text-sm font-medium hover:bg-accent/10">{{ i18n.t('admin_save_nickname') }}</button>
+          </div>
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
             <label class="block">
               <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_current_password') }}</span>
@@ -1840,6 +1862,7 @@ onUnmounted(() => {
               <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ u.email || '' }}</span>
               <span class="text-xs px-1.5 py-0.5 rounded-full ml-2" :class="u.role === 'super_admin' ? 'bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-300' : u.role === 'admin' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300' : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400'">{{ u.role === 'super_admin' ? i18n.t('admin_role_super_admin') : u.role === 'admin' ? i18n.t('admin_role_admin') : i18n.t('admin_role_user') }}</span>
               <span v-if="!u.approved" class="text-xs px-1.5 py-0.5 rounded-full ml-2 bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-300">{{ i18n.t('admin_pending') }}</span>
+              <span v-if="auth.isSuperAdmin && u.invite_tag" class="text-xs px-1.5 py-0.5 rounded-full ml-2 bg-cyan-100 text-cyan-700 dark:bg-cyan-900 dark:text-cyan-300">{{ i18n.t('admin_invite_tag', { tag: u.invite_tag }) }}</span>
             </div>
             <div class="flex items-center gap-2">
               <button @click="toggleUserVisibility(u, 'r18_enabled')" class="text-xs px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5" :class="u.r18_enabled ? 'text-purple-700 dark:text-purple-300 border-purple-500' : ''">

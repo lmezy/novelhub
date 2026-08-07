@@ -6,9 +6,16 @@ import pytest
 from app.api.routes.auth import (
     change_my_password,
     update_my_email,
+    update_my_nickname,
     update_my_settings,
 )
-from app.schemas.user import ChangePasswordRequest, UpdateEmailRequest, UserSettingsUpdate
+from app.schemas.user import (
+    ChangePasswordRequest,
+    UpdateEmailRequest,
+    UpdateNicknameRequest,
+    UserSettingsUpdate,
+)
+from fastapi import HTTPException
 from app.services.security import hash_password, verify_password
 
 
@@ -67,3 +74,33 @@ async def test_update_my_email_binds_email():
 
     assert result is user
     assert user.email == "user@example.com"
+
+
+@pytest.mark.asyncio
+async def test_update_my_nickname_saves():
+    user = SimpleNamespace(id="u1", nickname=None)
+    db = AsyncMock()
+    db.commit = AsyncMock()
+    db.refresh = AsyncMock()
+
+    result = await update_my_nickname(
+        UpdateNicknameRequest(nickname="新昵称"),
+        user,
+        db,
+    )
+
+    assert result is user
+    assert user.nickname == "新昵称"
+
+
+@pytest.mark.asyncio
+async def test_update_my_nickname_rejects_null_and_empty():
+    db = AsyncMock()
+
+    for value in ("null", "  ", ""):
+        with pytest.raises(HTTPException):
+            await update_my_nickname(
+                UpdateNicknameRequest(nickname=value),
+                SimpleNamespace(id="u1", nickname="old"),
+                db,
+            )

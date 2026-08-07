@@ -5,6 +5,7 @@ import { api } from "../api/client"
 export interface User {
   id: string
   username: string
+  nickname?: string | null
   email: string | null
   role: string
   r18_enabled: boolean

@@ -27,6 +27,7 @@ from .book_version import BookVersion
 from .source_change import SourceChange
 from .app_setting import AppSetting
 from .deleted_account import DeletedAccount
+from .invite import Invite
 
 
 
@@ -60,6 +61,7 @@ __all__=[
 
     "AppSetting",
     "DeletedAccount",
+    "Invite",
 ]
 
 from .chapter_embedding import ChapterEmbedding  # noqa: F401

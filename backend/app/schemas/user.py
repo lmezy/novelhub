@@ -45,6 +45,7 @@ class UserOut(BaseModel):
     id:str
 
     username:str
+    nickname: str | None = None
 
     email: str | None = None
 
@@ -60,6 +61,10 @@ class UserOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class AdminUserOut(UserOut):
+    invite_tag: str | None = None
 
 
 class UserSelfVisibilityUpdate(BaseModel):
@@ -86,4 +91,8 @@ class ChangePasswordRequest(BaseModel):
 
 class UpdateEmailRequest(BaseModel):
     email: EmailStr
+
+
+class UpdateNicknameRequest(BaseModel):
+    nickname: str
 

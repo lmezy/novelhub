@@ -26,6 +26,10 @@ const moveOpen = ref(false)
 const moveGroupIds = ref<string[]>([])
 const groupForm = ref<Record<string, { name: string; show: boolean }>>({})
 const inviteCopied = ref(false)
+const inviteCopiedId = ref<string | null>(null)
+const invites = ref<any[]>([])
+const inviteCreating = ref(false)
+const inviteError = ref("")
 
 const allSelected = computed(() =>
   favoriteBooks.value.length > 0 &&
@@ -36,16 +40,72 @@ const groupNameMap = computed(() =>
   Object.fromEntries(groups.value.map((g) => [g.id, g.name]))
 )
 
-function copyInviteLink() {
-  const code = auth.user?.invite_code
+async function copyText(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text)
+    } else {
+      const ta = document.createElement("textarea")
+      ta.value = text
+      ta.style.position = "fixed"
+      ta.style.opacity = "0"
+      document.body.appendChild(ta)
+      ta.select()
+      document.execCommand("copy")
+      document.body.removeChild(ta)
+    }
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function copyInviteLink(invite?: any) {
+  const code = invite?.code || auth.user?.invite_code
   if (!code) return
   const link = window.location.origin + "/login?invite=" + encodeURIComponent(code)
-  navigator.clipboard?.writeText(link).then(() => {
-    inviteCopied.value = true
-    setTimeout(() => {
-      inviteCopied.value = false
-    }, 2000)
-  }).catch(() => {})
+  const ok = await copyText(link)
+  if (!ok) {
+    inviteError.value = i18n.t('home_invite_copy_failed')
+    return
+  }
+  inviteCopied.value = true
+  inviteCopiedId.value = invite?.id || "permanent"
+  setTimeout(() => {
+    inviteCopied.value = false
+    inviteCopiedId.value = null
+  }, 2000)
+}
+
+async function loadInvites() {
+  try {
+    invites.value = await api.get<any[]>("/invites")
+  } catch {
+    invites.value = []
+  }
+}
+
+async function createInvite() {
+  inviteCreating.value = true
+  inviteError.value = ""
+  try {
+    const created = await api.post<any>("/invites")
+    await loadInvites()
+    await copyInviteLink(created)
+  } catch (e) {
+    inviteError.value = e instanceof Error ? e.message : i18n.t('home_invite_create_failed')
+  } finally {
+    inviteCreating.value = false
+  }
+}
+
+async function deleteInvite(id: string) {
+  try {
+    await api.delete("/invites/" + id)
+    await loadInvites()
+  } catch (e) {
+    inviteError.value = e instanceof Error ? e.message : i18n.t('home_invite_delete_failed')
+  }
 }
 
 async function loadGroups() {
@@ -240,6 +300,7 @@ onMounted(async () => {
   await loadGroups()
   await loadFavorites()
   if (auth.user) {
+    await loadInvites()
     try {
       const progress = await api.get<any[]>('/progress?user_id=' + auth.user.id)
       if (progress.length > 0) {
@@ -258,17 +319,40 @@ onMounted(async () => {
     <NavBar />
 
     <main class="max-w-5xl mx-auto px-4 py-8">
-      <section v-if="auth.user?.invite_code" class="mb-8 p-4 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
+      <section v-if="auth.user" class="mb-8 p-4 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
         <div class="flex items-center justify-between flex-wrap gap-3">
           <div>
             <p class="text-sm font-medium">{{ i18n.t('home_invite_title') }}</p>
             <p class="text-xs text-muted dark:text-gray-400 mt-1">{{ i18n.t('home_invite_hint') }}</p>
           </div>
-          <button
-            @click="copyInviteLink"
-            class="text-xs px-3 py-1.5 rounded border border-accent text-accent hover:bg-accent/10"
-          >{{ inviteCopied ? i18n.t('home_invite_copied') : i18n.t('home_invite_copy') }}</button>
+          <div class="flex flex-wrap items-center gap-2">
+            <button
+              @click="createInvite"
+              :disabled="inviteCreating"
+              class="text-xs px-3 py-1.5 rounded bg-accent text-white hover:opacity-90 disabled:opacity-50"
+            >{{ inviteCreating ? i18n.t('home_invite_creating') : i18n.t('home_invite_create') }}</button>
+          </div>
         </div>
+        <p v-if="inviteError" class="text-xs text-red-600 mt-2">{{ inviteError }}</p>
+        <div v-if="invites.length" class="mt-4 divide-y divide-border border-t border-border dark:border-gray-700">
+          <div v-for="inv in invites" :key="inv.id" class="py-2 flex items-center justify-between gap-3">
+            <div class="min-w-0">
+              <span class="text-sm font-mono">{{ inv.code }}</span>
+              <span class="text-xs text-muted dark:text-gray-400 ml-2">
+                {{ inv.used_at ? i18n.t('home_invite_used') : i18n.t('home_invite_valid_until', { time: new Date(inv.expires_at).toLocaleString() }) }}
+              </span>
+            </div>
+            <div class="flex items-center gap-2 shrink-0">
+              <button
+                @click="copyInviteLink(inv)"
+                :disabled="!!inv.used_at"
+                class="text-xs px-2 py-1 rounded border border-accent text-accent hover:bg-accent/10 disabled:opacity-40"
+              >{{ inviteCopied && inviteCopiedId === inv.id ? i18n.t('home_invite_copied') : i18n.t('home_invite_copy_link') }}</button>
+              <button @click="deleteInvite(inv.id)" class="text-xs px-2 py-1 rounded border border-red-300 text-red-500 hover:bg-red-50">{{ i18n.t('home_invite_delete') }}</button>
+            </div>
+          </div>
+        </div>
+        <p v-else class="text-xs text-muted dark:text-gray-400 mt-3">{{ i18n.t('home_invite_no_items') }}</p>
       </section>
 
       <section v-if="recentReads.length > 0" class="mb-10">

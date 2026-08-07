@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.models import User, Source, SourceChange
-from app.schemas.user import UserOut
+from app.schemas.user import AdminUserOut, UserOut
 from app.schemas.admin import (
     AdminUserCreate,
     AutoSyncSettingsUpdate,
@@ -32,17 +32,22 @@ from app.services.account import (
     username_available,
 )
 from app.services.invite import generate_invite_code
+from app.services.invite import generate_nickname
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 
-@router.get("/users", response_model=list[UserOut])
+@router.get("/users", response_model=list[AdminUserOut])
 async def list_users(
     user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.scalars(select(User).order_by(User.created_at.desc()))
-    return list(result)
+    users = list(result)
+    if user.role != "super_admin":
+        for target in users:
+            target.invite_tag = None
+    return users
 
 
 @router.post("/users", response_model=UserOut, status_code=201)
@@ -73,6 +78,7 @@ async def create_user(
         role=payload.role,
         approved=True,
         invite_code=generate_invite_code(),
+        nickname=generate_nickname(),
         r18_enabled=False,
         non_r18_enabled=True,
         can_manage_visibility=False,
