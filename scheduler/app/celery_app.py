@@ -35,12 +35,13 @@ app.conf.update(
         "tasks.daily_sync_all": {"queue": "scheduler"},
         "tasks.sync_single_source": {"queue": "scheduler"},
         "tasks.resync_all_books": {"queue": "scheduler"},
+        "tasks.auto_sync_check": {"queue": "scheduler"},
         "tasks.crawl_all_source": {"queue": "crawl"},
     },
     beat_schedule={
-        "daily-sync-all-sources": {
-            "task": "tasks.daily_sync_all",
-            "schedule": crontab(hour=3, minute=0),
+        "auto-sync-check": {
+            "task": "tasks.auto_sync_check",
+            "schedule": crontab(minute="*"),
         },
         "cookie-health-check": {
             "task": "tasks.check_cookie_health",

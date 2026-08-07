@@ -10,6 +10,7 @@ from app.models import User, Source, SourceChange
 from app.schemas.user import UserOut
 from app.schemas.admin import (
     AdminUserCreate,
+    AutoSyncSettingsUpdate,
     RegistrationApprovalUpdate,
     UserContentVisibilityUpdate,
     UserPasswordUpdate,
@@ -20,7 +21,9 @@ from app.services.auth import get_current_user, require_admin, require_super_adm
 from app.services.proxy_config import get_proxy_config, ProxyConfig, set_proxy_config
 from app.services.security import hash_password
 from app.services.settings import (
+    get_auto_sync_settings,
     get_registration_approval_enabled,
+    set_auto_sync_settings,
     set_registration_approval_enabled,
 )
 from app.services.account import (
@@ -102,6 +105,30 @@ async def update_registration_approval(
             payload.enabled,
         ),
     }
+
+
+@router.get("/settings/auto-sync")
+async def get_auto_sync(
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    return await get_auto_sync_settings(db)
+
+
+@router.put("/settings/auto-sync")
+async def update_auto_sync(
+    payload: AutoSyncSettingsUpdate,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        return await set_auto_sync_settings(
+            db,
+            payload.enabled,
+            payload.time,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.delete("/users/{user_id}", status_code=200)

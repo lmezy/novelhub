@@ -11,6 +11,15 @@ class SourceCreate(BaseModel):
     config: dict | None = None
 
 
+class SourceUpdate(BaseModel):
+    name: str | None = None
+    url: str | None = None
+    plugin_name: str | None = None
+    enabled: bool | None = None
+    is_r18: bool | None = None
+    config: dict | None = None
+
+
 class SourceOut(BaseModel):
     id: str
     name: str

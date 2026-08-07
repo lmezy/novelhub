@@ -1,3 +1,5 @@
+import re
+
 from pydantic import BaseModel, EmailStr, field_validator
 
 from app.services.validation import password_error, username_error
@@ -54,3 +56,15 @@ class UserPasswordUpdate(BaseModel):
 
 class RegistrationApprovalUpdate(BaseModel):
     enabled: bool
+
+
+class AutoSyncSettingsUpdate(BaseModel):
+    enabled: bool
+    time: str = "03:00"
+
+    @field_validator("time")
+    @classmethod
+    def _validate_time(cls, value: str) -> str:
+        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", value):
+            raise ValueError("time must be in HH:MM format")
+        return value

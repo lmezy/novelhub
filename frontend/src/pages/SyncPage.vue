@@ -15,8 +15,14 @@ const selectedSourceIds = ref<string[]>([])
 const starting = ref(false)
 const loadingTasks = ref(false)
 const pageError = ref("")
+const autoSyncEnabled = ref(false)
+const autoSyncTime = ref("03:00")
+const autoSyncSaving = ref(false)
+const autoSyncSaved = ref(false)
+const autoSyncError = ref("")
 
 const activeTask = computed(() => crawlStore.activeTask)
+const enabledSources = computed(() => sources.value.filter((s: any) => s.enabled))
 
 const activeProgress = computed(() => {
   const task = activeTask.value
@@ -80,6 +86,50 @@ async function selectTask(task: any) {
   await crawlStore.setTask(task)
 }
 
+function selectAllSources() {
+  selectedSourceIds.value = enabledSources.value.map((s: any) => s.id)
+}
+
+function invertSources() {
+  const selected = new Set(selectedSourceIds.value)
+  selectedSourceIds.value = enabledSources.value
+    .filter((s: any) => !selected.has(s.id))
+    .map((s: any) => s.id)
+}
+
+function clearSources() {
+  selectedSourceIds.value = []
+}
+
+async function loadAutoSyncSettings() {
+  try {
+    const res = await api.get<any>("/admin/settings/auto-sync")
+    autoSyncEnabled.value = res.enabled
+    autoSyncTime.value = res.time || "03:00"
+  } catch {
+    // Settings are admin-only; ignore for non-admin visitors.
+  }
+}
+
+async function saveAutoSyncSettings() {
+  autoSyncSaving.value = true
+  autoSyncError.value = ""
+  autoSyncSaved.value = false
+  try {
+    const res = await api.put<any>("/admin/settings/auto-sync", {
+      enabled: autoSyncEnabled.value,
+      time: autoSyncTime.value,
+    })
+    autoSyncEnabled.value = res.enabled
+    autoSyncTime.value = res.time
+    autoSyncSaved.value = true
+  } catch (e) {
+    autoSyncError.value = e instanceof Error ? e.message : i18n.t('sync_auto_save_failed')
+  } finally {
+    autoSyncSaving.value = false
+  }
+}
+
 async function startCrawl() {
   pageError.value = ""
   if (selectedSourceIds.value.length === 0) {
@@ -90,6 +140,7 @@ async function startCrawl() {
   try {
     const created: any[] = []
     for (const id of selectedSourceIds.value) {
+      if (!enabledSources.value.some((s: any) => s.id === id)) continue
       const task = await api.post<any>("/crawl/tasks", {
         source: id,
         max_pages: 0,
@@ -145,6 +196,7 @@ async function cancelTask() {
 
 onMounted(async () => {
   await loadSources()
+  await loadAutoSyncSettings()
   await loadTasks()
   if (crawlStore.activeTask?.id && !terminal.includes(crawlStore.activeTask.status)) {
     crawlStore.startPolling(crawlStore.activeTask.id)
@@ -173,18 +225,59 @@ onMounted(async () => {
 
       <section v-if="auth.isAdmin" class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 mb-6">
         <h2 class="text-sm font-semibold mb-3">{{ i18n.t('sync_start_full') }}</h2>
-        <div class="flex flex-col sm:flex-row gap-3">
-          <select
-            v-model="selectedSourceIds"
-            multiple
-            size="6"
-            class="flex-1 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
+
+        <div class="flex flex-wrap items-center gap-2 mb-3 text-xs">
+          <button @click="selectAllSources" class="px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5">{{ i18n.t('sync_select_all') }}</button>
+          <button @click="invertSources" class="px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5">{{ i18n.t('sync_select_invert') }}</button>
+          <button @click="clearSources" class="px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5">{{ i18n.t('sync_select_none') }}</button>
+          <span class="text-muted dark:text-gray-400">{{ i18n.t('sync_selected_count', { n: selectedSourceIds.length }) }} / {{ enabledSources.length }}</span>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 max-h-64 overflow-y-auto mb-4">
+          <label
+            v-for="s in enabledSources"
+            :key="s.id"
+            class="flex items-start gap-2 px-3 py-2 rounded border border-border dark:border-gray-700 bg-paper dark:bg-gray-800 cursor-pointer hover:bg-accent/5"
           >
-            <option v-for="s in sources" :key="s.id" :value="s.id">{{ s.name }} ({{ s.id }})</option>
-          </select>
+            <input type="checkbox" :value="s.id" v-model="selectedSourceIds" class="mt-0.5 rounded" />
+            <span class="min-w-0">
+              <span class="block text-sm font-medium truncate">{{ s.name }}</span>
+              <span class="block text-xs text-muted dark:text-gray-400 truncate">{{ s.id }}</span>
+            </span>
+          </label>
+          <p v-if="enabledSources.length === 0" class="col-span-full text-sm text-muted dark:text-gray-400 py-4 text-center">{{ i18n.t('sync_no_sources') }}</p>
+        </div>
+
+        <div class="flex items-center gap-3">
           <button @click="startCrawl" :disabled="starting" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">
             {{ starting ? i18n.t('sync_starting') : i18n.t('sync_start') }}
           </button>
+        </div>
+
+        <div class="mt-5 pt-4 border-t border-border dark:border-gray-700">
+          <h3 class="text-sm font-semibold mb-3">{{ i18n.t('sync_auto_title') }}</h3>
+          <div class="flex flex-wrap items-center gap-3">
+            <label class="inline-flex items-center gap-2 text-sm cursor-pointer">
+              <input type="checkbox" v-model="autoSyncEnabled" class="rounded" />
+              {{ i18n.t('sync_auto_enable') }}
+            </label>
+            <label class="inline-flex items-center gap-2 text-sm">
+              <span class="text-muted dark:text-gray-400">{{ i18n.t('sync_auto_time') }}</span>
+              <input
+                type="time"
+                v-model="autoSyncTime"
+                class="px-2 py-1.5 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
+              />
+            </label>
+            <button
+              @click="saveAutoSyncSettings"
+              :disabled="autoSyncSaving"
+              class="px-3 py-1.5 rounded bg-accent text-white text-xs font-medium hover:opacity-90 disabled:opacity-50"
+            >{{ autoSyncSaving ? i18n.t('sync_auto_saving') : i18n.t('sync_auto_save') }}</button>
+          </div>
+          <p v-if="autoSyncError" class="text-xs text-red-600 mt-2">{{ autoSyncError }}</p>
+          <p v-else-if="autoSyncSaved" class="text-xs text-green-600 mt-2">{{ i18n.t('sync_auto_saved') }}</p>
+          <p class="text-xs text-muted dark:text-gray-400 mt-2">{{ i18n.t('sync_auto_hint') }}</p>
         </div>
       </section>
 

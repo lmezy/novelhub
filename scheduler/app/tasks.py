@@ -7,7 +7,7 @@ resync_all_books    -- resync every book already in the library
 
 import asyncio
 from uuid import uuid4
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from celery_app import app
 from loguru import logger
@@ -49,6 +49,56 @@ def crawl_all_source(source_id: str, max_pages: int = 0, task_id: str | None = N
     return asyncio.get_event_loop().run_until_complete(
         _crawl_all_source_async(source_id, max_pages, task_id)
     )
+
+
+@app.task(name="tasks.auto_sync_check")
+def auto_sync_check() -> dict:
+    """Check app settings and enqueue configured automatic sync tasks."""
+    return asyncio.get_event_loop().run_until_complete(_auto_sync_check_async())
+
+
+async def _auto_sync_check_async() -> dict:
+    from app.core.database import SessionLocal
+    from app.models import CrawlTask, Source
+    from app.services.settings import (
+        get_auto_sync_last_run,
+        get_auto_sync_settings,
+        set_auto_sync_last_run,
+    )
+    from sqlalchemy import select
+
+    async with SessionLocal() as db:
+        auto_settings = await get_auto_sync_settings(db)
+        if not auto_settings["enabled"]:
+            return {"enabled": False}
+
+        now = datetime.now(timezone(timedelta(hours=8)))
+        if now.strftime("%H:%M") != auto_settings["time"]:
+            return {"enabled": True, "due": False}
+
+        today = now.strftime("%Y-%m-%d")
+        if await get_auto_sync_last_run(db) == today:
+            return {"enabled": True, "due": True, "already_run": True}
+
+        rows = await db.scalars(
+            select(Source).where(Source.enabled == True)
+        )
+        source_ids = list(rows.all())
+        for source_id in source_ids:
+            db.add(CrawlTask(
+                id=str(uuid4()),
+                source=source_id,
+                mode="discover_all",
+                max_pages=0,
+                status="pending",
+            ))
+        await set_auto_sync_last_run(db, today)
+        return {
+            "enabled": True,
+            "due": True,
+            "sources": len(source_ids),
+            "tasks_created": len(source_ids),
+        }
 
 
 async def _check_cookie_health_async() -> dict:
