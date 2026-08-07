@@ -12,12 +12,11 @@ from app.core.database import get_db
 from app.models import Source, Cookie
 from app.models.source_credential import SourceCredential
 from app.services.cookie_crypto import encrypt_cookie, decrypt_cookie
-from app.services.auth import require_admin
+from app.services.auth import get_current_user
 
 router = APIRouter(
     prefix="/credentials",
     tags=["credentials"],
-    dependencies=[Depends(require_admin)],
 )
 
 
@@ -38,14 +37,37 @@ class CredentialOut(BaseModel):
         from_attributes = True
 
 
+def _can_access_source(user, source: Source) -> bool:
+    if user.role in ("admin", "super_admin"):
+        return True
+    return source.owner_id is not None and source.owner_id == user.id
+
+
 @router.get("", response_model=list[CredentialOut])
-async def list_credentials(db: AsyncSession = Depends(get_db)):
-    result = await db.scalars(select(SourceCredential))
+async def list_credentials(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    query = select(SourceCredential)
+    if user.role not in ("admin", "super_admin"):
+        query = (
+            select(SourceCredential)
+            .join(Source, Source.id == SourceCredential.source)
+            .where(Source.owner_id == user.id)
+        )
+    result = await db.scalars(query)
     return list(result)
 
 
 @router.post("", response_model=CredentialOut, status_code=201)
-async def create_credential(payload: CredentialCreate, db: AsyncSession = Depends(get_db)):
+async def create_credential(
+    payload: CredentialCreate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    source = await db.get(Source, payload.source)
+    if source is None or not _can_access_source(user, source):
+        raise HTTPException(status_code=404, detail="Source not found")
     existing = await db.scalar(
         select(SourceCredential).where(SourceCredential.source == payload.source)
     )
@@ -65,16 +87,27 @@ async def create_credential(payload: CredentialCreate, db: AsyncSession = Depend
 
 
 @router.delete("/{cred_id}", status_code=204)
-async def delete_credential(cred_id: str, db: AsyncSession = Depends(get_db)):
+async def delete_credential(
+    cred_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     cred = await db.get(SourceCredential, cred_id)
     if cred is None:
+        raise HTTPException(status_code=404, detail="Credential not found")
+    source = await db.get(Source, cred.source)
+    if source is None or not _can_access_source(user, source):
         raise HTTPException(status_code=404, detail="Credential not found")
     await db.delete(cred)
     await db.commit()
 
 
 @router.post("/{cred_id}/auto-login")
-async def trigger_auto_login(cred_id: str, db: AsyncSession = Depends(get_db)):
+async def trigger_auto_login(
+    cred_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """Attempt auto-login using stored credentials and auto-save the resulting cookie."""
     cred = await db.get(SourceCredential, cred_id)
     if cred is None:
@@ -86,6 +119,8 @@ async def trigger_auto_login(cred_id: str, db: AsyncSession = Depends(get_db)):
     source = await db.get(Source, cred.source)
     if source is None:
         raise HTTPException(status_code=404, detail=f"Source not found: {cred.source}")
+    if not _can_access_source(user, source):
+        raise HTTPException(status_code=404, detail="Credential not found")
     config = source.config if source.plugin_name == "yuedu" and source.config else None
 
     try:

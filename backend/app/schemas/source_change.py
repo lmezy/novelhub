@@ -11,6 +11,7 @@ class SourceChangeCreate(BaseModel):
 class SourceChangeOut(BaseModel):
     id: str
     user_id: str
+    submitter_username: str | None = None
     action: str
     source_id: str | None = None
     source_data: dict | None = None

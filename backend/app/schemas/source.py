@@ -30,6 +30,9 @@ class SourceOut(BaseModel):
     is_r18: bool = False
     config: dict | None = None
     owner_id: str | None = None
+    submitter_id: str | None = None
+    submitter_username: str | None = None
+    show_contributor: bool = True
 
     class Config:
         from_attributes = True

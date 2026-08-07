@@ -44,6 +44,8 @@ async def list_progress(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    if user.role not in ("admin", "super_admin") and user_id != user.id:
+        return []
     query = (
         select(ReadingProgress)
         .join(Book, Book.id == ReadingProgress.book_id)
@@ -51,6 +53,12 @@ async def list_progress(
         .order_by(ReadingProgress.updated_at.desc())
         .limit(20)
     )
+    if user.role not in ("admin", "super_admin"):
+        query = query.where(or_(
+            Book.owner_id.is_(None),
+            Book.owner_id == user.id,
+            Book.is_public == True,
+        ))
     conditions = []
     if can_view_all_ages(user):
         conditions.append(Book.is_r18 == False)

@@ -3,6 +3,7 @@
 from sqlalchemy import Column, DateTime, ForeignKey, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import func
+from sqlalchemy.orm import relationship
 
 from .base import Base
 
@@ -20,3 +21,9 @@ class SourceChange(Base):
     review_note = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     reviewed_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", lazy="joined", foreign_keys=[user_id])
+
+    @property
+    def submitter_username(self) -> str | None:
+        return self.user.username if self.user else None

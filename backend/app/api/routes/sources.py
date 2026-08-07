@@ -1,5 +1,5 @@
 ﻿from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import and_, delete, or_, select, update
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -26,7 +26,7 @@ router = APIRouter(prefix="/sources", tags=["sources"])
 def _can_view_source(user: User, source: Source) -> bool:
     if user.role in ("admin", "super_admin"):
         return True
-    return source.owner_id is not None and source.owner_id == user.id
+    return source.owner_id is None or source.owner_id == user.id
 
 
 def _can_edit_source(user: User, source: Source) -> bool:
@@ -38,16 +38,27 @@ def _can_edit_source(user: User, source: Source) -> bool:
 @router.get("", response_model=list[SourceOut])
 async def list_sources(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     query = select(Source).order_by(Source.name.asc())
-    conditions = []
     if user.role not in ("admin", "super_admin"):
-        conditions.append(Source.owner_id == user.id)
+        query = query.where(
+            or_(Source.owner_id.is_(None), Source.owner_id == user.id)
+        )
+    conditions = []
     if can_view_all_ages(user):
         conditions.append(Source.is_r18 == False)
     if can_view_r18(user):
         conditions.append(Source.is_r18 == True)
-    query = query.where(and_(*conditions)) if conditions else query.where(Source.id == "__none__")
+    query = query.where(or_(*conditions)) if conditions else query.where(Source.id == "__none__")
     result = await db.scalars(query)
-    return list(result)
+    sources = list(result)
+    if user.role not in ("admin", "super_admin"):
+        serialized = []
+        for source in sources:
+            out = SourceOut.model_validate(source)
+            if not source.show_contributor:
+                out.submitter_username = None
+            serialized.append(out)
+        return serialized
+    return sources
 
 
 @router.post("", response_model=SourceOut, status_code=201)
@@ -73,7 +84,7 @@ async def create_source(
     return source
 
 
-@router.put("/{source_id}", response_model=SourceOut, dependencies=[Depends(require_admin)])
+@router.put("/{source_id}", response_model=SourceOut)
 async def update_source(
     source_id: str,
     payload: SourceUpdate,

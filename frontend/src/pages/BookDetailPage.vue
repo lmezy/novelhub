@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue"
+import { computed, onMounted, ref } from "vue"
 import { useRoute, useRouter } from "vue-router"
 import { useBooksStore, type Book, type Chapter, type CustomTagOnBook, type ShelfGroup } from "../stores/books"
 import { useAuthStore } from "../stores/auth"
@@ -40,6 +40,51 @@ const selectedCategoryIds = ref<string[]>([])
 const categorySaving = ref(false)
 const autoCategorizing = ref(false)
 const categoryError = ref("")
+const publishing = ref(false)
+
+const canPublish = computed(() =>
+  auth.isAdmin || book.value?.owner_id === auth.user?.id
+)
+
+async function publishBook() {
+  if (!book.value || !confirm(i18n.t('book_publish_confirm'))) return
+  publishing.value = true
+  try {
+    const res = await api.post<Book>(`/books/${book.value.id}/publish`, {
+      confirm_all_ages: true,
+    })
+    book.value = {
+      ...book.value,
+      owner_id: res.owner_id,
+      is_public: res.is_public,
+      all_ages_confirmed: res.all_ages_confirmed,
+    }
+    alert(i18n.t('book_publish_done'))
+  } catch (e) {
+    alert(e instanceof Error ? e.message : i18n.t('book_publish_failed'))
+  } finally {
+    publishing.value = false
+  }
+}
+
+async function unpublishBook() {
+  if (!book.value || !confirm(i18n.t('book_unpublish_confirm'))) return
+  publishing.value = true
+  try {
+    const res = await api.delete<Book>(`/books/${book.value.id}/publish`)
+    book.value = {
+      ...book.value,
+      owner_id: res.owner_id,
+      is_public: res.is_public,
+      all_ages_confirmed: res.all_ages_confirmed,
+    }
+    alert(i18n.t('book_unpublish_done'))
+  } catch (e) {
+    alert(e instanceof Error ? e.message : i18n.t('book_unpublish_failed'))
+  } finally {
+    publishing.value = false
+  }
+}
 
 function goBack() {
   const back = (window.history.state as { back?: string | null } | null)?.back
@@ -388,6 +433,22 @@ onMounted(async () => {
             </div>
           </div>
           <div class="flex items-center gap-2 mt-4">
+            <button
+              v-if="canPublish && !book.is_public"
+              @click="publishBook"
+              :disabled="publishing"
+              class="px-3 py-1 text-xs border border-green-600 text-green-700 dark:text-green-400 rounded hover:bg-green-50 dark:hover:bg-green-950 disabled:opacity-50"
+            >{{ i18n.t('book_publish') }}</button>
+            <button
+              v-if="canPublish && book.is_public"
+              @click="unpublishBook"
+              :disabled="publishing"
+              class="px-3 py-1 text-xs border border-border dark:border-gray-700 rounded hover:bg-accent/5 disabled:opacity-50"
+            >{{ i18n.t('book_unpublish') }}</button>
+            <span
+              v-if="book.is_public && book.all_ages_confirmed"
+              class="text-xs px-2 py-0.5 rounded-full bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300"
+            >{{ i18n.t('book_all_ages_confirmed') }}</span>
             <button
               @click="toggleFavorite"
               class="px-3 py-1 text-xs border border-border dark:border-gray-700 rounded hover:bg-accent/5 transition-colors"

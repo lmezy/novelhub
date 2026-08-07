@@ -52,6 +52,10 @@ class SetBookCoverRequest(BaseModel):
     cover: str | None = None
 
 
+class PublishBookRequest(BaseModel):
+    confirm_all_ages: bool = False
+
+
 def _normalize_book_title(title: str) -> str:
     return re.sub(
         r"[\s《》「」『』〈〉（）【】\[\]\"'“”‘’]+",
@@ -97,6 +101,13 @@ def _serialize_book(
         description=book.description,
         status=book.status,
         is_r18=book.is_r18 if is_admin else False,
+        owner_id=(
+            book.owner_id
+            if is_admin or book.owner_id == user.id
+            else None
+        ),
+        is_public=book.is_public,
+        all_ages_confirmed=book.all_ages_confirmed,
         is_favorite=is_favorite,
         created_at=book.created_at,
         updated_at=book.updated_at,
@@ -111,6 +122,12 @@ def _serialize_book(
 @router.get("", response_model=list[BookOut])
 async def list_books(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     query = select(Book).options(selectinload(Book.tags)).order_by(Book.updated_at.desc())
+    if user.role not in ("admin", "super_admin"):
+        query = query.where(or_(
+            Book.owner_id.is_(None),
+            Book.owner_id == user.id,
+            Book.is_public == True,
+        ))
     conditions = []
     if can_view_all_ages(user):
         conditions.append(Book.is_r18 == False)
@@ -250,6 +267,12 @@ async def list_favorite_books(
             BookFavoriteGroup,
             BookFavoriteGroup.favorite_id == BookFavorite.id,
         ).where(BookFavoriteGroup.group_id == group_id)
+    if user.role not in ("admin", "super_admin"):
+        query = query.where(or_(
+            Book.owner_id.is_(None),
+            Book.owner_id == user.id,
+            Book.is_public == True,
+        ))
     conditions = []
     if can_view_all_ages(user):
         conditions.append(Book.is_r18 == False)
@@ -333,6 +356,95 @@ async def set_book_cover(
         "cover": _book_cover_value(book),
         "display_cover": book.display_cover,
     }
+
+
+@router.post("/{book_id}/publish", response_model=BookOut)
+async def publish_book(
+    book_id: str,
+    payload: PublishBookRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    book = await db.get(Book, book_id)
+    if not ensure_book_visible(user, book):
+        raise HTTPException(status_code=404, detail="Book not found")
+    if user.role not in ("admin", "super_admin") and book.owner_id != user.id:
+        raise HTTPException(status_code=403, detail="Cannot publish this book")
+    if book.is_r18:
+        raise HTTPException(status_code=400, detail="R18 books cannot be published as all-ages")
+    if not payload.confirm_all_ages:
+        raise HTTPException(status_code=400, detail="All-ages confirmation is required")
+
+    from app.repositories.tag import TagRepository
+
+    book.is_public = True
+    book.all_ages_confirmed = True
+    tag = await TagRepository(db).get_or_create("all-ages")
+    existing_tag = await db.scalar(
+        select(BookTag).where(
+            BookTag.book_id == book.id,
+            BookTag.tag_id == tag.id,
+        )
+    )
+    if existing_tag is None:
+        db.add(BookTag(book_id=book.id, tag_id=tag.id))
+    await db.commit()
+    book = await db.scalar(
+        select(Book)
+        .options(selectinload(Book.tags), selectinload(Book.categories))
+        .where(Book.id == book.id)
+    )
+    if book is None:
+        raise HTTPException(status_code=404, detail="Book not found")
+    search_service.update_book_tags(book.id, list(book.tag_names))
+    favorite = await db.scalar(
+        select(BookFavorite).where(
+            BookFavorite.user_id == user.id,
+            BookFavorite.book_id == book.id,
+        )
+    )
+    return _serialize_book(book, user, favorite is not None)
+
+
+@router.delete("/{book_id}/publish", response_model=BookOut)
+async def unpublish_book(
+    book_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    book = await db.get(Book, book_id)
+    if not ensure_book_visible(user, book):
+        raise HTTPException(status_code=404, detail="Book not found")
+    if user.role not in ("admin", "super_admin") and book.owner_id != user.id:
+        raise HTTPException(status_code=403, detail="Cannot unpublish this book")
+
+    from app.repositories.tag import TagRepository
+
+    book.is_public = False
+    book.all_ages_confirmed = False
+    tag = await TagRepository(db).get_or_create("all-ages")
+    await db.execute(
+        delete(BookTag).where(
+            BookTag.book_id == book.id,
+            BookTag.tag_id == tag.id,
+        )
+    )
+    await db.commit()
+    book = await db.scalar(
+        select(Book)
+        .options(selectinload(Book.tags), selectinload(Book.categories))
+        .where(Book.id == book.id)
+    )
+    if book is None:
+        raise HTTPException(status_code=404, detail="Book not found")
+    search_service.update_book_tags(book.id, list(book.tag_names))
+    favorite = await db.scalar(
+        select(BookFavorite).where(
+            BookFavorite.user_id == user.id,
+            BookFavorite.book_id == book.id,
+        )
+    )
+    return _serialize_book(book, user, favorite is not None)
 
 
 @router.delete("/{book_id}/tags", status_code=204, dependencies=[Depends(require_admin)])
@@ -447,6 +559,12 @@ async def list_book_sources(
         raise HTTPException(status_code=404, detail="Book not found")
 
     query = select(Book).options(selectinload(Book.author)).where(Book.id != book_id)
+    if user.role not in ("admin", "super_admin"):
+        query = query.where(or_(
+            Book.owner_id.is_(None),
+            Book.owner_id == user.id,
+            Book.is_public == True,
+        ))
     conditions = []
     if can_view_all_ages(user):
         conditions.append(Book.is_r18 == False)

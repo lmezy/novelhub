@@ -1,5 +1,6 @@
 from sqlalchemy import Column, String, Boolean, ForeignKey, Index
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import relationship
 
 from .base import Base
 
@@ -48,6 +49,24 @@ class Source(Base):
         nullable=True
     )
 
+    submitter_id = Column(
+        String,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    show_contributor = Column(
+        Boolean,
+        default=True,
+        nullable=False,
+    )
+
     __table_args__ = (
         Index("ix_sources_owner_id", "owner_id"),
     )
+
+    submitter = relationship("User", lazy="joined", foreign_keys=[submitter_id])
+
+    @property
+    def submitter_username(self) -> str | None:
+        return self.submitter.username if self.submitter else None

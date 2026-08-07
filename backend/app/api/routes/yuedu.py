@@ -11,6 +11,7 @@ import json
 import re
 from typing import Any
 from urllib.parse import parse_qs, unquote, urljoin, urlsplit
+from uuid import uuid4
 
 from bs4 import BeautifulSoup
 
@@ -22,7 +23,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.models import CrawlTask, Source, User
+from app.models import CrawlTask, Source, SourceChange, User
 from app.services.auth import get_current_user
 from app.services.proxy_config import get_proxy_config
 from app.services.task_queue import enqueue_crawl_all
@@ -753,6 +754,7 @@ class YueduImportRequest(BaseModel):
     json_text: str | None = None
     is_r18: bool = False
     scope: str = "personal"
+    show_contributor: bool = True
 
 
 class YueduImportResult(BaseModel):
@@ -761,6 +763,73 @@ class YueduImportResult(BaseModel):
     skipped: int
     updated: int = 0
     sources: list[dict[str, Any]]
+    status: str = "imported"
+    approval_ids: list[str] = []
+
+
+async def _submit_global_approvals(
+    user: User,
+    db: AsyncSession,
+    sources_json: list[dict[str, Any]],
+    is_r18: bool,
+    show_contributor: bool,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Create pending SourceChange rows for a non-admin global source submit."""
+    results: list[dict[str, Any]] = []
+    approval_ids: list[str] = []
+    for src in sources_json:
+        name = src.get("bookSourceName", "Unknown")
+        base_url = src.get("bookSourceUrl", "")
+        source_id = _make_source_id(name, base_url, None)
+        existing = await db.get(Source, source_id)
+        if existing:
+            results.append({"id": source_id, "name": name, "status": "skipped"})
+            continue
+        existing_change = await db.scalar(
+            select(SourceChange).where(
+                SourceChange.source_id == source_id,
+                SourceChange.status == "pending",
+            )
+        )
+        if existing_change:
+            results.append({
+                "id": source_id,
+                "name": name,
+                "status": "pending",
+                "approval_id": existing_change.id,
+            })
+            approval_ids.append(existing_change.id)
+            continue
+        change = SourceChange(
+            id=str(uuid4()),
+            user_id=user.id,
+            action="create",
+            source_id=source_id,
+            source_data={
+                "id": source_id,
+                "name": name,
+                "url": base_url,
+                "plugin_name": "yuedu",
+                "enabled": True,
+                "is_r18": is_r18,
+                "config": src,
+                "owner_id": None,
+                "submitter_id": user.id,
+                "show_contributor": show_contributor,
+            },
+            status="pending",
+        )
+        db.add(change)
+        await db.flush()
+        results.append({
+            "id": source_id,
+            "name": name,
+            "status": "pending",
+            "approval_id": change.id,
+        })
+        approval_ids.append(change.id)
+    await db.commit()
+    return results, approval_ids
 
 
 @router.post("/import", response_model=YueduImportResult)
@@ -771,8 +840,7 @@ async def import_yuedu_sources(
 ):
     """Import YueDu book sources from a URL or raw JSON text."""
     scope = payload.scope or "personal"
-    if scope == "global" and user.role not in ("admin", "super_admin"):
-        raise HTTPException(status_code=403, detail="Only admins can import global sources")
+    is_admin = user.role in ("admin", "super_admin")
     owner_id = None if scope == "global" else user.id
     sources_json: list[dict[str, Any]] = []
 
@@ -803,6 +871,24 @@ async def import_yuedu_sources(
         raise HTTPException(status_code=400, detail="No valid book sources found in the input")
 
     total = len(sources_json)
+    if scope == "global" and not is_admin:
+        results, approval_ids = await _submit_global_approvals(
+            user,
+            db,
+            sources_json,
+            payload.is_r18,
+            payload.show_contributor,
+        )
+        return YueduImportResult(
+            total=total,
+            imported=len(approval_ids),
+            skipped=sum(1 for item in results if item["status"] == "skipped"),
+            updated=0,
+            sources=results,
+            status="pending_approval",
+            approval_ids=approval_ids,
+        )
+
     imported = 0
     updated = 0
     skipped = 0
@@ -823,6 +909,8 @@ async def import_yuedu_sources(
                 existing.config = src
                 existing.is_r18 = payload.is_r18
                 existing.owner_id = owner_id
+                if existing.submitter_id is None:
+                    existing.submitter_id = user.id
                 db.add(existing)
                 updated += 1
                 results.append({"id": source_id, "name": name, "status": "updated"})
@@ -840,6 +928,8 @@ async def import_yuedu_sources(
             is_r18=payload.is_r18,
             config=src,
             owner_id=owner_id,
+            submitter_id=user.id if scope == "global" else None,
+            show_contributor=payload.show_contributor if scope == "global" else True,
         )
         db.add(source)
         imported += 1
@@ -866,6 +956,7 @@ class YueduImportSyncRequest(BaseModel):
     discover: bool = True
     max_discover_pages: int = 3
     scope: str = "personal"
+    show_contributor: bool = True
 
 
 class YueduImportSyncResult(BaseModel):
@@ -902,10 +993,13 @@ async def import_yuedu_sources_as_tasks(
             json_text=payload.json_text,
             is_r18=payload.is_r18,
             scope=payload.scope,
+            show_contributor=payload.show_contributor,
         ),
         user,
         db,
     )
+    if import_result.status == "pending_approval":
+        return YueduImportTaskResult(tasks=[])
 
     if payload.cookie and payload.cookie.strip():
         for src_info in import_result.sources:
@@ -982,10 +1076,23 @@ async def import_and_sync_all(
             json_text=payload.json_text,
             is_r18=payload.is_r18,
             scope=payload.scope,
+            show_contributor=payload.show_contributor,
         ),
         user,
         db,
     )
+    if import_result.status == "pending_approval":
+        return YueduImportSyncResult(
+            sources_total=import_result.total,
+            sources_imported=0,
+            sources_skipped=import_result.skipped,
+            sources_updated=0,
+            books_synced=0,
+            chapters_downloaded=0,
+            books_discovered=0,
+            errors=[{"source": "global", "stage": "approval", "error": "pending approval"}],
+            details=[],
+        )
 
     result = YueduImportSyncResult(
         sources_total=import_result.total,
@@ -1115,8 +1222,6 @@ async def preview_yuedu_sources(
 ):
     """Preview what sources a URL or JSON text would import without saving."""
     scope = payload.scope or "personal"
-    if scope == "global" and user.role not in ("admin", "super_admin"):
-        raise HTTPException(status_code=403, detail="Only admins can preview global sources")
     sources_json: list[dict[str, Any]] = []
 
     if payload.json_text:

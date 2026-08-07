@@ -81,7 +81,10 @@ async def _auto_sync_check_async() -> dict:
             return {"enabled": True, "due": True, "already_run": True}
 
         rows = await db.scalars(
-            select(Source).where(Source.enabled == True)
+            select(Source).where(
+                Source.enabled == True,
+                Source.owner_id.is_(None),
+            )
         )
         source_ids = list(rows.all())
         for source_id in source_ids:
@@ -182,7 +185,10 @@ async def _daily_sync_all_async() -> dict:
 
     async with SessionLocal() as db:
         sources = await db.scalars(
-            select(Source).where(Source.enabled == True)
+            select(Source).where(
+                Source.enabled == True,
+                Source.owner_id.is_(None),
+            )
         )
         source_list = list(sources)
         task_obj = CrawlTask(

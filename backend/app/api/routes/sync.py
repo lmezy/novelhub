@@ -3,7 +3,7 @@ from pathlib import Path
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.models import Source
+from app.models import Source, User
 from app.schemas.sync import (
     BookshelfSyncRequest,
     BookshelfSyncResult,
@@ -19,11 +19,17 @@ from app.schemas.sync import (
     SyncRequest,
     SyncResult,
 )
-from app.services.auth import require_admin
+from app.services.auth import get_current_user, require_admin
 from app.services.local_library import parse_local_book, scan_local_library
 from app.services.sync import SyncService
 
-router = APIRouter(prefix="/sync", tags=["sync"], dependencies=[Depends(require_admin)])
+router = APIRouter(prefix="/sync", tags=["sync"])
+
+
+def _can_access_source(user: User, source: Source) -> bool:
+    if user.role in ("admin", "super_admin"):
+        return True
+    return source.owner_id is not None and source.owner_id == user.id
 
 
 async def _ensure_local_source(db: AsyncSession) -> str:
@@ -45,7 +51,7 @@ def _to_file_url(path: str) -> str:
     return path if path.startswith("file://") else f"file://{path}"
 
 
-@router.post("/local", response_model=SyncResult)
+@router.post("/local", response_model=SyncResult, dependencies=[Depends(require_admin)])
 async def import_local_book(
     payload: LocalImportRequest,
     db: AsyncSession = Depends(get_db),
@@ -60,7 +66,7 @@ async def import_local_book(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.post("/local/scan", response_model=LocalScanResult)
+@router.post("/local/scan", response_model=LocalScanResult, dependencies=[Depends(require_admin)])
 async def scan_local_library_endpoint(payload: LocalScanRequest):
     try:
         books = scan_local_library(payload.path, max_depth=payload.max_depth)
@@ -69,7 +75,7 @@ async def scan_local_library_endpoint(payload: LocalScanRequest):
     return LocalScanResult(root=payload.path, books=books)
 
 
-@router.post("/local/direct", response_model=LocalDirectResult)
+@router.post("/local/direct", response_model=LocalDirectResult, dependencies=[Depends(require_admin)])
 async def direct_local_books(payload: LocalImportRequest):
     paths = payload.book_paths or [payload.path]
     if not paths or not paths[0].strip():
@@ -83,7 +89,7 @@ async def direct_local_books(payload: LocalImportRequest):
     return LocalDirectResult(books=books)
 
 
-@router.post("/local/content", response_model=LocalContentResult)
+@router.post("/local/content", response_model=LocalContentResult, dependencies=[Depends(require_admin)])
 async def read_local_content(payload: LocalContentRequest):
     path = Path(payload.path).expanduser().resolve()
     if not path.is_file() or path.suffix.lower() not in (".md", ".txt"):
@@ -98,7 +104,7 @@ async def read_local_content(payload: LocalContentRequest):
     return LocalContentResult(path=str(path), title=title, content=content)
 
 
-@router.post("/local/import", response_model=LocalImportResult)
+@router.post("/local/import", response_model=LocalImportResult, dependencies=[Depends(require_admin)])
 async def import_local_books(
     payload: LocalImportRequest,
     db: AsyncSession = Depends(get_db),
@@ -130,7 +136,14 @@ async def import_local_books(
 
 
 @router.post("/book", response_model=SyncResult)
-async def sync_book(payload: SyncRequest, db: AsyncSession = Depends(get_db)):
+async def sync_book(
+    payload: SyncRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    source = await db.get(Source, payload.source_id)
+    if source is None or not _can_access_source(user, source):
+        raise HTTPException(status_code=404, detail="Source not found")
     try:
         return await SyncService(db).sync_book(payload.source_id, payload.url)
     except ValueError as exc:
@@ -138,7 +151,14 @@ async def sync_book(payload: SyncRequest, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/bookshelf", response_model=BookshelfSyncResult)
-async def sync_bookshelf(payload: BookshelfSyncRequest, db: AsyncSession = Depends(get_db)):
+async def sync_bookshelf(
+    payload: BookshelfSyncRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    source = await db.get(Source, payload.source_id)
+    if source is None or not _can_access_source(user, source):
+        raise HTTPException(status_code=404, detail="Source not found")
     try:
         return await SyncService(db).sync_bookshelf(payload.source_id)
     except ValueError as exc:
@@ -146,7 +166,14 @@ async def sync_bookshelf(payload: BookshelfSyncRequest, db: AsyncSession = Depen
 
 
 @router.post("/discover", response_model=DiscoverResult)
-async def discover_and_sync(payload: DiscoverRequest, db: AsyncSession = Depends(get_db)):
+async def discover_and_sync(
+    payload: DiscoverRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    source = await db.get(Source, payload.source_id)
+    if source is None or not _can_access_source(user, source):
+        raise HTTPException(status_code=404, detail="Source not found")
     try:
         return await SyncService(db).discover_and_sync(
             source_id=payload.source_id,

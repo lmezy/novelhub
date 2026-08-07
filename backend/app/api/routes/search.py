@@ -1,6 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Literal
-from app.models import User
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.database import get_db
+from app.models import Book, User
 from app.services.auth import get_current_user
 from app.services.visibility import can_view_all_ages, can_view_r18
 from pydantic import BaseModel, Field
@@ -41,8 +45,48 @@ class AdvancedSearchRequest(BaseModel):
 router = APIRouter(prefix="/search", tags=["search"])
 
 
+async def _filter_visible_hits(
+    user: User,
+    db: AsyncSession,
+    hits: list[dict],
+) -> list[dict]:
+    if user.role in ("admin", "super_admin"):
+        return hits
+    book_ids = {
+        str(hit.get("book_id") or hit.get("id") or "")
+        for hit in hits
+    }
+    book_ids.discard("")
+    if not book_ids:
+        return []
+    rows = await db.execute(
+        select(Book.id, Book.owner_id, Book.is_public).where(Book.id.in_(book_ids))
+    )
+    visibility_map = {
+        str(book_id): (owner_id, is_public)
+        for book_id, owner_id, is_public in rows.all()
+    }
+    return [
+        hit
+        for hit in hits
+        if _is_visible_book(
+            visibility_map.get(str(hit.get("book_id") or hit.get("id") or "")),
+            user.id,
+        )
+    ]
+
+
+def _is_visible_book(meta: tuple[str | None, bool] | None, user_id: str) -> bool:
+    if meta is None:
+        return False
+    owner_id, is_public = meta
+    return owner_id is None or owner_id == user_id or is_public
+
+
 @router.get("", response_model=SearchResult)
-async def search(user: User = Depends(get_current_user),
+async def search(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
     q: str = Query(default="", description="Search query"),
     scope: str = Query("books", pattern="^(books|chapters)$"),
     tag: str | None = Query(default=None, description="Book tag name"),
@@ -70,9 +114,10 @@ async def search(user: User = Depends(get_current_user),
             tag=tag,
         )
 
+    hits = await _filter_visible_hits(user, db, result["hits"])
     return SearchResult(
-        hits=result["hits"],
-        total=result.get("estimatedTotalHits", 0),
+        hits=hits,
+        total=len(hits),
         offset=result.get("offset", offset),
         limit=result.get("limit", limit),
     )
@@ -82,6 +127,7 @@ async def search(user: User = Depends(get_current_user),
 async def advanced_search(
     payload: AdvancedSearchRequest,
     user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     allow_r18 = can_view_r18(user)
     allow_all_ages = can_view_all_ages(user)
@@ -95,6 +141,8 @@ async def advanced_search(
         allow_r18=allow_r18,
         allow_all_ages=allow_all_ages,
     )
+    result["hits"] = await _filter_visible_hits(user, db, result["hits"])
+    result["total"] = len(result["hits"])
     return SearchResult(**result)
 
 

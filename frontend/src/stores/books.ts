@@ -12,6 +12,9 @@ export interface Book {
   cover: string | null
   status: string | null
   is_favorite?: boolean
+  owner_id?: string | null
+  is_public?: boolean
+  all_ages_confirmed?: boolean
   created_at: string
   updated_at: string
   tag_names: string[]

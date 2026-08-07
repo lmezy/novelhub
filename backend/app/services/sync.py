@@ -14,7 +14,18 @@ from app.crawler.registry import get_plugin
 from app.core.config import settings, sync_thread_count
 from app.core.database import SessionLocal
 from app.core.events import emit, EventType
-from app.models import Author, Book, BookTag, Chapter, Cookie, Source, Tag
+from app.models import (
+    Author,
+    Book,
+    BookFavorite,
+    BookTag,
+    Chapter,
+    Cookie,
+    Source,
+    SourceChange,
+    Tag,
+    User,
+)
 from app.repositories.tag import TagRepository
 from app.services.storage import BookStorage
 from app.services.search import search_service
@@ -154,6 +165,98 @@ class SyncService:
             if self._normalize_title_for_match(b.title) == normalized
         ]
 
+    async def _handle_global_r18_conflicts(self, book: Book) -> None:
+        """Mark same-title global books as R18 and queue admin confirmation."""
+        same = await self._find_same_title_books(book)
+        ids = {b.id for b in same}
+        ids.add(book.id)
+        books = [
+            b
+            for b in (
+            (await self.db.scalars(
+                select(Book)
+                .options(selectinload(Book.tags), selectinload(Book.categories))
+                .where(Book.id.in_(ids))
+            )).all()
+            )
+            if b.owner_id is None
+        ]
+        has_r18 = any(b.is_r18 for b in books)
+        has_non_r18 = any(not b.is_r18 for b in books)
+        if not (has_r18 and has_non_r18):
+            return
+
+        original_r18 = {b.id: b.is_r18 for b in books}
+        changed = False
+        for b in books:
+            if not b.is_r18:
+                b.is_r18 = True
+                changed = True
+        if changed:
+            await self.db.commit()
+
+        pending = list(
+            (
+                await self.db.scalars(
+                    select(SourceChange).where(
+                        SourceChange.action == "confirm_r18",
+                    )
+                )
+            ).all()
+        )
+        for change in pending:
+            data = change.source_data or {}
+            if data.get("title") == book.title:
+                return
+            if set(data.get("book_ids") or []).intersection(ids):
+                return
+
+        submitter_id = None
+        if hasattr(book, "source_id"):
+            source = await self.db.get(Source, book.source_id)
+            if source is not None:
+                submitter_id = source.submitter_id
+        if not submitter_id:
+            submitter_id = await self.db.scalar(
+                select(User.id)
+                .where(User.role.in_(("admin", "super_admin")))
+                .limit(1)
+            )
+        if not submitter_id:
+            return
+
+        self.db.add(SourceChange(
+            id=str(uuid4()),
+            user_id=submitter_id,
+            action="confirm_r18",
+            source_id=book.source_id,
+            source_data={
+                "kind": "book_r18_conflict",
+                "title": book.title,
+                "book_ids": [b.id for b in books],
+                "original_r18": original_r18,
+            },
+            status="pending",
+        ))
+        await self.db.commit()
+
+        for b in books:
+            try:
+                search_service.index_book({
+                    "id": b.id,
+                    "title": b.title,
+                    "author": b.author_name or "",
+                    "description": b.description or "",
+                    "status": b.status or "",
+                    "source_id": b.source_id or "",
+                    "author_id": b.author_id or "",
+                    "is_r18": b.is_r18,
+                    "tags": list(b.tag_names),
+                    "category_names": list(b.category_names),
+                })
+            except Exception:
+                continue
+
     async def _book_tag_names(self, book_id: str) -> list[str]:
         """Load tag names without triggering a sync lazy-load on ORM objects."""
         rows = await self.db.execute(
@@ -230,7 +333,11 @@ class SyncService:
 
         author = await self._get_or_create_author(author_name)
         book, is_new = await self._get_or_create_book(
-            source.id, author.id, remote_book, is_r18=is_r18
+            source.id,
+            author.id,
+            remote_book,
+            is_r18=is_r18,
+            owner_id=source.owner_id,
         )
         remote_cover_url = await self._persist_cover(book, plugin, remote_book)
 
@@ -317,6 +424,7 @@ class SyncService:
             "description": book.description,
             "status": book.status,
             "is_r18": book_is_r18,
+            "owner_id": source.owner_id,
         }
         created = 0
         skipped = 0
@@ -490,6 +598,10 @@ class SyncService:
             skipped=skipped,
             failed=len(failed_chapters),
         )
+        if source.owner_id is None:
+            synced_book = await self.db.get(Book, book_id)
+            if synced_book is not None:
+                await self._handle_global_r18_conflicts(synced_book)
         logger.info(
             "Sync complete book={} created={} skipped={} failed={}",
             book_id,
@@ -559,6 +671,7 @@ class SyncService:
         author_id: str,
         remote_book,
         is_r18: bool = False,
+        owner_id: str | None = None,
     ) -> tuple[Book, bool]:
         book = await self.db.scalar(
             select(Book)
@@ -574,6 +687,7 @@ class SyncService:
             book.description = remote_book.description
             book.status = remote_book.status
             book.is_r18 = is_r18
+            book.owner_id = owner_id
             await self.db.flush()
             return book, False
 
@@ -586,6 +700,7 @@ class SyncService:
             description=remote_book.description,
             status=remote_book.status,
             is_r18=is_r18,
+            owner_id=owner_id,
         )
         self.db.add(book)
         await self.db.flush()
@@ -685,6 +800,20 @@ class SyncService:
                 continue
             try:
                 result = await self.sync_book(source_id, shelf_book.url)
+                if source.owner_id and result.get("book_id"):
+                    existing_favorite = await self.db.scalar(
+                        select(BookFavorite).where(
+                            BookFavorite.user_id == source.owner_id,
+                            BookFavorite.book_id == result["book_id"],
+                        )
+                    )
+                    if existing_favorite is None:
+                        self.db.add(BookFavorite(
+                            id=str(uuid4()),
+                            user_id=source.owner_id,
+                            book_id=result["book_id"],
+                        ))
+                        await self.db.commit()
                 results.append({
                     "book_id": result["book_id"],
                     "status": "ok",

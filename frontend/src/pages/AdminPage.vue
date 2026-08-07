@@ -21,6 +21,9 @@ interface Source {
   is_r18: boolean
   config?: any
   owner_id?: string | null
+  submitter_id?: string | null
+  submitter_username?: string | null
+  show_contributor?: boolean
 }
 
 interface CookieItem {
@@ -33,12 +36,11 @@ interface CookieItem {
 const tab = ref<"sources" | "cookies" | "sync" | "logs" | "tokens" | "index" | "status" | "yuedu" | "add" | "creds" | "users" | "approvals" | "proxy" | "prefs">("yuedu")
 
 const availableTabs = computed(() => {
-  const common = ["yuedu", "sources", "sync", "logs", "tokens", "cookies", "prefs"] as const
+  const common = ["yuedu", "sources", "sync", "logs", "tokens", "prefs"] as const
   if (!auth.isAdmin) return common
   return [
     ...common,
     "add",
-    "creds",
     "users",
     "approvals",
     "index",
@@ -211,6 +213,48 @@ function resetSourceForm() {
   sourceConfigText.value = ""
 }
 
+function canManageSource(s: Source) {
+  return auth.isAdmin || s.owner_id === auth.user?.id
+}
+
+function sourceCookies(sourceId: string) {
+  return cookies.value.filter((c) => c.source === sourceId)
+}
+
+function sourceCreds(sourceId: string) {
+  return creds.value.filter((c) => c.source === sourceId)
+}
+
+function toggleSourceDetails(s: Source) {
+  if (expandedSourceId.value === s.id) {
+    expandedSourceId.value = ""
+    return
+  }
+  expandedSourceId.value = s.id
+  cookieForm.value = { source: s.id, cookie_data: "", expired_at: "" }
+  cookieEditingId.value = ""
+  cookieError.value = ""
+  cookieTestResult.value = null
+  cookieTestError.value = ""
+  credForm.value = { source: s.id, username: "", password: "" }
+  credError.value = ""
+}
+
+async function saveSourceCookie(s: Source) {
+  cookieForm.value.source = s.id
+  await createCookie()
+}
+
+async function testSourceCookie(s: Source) {
+  cookieForm.value.source = s.id
+  await testCookie()
+}
+
+async function saveSourceCred(s: Source) {
+  credForm.value.source = s.id
+  await createCred()
+}
+
 const cookies = ref<CookieItem[]>([])
 const cookieForm = ref({ source: "", cookie_data: "", expired_at: "" })
 const cookieEditingId = ref("")
@@ -313,8 +357,10 @@ const yueduCookie = ref("")
 const yueduDiscover = ref(true)
 const yueduIsR18 = ref(false)
 const yueduScope = ref("personal")
+const yueduShowContributor = ref(true)
 const yueduSyncResult = ref<any>(null)
 const yueduSyncError = ref("")
+const expandedSourceId = ref("")
 
 const localPath = ref("")
 const localImporting = ref(false)
@@ -519,6 +565,7 @@ async function yueduImport() {
     if (yueduJsonText.value) body.json_text = yueduJsonText.value
     body.is_r18 = yueduIsR18.value
     body.scope = yueduScope.value
+    body.show_contributor = yueduShowContributor.value
     yueduResult.value = await api.post("/yuedu/import", body)
     await loadSources()
     await loadCreds()
@@ -536,6 +583,7 @@ async function yueduImportAndSync() {
   try {
     const body: any = { discover: yueduDiscover.value, is_r18: yueduIsR18.value }
     body.scope = yueduScope.value
+    body.show_contributor = yueduShowContributor.value
     if (yueduUrl.value) body.url = yueduUrl.value
     if (yueduJsonText.value) body.json_text = yueduJsonText.value
     if (yueduCookie.value.trim()) body.cookie = yueduCookie.value.trim()
@@ -562,6 +610,7 @@ async function yueduPreviewAction() {
     if (yueduUrl.value) body.url = yueduUrl.value
     if (yueduJsonText.value) body.json_text = yueduJsonText.value
     body.scope = yueduScope.value
+    body.show_contributor = yueduShowContributor.value
     yueduPreview.value = await api.post("/yuedu/preview", body)
   } catch (e) {
     yueduError.value = e instanceof Error ? e.message : i18n.t('admin_preview_failed')
@@ -1167,18 +1216,105 @@ onUnmounted(() => {
         </div>
 
         <div class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900">
-          <div v-for="s in sources" :key="s.id" class="px-4 py-3 flex items-center justify-between">
-            <div>
-              <span class="text-sm font-medium">{{ s.name }}</span>
-              <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ s.id }} ({{ s.plugin_name }})</span>
-              <span v-if="s.owner_id" class="text-xs px-1.5 py-0.5 rounded ml-2 bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300">{{ i18n.t('admin_source_personal') }}</span>
-              <span v-else class="text-xs px-1.5 py-0.5 rounded ml-2 bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300">{{ i18n.t('admin_source_global') }}</span>
-              <span v-if="s.is_r18" class="text-xs px-1.5 py-0.5 rounded ml-2 bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-300">R18</span>
+          <div v-for="s in sources" :key="s.id" class="px-4 py-3">
+            <div class="flex items-center justify-between flex-wrap gap-2">
+              <div>
+                <span class="text-sm font-medium">{{ s.name }}</span>
+                <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ s.id }} ({{ s.plugin_name }})</span>
+                <span v-if="s.owner_id" class="text-xs px-1.5 py-0.5 rounded ml-2 bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300">{{ i18n.t('admin_source_personal') }}</span>
+                <span v-else class="text-xs px-1.5 py-0.5 rounded ml-2 bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300">{{ i18n.t('admin_source_global') }}</span>
+                <span v-if="s.is_r18" class="text-xs px-1.5 py-0.5 rounded ml-2 bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-300">R18</span>
+                <span
+                  v-if="!s.owner_id && s.show_contributor && s.submitter_username"
+                  class="text-xs text-muted dark:text-gray-400 ml-2"
+                >{{ i18n.t('admin_source_contributor', { name: s.submitter_username }) }}</span>
+              </div>
+              <div class="flex items-center gap-3">
+                <span class="text-xs" :class="s.enabled ? 'text-green-600' : 'text-red-500'">{{ s.enabled ? i18n.t('admin_enabled') : i18n.t('admin_disabled') }}</span>
+                <button v-if="canManageSource(s)" @click="toggleSourceDetails(s)" class="text-xs text-accent hover:underline">
+                  {{ i18n.t('admin_tab_cookies') }} / {{ i18n.t('admin_tab_creds') }}
+                </button>
+                <button v-if="canManageSource(s)" @click="editSource(s)" class="text-xs text-accent hover:underline">{{ i18n.t('admin_edit') }}</button>
+                <button v-if="canManageSource(s)" @click="deleteSource(s.id)" class="text-xs text-red-500 hover:text-red-700">{{ i18n.t('admin_delete') }}</button>
+              </div>
             </div>
-            <div class="flex items-center gap-3">
-              <span class="text-xs" :class="s.enabled ? 'text-green-600' : 'text-red-500'">{{ s.enabled ? i18n.t('admin_enabled') : i18n.t('admin_disabled') }}</span>
-              <button @click="editSource(s)" class="text-xs text-accent hover:underline">{{ i18n.t('admin_edit') }}</button>
-              <button @click="deleteSource(s.id)" class="text-xs text-red-500 hover:text-red-700">{{ i18n.t('admin_delete') }}</button>
+
+            <div v-if="expandedSourceId === s.id && canManageSource(s)" class="mt-4 grid gap-4 lg:grid-cols-2">
+              <div class="rounded-lg border border-border dark:border-gray-700 p-3">
+                <h3 class="text-xs font-semibold mb-3">{{ i18n.t('admin_tab_cookies') }}</h3>
+                <div v-if="sourceCookies(s.id).length" class="space-y-2 mb-3">
+                  <div
+                    v-for="c in sourceCookies(s.id)"
+                    :key="c.id"
+                    class="flex items-center justify-between gap-2 text-xs"
+                  >
+                    <span>{{ c.source }}</span>
+                    <div class="flex items-center gap-2">
+                      <button @click="editCookie(c)" class="text-accent hover:underline">{{ i18n.t('admin_edit') }}</button>
+                      <button @click="deleteCookie(c.id)" class="text-red-500 hover:underline">{{ i18n.t('admin_delete') }}</button>
+                    </div>
+                  </div>
+                </div>
+                <p v-else class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('admin_no_cookies') }}</p>
+                <textarea
+                  v-model="cookieForm.cookie_data"
+                  :placeholder="i18n.t('admin_placeholder_cookie')"
+                  rows="3"
+                  class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-xs font-mono bg-paper dark:bg-gray-800 resize-y mb-2"
+                />
+                <input
+                  v-model="cookieForm.expired_at"
+                  type="datetime-local"
+                  class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-xs bg-paper dark:bg-gray-800 mb-2"
+                />
+                <div class="flex gap-2">
+                  <button @click="saveSourceCookie(s)" class="px-3 py-1.5 rounded bg-accent text-white text-xs font-medium">{{ i18n.t('admin_save_cookie') }}</button>
+                  <button @click="testSourceCookie(s)" :disabled="cookieTesting" class="px-3 py-1.5 rounded border border-accent text-accent text-xs font-medium disabled:opacity-50">
+                    {{ cookieTesting ? i18n.t('admin_testing') : i18n.t('admin_test_cookie') }}
+                  </button>
+                </div>
+                <p v-if="cookieError" class="text-xs text-red-600 mt-2">{{ cookieError }}</p>
+                <div v-if="cookieTestResult" class="mt-2 text-xs text-green-700 dark:text-green-400">{{ cookieTestResult.message }}</div>
+                <p v-if="cookieTestError" class="text-xs text-red-600 mt-2">{{ cookieTestError }}</p>
+              </div>
+
+              <div class="rounded-lg border border-border dark:border-gray-700 p-3">
+                <h3 class="text-xs font-semibold mb-3">{{ i18n.t('admin_tab_creds') }}</h3>
+                <div v-if="sourceCreds(s.id).length" class="space-y-2 mb-3">
+                  <div
+                    v-for="c in sourceCreds(s.id)"
+                    :key="c.id"
+                    class="flex items-center justify-between gap-2 text-xs"
+                  >
+                    <span>{{ c.username }}</span>
+                    <div class="flex items-center gap-2">
+                      <button @click="autoLogin(c.id)" :disabled="credLoggingIn[c.id]" class="text-green-600 hover:underline disabled:opacity-50">
+                        {{ credLoggingIn[c.id] ? i18n.t('admin_logging_in') : i18n.t('admin_auto_login') }}
+                      </button>
+                      <button @click="startManualLogin(c.id)" :disabled="manualLoginLoading" class="text-blue-600 hover:underline disabled:opacity-50">
+                        {{ i18n.t('admin_manual_login') }}
+                      </button>
+                      <button @click="deleteCred(c.id)" class="text-red-500 hover:underline">{{ i18n.t('admin_delete') }}</button>
+                    </div>
+                    <p v-if="credLoginResult[c.id]" class="w-full text-green-700 dark:text-green-400">{{ credLoginResult[c.id].message }}</p>
+                    <p v-if="credLoginError[c.id]" class="w-full text-red-600">{{ credLoginError[c.id] }}</p>
+                  </div>
+                </div>
+                <p v-else class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('admin_no_creds') }}</p>
+                <input
+                  v-model="credForm.username"
+                  :placeholder="i18n.t('admin_placeholder_username')"
+                  class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-xs bg-paper dark:bg-gray-800 mb-2"
+                />
+                <input
+                  v-model="credForm.password"
+                  type="password"
+                  :placeholder="i18n.t('admin_placeholder_password')"
+                  class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-xs bg-paper dark:bg-gray-800 mb-2"
+                />
+                <button @click="saveSourceCred(s)" class="px-3 py-1.5 rounded bg-accent text-white text-xs font-medium">{{ i18n.t('admin_save_cred') }}</button>
+                <p v-if="credError" class="text-xs text-red-600 mt-2">{{ credError }}</p>
+              </div>
             </div>
           </div>
           <p v-if="sources.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">{{ i18n.t('admin_no_sources') }}</p>
@@ -1481,103 +1617,8 @@ onUnmounted(() => {
           <p v-else-if="prefsSaved" class="text-sm text-green-600 mb-2">{{ i18n.t('admin_pref_saved') }}</p>
           <button @click="savePrefs" :disabled="prefsSaving" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">{{ prefsSaving ? i18n.t('admin_saving') : i18n.t('admin_pref_save') }}</button>
         </div>
-      </section>
 
-      <section v-if="tab === 'yuedu'" class="space-y-6">
-        <div class="p-5 rounded-lg border-2 border-accent/30 dark:border-accent/50 bg-surface dark:bg-gray-900">
-          <h2 class="text-base font-bold mb-1">{{ i18n.t('admin_yuedu_title') }}</h2>
-          <p class="text-xs text-muted dark:text-gray-400 mb-5">{{ i18n.t('admin_yuedu_hint') }}</p>
-
-          <div class="space-y-4">
-            <div>
-              <label class="block text-xs font-medium mb-1.5">{{ i18n.t('admin_yuedu_source_url_label') }}</label>
-              <input v-model="yueduUrl" :placeholder="i18n.t('admin_yuedu_url_placeholder')" class="w-full px-3 py-2.5 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 focus:ring-2 focus:ring-accent/30 focus:border-accent" />
-            </div>
-            <div>
-              <label class="block text-xs font-medium mb-1.5">{{ i18n.t('admin_yuedu_cookie_label') }}</label>
-              <textarea v-model="yueduCookie" :placeholder="i18n.t('admin_yuedu_cookie_placeholder')" rows="3" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 resize-y font-mono text-xs" />
-            </div>
-            <div class="flex items-center gap-2">
-              <input type="checkbox" id="yuedu-discover" v-model="yueduDiscover" class="rounded" />
-              <label for="yuedu-discover" class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_yuedu_discover_label') }}</label>
-            </div>
-            <div class="flex items-center gap-2">
-              <input type="checkbox" id="yuedu-r18" v-model="yueduIsR18" class="rounded" />
-              <label for="yuedu-r18" class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_r18_label') }}</label>
-            </div>
-            <div v-if="auth.isAdmin" class="flex items-center gap-2">
-              <label for="yuedu-scope" class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_scope_label') }}</label>
-              <select id="yuedu-scope" v-model="yueduScope" class="px-2 py-1.5 rounded border border-border dark:border-gray-700 text-xs bg-paper dark:bg-gray-800">
-                <option value="personal">{{ i18n.t('admin_source_personal') }}</option>
-                <option value="global">{{ i18n.t('admin_source_global') }}</option>
-              </select>
-            </div>
-
-            <p v-if="yueduSyncError" class="text-sm text-red-600">{{ yueduSyncError }}</p>
-
-            <button @click="yueduImportAndSync" :disabled="yueduSyncImporting"
-              class="w-full py-3 rounded-lg bg-accent text-white font-semibold hover:opacity-90 disabled:opacity-50 transition-all text-sm">
-              {{ yueduSyncImporting ? i18n.t('admin_yuedu_importing_sync') : i18n.t('admin_yuedu_import_sync_btn') }}
-            </button>
-
-            <div v-if="yueduSyncResult" class="mt-4 space-y-3">
-              <div class="grid grid-cols-4 gap-3 text-center">
-                <div class="p-3 rounded bg-green-50 dark:bg-green-950">
-                  <div class="text-xl font-bold text-green-700 dark:text-green-400">{{ yueduSyncResult.sources_imported }}</div>
-                  <div class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_yuedu_sources_imported') }}</div>
-                </div>
-                <div class="p-3 rounded bg-blue-50 dark:bg-blue-950">
-                  <div class="text-xl font-bold text-blue-700 dark:text-blue-400">{{ yueduSyncResult.books_synced }}</div>
-                  <div class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_yuedu_bookshelf_synced') }}</div>
-                </div>
-                <div class="p-3 rounded bg-purple-50 dark:bg-purple-950">
-                  <div class="text-xl font-bold text-purple-700 dark:text-purple-400">{{ yueduSyncResult.chapters_downloaded }}</div>
-                  <div class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_yuedu_chapters_downloaded') }}</div>
-                </div>
-                <div class="p-3 rounded bg-amber-50 dark:bg-amber-950">
-                  <div class="text-xl font-bold text-amber-700 dark:text-amber-400">{{ yueduSyncResult.books_discovered }}</div>
-                  <div class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_yuedu_novels_discovered') }}</div>
-                </div>
-              </div>
-              <div v-if="yueduSyncResult.errors && yueduSyncResult.errors.length" class="p-3 rounded bg-red-50 dark:bg-red-950 text-sm">
-                <p class="font-medium text-red-700 dark:text-red-400 mb-1">{{ i18n.t('admin_yuedu_errors', { n: yueduSyncResult.errors.length }) }}</p>
-                <div class="max-h-32 overflow-y-auto space-y-1 text-xs text-red-600 dark:text-red-300">
-                  <p v-for="(e, i) in yueduSyncResult.errors" :key="i">{{ e.source }}: {{ e.error }}</p>
-                </div>
-              </div>
-            </div>
-
-            <p v-if="yueduError" class="text-sm text-red-600 mt-3">{{ yueduError }}</p>
-            <div v-if="yueduResult" class="mt-3 p-3 rounded bg-green-50 dark:bg-green-950 text-sm">
-              <p class="font-medium">{{ i18n.t('admin_yuedu_imported_count', { imported: yueduResult.imported, total: yueduResult.total }) }}</p>
-              <p class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_skipped_count', { skipped: yueduResult.skipped }) }}</p>
-              <p v-if="yueduResult.updated" class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_updated_count', { updated: yueduResult.updated }) }}</p>
-            </div>
-
-            <details class="mt-3">
-              <summary class="text-xs text-muted dark:text-gray-400 cursor-pointer hover:text-ink">{{ i18n.t('admin_yuedu_advanced') }}</summary>
-              <div class="mt-3 space-y-3">
-                <textarea v-model="yueduJsonText" :placeholder="i18n.t('admin_yuedu_advanced_json_placeholder')" rows="3" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 resize-y" />
-                <div class="flex gap-3">
-                  <button @click="yueduPreviewAction" :disabled="yueduPreviewing" class="px-3 py-1.5 rounded border border-border dark:border-gray-700 text-xs hover:bg-gray-50 dark:hover:bg-gray-800 disabled:opacity-50">
-                    {{ yueduPreviewing ? '...' : i18n.t('admin_yuedu_btn_preview') }}
-                  </button>
-                  <button @click="yueduImport" :disabled="yueduImporting" class="px-3 py-1.5 rounded border border-accent text-accent text-xs hover:bg-accent/10 disabled:opacity-50">
-                    {{ yueduImporting ? '...' : i18n.t('admin_yuedu_btn_import_only') }}
-                  </button>
-                </div>
-                <div v-if="yueduPreview" class="p-2 rounded bg-blue-50 dark:bg-blue-950 text-xs">
-                  <p class="font-medium mb-1">{{ i18n.t('admin_yuedu_preview_count', { n: yueduPreview.count }) }}</p>
-                  <div class="max-h-32 overflow-y-auto">
-                    <p v-for="(s, i) in yueduPreview.sources" :key="i">{{ s.name }}</p>
-                  </div>
-                </div>
-              </div>
-            </details>
-          </div>
-        </div>
-
-        <div class="mt-6 p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
+        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
           <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_tab_account') }}</h2>
           <div class="mb-4">
             <label class="block mb-2">
@@ -1607,6 +1648,79 @@ onUnmounted(() => {
           </div>
           <p v-if="accountError" class="text-sm text-red-600 mt-3">{{ accountError }}</p>
           <p v-else-if="accountMessage" class="text-sm text-green-600 mt-3">{{ accountMessage }}</p>
+        </div>
+      </section>
+
+      <section v-if="tab === 'yuedu'" class="space-y-6">
+        <div class="p-5 rounded-lg border-2 border-accent/30 dark:border-accent/50 bg-surface dark:bg-gray-900">
+          <h2 class="text-base font-bold mb-1">{{ i18n.t('admin_yuedu_title') }}</h2>
+          <p class="text-xs text-muted dark:text-gray-400 mb-5">{{ i18n.t('admin_yuedu_hint') }}</p>
+
+          <div class="space-y-4">
+            <div>
+              <label class="block text-xs font-medium mb-1.5">{{ i18n.t('admin_yuedu_source_url_label') }}</label>
+              <input v-model="yueduUrl" :placeholder="i18n.t('admin_yuedu_url_placeholder')" class="w-full px-3 py-2.5 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 focus:ring-2 focus:ring-accent/30 focus:border-accent" />
+            </div>
+            <div>
+              <label class="block text-xs font-medium mb-1.5">{{ i18n.t('admin_yuedu_advanced_json_placeholder') }}</label>
+              <textarea v-model="yueduJsonText" :placeholder="i18n.t('admin_yuedu_advanced_json_placeholder')" rows="4" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 resize-y font-mono text-xs" />
+            </div>
+            <div class="flex items-center gap-2">
+              <input type="checkbox" id="yuedu-r18" v-model="yueduIsR18" class="rounded" />
+              <label for="yuedu-r18" class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_r18_label') }}</label>
+            </div>
+            <div class="flex flex-wrap items-center gap-3">
+              <label for="yuedu-scope" class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_scope_label') }}</label>
+              <select id="yuedu-scope" v-model="yueduScope" class="px-2 py-1.5 rounded border border-border dark:border-gray-700 text-xs bg-paper dark:bg-gray-800">
+                <option value="personal">{{ i18n.t('admin_source_personal') }}</option>
+                <option value="global">{{ i18n.t('admin_source_global') }}</option>
+              </select>
+              <label v-if="yueduScope === 'global'" class="inline-flex items-center gap-2 text-xs text-muted dark:text-gray-400 cursor-pointer">
+                <input type="checkbox" v-model="yueduShowContributor" class="rounded" />
+                {{ i18n.t('admin_yuedu_show_contributor') }}
+              </label>
+            </div>
+
+            <p v-if="yueduSyncError" class="text-sm text-red-600">{{ yueduSyncError }}</p>
+
+            <button @click="yueduImport" :disabled="yueduImporting"
+              class="w-full py-3 rounded-lg bg-accent text-white font-semibold hover:opacity-90 disabled:opacity-50 transition-all text-sm">
+              {{ yueduImporting ? '...' : (yueduScope === 'global' ? (auth.isAdmin ? i18n.t('admin_yuedu_import_global') : i18n.t('admin_yuedu_submit_global')) : i18n.t('admin_yuedu_import_personal')) }}
+            </button>
+
+            <p v-if="yueduError" class="text-sm text-red-600 mt-3">{{ yueduError }}</p>
+            <div v-if="yueduResult" class="mt-3 p-3 rounded bg-green-50 dark:bg-green-950 text-sm">
+              <p class="font-medium">
+                {{ yueduResult.status === 'pending_approval'
+                  ? i18n.t('admin_yuedu_pending_approval', { n: yueduResult.imported })
+                  : i18n.t('admin_yuedu_imported_count', { imported: yueduResult.imported, total: yueduResult.total }) }}
+              </p>
+              <p class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_skipped_count', { skipped: yueduResult.skipped }) }}</p>
+              <p v-if="yueduResult.updated" class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_updated_count', { updated: yueduResult.updated }) }}</p>
+              <button
+                v-if="yueduScope === 'personal'"
+                @click="router.push('/sync')"
+                class="mt-3 px-3 py-1.5 rounded bg-accent text-white text-xs font-medium"
+              >{{ i18n.t('admin_yuedu_go_sync') }}</button>
+            </div>
+
+            <details class="mt-3">
+              <summary class="text-xs text-muted dark:text-gray-400 cursor-pointer hover:text-ink">{{ i18n.t('admin_yuedu_advanced') }}</summary>
+              <div class="mt-3 space-y-3">
+                <div class="flex gap-3">
+                  <button @click="yueduPreviewAction" :disabled="yueduPreviewing" class="px-3 py-1.5 rounded border border-border dark:border-gray-700 text-xs hover:bg-gray-50 dark:hover:bg-gray-800 disabled:opacity-50">
+                    {{ yueduPreviewing ? '...' : i18n.t('admin_yuedu_btn_preview') }}
+                  </button>
+                </div>
+                <div v-if="yueduPreview" class="p-2 rounded bg-blue-50 dark:bg-blue-950 text-xs">
+                  <p class="font-medium mb-1">{{ i18n.t('admin_yuedu_preview_count', { n: yueduPreview.count }) }}</p>
+                  <div class="max-h-32 overflow-y-auto">
+                    <p v-for="(s, i) in yueduPreview.sources" :key="i">{{ s.name }}</p>
+                  </div>
+                </div>
+              </div>
+            </details>
+          </div>
         </div>
       </section>
 
@@ -1898,11 +2012,12 @@ onUnmounted(() => {
           <h2 class="text-lg font-semibold">{{ i18n.t('admin_pending_approvals') }}</h2>
           <button @click="loadApprovals" class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm hover:bg-surface transition-colors">{{ i18n.t('admin_refresh') }}</button>
         </div>
+        <p class="text-xs text-muted dark:text-gray-400 -mt-3 mb-3">{{ i18n.t('admin_approval_sync_hint') }}</p>
         <p v-if="approvalError" class="text-sm text-red-600 mb-3">{{ approvalError }}</p>
         <div class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900">
           <div v-for="a in approvals" :key="a.id" class="px-4 py-3 flex items-center justify-between flex-wrap gap-2">
             <div>
-              <span class="text-xs px-1.5 py-0.5 rounded-full mr-2" :class="a.action === 'create' ? 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300' : 'bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300'">{{ a.action }}</span>
+              <span class="text-xs px-1.5 py-0.5 rounded-full mr-2" :class="a.action === 'create' ? 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300' : a.action === 'confirm_r18' ? 'bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-300' : 'bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300'">{{ a.action === 'confirm_r18' ? i18n.t('admin_approval_r18_conflict') : a.action }}</span>
               <template v-if="a.action === 'create' && a.source_data">
                 <span class="text-sm font-medium">{{ a.source_data.name }}</span>
                 <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ a.source_data.id }} ({{ a.source_data.plugin_name }})</span>
@@ -1910,7 +2025,11 @@ onUnmounted(() => {
               <template v-else-if="a.source_id">
                 <span class="text-sm font-medium">{{ i18n.t('admin_delete_source', { id: a.source_id }) }}</span>
               </template>
-              <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ i18n.t('admin_by_user', { id: a.user_id?.slice(0, 8) }) }}...</span>
+              <template v-else-if="a.action === 'confirm_r18' && a.source_data">
+                <span class="text-sm font-medium">{{ i18n.t('admin_approval_r18_conflict') }}</span>
+                <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ a.source_data.title }}</span>
+              </template>
+              <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ i18n.t('admin_by_user', { id: a.submitter_username || a.user_id?.slice(0, 8) }) }}...</span>
             </div>
             <div class="flex items-center gap-2">
               <button @click="reviewChange(a.id, 'approve')" :disabled="approvalReviewing[a.id]" class="px-3 py-1 rounded bg-green-600 text-white text-xs font-medium hover:bg-green-700 disabled:opacity-50">{{ i18n.t('admin_approve') }}</button>

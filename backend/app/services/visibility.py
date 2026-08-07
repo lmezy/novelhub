@@ -41,6 +41,13 @@ def can_view_all_ages(user: User) -> bool:
 def ensure_book_visible(user: User, book: Book | None) -> bool:
     if book is None:
         return False
+    if (
+        book.owner_id
+        and not book.is_public
+        and user.role not in ("admin", "super_admin")
+        and book.owner_id != user.id
+    ):
+        return False
     if book.is_r18:
         return can_view_r18(user)
     return can_view_all_ages(user)

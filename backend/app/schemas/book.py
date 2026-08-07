@@ -60,6 +60,9 @@ class BookOut(BaseModel):
     description: str | None = None
     status: str | None = None
     is_r18: bool = False
+    owner_id: str | None = None
+    is_public: bool = False
+    all_ages_confirmed: bool = False
     is_favorite: bool = False
     created_at: datetime | None = None
     updated_at: datetime | None = None

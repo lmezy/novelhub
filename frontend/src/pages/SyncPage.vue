@@ -20,9 +20,14 @@ const autoSyncTime = ref("03:00")
 const autoSyncSaving = ref(false)
 const autoSyncSaved = ref(false)
 const autoSyncError = ref("")
+const bookshelfSyncing = ref(false)
+const bookshelfResults = ref<any[]>([])
 
 const activeTask = computed(() => crawlStore.activeTask)
 const enabledSources = computed(() => sources.value.filter((s: any) => s.enabled))
+const syncableSources = computed(() =>
+  enabledSources.value.filter((s: any) => auth.isAdmin || s.owner_id === auth.user?.id)
+)
 
 const activeProgress = computed(() => {
   const task = activeTask.value
@@ -87,12 +92,12 @@ async function selectTask(task: any) {
 }
 
 function selectAllSources() {
-  selectedSourceIds.value = enabledSources.value.map((s: any) => s.id)
+  selectedSourceIds.value = syncableSources.value.map((s: any) => s.id)
 }
 
 function invertSources() {
   const selected = new Set(selectedSourceIds.value)
-  selectedSourceIds.value = enabledSources.value
+  selectedSourceIds.value = syncableSources.value
     .filter((s: any) => !selected.has(s.id))
     .map((s: any) => s.id)
 }
@@ -140,7 +145,7 @@ async function startCrawl() {
   try {
     const created: any[] = []
     for (const id of selectedSourceIds.value) {
-      if (!enabledSources.value.some((s: any) => s.id === id)) continue
+      if (!syncableSources.value.some((s: any) => s.id === id)) continue
       const task = await api.post<any>("/crawl/tasks", {
         source: id,
         max_pages: 0,
@@ -155,6 +160,39 @@ async function startCrawl() {
     pageError.value = e instanceof Error ? e.message : i18n.t('sync_failed_start')
   } finally {
     starting.value = false
+  }
+}
+
+async function startBookshelfSync() {
+  pageError.value = ""
+  bookshelfResults.value = []
+  if (selectedSourceIds.value.length === 0) {
+    pageError.value = i18n.t('sync_please_select_source')
+    return
+  }
+  bookshelfSyncing.value = true
+  try {
+    for (const id of selectedSourceIds.value) {
+      if (!syncableSources.value.some((s: any) => s.id === id)) continue
+      try {
+        const result = await api.post<any>("/sync/bookshelf", { source_id: id })
+        bookshelfResults.value.push({
+          source_id: id,
+          source_name: sourceName({ source: id }),
+          ok: true,
+          total: result.total || 0,
+        })
+      } catch (e) {
+        bookshelfResults.value.push({
+          source_id: id,
+          source_name: sourceName({ source: id }),
+          ok: false,
+          error: e instanceof Error ? e.message : i18n.t('sync_failed_start'),
+        })
+      }
+    }
+  } finally {
+    bookshelfSyncing.value = false
   }
 }
 
@@ -230,12 +268,12 @@ onMounted(async () => {
           <button @click="selectAllSources" class="px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5">{{ i18n.t('sync_select_all') }}</button>
           <button @click="invertSources" class="px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5">{{ i18n.t('sync_select_invert') }}</button>
           <button @click="clearSources" class="px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5">{{ i18n.t('sync_select_none') }}</button>
-          <span class="text-muted dark:text-gray-400">{{ i18n.t('sync_selected_count', { n: selectedSourceIds.length }) }} / {{ enabledSources.length }}</span>
+          <span class="text-muted dark:text-gray-400">{{ i18n.t('sync_selected_count', { n: selectedSourceIds.length }) }} / {{ syncableSources.length }}</span>
         </div>
 
         <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 max-h-64 overflow-y-auto mb-4">
           <label
-            v-for="s in enabledSources"
+            v-for="s in syncableSources"
             :key="s.id"
             class="flex items-start gap-2 px-3 py-2 rounded border border-border dark:border-gray-700 bg-paper dark:bg-gray-800 cursor-pointer hover:bg-accent/5"
           >
@@ -245,13 +283,23 @@ onMounted(async () => {
               <span class="block text-xs text-muted dark:text-gray-400 truncate">{{ s.id }}</span>
             </span>
           </label>
-          <p v-if="enabledSources.length === 0" class="col-span-full text-sm text-muted dark:text-gray-400 py-4 text-center">{{ i18n.t('sync_no_sources') }}</p>
+          <p v-if="syncableSources.length === 0" class="col-span-full text-sm text-muted dark:text-gray-400 py-4 text-center">{{ i18n.t('sync_no_sources') }}</p>
         </div>
 
-        <div class="flex items-center gap-3">
+        <div class="flex flex-wrap items-center gap-3">
           <button @click="startCrawl" :disabled="starting" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">
-            {{ starting ? i18n.t('sync_starting') : i18n.t('sync_start') }}
+            {{ starting ? i18n.t('sync_starting') : i18n.t('sync_import_books') }}
           </button>
+          <button @click="startBookshelfSync" :disabled="bookshelfSyncing" class="px-4 py-2 rounded border border-accent text-accent text-sm font-medium hover:bg-accent/10 disabled:opacity-50">
+            {{ bookshelfSyncing ? i18n.t('sync_starting') : i18n.t('sync_import_bookshelf') }}
+          </button>
+        </div>
+        <div v-if="bookshelfResults.length" class="mt-3 space-y-1 text-xs">
+          <p
+            v-for="r in bookshelfResults"
+            :key="r.source_id"
+            :class="r.ok ? 'text-green-700 dark:text-green-400' : 'text-red-600'"
+          >{{ r.source_name }}: {{ r.ok ? i18n.t('sync_bookshelf_done', { n: r.total }) : r.error }}</p>
         </div>
 
         <div v-if="auth.isAdmin" class="mt-5 pt-4 border-t border-border dark:border-gray-700">

@@ -19,11 +19,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.models import Source, Cookie
+from app.models import Source, Cookie, User
 from app.models.source_credential import SourceCredential
 from app.services.cookie_crypto import decrypt_cookie, encrypt_cookie
 from app.services.manual_login import ManualLoginManager, ManualLoginSession
-from app.services.auth import require_admin
+from app.services.auth import get_current_user
 
 router = APIRouter(tags=["manual-login"])
 
@@ -46,7 +46,11 @@ class ScrollRequest(BaseModel):
 
 
 @router.post("/credentials/{cred_id}/manual-login/start")
-async def start_manual_login(cred_id: str, db: AsyncSession = Depends(get_db)):
+async def start_manual_login(
+    cred_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """Start a remote-controlled browser session for manual login."""
     cred = await db.get(SourceCredential, cred_id)
     if cred is None:
@@ -55,6 +59,8 @@ async def start_manual_login(cred_id: str, db: AsyncSession = Depends(get_db)):
     source = await db.get(Source, cred.source)
     if source is None:
         raise HTTPException(status_code=404, detail=f"Source not found: {cred.source}")
+    if user.role not in ("admin", "super_admin") and source.owner_id != user.id:
+        raise HTTPException(status_code=404, detail="Credential not found")
 
     # Determine the login URL
     config = source.config if source.plugin_name == "yuedu" and source.config else {}
