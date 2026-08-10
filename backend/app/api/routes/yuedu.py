@@ -7,6 +7,7 @@ Endpoints:
 
 import asyncio
 import hashlib
+import html
 import json
 import re
 from typing import Any
@@ -715,7 +716,12 @@ async def _load_sources_from_text(text: str) -> list[dict[str, Any]]:
     try:
         parsed = json.loads(stripped)
     except json.JSONDecodeError:
-        return await _load_sources_from_html(stripped, "")
+        try:
+            parsed = json.loads(html.unescape(stripped))
+        except json.JSONDecodeError:
+            if "<" not in stripped:
+                return []
+            return await _load_sources_from_html(stripped, "")
 
     if isinstance(parsed, dict) and isinstance(parsed.get("sourceUrls"), list):
         sources: list[dict[str, Any]] = []
@@ -765,6 +771,44 @@ class YueduImportResult(BaseModel):
     sources: list[dict[str, Any]]
     status: str = "imported"
     approval_ids: list[str] = []
+
+
+async def _load_import_sources(payload: YueduImportRequest) -> list[dict[str, Any]]:
+    """Load sources from json_text, falling back to url when the text is not source data."""
+    if payload.json_text:
+        try:
+            sources = await _load_sources_from_text(payload.json_text)
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"Failed to fetch source URL: {e}")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        if sources or not payload.url:
+            return sources
+        logger.warning(
+            "json_text produced no book sources ({} chars); falling back to url={}",
+            len(payload.json_text),
+            payload.url,
+        )
+        try:
+            return await _fetch_sources_from_url(payload.url)
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"Failed to fetch URL: {e}")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"URL returned invalid JSON: {e}")
+    if payload.url:
+        try:
+            return await _fetch_sources_from_url(payload.url)
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"Failed to fetch URL: {e}")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"URL returned invalid JSON: {e}")
+    raise HTTPException(status_code=400, detail="Either url or json_text is required")
 
 
 async def _submit_global_approvals(
@@ -842,30 +886,7 @@ async def import_yuedu_sources(
     scope = payload.scope or "personal"
     is_admin = user.role in ("admin", "super_admin")
     owner_id = None if scope == "global" else user.id
-    sources_json: list[dict[str, Any]] = []
-
-    if payload.json_text:
-        try:
-            sources_json = await _load_sources_from_text(payload.json_text)
-        except json.JSONDecodeError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"Failed to fetch source URL: {e}")
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-
-    elif payload.url:
-        try:
-            sources_json = await _fetch_sources_from_url(payload.url)
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"Failed to fetch URL: {e}")
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        except json.JSONDecodeError as e:
-            raise HTTPException(status_code=400, detail=f"URL returned invalid JSON: {e}")
-
-    else:
-        raise HTTPException(status_code=400, detail="Either url or json_text is required")
+    sources_json = await _load_import_sources(payload)
 
     if not sources_json:
         raise HTTPException(status_code=400, detail="No valid book sources found in the input")
@@ -1222,30 +1243,7 @@ async def preview_yuedu_sources(
 ):
     """Preview what sources a URL or JSON text would import without saving."""
     scope = payload.scope or "personal"
-    sources_json: list[dict[str, Any]] = []
-
-    if payload.json_text:
-        try:
-            sources_json = await _load_sources_from_text(payload.json_text)
-        except json.JSONDecodeError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"Failed to fetch source URL: {e}")
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-
-    elif payload.url:
-        try:
-            sources_json = await _fetch_sources_from_url(payload.url)
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"Failed to fetch URL: {e}")
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        except json.JSONDecodeError as e:
-            raise HTTPException(status_code=400, detail=f"URL returned invalid JSON: {e}")
-
-    else:
-        raise HTTPException(status_code=400, detail="Either url or json_text is required")
+    sources_json = await _load_import_sources(payload)
 
     preview = []
     for src in sources_json:

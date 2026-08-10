@@ -69,6 +69,17 @@ async def seed_default_super_admin():
         await AutoCategorizationService.ensure_default_categories(db)
 
 
+@app.on_event("startup")
+async def ensure_search_indexes():
+    """Create Meilisearch indexes on startup so stats/search do not 404."""
+    try:
+        from app.services.search import search_service
+
+        search_service.ensure_indexes()
+    except Exception as exc:
+        logger.warning("Search index initialization failed: {}", exc)
+
+
 @app.get("/")
 async def root():
     return {"project": settings.PROJECT_NAME, "status": "running"}

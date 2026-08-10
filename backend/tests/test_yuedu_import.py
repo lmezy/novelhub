@@ -15,6 +15,7 @@ from app.api.routes.yuedu import (
     _parse_yckceo_listing_ids,
     import_and_sync_all,
     import_yuedu_sources,
+    preview_yuedu_sources,
 )
 from app.services.sync import SyncService
 
@@ -176,6 +177,64 @@ async def test_load_sources_from_text_accepts_url():
 
     assert len(sources) == 1
     assert sources[0]["bookSourceName"] == "A"
+
+
+@pytest.mark.asyncio
+async def test_load_sources_from_text_skips_html_parser_for_cookie_text():
+    from app.api.routes.yuedu import _load_sources_from_text
+
+    with patch("app.api.routes.yuedu._load_sources_from_html", AsyncMock()) as parse_html:
+        sources = await _load_sources_from_text(
+            "server_name_session=708a51e1dbbab4fad1062dc28739af2c; theme=light"
+        )
+
+    assert sources == []
+    parse_html.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_import_yuedu_sources_falls_back_to_url_when_json_text_is_cookie(mock_db):
+    source = {"bookSourceName": "Alice", "bookSourceUrl": "https://www.alicesw.com"}
+    import_url = "https://www.yckceo.com/yuedu/shuyuan/json/id/7585.json"
+
+    with patch(
+        "app.api.routes.yuedu._fetch_sources_from_url",
+        AsyncMock(return_value=[source]),
+    ) as fetch:
+        result = await import_yuedu_sources(
+            YueduImportRequest(
+                url=import_url,
+                json_text="server_name_session=708a51e1dbbab4fad1062dc28739af2c; theme=light",
+            ),
+            SimpleNamespace(id="u1", role="user"),
+            mock_db,
+        )
+
+    assert result.total == 1
+    assert result.imported == 1
+    fetch.assert_awaited_once_with(import_url)
+
+
+@pytest.mark.asyncio
+async def test_preview_yuedu_sources_falls_back_to_url_when_json_text_is_cookie():
+    source = {"bookSourceName": "Alice", "bookSourceUrl": "https://www.alicesw.com"}
+    import_url = "https://www.yckceo.com/yuedu/shuyuan/json/id/7585.json"
+
+    with patch(
+        "app.api.routes.yuedu._fetch_sources_from_url",
+        AsyncMock(return_value=[source]),
+    ) as fetch:
+        result = await preview_yuedu_sources(
+            YueduImportRequest(
+                url=import_url,
+                json_text="server_name_session=708a51e1dbbab4fad1062dc28739af2c; theme=light",
+            ),
+            SimpleNamespace(id="u1", role="user"),
+        )
+
+    assert result["count"] == 1
+    assert result["sources"][0]["name"] == "Alice"
+    fetch.assert_awaited_once_with(import_url)
 
 
 @pytest.mark.asyncio

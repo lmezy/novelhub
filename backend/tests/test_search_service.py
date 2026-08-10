@@ -1,5 +1,8 @@
 from unittest.mock import MagicMock, patch
 
+import requests
+from meilisearch.errors import MeilisearchApiError
+
 from app.services.search import SearchService
 
 
@@ -29,6 +32,27 @@ def test_ensure_index_updates_settings():
     index.update_filterable_attributes.assert_called_once()
     index.update_searchable_attributes.assert_called_once()
     index.update_pagination_settings.assert_called_once_with({"maxTotalHits": 10000})
+
+
+def test_ensure_indexes_creates_missing_indexes():
+    service, client = _make_service()
+    response = requests.Response()
+    response.status_code = 404
+    response.encoding = "utf-8"
+    response._content = b'{"message":"Index `books` not found."}'
+    client.get_index.side_effect = MeilisearchApiError("missing", response)
+
+    service.ensure_indexes()
+
+    assert client.create_index.call_count == 2
+
+
+def test_get_index_stats_ensures_indexes_first():
+    service, client = _make_service()
+
+    service.get_index_stats()
+
+    assert service._ensured == {"books", "chapters"}
 
 
 def test_search_books_restricts_attributes():

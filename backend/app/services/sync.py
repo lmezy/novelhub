@@ -850,10 +850,12 @@ class SyncService:
         for bt in old_tags:
             await self.db.delete(bt)
 
+        seen: set[str] = set()
         for name in tag_names:
             name = name.strip().lower()
-            if not name:
+            if not name or name in seen:
                 continue
+            seen.add(name)
             tag = await tag_repo.get_or_create(name)
             bt = BookTag(book_id=book_id, tag_id=tag.id)
             self.db.add(bt)

@@ -59,6 +59,24 @@ def test_chapter_concurrency_uses_env_override():
         assert SyncService._chapter_concurrency({"concurrentRate": "2000"}) == 9
 
 
+@pytest.mark.asyncio
+async def test_save_tags_deduplicates_duplicate_names():
+    db = _mock_db()
+    db.scalars = AsyncMock(return_value=[])
+    service = SyncService(db)
+
+    tag_a = SimpleNamespace(id="t1")
+    tag_b = SimpleNamespace(id="t2")
+    repo = MagicMock()
+    repo.get_or_create = AsyncMock(side_effect=[tag_a, tag_b])
+
+    with patch("app.services.sync.TagRepository", return_value=repo):
+        await service._save_tags("book1", ["r18", "R18", "xuanhuan", "r18"])
+
+    assert db.add.call_count == 2
+    assert repo.get_or_create.await_count == 2
+
+
 def test_sync_thread_count_caps_at_legado_max():
     from app.core.config import settings, sync_thread_count
 

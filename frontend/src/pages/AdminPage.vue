@@ -221,6 +221,10 @@ function sourceCookies(sourceId: string) {
   return cookies.value.filter((c) => c.source === sourceId)
 }
 
+function cookieExpired(c: CookieItem) {
+  return !!c.expired_at && new Date(c.expired_at) < new Date()
+}
+
 function sourceCreds(sourceId: string) {
   return creds.value.filter((c) => c.source === sourceId)
 }
@@ -578,6 +582,14 @@ async function yueduImport() {
     yueduResult.value = await api.post("/yuedu/import", body)
     await loadSources()
     await loadCreds()
+    if (
+      yueduResult.value.status !== "pending_approval" &&
+      yueduResult.value.sources?.length
+    ) {
+      tab.value = "sources"
+      expandedSourceId.value = yueduResult.value.sources[0].id
+      window.scrollTo({ top: 0, behavior: "smooth" })
+    }
   } catch (e) {
     yueduError.value = e instanceof Error ? e.message : i18n.t('admin_import_failed')
   } finally {
@@ -1308,6 +1320,12 @@ onUnmounted(() => {
                 <span v-if="s.owner_id" class="text-xs px-1.5 py-0.5 rounded ml-2 bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300">{{ i18n.t('admin_source_personal') }}</span>
                 <span v-else class="text-xs px-1.5 py-0.5 rounded ml-2 bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300">{{ i18n.t('admin_source_global') }}</span>
                 <span v-if="s.is_r18" class="text-xs px-1.5 py-0.5 rounded ml-2 bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-300">R18</span>
+                <span
+                  v-if="sourceCookies(s.id).length"
+                  class="text-xs px-1.5 py-0.5 rounded ml-2"
+                  :class="cookieExpired(sourceCookies(s.id)[0]) ? 'bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300' : 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300'"
+                >{{ cookieExpired(sourceCookies(s.id)[0]) ? i18n.t('admin_cookie_expired') : i18n.t('admin_cookie_saved') }}</span>
+                <span v-else class="text-xs px-1.5 py-0.5 rounded ml-2 bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400">{{ i18n.t('admin_cookie_not_saved') }}</span>
                 <span
                   v-if="!s.owner_id && s.show_contributor && s.submitter_username"
                   class="text-xs text-muted dark:text-gray-400 ml-2"

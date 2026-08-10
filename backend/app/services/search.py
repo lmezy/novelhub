@@ -75,6 +75,11 @@ class SearchService:
             pass
         self._ensured.add(name)
 
+    def ensure_indexes(self) -> None:
+        """Create the books/chapters indexes if they do not exist yet."""
+        self._ensure_index(self.INDEX_BOOKS)
+        self._ensure_index(self.INDEX_CHAPTERS)
+
     def index_book(self, book: dict) -> None:
         self._ensure_index(self.INDEX_BOOKS)
         self.client.index(self.INDEX_BOOKS).add_documents([book])
@@ -767,6 +772,10 @@ class SearchService:
 
     def get_index_stats(self) -> dict:
         """Return document counts for both indexes."""
+        try:
+            self.ensure_indexes()
+        except Exception as exc:
+            logger.warning("Failed to ensure search indexes before stats: {}", exc)
         result = {}
         for idx_name in [self.INDEX_BOOKS, self.INDEX_CHAPTERS]:
             try:
