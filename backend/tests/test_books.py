@@ -11,6 +11,7 @@ from app.api.routes.books import (
     _book_cover_value,
     _normalize_book_title,
     batch_delete_books_by_source,
+    convert_book_to_r18,
     list_book_sources,
     remove_book_tag,
     set_book_cover,
@@ -146,6 +147,60 @@ async def test_batch_delete_books_by_source_requires_existing_source():
         )
 
     assert exc_info.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_convert_book_to_r18_marks_unpublishes_and_retags():
+    db = AsyncMock()
+    book = SimpleNamespace(
+        id="book-1",
+        is_r18=False,
+        is_public=True,
+        all_ages_confirmed=True,
+        owner_id=None,
+        title="测试书",
+        author_name="作者",
+        description=None,
+        status=None,
+        source_id=None,
+        author_id=None,
+        source_book_id=None,
+        cover=None,
+        display_cover=None,
+        created_at=None,
+        updated_at=None,
+        tag_names=[],
+        category_names=[],
+        categories=[],
+    )
+    db.get = AsyncMock(return_value=book)
+    db.scalar = AsyncMock(side_effect=[None, book, None])
+    db.execute = AsyncMock()
+    db.add = MagicMock()
+    db.commit = AsyncMock()
+
+    tag_all = SimpleNamespace(id="tag-all")
+    tag_r18 = SimpleNamespace(id="tag-r18")
+    tag_repo = MagicMock()
+    tag_repo.get_or_create = AsyncMock(side_effect=[tag_all, tag_r18])
+
+    with (
+        patch("app.api.routes.books.ensure_book_visible", return_value=True),
+        patch("app.repositories.tag.TagRepository", return_value=tag_repo),
+        patch("app.api.routes.books.search_service") as search_mock,
+    ):
+        result = await convert_book_to_r18(
+            "book-1",
+            SimpleNamespace(id="u1", role="super_admin"),
+            db,
+        )
+
+    assert book.is_r18 is True
+    assert book.is_public is False
+    assert book.all_ages_confirmed is False
+    assert result.id == "book-1"
+    search_mock.index_book.assert_called_once()
+    assert search_mock.index_book.call_args.args[0]["is_r18"] is True
 
 
 def test_book_cover_value_prefers_display_cover():

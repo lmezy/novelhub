@@ -29,3 +29,8 @@ html.reader-locked body {
   overflow: hidden;
   overscroll-behavior: none;
 }
+
+.reader-content.hide-content-images img,
+.page-body.hide-content-images img {
+  display: none !important;
+}

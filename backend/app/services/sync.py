@@ -99,6 +99,12 @@ JUNK_CHAPTER_PATH_SEGMENTS = (
     "booklist",
 )
 
+HTML_IMG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+MD_IMG_RE = re.compile(
+    r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+[\"'][^\"']*[\"'])?\)"
+)
+MAX_CONTENT_IMAGES_PER_CHAPTER = 50
+
 
 class SyncService:
     def __init__(self, db: AsyncSession, storage: BookStorage | None = None):
@@ -356,6 +362,88 @@ class SyncService:
             )
         )
 
+    @staticmethod
+    def _img_src_from_tag(tag: str) -> str | None:
+        for attr in ("data-src", "data-original", "data-lazy-src", "src"):
+            match = re.search(
+                attr + r'\s*=\s*["\']([^"\']+)["\']',
+                tag,
+                re.IGNORECASE,
+            )
+            if match and match.group(1).strip():
+                return match.group(1).strip()
+        return None
+
+    @staticmethod
+    def _strip_content_images(content: str) -> str:
+        """Remove image markup before sending content to the search index."""
+        text = HTML_IMG_RE.sub("", content or "")
+        return MD_IMG_RE.sub("", text)
+
+    async def _process_content_images(
+        self,
+        book: Book,
+        chapter_id: str,
+        content: str,
+        base_url: str,
+        plugin,
+    ) -> str:
+        """Download in-content images and rewrite references to local URLs."""
+        if not content:
+            return content
+        fetcher = getattr(plugin, "fetch_content_image", None)
+        if fetcher is None:
+            return content
+
+        refs: list[tuple[str, str, str]] = []
+        for tag in HTML_IMG_RE.findall(content):
+            src = self._img_src_from_tag(tag)
+            if not src:
+                continue
+            alt_match = re.search(r'alt\s*=\s*["\']([^"\']*)["\']', tag, re.I)
+            refs.append((tag, src, alt_match.group(1) if alt_match else ""))
+        for match in MD_IMG_RE.finditer(content):
+            refs.append((match.group(0), match.group(2), match.group(1)))
+        if not refs:
+            return content
+        refs = refs[:MAX_CONTENT_IMAGES_PER_CHAPTER]
+
+        replaced: dict[str, str] = {}
+        for original, src, alt in refs:
+            if src.startswith("data:"):
+                continue
+            abs_url = urljoin(base_url or "", src).split("#", 1)[0]
+            if abs_url in replaced:
+                replacement = replaced[abs_url]
+            else:
+                replacement = ""
+                try:
+                    result = await fetcher(abs_url, referer=base_url or None)
+                except Exception:
+                    result = None
+                if result is not None:
+                    data, _content_type = result
+                    try:
+                        rel_path = self.storage.save_chapter_image(
+                            book.id,
+                            abs_url,
+                            data,
+                        )
+                        filename = rel_path.split("/")[-1]
+                        replacement = (
+                            f'<img src="/api/chapters/{chapter_id}/images/'
+                            f'{filename}" alt="{alt}" loading="lazy">'
+                        )
+                    except Exception:
+                        replacement = ""
+                if not replacement:
+                    replacement = (
+                        f'<img src="{abs_url}" alt="{alt}" loading="lazy">'
+                    )
+                replaced[abs_url] = replacement
+            content = content.replace(original, replacement, 1)
+        return content
+
     async def sync_book(
         self,
         source_id: str,
@@ -540,14 +628,22 @@ class SyncService:
 
         async def _producer(remote_chapter) -> None:
             async with semaphore:
+                chapter_db_id = str(uuid4())
                 try:
                     content = await self._fetch_chapter_with_retry(
                         plugin,
                         remote_chapter,
                     )
-                    result = (remote_chapter, content, None)
+                    content = await self._process_content_images(
+                        book,
+                        chapter_db_id,
+                        content,
+                        remote_chapter.url,
+                        plugin,
+                    )
+                    result = (remote_chapter, content, None, chapter_db_id)
                 except Exception as exc:
-                    result = (remote_chapter, None, exc)
+                    result = (remote_chapter, None, exc, chapter_db_id)
             await results_queue.put(result)
 
         producers = [
@@ -559,7 +655,7 @@ class SyncService:
         book_row_verified = await self._ensure_book_row(book_id, book_values)
         try:
             while remaining > 0:
-                remote_chapter, content, error = await results_queue.get()
+                remote_chapter, content, error, chapter_db_id = await results_queue.get()
                 remaining -= 1
                 await _checkpoint()
                 if error is not None:
@@ -589,7 +685,7 @@ class SyncService:
                         content,
                     )
                     chapter = Chapter(
-                        id=str(uuid4()),
+                        id=chapter_db_id,
                         book_id=book_id,
                         chapter_number=remote_chapter.chapter_number,
                         source_chapter_id=remote_chapter.source_chapter_id,
@@ -613,7 +709,9 @@ class SyncService:
                         "book_id": book_id,
                         "title": chapter.title or "",
                         "chapter_number": chapter.chapter_number,
-                        "content": content[: search_service.CONTENT_INDEX_LIMIT],
+                        "content": self._strip_content_images(content)[
+                            : search_service.CONTENT_INDEX_LIMIT
+                        ],
                         "book_title": book_title,
                         "book_author": book_author,
                         "book_description": book_description,
@@ -1025,6 +1123,13 @@ class SyncService:
             raise ValueError("Chapter not found in source TOC")
 
         content = await self._fetch_chapter_with_retry(plugin, remote_chapter)
+        content = await self._process_content_images(
+            book,
+            chapter.id,
+            content,
+            remote_chapter.url,
+            plugin,
+        )
         book_id = book.id
         book_is_r18 = book.is_r18
         book_author = book.author_name or "Unknown"
@@ -1054,7 +1159,9 @@ class SyncService:
             "book_id": book_id,
             "title": chapter.title or "",
             "chapter_number": chapter.chapter_number,
-            "content": content[: search_service.CONTENT_INDEX_LIMIT],
+            "content": self._strip_content_images(content)[
+                : search_service.CONTENT_INDEX_LIMIT
+            ],
             "book_title": book.title,
             "book_author": book_author,
             "book_description": book_description,

@@ -27,3 +27,33 @@ def test_save_display_cover_keeps_source_cover(tmp_path):
     assert display_path == "covers/book-1_display.png"
     assert (tmp_path / "covers" / "book-1.jpg").exists()
     assert (tmp_path / "covers" / "book-1_display.png").exists()
+
+
+def test_save_chapter_image_returns_relative_path(tmp_path):
+    storage = BookStorage(str(tmp_path / "books"))
+
+    rel = storage.save_chapter_image(
+        "book-1",
+        "https://example.com/pic.jpg",
+        b"\xff\xd8\xff\xe0img",
+    )
+
+    assert rel.startswith("book-1/images/")
+    assert rel.endswith(".jpg")
+    assert (tmp_path / "books" / rel).read_bytes() == b"\xff\xd8\xff\xe0img"
+
+
+def test_chapter_image_path_rejects_traversal(tmp_path):
+    storage = BookStorage(str(tmp_path / "books"))
+    storage.save_chapter_image(
+        "book-1",
+        "https://example.com/pic.jpg",
+        b"\xff\xd8\xff\xe0img",
+    )
+
+    try:
+        storage.chapter_image_path("book-1", "../outside.jpg")
+    except FileNotFoundError:
+        pass
+    else:
+        raise AssertionError("Path traversal should be rejected")

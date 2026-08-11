@@ -33,6 +33,8 @@ const filteredBooks = computed(() => {
   )
 })
 
+const showCovers = computed(() => auth.user?.settings?.show_covers !== false)
+
 const sourceNameMap = computed(() =>
   Object.fromEntries(sourceOptions.value.map((s) => [s.id, s.name]))
 )
@@ -339,7 +341,7 @@ onMounted(async () => {
               :title="book.is_favorite ? i18n.t('books_favorite_on') : i18n.t('books_favorite_off')"
             >{{ book.is_favorite ? '★' : '☆' }}</button>
             <img
-              v-if="book.cover"
+              v-if="showCovers && book.cover"
               :src="book.cover"
               :alt="book.title"
               class="w-full h-44 object-cover rounded-md mb-3 border border-border dark:border-gray-700"

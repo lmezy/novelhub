@@ -37,6 +37,8 @@ function searchByField(field: "author" | "tags", value: string) {
   router.push({ path: "/search", query: { field, q: value } })
 }
 
+const showCovers = computed(() => auth.user?.settings?.show_covers !== false)
+
 const allSelected = computed(() =>
   favoriteBooks.value.length > 0 &&
   selectedIds.value.length === favoriteBooks.value.length
@@ -507,7 +509,7 @@ onMounted(async () => {
               :title="i18n.t('home_delete_title')"
             >&times;</button>
             <img
-              v-if="book.cover"
+              v-if="showCovers && book.cover"
               :src="book.cover"
               :alt="book.title"
               class="w-full h-44 object-cover rounded-md mb-3 border border-border dark:border-gray-700"

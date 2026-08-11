@@ -28,6 +28,8 @@ const chapterSyncing = ref(false)
 const alternates = ref<any[]>([])
 const showSourceMenu = ref(false)
 
+const showContentImages = computed(() => auth.user?.settings?.show_content_images !== false)
+
 const isMobileLayout = ref(false)
 const menuVisible = ref(false)
 const currentPage = ref(0)
@@ -97,7 +99,12 @@ const readerFontStyle = computed(() => {
 
 const chapterBodyHtml = computed(() => {
   if (!chapter.value) return ""
-  const html = chapter.value.content
+  let html = chapter.value.content
+    .replace(
+      /!\[([^\]]*)\]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)/g,
+      '<img src="$2" alt="$1" loading="lazy">',
+    )
+  html = html
     .replace(/\n\n/g, "</p><p>")
     .replace(/\n/g, "<br>")
   return "<p>" + html + "</p>"
@@ -439,7 +446,11 @@ onUnmounted(() => {
                 <h1 class="page-title">
                   {{ chapter.title || i18n.t('reader_chapter_fallback', { n: chapter.chapter_number }) }}
                 </h1>
-                <div class="page-body" v-html="chapterBodyHtml" />
+                <div
+                  class="page-body"
+                  :class="{ 'hide-content-images': !showContentImages }"
+                  v-html="chapterBodyHtml"
+                />
               </div>
             </article>
           </div>
@@ -690,6 +701,7 @@ onUnmounted(() => {
         <article
           v-else-if="chapter"
           class="reader-content prose"
+          :class="{ 'hide-content-images': !showContentImages }"
           :style="readerFontStyle"
         >
           <h1 class="text-2xl font-bold mb-8 text-center">

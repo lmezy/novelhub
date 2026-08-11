@@ -48,6 +48,26 @@
 - `frontend/src/pages/BooksPage.vue`：书库页新增“书源”筛选下拉；选中书源后显示“删除该书源书籍 (N)”按钮，确认后删除该书源同步的全部书籍；卡片底部同时展示该书来源名称。
 - 测试：`test_books.py` 新增按书源删除接口测试（删除数量、书源不存在返回 404）。
 
+### 0.8 图片显示开关与正文图片同步
+
+- 用户设置（`settings` JSON，无需迁移）新增 `show_covers`、`show_content_images`，`backend/app/schemas/user.py` 的 `UserSettingsUpdate` 支持保存。
+- 设置页“个人设置”新增“显示书籍封面 / 显示正文图片”两个开关（`frontend/src/pages/AdminPage.vue`）。
+- 封面开关应用到书架（`HomePage.vue`）、书库（`BooksPage.vue`）、书籍详情（`BookDetailPage.vue`）。
+- 正文图片开关应用到阅读器（`ReaderPage.vue`），关闭时通过 CSS 隐藏章节内所有 `<img>`。
+- 正文图片同步：
+  - `backend/app/crawler/plugins/yuedu/__init__.py`：抓正文时不再把 HTML 全部转成纯文本，而是把 `<img>`（含 `data-src` 懒加载）转换为 markdown 图片引用保留；新增 `fetch_content_image()` 下载单张正文图片（支持 `imageDecode`）。
+  - `backend/app/services/storage.py`：新增 `save_chapter_image()` / `chapter_image_path()`，按书籍 ID 保存图片并阻止路径穿越。
+  - `backend/app/services/sync.py`：同步/重同步章节时扫描 markdown 与 HTML 图片，下载后改写为 `/api/chapters/{chapter_id}/images/{file}` 本地地址；下载失败回退到原图 URL；搜索索引写入前移除图片标记。
+  - `backend/app/api/routes/chapters.py`：新增 `GET /api/chapters/{chapter_id}/images/{filename}`，带可见性校验后返回本地图片。
+- 测试：`test_user_settings.py` 覆盖新设置字段；`test_cover_storage.py` 覆盖图片保存与路径穿越校验；`test_sync_service.py` 覆盖图片下载改写、失败回退、索引清洗。
+
+### 0.9 全年龄转 R18、书源切换与 Cookie 过期提示
+
+- `backend/app/api/routes/books.py`：新增 `POST /api/books/{book_id}/to-r18`，将全年龄书籍标记为 R18，同时取消公开并清理 `all-ages` 标签、补 `r18` 标签、刷新搜索索引；书籍作者（非管理员）也能看到自己的 `is_r18` 分类。
+- `frontend/src/pages/BookDetailPage.vue`：全年龄书籍不再显示“公开为全年龄书籍”按钮，改为显示“转为 R18”按钮；书源切换按钮文案改为“切换书源”。
+- `frontend/src/pages/AdminPage.vue`：Cookie 已过期时在输入框上方显示“请重新获取 Cookie”提示。
+- 测试：`test_books.py` 新增 `to-r18` 接口测试。
+
 ## 1. 原始需求
 
 ### 1.1 阅读体验

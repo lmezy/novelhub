@@ -108,7 +108,7 @@ def _serialize_book(
         cover=cover,
         description=book.description,
         status=book.status,
-        is_r18=book.is_r18 if is_admin else False,
+        is_r18=book.is_r18 if (is_admin or book.owner_id == user.id) else False,
         owner_id=(
             book.owner_id
             if is_admin or book.owner_id == user.id
@@ -483,6 +483,71 @@ async def unpublish_book(
     if book is None:
         raise HTTPException(status_code=404, detail="Book not found")
     search_service.update_book_tags(book.id, list(book.tag_names))
+    favorite = await db.scalar(
+        select(BookFavorite).where(
+            BookFavorite.user_id == user.id,
+            BookFavorite.book_id == book.id,
+        )
+    )
+    return _serialize_book(book, user, favorite is not None)
+
+
+@router.post("/{book_id}/to-r18", response_model=BookOut)
+async def convert_book_to_r18(
+    book_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Mark an all-ages book as R18, unpublishing it in the process."""
+    book = await db.get(Book, book_id)
+    if not ensure_book_visible(user, book):
+        raise HTTPException(status_code=404, detail="Book not found")
+    if user.role not in ("admin", "super_admin") and book.owner_id != user.id:
+        raise HTTPException(status_code=403, detail="Cannot modify this book")
+
+    from app.repositories.tag import TagRepository
+
+    book.is_r18 = True
+    book.is_public = False
+    book.all_ages_confirmed = False
+    tag_repo = TagRepository(db)
+    all_ages_tag = await tag_repo.get_or_create("all-ages")
+    await db.execute(
+        delete(BookTag).where(
+            BookTag.book_id == book.id,
+            BookTag.tag_id == all_ages_tag.id,
+        )
+    )
+    r18_tag = await tag_repo.get_or_create("r18")
+    existing_r18 = await db.scalar(
+        select(BookTag).where(
+            BookTag.book_id == book.id,
+            BookTag.tag_id == r18_tag.id,
+        )
+    )
+    if existing_r18 is None:
+        db.add(BookTag(book_id=book.id, tag_id=r18_tag.id))
+    await db.commit()
+
+    book = await db.scalar(
+        select(Book)
+        .options(selectinload(Book.tags), selectinload(Book.categories))
+        .where(Book.id == book.id)
+    )
+    if book is None:
+        raise HTTPException(status_code=404, detail="Book not found")
+    search_service.index_book({
+        "id": book.id,
+        "title": book.title,
+        "author": book.author_name or "",
+        "description": book.description or "",
+        "status": book.status or "",
+        "source_id": book.source_id or "",
+        "author_id": book.author_id or "",
+        "is_r18": book.is_r18,
+        "tags": list(book.tag_names),
+        "category_names": list(book.category_names),
+    })
     favorite = await db.scalar(
         select(BookFavorite).where(
             BookFavorite.user_id == user.id,

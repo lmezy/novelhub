@@ -82,6 +82,8 @@ class UserSettingsUpdate(BaseModel):
     font_size: int | None = None
     language: str | None = None
     theme: str | None = None
+    show_covers: bool | None = None
+    show_content_images: bool | None = None
 
 
 class ChangePasswordRequest(BaseModel):

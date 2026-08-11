@@ -11,6 +11,7 @@ export interface Book {
   description: string | null
   cover: string | null
   status: string | null
+  is_r18?: boolean
   is_favorite?: boolean
   owner_id?: string | null
   is_public?: boolean

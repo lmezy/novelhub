@@ -38,6 +38,23 @@ async def test_update_my_settings_saves_personal_preferences():
 
 
 @pytest.mark.asyncio
+async def test_update_my_settings_saves_image_display_flags():
+    user = SimpleNamespace(id="u1", settings={})
+    db = AsyncMock()
+    db.commit = AsyncMock()
+    db.refresh = AsyncMock()
+
+    result = await update_my_settings(
+        UserSettingsUpdate(show_covers=False, show_content_images=False),
+        user,
+        db,
+    )
+
+    assert result is user
+    assert user.settings == {"show_covers": False, "show_content_images": False}
+
+
+@pytest.mark.asyncio
 async def test_change_my_password_updates_hash():
     user = SimpleNamespace(
         id="u1",

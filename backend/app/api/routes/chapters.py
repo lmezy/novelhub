@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -49,6 +50,26 @@ async def get_chapter(chapter_id: str, user: User = Depends(get_current_user), d
         content_path=chapter.content_path,
         content=content or "",
     )
+
+
+@router.get("/chapters/{chapter_id}/images/{filename}")
+async def get_chapter_image(
+    chapter_id: str,
+    filename: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    chapter = await db.get(Chapter, chapter_id)
+    if chapter is None:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+    book = await db.get(Book, chapter.book_id)
+    if not ensure_book_visible(user, book):
+        raise HTTPException(status_code=404, detail="Chapter not found")
+    try:
+        path = BookStorage().chapter_image_path(book.id, filename)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Image not found")
+    return FileResponse(path)
 
 
 @router.post("/chapters/{chapter_id}/sync", dependencies=[Depends(require_admin)])

@@ -1174,8 +1174,7 @@ class YueduPlugin:
 
         if content and ("<" in content or ">" in content):
             try:
-                soup = BeautifulSoup(content, "lxml")
-                content = soup.get_text("\n", strip=True)
+                content = self._content_text_preserving_images(content)
             except Exception:
                 pass
 
@@ -1210,6 +1209,18 @@ class YueduPlugin:
                 continue
             for tag in el.find_all(["script", "style", "ins", "nav", "header", "footer"]):
                 tag.decompose()
+            for img in el.find_all("img"):
+                src = (
+                    img.get("src")
+                    or img.get("data-src")
+                    or img.get("data-original")
+                    or ""
+                ).strip()
+                if not src:
+                    img.decompose()
+                    continue
+                alt = img.get("alt") or ""
+                img.replace_with(f"\n![{alt}]({src})\n")
             paragraphs = [
                 p.get_text(strip=True)
                 for p in el.find_all(["p", "br"])
@@ -1221,6 +1232,28 @@ class YueduPlugin:
             if text:
                 return text
         return ""
+
+    @staticmethod
+    def _content_text_preserving_images(content: str) -> str:
+        """Convert parsed chapter HTML to text while keeping image references."""
+        soup = BeautifulSoup(content, "lxml")
+        for tag in soup.find_all(
+            ["script", "style", "ins", "nav", "header", "footer", "iframe"],
+        ):
+            tag.decompose()
+        for img in soup.find_all("img"):
+            src = (
+                img.get("src")
+                or img.get("data-src")
+                or img.get("data-original")
+                or ""
+            ).strip()
+            if not src:
+                img.decompose()
+                continue
+            alt = img.get("alt") or ""
+            img.replace_with(f"![{alt}]({src})")
+        return soup.get_text("\n", strip=True)
 
     # ---- Required: fetch_bookshelf ----
 
@@ -2585,6 +2618,95 @@ class YueduPlugin:
                 break
         if last_error is not None:
             logger.warning("Failed to fetch cover {}: {}", url, last_error)
+        return None
+
+    async def fetch_content_image(
+        self,
+        url: str,
+        referer: str | None = None,
+    ) -> tuple[bytes, str] | None:
+        """Fetch one in-content image, applying imageDecode when configured."""
+        import asyncio
+        import httpx
+
+        if not url.startswith(("http://", "https://")):
+            return None
+        await self._sleep_rate_limit()
+        headers = self._build_headers({
+            "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+        })
+        if referer:
+            headers["Referer"] = referer
+
+        proxy_url = None
+        try:
+            from app.services.proxy_config import get_proxy_config
+            cfg = get_proxy_config()
+            if cfg.enabled:
+                proxy_url = cfg.https_proxy or cfg.http_proxy
+        except Exception:
+            pass
+
+        async def _request(proxy: str | None) -> tuple[bytes, str]:
+            nonlocal headers
+            last_error: httpx.HTTPError | None = None
+            for attempt in range(3):
+                try:
+                    client = await self._get_http_client(proxy)
+                    resp = await client.get(url, headers=headers)
+                    if resp.status_code == 403 and attempt == 0:
+                        headers = self._with_403_fallback(headers)
+                        await asyncio.sleep(1.0 + random.uniform(0.5, 1.0))
+                        continue
+                    if resp.status_code in (429, 500, 502, 503, 504):
+                        retry_after = resp.headers.get("Retry-After", "")
+                        wait = (
+                            float(retry_after)
+                            if retry_after and retry_after.replace(".", "", 1).isdigit()
+                            else 2 ** attempt
+                        )
+                        await asyncio.sleep(wait + random.uniform(0.5, 1.5))
+                        continue
+                    resp.raise_for_status()
+                    self._capture_cookie_jar(resp)
+                    return resp.content, resp.headers.get("content-type", "")
+                except httpx.HTTPError as exc:
+                    last_error = exc
+                    if attempt < 2:
+                        await asyncio.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError(f"Request failed after retries: {url}")
+
+        proxies: list[str | None] = [None]
+        if proxy_url:
+            proxies.insert(0, proxy_url)
+
+        last_error: Exception | None = None
+        for proxy in proxies:
+            try:
+                data, content_type = await _request(proxy)
+                if not data or len(data) < 128:
+                    return None
+                if self.engine:
+                    decoded = self.engine.decode_content_image(data)
+                    if decoded:
+                        data = decoded
+                return data, content_type
+            except httpx.RequestError as exc:
+                last_error = exc
+                if proxy is None:
+                    break
+                logger.warning(
+                    "Configured proxy %s unreachable for content image (%s); retrying direct",
+                    proxy_url,
+                    exc,
+                )
+            except Exception as exc:
+                last_error = exc
+                break
+        if last_error is not None:
+            logger.warning("Failed to fetch content image {}: {}", url, last_error)
         return None
 
     def get_search_check_keyword(self, default: str = "\u6211\u7684") -> str:

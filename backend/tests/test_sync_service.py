@@ -62,6 +62,69 @@ def test_chapter_concurrency_uses_env_override():
         assert SyncService._chapter_concurrency({"concurrentRate": "2000"}) == 9
 
 
+def test_strip_content_images_removes_html_and_markdown_images():
+    content = (
+        '开头 <img src="/api/chapters/c1/images/a.jpg" alt="a"> 中间 '
+        "![b](https://example.com/b.jpg) 结尾"
+    )
+
+    cleaned = SyncService._strip_content_images(content)
+
+    assert "<img" not in cleaned
+    assert "![b]" not in cleaned
+    assert "开头" in cleaned
+    assert "中间" in cleaned
+    assert "结尾" in cleaned
+
+
+@pytest.mark.asyncio
+async def test_process_content_images_downloads_and_rewrites_references():
+    db = _mock_db()
+    storage = MagicMock()
+    storage.save_chapter_image.return_value = "book-1/images/abc.jpg"
+    service = SyncService(db, storage=storage)
+    plugin = SimpleNamespace(
+        fetch_content_image=AsyncMock(return_value=(b"\xff\xd8\xff", "image/jpeg")),
+    )
+    content = (
+        '文字 ![图一](https://example.com/a.jpg) 继续 '
+        '<img data-src="https://example.com/b.jpg" alt="图二"> 结尾'
+    )
+
+    result = await service._process_content_images(
+        SimpleNamespace(id="book-1"),
+        "chapter-1",
+        content,
+        "https://example.com/read/1.html",
+        plugin,
+    )
+
+    assert result.count("/api/chapters/chapter-1/images/abc.jpg") == 2
+    assert plugin.fetch_content_image.await_count == 2
+    assert storage.save_chapter_image.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_process_content_images_keeps_remote_url_when_download_fails():
+    db = _mock_db()
+    service = SyncService(db, storage=MagicMock())
+    plugin = SimpleNamespace(
+        fetch_content_image=AsyncMock(return_value=None),
+    )
+    content = "![图](https://example.com/a.jpg)"
+
+    result = await service._process_content_images(
+        SimpleNamespace(id="book-1"),
+        "chapter-1",
+        content,
+        "https://example.com/read/1.html",
+        plugin,
+    )
+
+    assert '<img src="https://example.com/a.jpg"' in result
+    assert "/api/chapters/chapter-1/images/" not in result
+
+
 @pytest.mark.asyncio
 async def test_save_tags_deduplicates_duplicate_names():
     db = _mock_db()

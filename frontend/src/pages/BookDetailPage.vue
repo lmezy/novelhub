@@ -41,6 +41,7 @@ const categorySaving = ref(false)
 const autoCategorizing = ref(false)
 const categoryError = ref("")
 const publishing = ref(false)
+const convertingToR18 = ref(false)
 const editing = ref(false)
 const newCategoryName = ref("")
 const newCategoryR18 = ref(false)
@@ -50,29 +51,10 @@ const canPublish = computed(() =>
   auth.isAdmin || book.value?.owner_id === auth.user?.id
 )
 
+const showCovers = computed(() => auth.user?.settings?.show_covers !== false)
+
 function searchByField(field: "author" | "tags" | "category", value: string) {
   router.push({ path: "/search", query: { field, q: value } })
-}
-
-async function publishBook() {
-  if (!book.value || !confirm(i18n.t('book_publish_confirm'))) return
-  publishing.value = true
-  try {
-    const res = await api.post<Book>(`/books/${book.value.id}/publish`, {
-      confirm_all_ages: true,
-    })
-    book.value = {
-      ...book.value,
-      owner_id: res.owner_id,
-      is_public: res.is_public,
-      all_ages_confirmed: res.all_ages_confirmed,
-    }
-    alert(i18n.t('book_publish_done'))
-  } catch (e) {
-    alert(e instanceof Error ? e.message : i18n.t('book_publish_failed'))
-  } finally {
-    publishing.value = false
-  }
 }
 
 async function unpublishBook() {
@@ -91,6 +73,25 @@ async function unpublishBook() {
     alert(e instanceof Error ? e.message : i18n.t('book_unpublish_failed'))
   } finally {
     publishing.value = false
+  }
+}
+
+async function convertToR18() {
+  if (!book.value || !confirm(i18n.t('book_convert_r18_confirm', { title: book.value.title }))) return
+  convertingToR18.value = true
+  try {
+    const res = await api.post<Book>(`/books/${book.value.id}/to-r18`)
+    book.value = {
+      ...book.value,
+      is_r18: res.is_r18,
+      is_public: res.is_public,
+      all_ages_confirmed: res.all_ages_confirmed,
+    }
+    alert(i18n.t('book_convert_r18_done'))
+  } catch (e) {
+    alert(e instanceof Error ? e.message : i18n.t('book_convert_r18_failed'))
+  } finally {
+    convertingToR18.value = false
   }
 }
 
@@ -386,7 +387,7 @@ onMounted(async () => {
         <header class="mb-8">
           <div class="mb-4">
             <img
-              v-if="book.cover"
+              v-if="showCovers && book.cover"
               :src="book.cover"
               :alt="book.title"
               class="w-40 h-56 object-cover rounded-lg border border-border dark:border-gray-700"
@@ -458,7 +459,7 @@ onMounted(async () => {
             <button
               @click="showSources = !showSources"
               class="px-3 py-1 text-xs border border-border dark:border-gray-700 rounded hover:bg-accent/5 transition-colors"
-            >{{ i18n.t('book_sources') }} ({{ alternates.length }})</button>
+            >{{ i18n.t('book_switch_source') }} ({{ alternates.length }})</button>
             <div
               v-if="showSources"
               class="mt-2 divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900"
@@ -484,11 +485,11 @@ onMounted(async () => {
           </div>
           <div class="flex items-center gap-2 mt-4">
             <button
-              v-if="canPublish && !book.is_public"
-              @click="publishBook"
-              :disabled="publishing"
-              class="px-3 py-1 text-xs border border-green-600 text-green-700 dark:text-green-400 rounded hover:bg-green-50 dark:hover:bg-green-950 disabled:opacity-50"
-            >{{ i18n.t('book_publish') }}</button>
+              v-if="canPublish && !book.is_r18"
+              @click="convertToR18"
+              :disabled="convertingToR18"
+              class="px-3 py-1 text-xs border border-purple-500 text-purple-700 dark:text-purple-400 rounded hover:bg-purple-50 dark:hover:bg-purple-950 disabled:opacity-50"
+            >{{ convertingToR18 ? i18n.t('book_converting_r18') : i18n.t('book_convert_r18') }}</button>
             <button
               v-if="canPublish && book.is_public"
               @click="unpublishBook"

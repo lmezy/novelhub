@@ -38,6 +38,29 @@ def test_rate_limit_disabled_reflects_env_override():
         assert YueduPlugin._rate_limit_disabled() is False
 
 
+def test_content_text_preserving_images_keeps_markdown_refs():
+    html = (
+        '<div><p>开头</p>'
+        '<img src="https://example.com/a.jpg" alt="图A">'
+        '<p>结尾</p></div>'
+    )
+
+    text = YueduPlugin._content_text_preserving_images(html)
+
+    assert "![图A](https://example.com/a.jpg)" in text
+    assert "<img" not in text
+    assert "开头" in text
+    assert "结尾" in text
+
+
+def test_content_text_preserving_images_supports_lazy_src():
+    html = '<img data-src="https://example.com/lazy.jpg" alt="懒加载">'
+
+    text = YueduPlugin._content_text_preserving_images(html)
+
+    assert "![懒加载](https://example.com/lazy.jpg)" in text
+
+
 def test_parse_bookshelf_direct_anchor_fallback():
     plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
     html = """

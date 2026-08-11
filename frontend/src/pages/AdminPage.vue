@@ -55,7 +55,14 @@ const sourceConfigText = ref("")
 const sourceEditingId = ref("")
 const sourceError = ref("")
 
-const prefs = ref({ font: "sans", font_size: 16, language: "zh", theme: "light" })
+const prefs = ref({
+  font: "sans",
+  font_size: 16,
+  language: "zh",
+  theme: "light",
+  show_covers: true,
+  show_content_images: true,
+})
 const prefsSaving = ref(false)
 const prefsError = ref("")
 const prefsSaved = ref(false)
@@ -1377,6 +1384,10 @@ onUnmounted(() => {
                   </div>
                 </div>
                 <p v-else class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('admin_no_cookies') }}</p>
+                <p
+                  v-if="sourceCookies(s.id).length && cookieExpired(sourceCookies(s.id)[0])"
+                  class="text-xs text-red-600 mb-2"
+                >{{ i18n.t('admin_cookie_expired_hint') }}</p>
                 <textarea
                   v-model="cookieForm.cookie_data"
                   :placeholder="i18n.t('admin_placeholder_cookie')"
@@ -1734,6 +1745,14 @@ onUnmounted(() => {
                 <option value="light">{{ i18n.t('reader_light_mode') }}</option>
                 <option value="dark">{{ i18n.t('reader_dark_mode') }}</option>
               </select>
+            </label>
+            <label class="flex items-center justify-between gap-3 text-sm cursor-pointer">
+              <span>{{ i18n.t('admin_pref_show_covers') }}</span>
+              <input type="checkbox" v-model="prefs.show_covers" class="rounded" />
+            </label>
+            <label class="flex items-center justify-between gap-3 text-sm cursor-pointer">
+              <span>{{ i18n.t('admin_pref_show_content_images') }}</span>
+              <input type="checkbox" v-model="prefs.show_content_images" class="rounded" />
             </label>
           </div>
           <p v-if="prefsError" class="text-sm text-red-600 mb-2">{{ prefsError }}</p>

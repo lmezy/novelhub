@@ -21,6 +21,28 @@ class BookStorage:
     def cover_dir(self) -> Path:
         return self.root.parent / "covers"
 
+    def chapter_images_dir(self, book_id: str) -> Path:
+        return self.root / safe_segment(book_id) / "images"
+
+    def save_chapter_image(self, book_id: str, url: str, data: bytes) -> str:
+        """Save one in-content image and return a storage-relative path."""
+        directory = self.chapter_images_dir(book_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(str(url).encode("utf-8")).hexdigest()[:16]
+        extension = self._image_extension(data)
+        path = directory / f"{digest}.{extension}"
+        if not path.exists():
+            path.write_bytes(data)
+        return path.relative_to(self.root).as_posix()
+
+    def chapter_image_path(self, book_id: str, filename: str) -> Path:
+        """Resolve a stored chapter image path, rejecting path traversal."""
+        images_dir = self.chapter_images_dir(book_id).resolve()
+        path = (images_dir / filename).resolve()
+        if path.parent != images_dir or not path.is_file():
+            raise FileNotFoundError(f"Chapter image not found: {filename}")
+        return path
+
     @staticmethod
     def _image_extension(data: bytes) -> str:
         if data.startswith(b"\xff\xd8\xff"):
