@@ -2253,30 +2253,54 @@ class YueduPlugin:
                 "interval_slot": 0.0,
                 "window_start": 0.0,
                 "window_used": 0,
+                "total_requests": 0,
             },
         )
         async with lock:
             now = time.monotonic()
             if mode == "interval":
                 wait_s = state["interval_slot"] + window_ms / 1000.0 - now
+                # Add jitter so the request pattern is not a fixed cadence.
+                wait_s += random.uniform(0.2, 0.6)
                 if wait_s > 0:
                     await asyncio.sleep(wait_s)
                     now = time.monotonic()
                 state["interval_slot"] = now
-                return
-
-            window_s = window_ms / 1000.0
-            if state["window_start"] + window_s <= now:
-                state["window_start"] = now
-                state["window_used"] = 0
-            if state["window_used"] >= count:
-                wait_s = state["window_start"] + window_s - now
-                if wait_s > 0:
-                    await asyncio.sleep(wait_s)
-                    now = time.monotonic()
+            else:
+                window_s = window_ms / 1000.0
+                if state["window_start"] + window_s <= now:
                     state["window_start"] = now
                     state["window_used"] = 0
-            state["window_used"] += 1
+                if state["window_used"] >= count:
+                    wait_s = state["window_start"] + window_s - now
+                    if wait_s > 0:
+                        await asyncio.sleep(wait_s)
+                        now = time.monotonic()
+                        state["window_start"] = now
+                        state["window_used"] = 0
+                state["window_used"] += 1
+
+            state["total_requests"] += 1
+            total = state["total_requests"]
+            try:
+                from app.core.config import settings as crawl_settings
+                cooldown_every = int(
+                    getattr(crawl_settings, "SYNC_RATE_COOLDOWN_EVERY", 0) or 0
+                )
+                cooldown_seconds = float(
+                    getattr(crawl_settings, "SYNC_RATE_COOLDOWN_SECONDS", 0) or 0
+                )
+            except Exception:
+                cooldown_every = 0
+                cooldown_seconds = 0
+            if (
+                cooldown_every > 0
+                and cooldown_seconds > 0
+                and total % cooldown_every == 0
+            ):
+                await asyncio.sleep(
+                    cooldown_seconds + random.uniform(0, 1)
+                )
 
     def _capture_cookie_jar(self, resp) -> None:
         """Collect Set-Cookie headers when the source enables its cookie jar."""

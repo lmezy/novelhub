@@ -55,7 +55,10 @@ def test_clean_sync_tags_drops_title_and_author_fragments():
 def test_chapter_concurrency_uses_env_override():
     from app.core.config import settings
 
-    with patch.object(settings, "SYNC_IGNORE_RATE_LIMIT", True):
+    with (
+        patch.object(settings, "SYNC_IGNORE_RATE_LIMIT", True),
+        patch.object(settings, "SYNC_CHAPTER_CONCURRENCY", 9),
+    ):
         assert SyncService._chapter_concurrency({"concurrentRate": "2000"}) == 9
 
 
