@@ -78,6 +78,18 @@ def test_parse_local_book_returns_chapter_refs(tmp_path):
     assert info["chapters"][0]["title"] == "Chapter 1"
 
 
+def test_parse_local_book_respects_r18_override(tmp_path):
+    book = _book_dir(
+        tmp_path,
+        "Alice",
+        "Book One",
+        {"title": "Book One", "author": "Alice"},
+    )
+
+    assert parse_local_book(book, is_r18=True)["is_r18"] is True
+    assert parse_local_book(book, is_r18=False)["is_r18"] is False
+
+
 def test_list_local_import_roots_and_directories(tmp_path, monkeypatch):
     root = tmp_path / "books"
     child = root / "demo"

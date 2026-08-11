@@ -41,10 +41,18 @@ const categorySaving = ref(false)
 const autoCategorizing = ref(false)
 const categoryError = ref("")
 const publishing = ref(false)
+const editing = ref(false)
+const newCategoryName = ref("")
+const newCategoryR18 = ref(false)
+const categoryCreating = ref(false)
 
 const canPublish = computed(() =>
   auth.isAdmin || book.value?.owner_id === auth.user?.id
 )
+
+function searchByField(field: "author" | "tags" | "category", value: string) {
+  router.push({ path: "/search", query: { field, q: value } })
+}
 
 async function publishBook() {
   if (!book.value || !confirm(i18n.t('book_publish_confirm'))) return
@@ -141,6 +149,26 @@ async function saveCategories() {
     categoryError.value = e instanceof Error ? e.message : i18n.t('book_category_failed')
   } finally {
     categorySaving.value = false
+  }
+}
+
+async function createCategory() {
+  const name = newCategoryName.value.trim()
+  if (!name) return
+  categoryCreating.value = true
+  categoryError.value = ""
+  try {
+    await api.post("/categories", {
+      name,
+      is_r18: newCategoryR18.value,
+    })
+    newCategoryName.value = ""
+    newCategoryR18.value = false
+    await loadCategories()
+  } catch (e) {
+    categoryError.value = e instanceof Error ? e.message : i18n.t('book_category_create_failed')
+  } finally {
+    categoryCreating.value = false
   }
 }
 
@@ -371,28 +399,50 @@ onMounted(async () => {
             <p v-if="coverError" class="text-xs text-red-600 mt-1">{{ coverError }}</p>
           </div>
           <h1 class="text-3xl font-bold mb-2">{{ book.title }}</h1>
-          <p v-if="book.author_name" class="text-muted dark:text-gray-400 mb-1">{{ book.author_name }}</p>
+          <button
+            v-if="book.author_name"
+            @click="searchByField('author', book.author_name)"
+            :title="i18n.t('book_author_search')"
+            class="text-muted dark:text-gray-400 mb-1 hover:text-accent transition-colors"
+          >{{ book.author_name }}</button>
           <div v-if="book.tag_names?.length" class="flex flex-wrap gap-1 mb-2">
-            <span
+            <template
               v-for="tag in book.tag_names"
               :key="tag"
-              class="text-xs px-2 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-muted dark:text-gray-400"
             >
-              {{ tag }}
               <button
-                v-if="auth.isAdmin"
-                @click="removeSourceTag(tag)"
-                class="ml-1 text-red-400 hover:text-red-600"
-                :title="i18n.t('book_source_tag_remove')"
-              >&times;</button>
-            </span>
+                v-if="!editing"
+                @click="searchByField('tags', tag)"
+                :title="i18n.t('book_tag_search')"
+                class="text-xs px-2 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-muted dark:text-gray-400 hover:text-accent transition-colors"
+              >{{ tag }}</button>
+              <span
+                v-else
+                class="inline-flex items-center text-xs px-2 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-muted dark:text-gray-400"
+              >
+                {{ tag }}
+                <button
+                  v-if="auth.isAdmin"
+                  @click="removeSourceTag(tag)"
+                  class="ml-1 text-red-400 hover:text-red-600"
+                  :title="i18n.t('book_source_tag_remove')"
+                >&times;</button>
+              </span>
+            </template>
           </div>
           <div v-if="book.category_names?.length" class="flex flex-wrap gap-1 mb-2">
-            <span
+            <template
               v-for="cat in book.category_names"
               :key="cat"
-              class="text-xs px-2 py-0.5 rounded bg-accent/10 text-accent"
-            >{{ cat }}</span>
+            >
+              <button
+                v-if="!editing"
+                @click="searchByField('category', cat)"
+                :title="i18n.t('book_category_search')"
+                class="text-xs px-2 py-0.5 rounded bg-accent/10 text-accent hover:bg-accent/20 transition-colors"
+              >{{ cat }}</button>
+              <span v-else class="text-xs px-2 py-0.5 rounded bg-accent/10 text-accent">{{ cat }}</span>
+            </template>
           </div>
           <p v-if="book.description" class="text-muted dark:text-gray-400 mb-3">{{ book.description }}</p>
           <div class="flex items-center gap-3">
@@ -454,6 +504,10 @@ onMounted(async () => {
               class="px-3 py-1 text-xs border border-border dark:border-gray-700 rounded hover:bg-accent/5 transition-colors"
             >{{ favorite ? i18n.t('book_favorite_added') : i18n.t('book_favorite') }}</button>
             <button
+              @click="editing = !editing"
+              class="px-3 py-1 text-xs border border-accent/50 text-accent rounded hover:bg-accent/5 transition-colors"
+            >{{ editing ? i18n.t('book_edit_done') : i18n.t('book_edit') }}</button>
+            <button
               v-if="auth.isAdmin"
               @click="deleteThisBook"
               class="px-3 py-1 text-xs text-red-500 border border-red-200 rounded hover:bg-red-50 transition-colors"
@@ -472,7 +526,7 @@ onMounted(async () => {
           </div>
         </header>
 
-        <section v-if="auth.isAdmin" class="mb-8">
+        <section v-if="auth.isAdmin && editing" class="mb-8">
           <h2 class="text-lg font-semibold mb-3">{{ i18n.t('book_category_manage') }}</h2>
           <div v-if="allCategories.length" class="flex flex-wrap gap-3 mb-3">
             <label
@@ -485,6 +539,23 @@ onMounted(async () => {
             </label>
           </div>
           <p v-else class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('book_category_empty') }}</p>
+          <div class="flex flex-wrap items-center gap-2 mb-3">
+            <input
+              v-model="newCategoryName"
+              :placeholder="i18n.t('book_category_name_placeholder')"
+              @keyup.enter="createCategory"
+              class="w-36 px-2 py-1.5 rounded border border-border dark:border-gray-700 text-xs bg-paper dark:bg-gray-800"
+            />
+            <label class="inline-flex items-center gap-1 text-xs text-muted dark:text-gray-400 cursor-pointer">
+              <input type="checkbox" v-model="newCategoryR18" class="rounded" />
+              {{ i18n.t('book_category_r18') }}
+            </label>
+            <button
+              @click="createCategory"
+              :disabled="categoryCreating"
+              class="px-3 py-1.5 rounded border border-accent/40 text-accent text-xs font-medium hover:bg-accent/5 disabled:opacity-50"
+            >{{ i18n.t('book_category_add') }}</button>
+          </div>
           <button
             @click="saveCategories"
             :disabled="categorySaving"
@@ -501,21 +572,37 @@ onMounted(async () => {
         <section class="mb-8">
           <h2 class="text-lg font-semibold mb-3">{{ i18n.t('book_custom_tags') }}</h2>
           <div v-if="customTags.length" class="flex flex-wrap gap-2 mb-3">
-            <button
+            <template
               v-for="tag in customTags"
               :key="tag.id"
-              @click="tag.is_public ? tagDetail = tag : null"
-              class="inline-flex items-center gap-1 text-xs px-2 py-1 rounded bg-amber-100 dark:bg-amber-900/60 text-amber-700 dark:text-amber-300"
-              :class="tag.is_public ? 'cursor-pointer hover:opacity-80' : 'cursor-default'"
             >
-              {{ tag.name }} ×{{ tag.count }}
+              <button
+                v-if="!editing"
+                @click="searchByField('tags', tag.name)"
+                :title="i18n.t('book_tag_search')"
+                class="inline-flex items-center gap-1 text-xs px-2 py-1 rounded bg-amber-100 dark:bg-amber-900/60 text-amber-700 dark:text-amber-300 hover:opacity-80 transition-opacity"
+              >
+                {{ tag.name }} ×{{ tag.count }}
+                <span
+                  v-if="tag.is_public"
+                  @click.stop="tagDetail = tag"
+                  class="text-accent cursor-pointer"
+                  :title="i18n.t('book_tag_detail')"
+                >ℹ</span>
+              </button>
               <span
-                v-if="tag.applied_by_me"
-                @click.stop="removeCustomTag(tag)"
-                class="text-red-500 hover:text-red-700 cursor-pointer"
-                :title="i18n.t('book_tag_remove')"
-              >&times;</span>
-            </button>
+                v-else
+                class="inline-flex items-center gap-1 text-xs px-2 py-1 rounded bg-amber-100 dark:bg-amber-900/60 text-amber-700 dark:text-amber-300"
+              >
+                {{ tag.name }} ×{{ tag.count }}
+                <span
+                  v-if="tag.applied_by_me"
+                  @click="removeCustomTag(tag)"
+                  class="text-red-500 hover:text-red-700 cursor-pointer"
+                  :title="i18n.t('book_tag_remove')"
+                >&times;</span>
+              </span>
+            </template>
           </div>
           <p v-else class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('book_custom_tags_empty') }}</p>
           <div class="flex flex-wrap items-center gap-2">

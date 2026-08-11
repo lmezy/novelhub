@@ -66,6 +66,8 @@ async def create_cookie(
             expired_at=payload.expired_at,
         )
         result = await repo.add(cookie)
+        await db.commit()
+        await db.refresh(result)
         logger.info("Cookie saved for source=%s id=%s", payload.source, cookie.id)
         return result
     except HTTPException:
@@ -111,6 +113,8 @@ async def update_cookie(
     if "expired_at" in data:
         cookie.expired_at = data["expired_at"]
     await db.flush()
+    await db.commit()
+    await db.refresh(cookie)
     return cookie
 
 
@@ -128,6 +132,7 @@ async def delete_cookie(
     if source is None or not _can_access_source(user, source):
         raise HTTPException(status_code=404, detail="Cookie not found")
     await repo.delete(cookie)
+    await db.commit()
 
 
 @router.post("/test", status_code=200)

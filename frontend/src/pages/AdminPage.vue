@@ -246,6 +246,10 @@ function toggleSourceDetails(s: Source) {
 
 async function saveSourceCookie(s: Source) {
   cookieForm.value.source = s.id
+  const existing = sourceCookies(s.id)[0]
+  if (existing) {
+    cookieEditingId.value = existing.id
+  }
   await createCookie()
 }
 
@@ -376,6 +380,7 @@ const localSelected = ref<string[]>([])
 const localScanning = ref(false)
 const localDirectResult = ref<any>(null)
 const localRoots = ref<any[]>([])
+const localClass = ref<"auto" | "all" | "r18">("auto")
 const localBrowserOpen = ref(false)
 const localBrowserPath = ref("")
 const localBrowserName = ref("")
@@ -394,6 +399,13 @@ const manualAnalyzing = ref(false)
 const manualAnalyzeResult = ref<any>(null)
 const manualResult = ref<any>(null)
 const manualError = ref("")
+const manualClass = ref<"auto" | "all" | "r18">("auto")
+
+function classificationValue(value: "auto" | "all" | "r18"): boolean | null {
+  if (value === "all") return false
+  if (value === "r18") return true
+  return null
+}
 
 const creds = ref<any[]>([])
 const credForm = ref({ source: "", username: "", password: "" })
@@ -651,6 +663,7 @@ async function importLocal() {
   try {
     localResult.value = await api.post<any>("/sync/local", {
       path: localPath.value.trim(),
+      is_r18: classificationValue(localClass.value),
     })
     await loadSources()
   } catch (e) {
@@ -718,6 +731,7 @@ async function scanLocal() {
     const res = await api.post<any>("/sync/local/scan", {
       path: localPath.value.trim(),
       max_depth: 3,
+      is_r18: classificationValue(localClass.value),
     })
     localScanRoot.value = res.root || ""
     localScan.value = res.books || []
@@ -772,6 +786,7 @@ async function importLocalSelected() {
     localResult.value = await api.post<any>("/sync/local/import", {
       path: localPath.value.trim(),
       book_paths: localSelected.value,
+      is_r18: classificationValue(localClass.value),
     })
     await loadSources()
   } catch (e) {
@@ -793,6 +808,7 @@ async function importLocalAll() {
     localResult.value = await api.post<any>("/sync/local/import", {
       path: localPath.value.trim(),
       book_paths: localScan.value.map(book => book.path),
+      is_r18: classificationValue(localClass.value),
     })
     await loadSources()
   } catch (e) {
@@ -815,6 +831,7 @@ async function directLocalSelected() {
     localDirectResult.value = await api.post<any>("/sync/local/direct", {
       path: localPath.value.trim(),
       book_paths: localSelected.value,
+      is_r18: classificationValue(localClass.value),
     })
   } catch (e) {
     localError.value = e instanceof Error ? e.message : i18n.t('admin_local_import_failed')
@@ -846,6 +863,7 @@ async function analyzeManualText(sourceText?: string, filename?: string) {
     const res = await api.post<any>("/books/manual/analyze", {
       text,
       filename: filename || null,
+      is_r18: classificationValue(manualClass.value),
     })
     manualAnalyzeResult.value = res
     if (res.title) manualTitle.value = res.title
@@ -910,6 +928,7 @@ async function submitManualBook() {
       status: manualStatus.value,
       description: manualDescription.value.trim() || null,
       tags: manualTags.value.split(/[,，\s]+/).filter(Boolean),
+      is_r18: classificationValue(manualClass.value),
       chapters,
     })
     manualTitle.value = ""
@@ -1370,7 +1389,9 @@ onUnmounted(() => {
                   class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-xs bg-paper dark:bg-gray-800 mb-2"
                 />
                 <div class="flex gap-2">
-                  <button @click="saveSourceCookie(s)" class="px-3 py-1.5 rounded bg-accent text-white text-xs font-medium">{{ i18n.t('admin_save_cookie') }}</button>
+                  <button @click="saveSourceCookie(s)" class="px-3 py-1.5 rounded bg-accent text-white text-xs font-medium">
+                    {{ sourceCookies(s.id).length ? i18n.t('admin_update_cookie') : i18n.t('admin_save_cookie') }}
+                  </button>
                   <button @click="testSourceCookie(s)" :disabled="cookieTesting" class="px-3 py-1.5 rounded border border-accent text-accent text-xs font-medium disabled:opacity-50">
                     {{ cookieTesting ? i18n.t('admin_testing') : i18n.t('admin_test_cookie') }}
                   </button>
@@ -1783,6 +1804,26 @@ onUnmounted(() => {
               </label>
             </div>
 
+            <div>
+              <label for="yuedu-cookie" class="block text-xs font-medium mb-1.5">{{ i18n.t('admin_yuedu_cookie_label') }}</label>
+              <textarea
+                id="yuedu-cookie"
+                v-model="yueduCookie"
+                :placeholder="i18n.t('admin_yuedu_cookie_placeholder')"
+                rows="2"
+                class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 resize-y font-mono text-xs"
+              ></textarea>
+            </div>
+            <label class="inline-flex items-center gap-2 text-xs text-muted dark:text-gray-400 cursor-pointer">
+              <input type="checkbox" v-model="yueduDiscover" class="rounded" />
+              {{ i18n.t('admin_yuedu_discover_label') }}
+            </label>
+            <button
+              @click="yueduImportAndSync"
+              :disabled="yueduSyncImporting"
+              class="w-full py-3 rounded-lg border border-accent text-accent font-semibold hover:bg-accent/10 disabled:opacity-50 transition-all text-sm"
+            >{{ yueduSyncImporting ? i18n.t('admin_yuedu_importing_sync') : i18n.t('admin_yuedu_import_sync_btn') }}</button>
+
             <p v-if="yueduSyncError" class="text-sm text-red-600">{{ yueduSyncError }}</p>
 
             <button @click="yueduImport" :disabled="yueduImporting"
@@ -1847,6 +1888,17 @@ onUnmounted(() => {
             >{{ i18n.t('admin_local_choose_dir') }}</button>
           </div>
           <p v-if="localError" class="text-sm text-red-600 mt-2">{{ localError }}</p>
+          <div class="mt-3 flex flex-wrap items-center gap-2">
+            <label class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_import_classification') }}</label>
+            <select
+              v-model="localClass"
+              class="px-2 py-1.5 rounded border border-border dark:border-gray-700 text-xs bg-paper dark:bg-gray-800"
+            >
+              <option value="auto">{{ i18n.t('admin_classification_auto') }}</option>
+              <option value="all">{{ i18n.t('admin_classification_all_ages') }}</option>
+              <option value="r18">{{ i18n.t('admin_classification_r18') }}</option>
+            </select>
+          </div>
           <div class="mt-3 flex flex-wrap gap-2">
             <button
               @click="scanLocal"
@@ -2001,12 +2053,17 @@ onUnmounted(() => {
             <input v-model="manualTitle" :placeholder="i18n.t('admin_manual_title_placeholder')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
             <input v-model="manualAuthor" :placeholder="i18n.t('admin_manual_author_placeholder')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
           </div>
-          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-3">
             <select v-model="manualStatus" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800">
               <option value="ongoing">{{ i18n.t('admin_manual_status_ongoing') }}</option>
               <option value="completed">{{ i18n.t('admin_manual_status_completed') }}</option>
             </select>
             <input v-model="manualTags" :placeholder="i18n.t('admin_manual_tags_placeholder')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            <select v-model="manualClass" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800">
+              <option value="auto">{{ i18n.t('admin_classification_auto') }}</option>
+              <option value="all">{{ i18n.t('admin_classification_all_ages') }}</option>
+              <option value="r18">{{ i18n.t('admin_classification_r18') }}</option>
+            </select>
           </div>
           <textarea
             v-model="manualDescription"

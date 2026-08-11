@@ -32,12 +32,14 @@ class ManualBookCreate(BaseModel):
     description: str | None = None
     status: str = "ongoing"
     tags: list[str] = []
+    is_r18: bool | None = None
     chapters: list[ManualChapterIn]
 
 
 class ManualAnalyzeRequest(BaseModel):
     text: str
     filename: str | None = None
+    is_r18: bool | None = None
 
 
 class ManualAnalyzeResult(BaseModel):

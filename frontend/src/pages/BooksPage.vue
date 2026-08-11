@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue"
+import { useRouter } from "vue-router"
 import { useBooksStore, type Book } from "../stores/books"
 import { useAuthStore } from "../stores/auth"
 import { useI18nStore } from "../stores/i18n"
@@ -9,12 +10,17 @@ import NavBar from "../components/NavBar.vue"
 const store = useBooksStore()
 const auth = useAuthStore()
 const i18n = useI18nStore()
+const router = useRouter()
 const selectedIds = ref<string[]>([])
 const batchDeleting = ref(false)
 const batchFavoriting = ref(false)
 const autoCategorizing = ref(false)
 const categories = ref<{ id: string; name: string; color?: string | null }[]>([])
 const selectedCategory = ref("")
+const newCategoryName = ref("")
+const newCategoryR18 = ref(false)
+const categoryCreating = ref(false)
+const categoryError = ref("")
 
 const filteredBooks = computed(() => {
   if (!selectedCategory.value) return store.books
@@ -114,6 +120,30 @@ async function loadCategories() {
   }
 }
 
+function searchByField(field: "author" | "tags" | "category", value: string) {
+  router.push({ path: "/search", query: { field, q: value } })
+}
+
+async function createCategory() {
+  const name = newCategoryName.value.trim()
+  if (!name) return
+  categoryCreating.value = true
+  categoryError.value = ""
+  try {
+    await api.post("/categories", {
+      name,
+      is_r18: newCategoryR18.value,
+    })
+    newCategoryName.value = ""
+    newCategoryR18.value = false
+    await loadCategories()
+  } catch (e) {
+    categoryError.value = e instanceof Error ? e.message : i18n.t('book_category_create_failed')
+  } finally {
+    categoryCreating.value = false
+  }
+}
+
 onMounted(async () => {
   await loadCategories()
   await store.fetchBooks()
@@ -174,6 +204,26 @@ onMounted(async () => {
                 <option v-for="cat in categories" :key="cat.id" :value="cat.name">{{ cat.name }}</option>
               </select>
             </label>
+            <template v-if="auth.isAdmin">
+              <span class="inline-flex items-center gap-1">
+                <input
+                  v-model="newCategoryName"
+                  :placeholder="i18n.t('book_category_name_placeholder')"
+                  @keyup.enter="createCategory"
+                  class="w-28 px-2 py-1 rounded border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-xs"
+                />
+                <label class="inline-flex items-center gap-1 text-muted dark:text-gray-400 cursor-pointer">
+                  <input type="checkbox" v-model="newCategoryR18" class="rounded" />
+                  {{ i18n.t('book_category_r18') }}
+                </label>
+                <button
+                  @click="createCategory"
+                  :disabled="categoryCreating"
+                  class="px-2 py-1 rounded bg-accent text-white text-xs disabled:opacity-50"
+                >{{ i18n.t('book_category_add') }}</button>
+              </span>
+              <span v-if="categoryError" class="text-red-600">{{ categoryError }}</span>
+            </template>
             <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
               <input
                 type="checkbox"
@@ -226,25 +276,36 @@ onMounted(async () => {
               class="w-full h-44 object-cover rounded-md mb-3 border border-border dark:border-gray-700"
             />
             <h3 class="font-semibold text-ink mb-1 truncate pr-6">{{ book.title }}</h3>
-            <p v-if="book.author_name" class="text-xs text-muted dark:text-gray-400 mb-1">{{ book.author_name }}</p>
+            <button
+              v-if="book.author_name"
+              @click.prevent.stop="searchByField('author', book.author_name)"
+              :title="i18n.t('book_author_search')"
+              class="text-xs text-muted dark:text-gray-400 mb-1 hover:text-accent transition-colors"
+            >{{ book.author_name }}</button>
             <div v-if="book.category_names?.length" class="flex flex-wrap gap-1 mb-1">
-              <span
+              <button
                 v-for="cat in book.category_names"
                 :key="cat"
+                @click.prevent.stop="searchByField('category', cat)"
+                :title="i18n.t('book_category_search')"
                 class="text-xs px-2 py-0.5 rounded bg-accent/10 text-accent"
-              >{{ cat }}</span>
+              >{{ cat }}</button>
             </div>
             <div v-if="book.tag_names?.length || book.custom_tags?.length" class="flex flex-wrap gap-1 mb-2">
-              <span
+              <button
                 v-for="tag in book.tag_names"
                 :key="tag"
+                @click.prevent.stop="searchByField('tags', tag)"
+                :title="i18n.t('book_tag_search')"
                 class="text-xs px-2 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-muted dark:text-gray-400"
-              >{{ tag }}</span>
-              <span
+              >{{ tag }}</button>
+              <button
                 v-for="tag in book.custom_tags || []"
                 :key="tag.id"
+                @click.prevent.stop="searchByField('tags', tag.name)"
+                :title="i18n.t('book_tag_search')"
                 class="text-xs px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-900/60 text-amber-700 dark:text-amber-300"
-              >{{ tag.name }}<template v-if="tag.count > 1"> ×{{ tag.count }}</template></span>
+              >{{ tag.name }}<template v-if="tag.count > 1"> ×{{ tag.count }}</template></button>
             </div>
             <p class="text-sm text-muted dark:text-gray-400 line-clamp-2 mb-3">
               {{ book.description || i18n.t('home_no_desc') }}

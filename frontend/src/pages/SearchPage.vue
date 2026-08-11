@@ -2,7 +2,7 @@
 import { onMounted, ref, watch } from "vue"
 import { api } from "../api/client"
 import NavBar from "../components/NavBar.vue"
-import { useRouter } from "vue-router"
+import { useRoute, useRouter } from "vue-router"
 import { useAuthStore } from "../stores/auth"
 import { useI18nStore } from "../stores/i18n"
 
@@ -40,6 +40,7 @@ interface SearchHit {
 }
 
 const router = useRouter()
+const route = useRoute()
 const auth = useAuthStore()
 const i18n = useI18nStore()
 
@@ -136,9 +137,38 @@ function goToHit(hit: SearchHit) {
   }
 }
 
+function applyQuery() {
+  const field = (route.query.field as string) || ""
+  const q = (route.query.q as string) || ""
+  if (
+    q &&
+    ["title", "author", "chapter_title", "description", "content", "tags", "category"].includes(field)
+  ) {
+    const fuzzyFields = ["title", "author", "description", "content", "chapter_title"]
+    conditions.value = [{
+      enabled: true,
+      field: field as SearchField,
+      mode: fuzzyFields.includes(field) ? "fuzzy" : "exact",
+      value: q,
+    }]
+    match.value = "and"
+    doSearch()
+    return
+  }
+  if (!conditions.value.length || !conditions.value[0].value) {
+    conditions.value = [{ enabled: true, field: "title", mode: "exact", value: "" }]
+    searched.value = false
+    results.value = []
+    total.value = 0
+  }
+}
+
+watch(() => route.query, applyQuery)
+
 onMounted(async () => {
   await auth.fetchMe()
   await loadTags()
+  applyQuery()
 })
 </script>
 

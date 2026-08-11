@@ -40,6 +40,7 @@ class DiscoverResult(BaseModel):
 class LocalScanRequest(BaseModel):
     path: str
     max_depth: int = 3
+    is_r18: bool | None = None
 
 
 class LocalImportRoot(BaseModel):
@@ -85,6 +86,7 @@ class LocalScanResult(BaseModel):
 class LocalImportRequest(BaseModel):
     path: str
     book_paths: list[str] | None = None
+    is_r18: bool | None = None
 
 
 class LocalChapterRef(BaseModel):

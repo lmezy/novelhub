@@ -198,6 +198,7 @@ def enrich_book_metadata(
     fallback_title: str = "",
     fallback_author: str = "",
     sample_limit: int = 300_000,
+    is_r18: bool | None = None,
 ) -> dict:
     """Merge explicit metadata with heuristics extracted from local content."""
     meta = dict(meta or {})
@@ -241,13 +242,14 @@ def enrich_book_metadata(
             description=description,
         ),
     ])
-    is_r18 = _as_bool(meta.get("is_r18", False)) or detect_r18(
+    detected_r18 = _as_bool(meta.get("is_r18", False)) or detect_r18(
         title=title,
         author=author,
         description=description,
         tags=tags,
         content_text=text,
     )
+    is_r18 = detected_r18 if is_r18 is None else bool(is_r18)
     categories = suggest_categories(
         tags,
         title=title,
@@ -266,10 +268,15 @@ def enrich_book_metadata(
     }
 
 
-def analyze_book_text(text: str, filename: str | None = None) -> dict:
+def analyze_book_text(
+    text: str,
+    filename: str | None = None,
+    is_r18: bool | None = None,
+) -> dict:
     """Analyze pasted manual-upload text without splitting chapters."""
     return enrich_book_metadata(
         chapters=[("", text)],
         filename=filename,
         fallback_author="未知作者",
+        is_r18=is_r18,
     )

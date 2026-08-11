@@ -362,6 +362,7 @@ class SyncService:
         url: str,
         progress_cb: Callable[[dict], Awaitable[None]] | None = None,
         checkpoint_cb: Callable[[], Awaitable[None]] | None = None,
+        is_r18_override: bool | None = None,
     ) -> dict:
         source = await self.db.get(Source, source_id)
         if source is None or not source.enabled:
@@ -397,7 +398,11 @@ class SyncService:
 
         book_title = self._safe_title(remote_book)
         author_name = self._safe_author(remote_book.author)
-        is_r18 = self._is_book_r18(source, remote_book)
+        is_r18 = (
+            self._is_book_r18(source, remote_book)
+            if is_r18_override is None
+            else bool(is_r18_override)
+        )
 
         author = await self._get_or_create_author(author_name)
         book, is_new = await self._get_or_create_book(

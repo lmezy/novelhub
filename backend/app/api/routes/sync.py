@@ -69,7 +69,11 @@ async def import_local_book(
     if not path:
         raise HTTPException(status_code=400, detail="Local path is required")
     try:
-        return await SyncService(db).sync_book(source_id, _to_file_url(path))
+        return await SyncService(db).sync_book(
+            source_id,
+            _to_file_url(path),
+            is_r18_override=payload.is_r18,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -77,7 +81,11 @@ async def import_local_book(
 @router.post("/local/scan", response_model=LocalScanResult, dependencies=[Depends(require_admin)])
 async def scan_local_library_endpoint(payload: LocalScanRequest):
     try:
-        books = scan_local_library(payload.path, max_depth=payload.max_depth)
+        books = scan_local_library(
+            payload.path,
+            max_depth=payload.max_depth,
+            is_r18=payload.is_r18,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return LocalScanResult(root=payload.path, books=books)
@@ -104,7 +112,7 @@ async def direct_local_books(payload: LocalImportRequest):
     books = []
     try:
         for path in paths:
-            books.append(parse_local_book(path))
+            books.append(parse_local_book(path, is_r18=payload.is_r18))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return LocalDirectResult(books=books)
@@ -138,7 +146,11 @@ async def import_local_books(
     results = []
     for path in paths:
         try:
-            result = await SyncService(db).sync_book(source_id, _to_file_url(path))
+            result = await SyncService(db).sync_book(
+                source_id,
+                _to_file_url(path),
+                is_r18_override=payload.is_r18,
+            )
             results.append({
                 "path": path,
                 "status": "ok",

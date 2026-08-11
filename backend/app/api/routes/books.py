@@ -239,6 +239,7 @@ async def create_manual_book(
             status=payload.status,
             tags=payload.tags,
             chapters=[chapter.model_dump() for chapter in payload.chapters],
+            is_r18=payload.is_r18,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -253,7 +254,7 @@ async def analyze_manual_book(payload: ManualAnalyzeRequest):
     text = (payload.text or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="Text is required")
-    result = analyze_book_text(text, payload.filename)
+    result = analyze_book_text(text, payload.filename, is_r18=payload.is_r18)
     return ManualAnalyzeResult(
         **result,
         chapter_count=len(split_text_chapters(text)),

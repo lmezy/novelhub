@@ -41,3 +41,22 @@ def test_enrich_book_metadata_merges_explicit_and_suggested_tags():
 def test_extract_status_recognizes_completed_text():
     assert extract_status("这是一本已完结的小说") == "completed"
     assert extract_status("本书连载中") == "ongoing"
+
+
+def test_enrich_book_metadata_all_ages_override_ignores_r18_content():
+    result = enrich_book_metadata(
+        chapters=[("第一章", "正文包含色情内容")],
+        is_r18=False,
+    )
+
+    assert result["is_r18"] is False
+    assert "肉文" not in result["categories"]
+
+
+def test_enrich_book_metadata_r18_override_marks_clean_text():
+    result = enrich_book_metadata(
+        chapters=[("第一章", "干净的正文内容")],
+        is_r18=True,
+    )
+
+    assert result["is_r18"] is True

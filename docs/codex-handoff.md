@@ -1,9 +1,46 @@
 # NovelHub 完整交接记录
 
-> 最后更新：2026-08-07
+> 最后更新：2026-08-11
 > 状态：本地代码已完成本轮增强，待提交
 > 分支：`develop`
 > HEAD：以 git log 为准
+
+## 0. 本轮修改（2026-08-11）
+
+### 0.1 修复 Cookie 保存后仍显示“保存 Cookie”
+
+- 根因：`POST /api/cookies`、`PUT /api/cookies/{id}`、`DELETE /api/cookies/{id}` 只 `flush` 未 `commit`，请求结束后事务回滚，刷新后 Cookie 丢失。
+- `backend/app/api/routes/cookies.py`：创建/更新/删除 Cookie 均补充 `commit`。
+- `frontend/src/pages/AdminPage.vue`：已有 Cookie 时保存按钮显示“更新 Cookie”并走 PUT，避免重复创建报 409；恢复“导入并同步全部”区域缺失的 Cookie 输入框、发现开关和按钮。
+
+### 0.2 书籍页面支持添加分类
+
+- `frontend/src/pages/BooksPage.vue`：书库页分类筛选旁新增管理员“添加分类”输入（名称 + R18 开关）。
+- `frontend/src/pages/BookDetailPage.vue`：编辑模式下的“设置分类”区域新增“添加分类”。
+- 后端沿用已有 `POST /api/categories`，无需数据库迁移。
+
+### 0.3 本地导入/手动上传支持选择全年龄
+
+- `backend/app/schemas/sync.py`、`backend/app/schemas/book.py`：`LocalImportRequest`、`LocalScanRequest`、`ManualBookCreate`、`ManualAnalyzeRequest` 增加 `is_r18: bool | None`。
+- `backend/app/services/book_enrichment.py`：`enrich_book_metadata` 支持 `is_r18` 覆盖自动检测，分类也按覆盖后的结果计算。
+- `backend/app/services/sync.py`：`sync_book` 支持 `is_r18_override`，覆盖后同步写入对应 `is_r18` 与 `r18`/`all-ages` 标签。
+- `backend/app/services/local_library.py`、`backend/app/services/manual_import.py` 与对应路由透传覆盖值。
+- `frontend/src/pages/AdminPage.vue`：本地导入和手动上传均新增“自动检测 / 全年龄 / R18”下拉，扫描预览、导入、手动保存都会带上选择。
+
+### 0.4 书籍详情增加编辑模式
+
+- `frontend/src/pages/BookDetailPage.vue`：新增“编辑 / 完成编辑”按钮；普通查看时标签、分类、作者可点击跳转搜索，删除按钮不再直接暴露；编辑模式下才显示来源标签删除、自定义标签移除和分类管理。
+
+### 0.5 标签/分类/作者点击跳转搜索
+
+- `frontend/src/pages/BookDetailPage.vue`、`BooksPage.vue`、`HomePage.vue`：作者、标签、分类点击后跳转 `/search?field=...&q=...`。
+- `frontend/src/pages/SearchPage.vue`：读取 URL 查询参数自动填充搜索条件并执行；作者/书名用模糊匹配，标签/分类用精确匹配。
+
+### 0.6 测试
+
+- 新增 `backend/tests/test_cookies.py`，验证 Cookie 创建/更新/删除会提交事务。
+- `test_book_enrichment.py`、`test_local_library.py`、`test_manual_import.py` 增加全年龄/R18 覆盖测试。
+- 完整 `pytest`：237 passed；`npm run typecheck`、`npm run build` 均通过。
 
 ## 1. 原始需求
 

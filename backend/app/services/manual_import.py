@@ -25,6 +25,7 @@ class ManualImportService:
         status: str,
         tags: list[str],
         chapters: list[dict],
+        is_r18: bool | None = None,
     ) -> dict:
         title = (title or "").strip()
         if not chapters:
@@ -46,6 +47,7 @@ class ManualImportService:
             },
             chapters=chapter_pairs,
             fallback_author="未知作者",
+            is_r18=is_r18,
         )
         title = enriched["title"]
         if not title:

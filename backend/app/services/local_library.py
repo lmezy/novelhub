@@ -45,7 +45,7 @@ def looks_like_book_dir(path: Path) -> bool:
     return any(path.glob("*.md"))
 
 
-def parse_local_book(path: str | Path) -> dict:
+def parse_local_book(path: str | Path, is_r18: bool | None = None) -> dict:
     """Parse one local book directory without touching the database."""
     book_dir = Path(path).expanduser().resolve()
     if book_dir.is_file():
@@ -64,6 +64,7 @@ def parse_local_book(path: str | Path) -> dict:
             filename=book_dir.name,
             fallback_title=book_dir.stem,
             fallback_author="Unknown",
+            is_r18=is_r18,
         )
         return {
             "path": str(book_dir),
@@ -110,6 +111,7 @@ def parse_local_book(path: str | Path) -> dict:
         filename=book_dir.name,
         fallback_title=book_dir.name,
         fallback_author=book_dir.parent.name,
+        is_r18=is_r18,
     )
     return {
         "path": str(book_dir),
@@ -127,7 +129,11 @@ def parse_local_book(path: str | Path) -> dict:
     }
 
 
-def scan_local_library(root: str, max_depth: int = 3) -> list[dict]:
+def scan_local_library(
+    root: str,
+    max_depth: int = 3,
+    is_r18: bool | None = None,
+) -> list[dict]:
     """Scan a directory tree and return candidate local book folders."""
     root_path = Path(root).expanduser().resolve()
     if not root_path.is_dir():
@@ -147,7 +153,7 @@ def scan_local_library(root: str, max_depth: int = 3) -> list[dict]:
         root_book_ok = depth > 0 or (current / "metadata.json").is_file()
         if root_book_ok and looks_like_book_dir(current):
             try:
-                info = parse_local_book(current)
+                info = parse_local_book(current, is_r18=is_r18)
             except ValueError:
                 dirnames[:] = []
                 continue
@@ -181,7 +187,7 @@ def scan_local_library(root: str, max_depth: int = 3) -> list[dict]:
             if key in added_paths:
                 continue
             try:
-                info = parse_local_book(file_path)
+                info = parse_local_book(file_path, is_r18=is_r18)
             except ValueError:
                 continue
             if info["chapter_count"] == 0:
