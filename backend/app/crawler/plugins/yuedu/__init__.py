@@ -132,16 +132,22 @@ GENERIC_BOOK_DESC_SELECTORS = [
 ]
 
 GENERIC_CHAPTER_SELECTORS = [
-    "#list a",
-    ".listmain a",
-    ".chapterlist a",
-    "ul.chapter-list a",
+    "div.book_newchap a",
+    ".book_newchap a",
+    "#chapters a",
     ".chapter-list a",
+    ".listmain a",
+    "ul.chapter-list a",
     "div.listmain a",
     "li.chapter-item a",
     "dd.chapter a",
     ".book-catalog a",
     "#catalog a",
+    "#list a",
+    "#content a",
+    "[class*='chapter'] a",
+    "[class*='catalog'] a",
+    "[class*='list'] a",
 ]
 
 GENERIC_BOOK_COVER_SELECTORS = [
@@ -158,6 +164,106 @@ GENERIC_BOOK_COVER_SELECTORS = [
     "img.cover",
     "img[class*='cover']",
 ]
+
+TOC_LINK_TEXTS = {
+    "查看所有章节",
+    "查看全部章节",
+    "全部章节",
+    "章节列表",
+    "章节目录",
+    "查看目录",
+    "所有章节",
+    "目录",
+}
+
+TOC_LINK_PATH_RE = re.compile(
+    r"/(?:other/chapters|chapters|booktoc|chapterlist|toc|book/chapters)(?:/|\.)",
+    re.IGNORECASE,
+)
+
+CHAPTER_PATH_SEGMENTS = (
+    "book",
+    "read",
+    "chapter",
+    "chapters",
+    "novel",
+    "article",
+    "content",
+    "view",
+    "show",
+    "xiaoshuo",
+    "txt",
+    "files",
+)
+
+NAV_PATH_SEGMENTS = (
+    "list",
+    "lists",
+    "sort",
+    "rank",
+    "top",
+    "all",
+    "order",
+    "update",
+    "finish",
+    "wanben",
+    "quanben",
+    "allvisit",
+    "lastupdate",
+    "history",
+    "bookcase",
+    "bookshelf",
+    "user",
+    "users",
+    "login",
+    "register",
+    "signup",
+    "search",
+    "category",
+    "tag",
+    "tags",
+    "author",
+    "about",
+    "help",
+    "faq",
+    "contact",
+    "index",
+    "original",
+    "other",
+    "fenlei",
+    "booklist",
+)
+
+TOC_NOISE_TITLES = {
+    "首页",
+    "原创",
+    "最新",
+    "电子魅魔",
+    "Ai性伴侣",
+    "色情游戏",
+    "查看所有章节",
+    "查看全部章节",
+    "全部章节",
+    "章节列表",
+    "章节目录",
+    "目录",
+    "返回书页",
+    "直达底部",
+    "简体站",
+    "繁體站",
+    "发布页",
+    "上一章",
+    "下一章",
+    "返回目录",
+    "开始阅读",
+}
+
+BLOCK_PAGE_MARKERS = (
+    "访问异常",
+    "访问过于频繁",
+    "请求过于频繁",
+    "操作过于频繁",
+)
 
 
 class YueduPlugin:
@@ -244,6 +350,8 @@ class YueduPlugin:
         self.engine.run_pre_update_js(toc_data)
 
         toc_url = str(info.get("tocUrl") or "").strip()
+        if not toc_url:
+            toc_url = self._find_toc_url(html, url)
         if toc_url and not toc_url.startswith(("http://", "https://")):
             toc_url = self._make_absolute(toc_url, url)
         if not toc_url:
@@ -258,6 +366,17 @@ class YueduPlugin:
             self.engine.parse_toc(toc_html),
             toc_url,
         )
+        if not toc:
+            # The configured ruleToc may be outdated. Fall back to the generic
+            # chapter scanner on the real TOC page (book page or full list).
+            generic_toc = self._parse_book_generic(toc_html, toc_url)
+            toc = [
+                {
+                    "chapterName": chapter.title,
+                    "chapterUrl": chapter.url,
+                }
+                for chapter in generic_toc["chapters"]
+            ]
 
         # Follow nextTocUrl for paginated tables of contents
         max_toc_pages = 20
@@ -367,6 +486,7 @@ class YueduPlugin:
 
         if not chapters:
             chapters = generic["chapters"]
+        chapters = self._dedupe_chapters(chapters, url)
         chapters = self._attach_next_urls(chapters)
 
         cover_url = self._pick_cover_url(info.get("coverUrl"), url)
@@ -383,6 +503,128 @@ class YueduPlugin:
             tags=tags,
             cover_url=cover_url or None,
         )
+
+    def _find_toc_url(self, html: str, book_url: str) -> str:
+        """Find a full chapter-list URL from a book detail page.
+
+        Many sites keep only the latest chapters on the book page and put the
+        complete TOC on a separate page (for example `/other/chapters/id/1.html`
+        or `/chapters/1.html`). The link text is usually "查看所有章节".
+        """
+        try:
+            soup = BeautifulSoup(html, "lxml")
+        except Exception:
+            return ""
+
+        candidates: list[str] = []
+        for a_tag in soup.select("a[href]"):
+            href = (a_tag.get("href") or "").strip()
+            if not href or href.startswith(("javascript:", "#")):
+                continue
+            text = a_tag.get_text(" ", strip=True).strip().lower()
+            absolute = self._make_absolute(href, book_url or self.base_url)
+            if not absolute.startswith(("http://", "https://")):
+                continue
+            if urlparse(absolute).path in ("", "/"):
+                continue
+            if absolute.rstrip("/") == self._make_absolute(
+                book_url,
+                self.base_url,
+            ).rstrip("/"):
+                continue
+            if text and any(marker in text for marker in TOC_LINK_TEXTS):
+                candidates.append(absolute)
+                continue
+            if TOC_LINK_PATH_RE.search(urlparse(absolute).path):
+                candidates.append(absolute)
+
+        # Prefer an explicit TOC path over a generic link text match.
+        for candidate in candidates:
+            if TOC_LINK_PATH_RE.search(urlparse(candidate).path):
+                return candidate
+        return candidates[0] if candidates else ""
+
+    @staticmethod
+    def _dedupe_chapters(
+        chapters: list["RemoteChapter"],
+        book_url: str,
+    ) -> list["RemoteChapter"]:
+        """Deduplicate chapters by URL and by repeated title on the same book.
+
+        A broad generic TOC scanner often sees the same chapter twice (for
+        example a "start reading" button plus the real list entry, or a link
+        ending in `/0.html` alongside the canonical hash URL). When the same
+        normalized title appears under the same parent path, keep the
+        canonical-looking URL.
+        """
+        def normalized_url(url: str) -> str:
+            return url.split("#", 1)[0].rstrip("/")
+
+        def parent_path(url: str) -> str:
+            path = urlparse(url).path.rstrip("/")
+            return path.rsplit("/", 1)[0] if "/" in path else path
+
+        def normalized_title(title: str) -> str:
+            return re.sub(
+                r"[\s《》「」『』〈〉（）【】\[\]\"'“”‘’]+",
+                "",
+                title or "",
+            ).lower()
+
+        seen_urls: set[str] = set()
+        by_title: dict[str, list[RemoteChapter]] = {}
+        result: list[RemoteChapter] = []
+
+        for chapter in chapters:
+            key = normalized_url(chapter.url)
+            if key in seen_urls:
+                continue
+            seen_urls.add(key)
+            title_key = normalized_title(chapter.title)
+            if title_key:
+                by_title.setdefault(title_key, []).append(chapter)
+            result.append(chapter)
+
+        final: list[RemoteChapter] = []
+        seen_kept: set[str] = set()
+        for chapter in result:
+            if id(chapter) in seen_kept:
+                continue
+            title_key = normalized_title(chapter.title)
+            group = by_title.get(title_key) or [chapter]
+            same_path_groups: dict[str, list[RemoteChapter]] = {}
+            for ch in group:
+                same_path_groups.setdefault(parent_path(ch.url), []).append(ch)
+            duplicate_group = next(
+                (
+                    same_group
+                    for same_group in same_path_groups.values()
+                    if len(same_group) > 1
+                ),
+                None,
+            )
+            if duplicate_group is None:
+                final.append(chapter)
+                seen_kept.add(id(chapter))
+                continue
+
+            def _canonical_score(ch: RemoteChapter) -> tuple[int, int]:
+                path = urlparse(ch.url).path.rstrip("/")
+                last = path.rsplit("/", 1)[-1].lower()
+                if last in ("0", "0.html"):
+                    return (0, len(path))
+                if re.fullmatch(r"[0-9a-f]{8,}", last.rsplit(".", 1)[0], re.I):
+                    return (2, len(path))
+                return (1, len(path))
+
+            best = max(duplicate_group, key=_canonical_score)
+            if chapter is best:
+                final.append(chapter)
+                for ch in group:
+                    seen_kept.add(id(ch))
+            else:
+                seen_kept.add(id(chapter))
+        return final
 
     def _parse_book_generic(
         self,
@@ -943,7 +1185,11 @@ class YueduPlugin:
         replace_rules = (self.config.get("ruleContent") or {}).get("replaceRegex", [])
         if replace_rules:
             content = self.engine._apply_replace_regex(content, replace_rules).strip()
-        return content or ""
+        if not content:
+            raise RuntimeError(
+                f"Chapter returned empty content: {chapter.url}"
+            )
+        return content
 
     def _parse_chapter_content_generic(self, html: str) -> str:
         """Extract readable text when the configured content rule misses."""
@@ -1281,25 +1527,42 @@ class YueduPlugin:
         return False
 
     def _is_chapter_url(self, url: str, book_url: str) -> bool:
-        """Filter out book-page, category, and navigation links from a TOC."""
+        """Filter out book-page, category, navigation, and ad links from a TOC."""
         abs_url = self._make_absolute(url, book_url or self.base_url)
         abs_book = self._make_absolute(book_url, self.base_url)
         if abs_url.rstrip("/") == abs_book.rstrip("/"):
             return False
 
-        path = urlparse(abs_url).path.lower()
-        skip_paths = (
-            "/lists/", "/list", "/category/", "/categories/", "/tag/", "/tags/",
-            "/author/", "/search", "/bookcase/", "/bookshelf/", "/user/",
-            "/login", "/register", "/signup", "/about", "/help", "/faq",
-            "/contact", "/rank", "/top", "/sort", "/finish", "/wanben",
-            "/quanben", "/allvisit", "/lastupdate", "/history", "/index",
-        )
-        if any(seg in path for seg in skip_paths):
+        parsed = urlparse(abs_url)
+        if parsed.scheme not in ("http", "https"):
             return False
+        path = parsed.path.lower().split("?", 1)[0].rstrip("/")
+        if not path or path == "/":
+            return False
+
+        # A book detail page is not a chapter, even if it sits under /book/.
         if self._is_book_url(abs_url, require_pattern=True):
             return False
-        return True
+
+        same_host = (
+            parsed.netloc.lower() == urlparse(self.base_url).netloc.lower()
+        )
+        segments = [segment for segment in path.split("/") if segment]
+
+        if same_host:
+            if len(segments) < 2:
+                return False
+            if any(segment in NAV_PATH_SEGMENTS for segment in segments):
+                return False
+            return True
+
+        # External links are usually ads/mirror links on Chinese novel sites.
+        # Only accept them when the path clearly looks like a chapter page.
+        if len(segments) < 3:
+            return False
+        if any(segment in NAV_PATH_SEGMENTS for segment in segments):
+            return False
+        return any(segment in CHAPTER_PATH_SEGMENTS for segment in segments)
 
     # ---- Bookshelf URL auto-detection ----
 
@@ -2089,6 +2352,10 @@ class YueduPlugin:
                         continue
                     resp.raise_for_status()
                     self._capture_cookie_jar(resp)
+                    if self._is_blocked_page(resp.text):
+                        raise RuntimeError(
+                            f"Site returned an anti-bot/rate-limit page: {url}"
+                        )
                     return resp.text
                 except httpx.HTTPError as exc:
                     last_error = exc
@@ -2120,6 +2387,21 @@ class YueduPlugin:
         if last_error is not None:
             raise last_error
         raise RuntimeError(f"Request failed after retries: {url}")
+
+    @staticmethod
+    def _is_blocked_page(html: str) -> bool:
+        """Detect the common Chinese novel-site anti-bot / rate-limit page."""
+        if not html:
+            return False
+        lowered = html.lower()
+        if not any(marker in lowered for marker in BLOCK_PAGE_MARKERS):
+            return False
+        return (
+            "请稍后再试" in lowered
+            or "后再试" in lowered
+            or "访问频繁" in lowered
+            or "请求频繁" in lowered
+        )
 
     async def _get(self, url: str) -> str:
         """HTTP GET with cookie, headers from config, rate limiting, and cookie jar."""
@@ -2162,6 +2444,10 @@ class YueduPlugin:
                         continue
                     resp.raise_for_status()
                     self._capture_cookie_jar(resp)
+                    if self._is_blocked_page(resp.text):
+                        raise RuntimeError(
+                            f"Site returned an anti-bot/rate-limit page: {url}"
+                        )
                     return resp.text
                 except httpx.HTTPError as exc:
                     last_error = exc

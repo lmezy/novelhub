@@ -983,3 +983,143 @@ def test_split_kind_text_splits_metadata_labels():
     assert plugin._split_kind_text(
         "分类：都市 作者：张三 字数：10万"
     ) == ["都市", "张三"]
+
+
+def test_find_toc_url_detects_all_chapters_link():
+    plugin = YueduPlugin({"bookSourceUrl": "https://www.alicesw.com"})
+    html = """
+    <html><body>
+      <a href="/novel/1.html">书名</a>
+      <a href="/other/chapters/id/1.html">查看所有章节</a>
+      <a href="https://www.ainvmei.com/">广告</a>
+    </body></html>
+    """
+
+    assert plugin._find_toc_url(
+        html,
+        "https://www.alicesw.com/novel/1.html",
+    ) == "https://www.alicesw.com/other/chapters/id/1.html"
+
+
+def test_parse_book_generic_filters_nav_and_ad_links():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.alicesw.com",
+        "bookUrlPattern": r"https?://www\.alicesw\.com/novel/\d+\.html",
+    })
+    html = """
+    <html><body>
+      <h1>书名</h1>
+      <a href="/">首页</a>
+      <a href="/original.html">原创</a>
+      <a href="/all/order/update_time+desc.html">最新</a>
+      <a href="/book/53181/a.html">第一章 测试</a>
+      <a href="/book/53181/b.html">第二章 测试</a>
+      <a href="/other/chapters/id/51859.html">查看所有章节</a>
+      <a href="https://www.ainvmei.com/?rf=1">电子魅魔</a>
+      <a href="https://alicesw.tw">繁體站</a>
+      <a href="/novel/51859.html">书名</a>
+    </body></html>
+    """
+
+    parsed = plugin._parse_book_generic(
+        html,
+        "https://www.alicesw.com/novel/51859.html",
+    )
+
+    assert [(c.title, c.url) for c in parsed["chapters"]] == [
+        ("第一章 测试", "https://www.alicesw.com/book/53181/a.html"),
+        ("第二章 测试", "https://www.alicesw.com/book/53181/b.html"),
+    ]
+
+
+def test_dedupe_chapters_keeps_canonical_url_for_duplicate_title():
+    chapters = [
+        SimpleNamespace(
+            title="第八章 母授神功显真容",
+            url="https://www.alicesw.com/book/53181/0.html",
+        ),
+        SimpleNamespace(
+            title="第八章 母授神功显真容",
+            url="https://www.alicesw.com/book/53181/4166062659822.html",
+        ),
+        SimpleNamespace(
+            title="第七章 儿入千户母担忧",
+            url="https://www.alicesw.com/book/53181/e27572c2118b8.html",
+        ),
+    ]
+
+    result = YueduPlugin._dedupe_chapters(
+        chapters,
+        "https://www.alicesw.com/novel/51859.html",
+    )
+
+    assert [c.url for c in result] == [
+        "https://www.alicesw.com/book/53181/4166062659822.html",
+        "https://www.alicesw.com/book/53181/e27572c2118b8.html",
+    ]
+
+
+def test_is_blocked_page_detects_rate_limit():
+    plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
+    blocked = """
+    <title>提示信息</title>
+    <script>let msg = "访问异常，请稍后再试，请于 2026-08-12 10:42:15 后再试";</script>
+    """
+
+    assert plugin._is_blocked_page(blocked) is True
+    assert plugin._is_blocked_page("<html><body>ok</body></html>") is False
+
+
+@pytest.mark.asyncio
+async def test_fetch_chapter_content_raises_on_empty_content():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "ruleContent": {"content": "#missing@text"},
+    })
+    html = "<html><body><p>只有导航，没有正文</p></body></html>"
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        with pytest.raises(RuntimeError, match="empty content"):
+            await plugin.fetch_chapter_content(
+                SimpleNamespace(url="https://example.com/book/1.html")
+            )
+
+
+@pytest.mark.asyncio
+async def test_fetch_book_uses_auto_detected_full_toc_and_filters_junk():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.alicesw.com",
+        "bookUrlPattern": r"https?://www\.alicesw\.com/novel/\d+\.html",
+        "ruleBookInfo": {"name": "h1@text"},
+        "ruleToc": {},
+    })
+    book_html = """
+    <html><body>
+      <h1>书名</h1>
+      <a href="/other/chapters/id/123.html">查看所有章节</a>
+    </body></html>
+    """
+    toc_html = """
+    <html><body>
+      <a href="/">首页</a>
+      <a href="/original.html">原创</a>
+      <a href="/book/1/a.html">第一章</a>
+      <a href="/book/1/b.html">第二章</a>
+      <a href="https://www.ainvmei.com/">电子魅魔</a>
+    </body></html>
+    """
+
+    async def fake_get(url):
+        if url == "https://www.alicesw.com/novel/123.html":
+            return book_html
+        if url == "https://www.alicesw.com/other/chapters/id/123.html":
+            return toc_html
+        raise AssertionError(f"unexpected url: {url}")
+
+    with patch.object(plugin, "_get", fake_get):
+        book = await plugin.fetch_book("https://www.alicesw.com/novel/123.html")
+
+    assert [(c.title, c.url) for c in book.chapters] == [
+        ("第一章", "https://www.alicesw.com/book/1/a.html"),
+        ("第二章", "https://www.alicesw.com/book/1/b.html"),
+    ]

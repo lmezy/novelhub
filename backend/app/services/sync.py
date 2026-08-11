@@ -2,7 +2,7 @@ import asyncio
 import re
 from uuid import uuid4
 from collections.abc import Awaitable, Callable
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
@@ -37,6 +37,69 @@ class SyncPaused(Exception):
     """Raised by a task checkpoint when a crawl task has been paused."""
 
 
+JUNK_CHAPTER_TITLES = {
+    "首页",
+    "原创",
+    "最新",
+    "电子魅魔",
+    "Ai性伴侣",
+    "色情游戏",
+    "查看所有章节",
+    "查看全部章节",
+    "全部章节",
+    "章节列表",
+    "章节目录",
+    "目录",
+    "返回书页",
+    "直达底部",
+    "简体站",
+    "繁體站",
+    "发布页",
+    "上一章",
+    "下一章",
+    "返回目录",
+    "开始阅读",
+}
+
+JUNK_CHAPTER_PATH_SEGMENTS = (
+    "list",
+    "lists",
+    "sort",
+    "rank",
+    "top",
+    "all",
+    "order",
+    "update",
+    "finish",
+    "wanben",
+    "quanben",
+    "allvisit",
+    "lastupdate",
+    "history",
+    "bookcase",
+    "bookshelf",
+    "user",
+    "users",
+    "login",
+    "register",
+    "signup",
+    "search",
+    "category",
+    "tag",
+    "tags",
+    "author",
+    "about",
+    "help",
+    "faq",
+    "contact",
+    "index",
+    "original",
+    "other",
+    "fenlei",
+    "booklist",
+)
+
+
 class SyncService:
     def __init__(self, db: AsyncSession, storage: BookStorage | None = None):
         self.db = db
@@ -67,6 +130,8 @@ class SyncService:
                 return await plugin.fetch_chapter_content(remote_chapter)
             except Exception as exc:
                 last_error = exc
+                if "anti-bot" in str(exc).lower() or "rate-limit" in str(exc).lower():
+                    raise
                 if attempt < attempts - 1:
                     await asyncio.sleep((2 ** attempt) + 0.5)
         if last_error is not None:
@@ -493,6 +558,8 @@ class SyncService:
                 remaining -= 1
                 await _checkpoint()
                 if error is not None:
+                    if "anti-bot" in str(error).lower() or "rate-limit" in str(error).lower():
+                        raise error
                     failed_chapters.append({
                         "chapter_number": remote_chapter.chapter_number,
                         "title": remote_chapter.title,
@@ -719,6 +786,9 @@ class SyncService:
         Legado identifies chapters by their URL, while older NovelHub syncs
         stored the positional chapter number. Upgrading in place prevents a
         full re-download when the TOC order is stable.
+
+        Blank chapters (from anti-bot/error pages) and obvious TOC junk (nav,
+        ads, "查看所有章节") are dropped so a re-sync can fetch real content.
         """
         rows = await self.db.scalars(
             select(Chapter).where(Chapter.book_id == book_id)
@@ -751,8 +821,68 @@ class SyncService:
             legacy.source_chapter_id = source_id
             by_id[source_id] = legacy
 
+        remote_ids = {
+            str(remote_chapter.source_chapter_id or "")
+            for remote_chapter in remote_chapters
+        }
+        remote_titles = {
+            self._normalize_title_for_match(remote_chapter.title)
+            for remote_chapter in remote_chapters
+        }
+        remote_hosts = {
+            urlparse(remote_chapter.url).netloc.lower()
+            for remote_chapter in remote_chapters
+            if urlparse(remote_chapter.url).scheme in ("http", "https")
+        }
+        stale_ids: list[str] = []
+        for source_id, chapter in list(by_id.items()):
+            if source_id in remote_ids:
+                if not self._chapter_has_real_content(chapter):
+                    stale_ids.append(source_id)
+            elif self._looks_like_junk_chapter(chapter, remote_hosts):
+                stale_ids.append(source_id)
+            elif (
+                self._normalize_title_for_match(chapter.title)
+                and self._normalize_title_for_match(chapter.title) in remote_titles
+            ):
+                # A duplicate/old URL for a chapter that still exists in the
+                # current TOC under a canonical URL.
+                stale_ids.append(source_id)
+        for source_id in stale_ids:
+            chapter = by_id.pop(source_id)
+            await self.db.delete(chapter)
+
         await self.db.flush()
         return set(by_id)
+
+    def _chapter_has_real_content(self, chapter: Chapter) -> bool:
+        """Return False only when we can read the file and it is effectively empty."""
+        try:
+            content = self.storage.read_chapter(chapter.content_path)
+        except Exception:
+            return True
+        if not isinstance(content, str):
+            return True
+        body = re.sub(r"^#.*(?:\r?\n|$)", "", content, flags=re.M).strip()
+        return len(body) >= 20
+
+    @staticmethod
+    def _looks_like_junk_chapter(chapter: Chapter, remote_hosts: set[str]) -> bool:
+        title = SyncService._normalize_title_for_match(chapter.title)
+        if title in JUNK_CHAPTER_TITLES:
+            return True
+        url = str(chapter.source_chapter_id or "")
+        if not url.startswith(("http://", "https://")):
+            # Legacy numeric IDs are kept unless their title is obvious junk.
+            return False
+        parsed = urlparse(url)
+        if remote_hosts and parsed.netloc.lower() not in remote_hosts:
+            return True
+        path = parsed.path.lower()
+        segments = [segment for segment in path.split("/") if segment]
+        if len(segments) < 2:
+            return True
+        return any(segment in JUNK_CHAPTER_PATH_SEGMENTS for segment in segments)
 
     async def _ensure_book_row(self, book_id: str, book_values: dict) -> bool:
         """Restore a missing book row before chapter inserts."""
@@ -1188,6 +1318,8 @@ class SyncService:
                 if isinstance(outcome, SyncPaused):
                     raise outcome
                 if isinstance(outcome, BaseException):
+                    if "anti-bot" in str(outcome).lower() or "rate-limit" in str(outcome).lower():
+                        raise outcome
                     await self.db.rollback()
                     books_failed += 1
                     logger.warning(

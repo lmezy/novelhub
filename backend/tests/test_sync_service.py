@@ -601,6 +601,77 @@ async def test_reconcile_chapter_ids_keeps_existing_urls():
 
 
 @pytest.mark.asyncio
+async def test_reconcile_chapter_ids_drops_blank_junk_and_duplicate_chapters():
+    blank = Chapter(
+        id="c1",
+        book_id="book-1",
+        chapter_number=1,
+        source_chapter_id="https://example.com/book/1/a.html",
+        title="第一章",
+        content_path="/blank/000001.md",
+    )
+    junk = Chapter(
+        id="c2",
+        book_id="book-1",
+        chapter_number=2,
+        source_chapter_id="https://ads.example.com/?rf=1",
+        title="电子魅魔",
+        content_path="/junk/000002.md",
+    )
+    duplicate = Chapter(
+        id="c3",
+        book_id="book-1",
+        chapter_number=3,
+        source_chapter_id="https://example.com/book/1/0.html",
+        title="第二章",
+        content_path="/dup/000003.md",
+    )
+    real = Chapter(
+        id="c4",
+        book_id="book-1",
+        chapter_number=4,
+        source_chapter_id="https://example.com/book/1/b.html",
+        title="第二章",
+        content_path="/real/000004.md",
+    )
+    remote_chapters = [
+        RemoteChapter(
+            source_chapter_id="https://example.com/book/1/a.html",
+            title="第一章",
+            url="https://example.com/book/1/a.html",
+            chapter_number=1,
+        ),
+        RemoteChapter(
+            source_chapter_id="https://example.com/book/1/b.html",
+            title="第二章",
+            url="https://example.com/book/1/b.html",
+            chapter_number=2,
+        ),
+    ]
+
+    db = AsyncMock()
+    db.scalars = AsyncMock(
+        return_value=SimpleNamespace(all=lambda: [blank, junk, duplicate, real])
+    )
+    db.flush = AsyncMock()
+    db.delete = AsyncMock()
+
+    service = SyncService(db)
+    service.storage = MagicMock()
+    service.storage.read_chapter.side_effect = lambda path: {
+        "/blank/000001.md": "#第一章\n\n",
+        "/junk/000002.md": "some content",
+        "/dup/000003.md": "#第二章\n\n",
+        "/real/000004.md": "#第二章\n\n这是一段足够长的真实正文内容，用于确认章节不会被误删。",
+    }.get(path, "")
+
+    result = await service._reconcile_chapter_ids("book-1", remote_chapters)
+
+    assert result == {"https://example.com/book/1/b.html"}
+    assert db.delete.await_count == 3
+
+
+@pytest.mark.asyncio
 async def test_ensure_book_row_restores_missing_book():
     db = AsyncMock()
     db.scalar = AsyncMock(return_value=None)
