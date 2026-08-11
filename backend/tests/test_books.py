@@ -4,10 +4,13 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from types import SimpleNamespace
 
+from app.models import Book
 from app.api.routes.books import (
+    BatchDeleteBySourceRequest,
     SetBookCoverRequest,
     _book_cover_value,
     _normalize_book_title,
+    batch_delete_books_by_source,
     list_book_sources,
     remove_book_tag,
     set_book_cover,
@@ -96,6 +99,53 @@ async def test_remove_book_tag_deletes_association_and_reindexes():
     db.delete.assert_any_call(book_tag)
     db.delete.assert_any_call(tag)
     search.update_book_tags.assert_called_once_with("book-1", ["穿越"])
+
+
+@pytest.mark.asyncio
+async def test_batch_delete_books_by_source_deletes_all_source_books():
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=SimpleNamespace(id="src-1"))
+    db.scalars = AsyncMock(return_value=["book-1", "book-2"])
+
+    with patch("app.api.routes.books.delete_books", new=AsyncMock(return_value=2)) as delete_mock:
+        result = await batch_delete_books_by_source(
+            BatchDeleteBySourceRequest(source_id="src-1"),
+            db,
+        )
+
+    assert result == {"source_id": "src-1", "deleted": 2}
+    delete_mock.assert_awaited_once_with(db, ["book-1", "book-2"])
+
+
+@pytest.mark.asyncio
+async def test_batch_delete_by_source_filters_only_matching_source():
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=SimpleNamespace(id="src-a"))
+    db.scalars = AsyncMock(return_value=["a-1", "a-2"])
+
+    with patch("app.api.routes.books.delete_books", new=AsyncMock(return_value=2)) as delete_mock:
+        await batch_delete_books_by_source(
+            BatchDeleteBySourceRequest(source_id="src-a"),
+            db,
+        )
+
+    stmt = db.scalars.call_args.args[0]
+    assert stmt.whereclause.compare(Book.source_id == "src-a")
+    delete_mock.assert_awaited_once_with(db, ["a-1", "a-2"])
+
+
+@pytest.mark.asyncio
+async def test_batch_delete_books_by_source_requires_existing_source():
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=None)
+
+    with pytest.raises(Exception) as exc_info:
+        await batch_delete_books_by_source(
+            BatchDeleteBySourceRequest(source_id="missing"),
+            db,
+        )
+
+    assert exc_info.value.status_code == 404
 
 
 def test_book_cover_value_prefers_display_cover():

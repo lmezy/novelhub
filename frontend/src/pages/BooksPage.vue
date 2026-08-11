@@ -21,11 +21,31 @@ const newCategoryName = ref("")
 const newCategoryR18 = ref(false)
 const categoryCreating = ref(false)
 const categoryError = ref("")
+const sourceOptions = ref<{ id: string; name: string }[]>([])
+const selectedSource = ref("")
+const deletingSource = ref(false)
+const sourceError = ref("")
 
 const filteredBooks = computed(() => {
-  if (!selectedCategory.value) return store.books
-  return store.books.filter((book) => book.category_names?.includes(selectedCategory.value))
+  return store.books.filter((book) =>
+    (!selectedCategory.value || book.category_names?.includes(selectedCategory.value)) &&
+    (!selectedSource.value || book.source_id === selectedSource.value)
+  )
 })
+
+const sourceNameMap = computed(() =>
+  Object.fromEntries(sourceOptions.value.map((s) => [s.id, s.name]))
+)
+
+const sourceBookCount = computed(() =>
+  selectedSource.value
+    ? store.books.filter((book) => book.source_id === selectedSource.value).length
+    : 0
+)
+
+const selectedSourceName = computed(() =>
+  sourceNameMap.value[selectedSource.value] || selectedSource.value || ""
+)
 
 const allSelected = computed(() =>
   filteredBooks.value.length > 0 &&
@@ -83,6 +103,28 @@ async function batchDelete() {
   }
 }
 
+async function deleteSourceBooks() {
+  if (!selectedSource.value) return
+  const count = sourceBookCount.value
+  if (!count) return
+  if (!confirm(i18n.t('books_source_delete_confirm', { name: selectedSourceName.value, n: count }))) return
+  deletingSource.value = true
+  sourceError.value = ""
+  try {
+    const res = await api.post<{ deleted: number }>("/books/batch-delete-by-source", {
+      source_id: selectedSource.value,
+    })
+    selectedIds.value = []
+    selectedSource.value = ""
+    await store.fetchBooks()
+    alert(i18n.t('books_source_delete_done', { n: res.deleted }))
+  } catch (e) {
+    sourceError.value = e instanceof Error ? e.message : i18n.t('books_source_delete_failed')
+  } finally {
+    deletingSource.value = false
+  }
+}
+
 async function batchAddShelf() {
   if (!selectedIds.value.length) return
   batchFavoriting.value = true
@@ -120,6 +162,15 @@ async function loadCategories() {
   }
 }
 
+async function loadSources() {
+  try {
+    const rows = await api.get<any[]>("/sources")
+    sourceOptions.value = rows.map((s) => ({ id: s.id, name: s.name || s.id }))
+  } catch {
+    sourceOptions.value = []
+  }
+}
+
 function searchByField(field: "author" | "tags" | "category", value: string) {
   router.push({ path: "/search", query: { field, q: value } })
 }
@@ -146,6 +197,7 @@ async function createCategory() {
 
 onMounted(async () => {
   await loadCategories()
+  await loadSources()
   await store.fetchBooks()
 })
 </script>
@@ -181,6 +233,13 @@ onMounted(async () => {
               :disabled="batchDeleting"
               class="text-xs px-3 py-1.5 rounded bg-red-500 text-white hover:bg-red-600 disabled:opacity-50"
             >{{ i18n.t('books_batch_delete') }} ({{ selectedIds.length }})</button>
+            <button
+              v-if="auth.isAdmin && selectedSource"
+              @click="deleteSourceBooks"
+              :disabled="deletingSource || sourceBookCount === 0"
+              class="text-xs px-3 py-1.5 rounded bg-red-600 text-white hover:bg-red-700 disabled:opacity-50"
+            >{{ deletingSource ? i18n.t('books_deleting') : i18n.t('books_source_delete', { n: sourceBookCount }) }}</button>
+            <span v-if="sourceError" class="text-xs text-red-600">{{ sourceError }}</span>
           </div>
         </div>
 
@@ -202,6 +261,16 @@ onMounted(async () => {
               >
                 <option value="">{{ i18n.t('books_all_categories') }}</option>
                 <option v-for="cat in categories" :key="cat.id" :value="cat.name">{{ cat.name }}</option>
+              </select>
+            </label>
+            <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
+              <span>{{ i18n.t('books_source_label') }}</span>
+              <select
+                v-model="selectedSource"
+                class="px-2 py-1 rounded border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-xs focus:outline-none"
+              >
+                <option value="">{{ i18n.t('books_all_sources') }}</option>
+                <option v-for="s in sourceOptions" :key="s.id" :value="s.id">{{ s.name }}</option>
               </select>
             </label>
             <template v-if="auth.isAdmin">
@@ -247,7 +316,7 @@ onMounted(async () => {
           </div>
 
           <p v-if="filteredBooks.length === 0" class="text-muted dark:text-gray-400 text-center py-10">
-            {{ i18n.t('books_category_empty') }}
+            {{ i18n.t('books_filter_empty') }}
           </p>
 
           <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -315,6 +384,9 @@ onMounted(async () => {
                 class="text-xs px-2 py-0.5 rounded-full"
                 :class="book.status === 'completed' ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'"
               >{{ book.status === 'completed' ? i18n.t('home_completed') : book.status || i18n.t('home_ongoing') }}</span>
+              <span v-if="book.source_id" class="text-xs text-muted dark:text-gray-400 truncate max-w-[7rem]">
+                {{ sourceNameMap[book.source_id] || book.source_id }}
+              </span>
               <span class="text-xs text-muted dark:text-gray-400 ml-auto">
                 {{ new Date(book.updated_at).toLocaleDateString() }}
               </span>

@@ -51,6 +51,10 @@ class BatchFavoriteRequest(BaseModel):
     ids: list[str]
 
 
+class BatchDeleteBySourceRequest(BaseModel):
+    source_id: str
+
+
 class SetBookCoverRequest(BaseModel):
     source_book_id: str | None = None
     cover: str | None = None
@@ -175,6 +179,26 @@ async def batch_delete_books(
     book_ids = [book.id for book in books]
     await delete_books(db, book_ids)
     return {"deleted": len(book_ids)}
+
+
+@router.post("/batch-delete-by-source", dependencies=[Depends(require_admin)])
+async def batch_delete_books_by_source(
+    payload: BatchDeleteBySourceRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    source_id = payload.source_id.strip()
+    if not source_id:
+        raise HTTPException(status_code=400, detail="Source id is required")
+    source = await db.get(Source, source_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Source not found")
+    book_ids = list(
+        await db.scalars(
+            select(Book.id).where(Book.source_id == source_id)
+        )
+    )
+    deleted = await delete_books(db, book_ids)
+    return {"source_id": source_id, "deleted": deleted}
 
 
 @router.post("/batch-favorite")

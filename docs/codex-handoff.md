@@ -42,6 +42,12 @@
 - `test_book_enrichment.py`、`test_local_library.py`、`test_manual_import.py` 增加全年龄/R18 覆盖测试。
 - 完整 `pytest`：237 passed；`npm run typecheck`、`npm run build` 均通过。
 
+### 0.7 书库按书源筛选与批量删除
+
+- `backend/app/api/routes/books.py`：新增 `POST /api/books/batch-delete-by-source`（管理员），按 `source_id` 查出该书源同步的全部书籍并复用 `delete_books` 清理章节、标签、分类、收藏、阅读进度与搜索索引。
+- `frontend/src/pages/BooksPage.vue`：书库页新增“书源”筛选下拉；选中书源后显示“删除该书源书籍 (N)”按钮，确认后删除该书源同步的全部书籍；卡片底部同时展示该书来源名称。
+- 测试：`test_books.py` 新增按书源删除接口测试（删除数量、书源不存在返回 404）。
+
 ## 1. 原始需求
 
 ### 1.1 阅读体验
