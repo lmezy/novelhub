@@ -381,7 +381,8 @@ class YueduPlugin:
             self.engine.parse_toc(toc_html),
             toc_url,
         )
-        if not toc:
+        android_toc_rule = self._uses_android_js_rule("ruleToc", "chapterList")
+        if not toc and not android_toc_rule:
             # The configured ruleToc may be outdated. Fall back to the generic
             # chapter scanner on the real TOC page (book page or full list).
             generic_toc = self._parse_book_generic(toc_html, toc_url)
@@ -525,7 +526,7 @@ class YueduPlugin:
                 url=url,
                 chapter_number=1,
             )]
-        if not chapters:
+        if not chapters and not android_toc_rule:
             chapters = generic["chapters"]
         if not chapters and self._has_forum_content(html):
             # Several Cool18-compatible sources use Android Jsoup in ruleToc.
@@ -1303,6 +1304,7 @@ class YueduPlugin:
             "#content-section",
             ".content-section pre",
             ".content-section",
+            ".chapter_content_box",
             "#content",
             "#chapter-content",
             "article",

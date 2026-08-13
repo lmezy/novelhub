@@ -1194,6 +1194,8 @@ async def test_cool18_android_rules_fall_back_to_forum_post_content():
         <img data-src="https://cdn.example.com/1.jpg" alt="page 1">
         Last line
       </pre></div>
+      <a href="/index.php?app=forum&act=userview&username=author">Author posts</a>
+      <a href="/index.php?app=sys&act=threadmanage&tid=1">Manage</a>
     </body></html>
     """
     url = "https://forum.example/index.php?app=forum&act=threadview&tid=1"
@@ -1207,6 +1209,31 @@ async def test_cool18_android_rules_fall_back_to_forum_post_content():
     ]
     assert "First line" in content
     assert "![page 1](https://cdn.example.com/1.jpg)" in content
+
+
+@pytest.mark.asyncio
+async def test_android_content_rule_falls_back_to_banshanren_chapter_container():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.banshanren.com",
+        "ruleContent": {
+            "content": "<js>var doc = org.jsoup.Jsoup.parse(result);</js>",
+        },
+    })
+    html = """
+    <div class="chapter_content_box">
+      <h2>Chapter 1</h2>
+      <p>First paragraph<span class="z">0</span></p>
+      <p>Second paragraph</p>
+    </div>
+    """
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        content = await plugin.fetch_chapter_content(
+            SimpleNamespace(url="https://www.banshanren.com/novel/book/1")
+        )
+
+    assert "First paragraph" in content
+    assert "Second paragraph" in content
 
 
 @pytest.mark.asyncio
