@@ -337,6 +337,9 @@ class YueduPlugin:
         if not self.engine:
             raise RuntimeError("YueduPlugin not configured")
 
+        # Rules may refer to Legado's page-scoped ``baseUrl``.
+        self.engine.set_page_url(url)
+
         # Use webJs-enabled fetch if the source has webJs configured
         web_js = self.engine.get_web_js()
         if web_js:
@@ -362,6 +365,7 @@ class YueduPlugin:
         else:
             toc_html = await self._get(toc_url)
 
+        self.engine.set_page_url(toc_url)
         toc = self._resolve_toc_entries(
             self.engine.parse_toc(toc_html),
             toc_url,
@@ -445,6 +449,7 @@ class YueduPlugin:
         info["author"] = author
 
         chapters: list[RemoteChapter] = []
+        self_chapter_title = ""
         chapter_num = 0
         seen_chapter_urls: set[str] = set()
         for ch in toc:
@@ -465,9 +470,15 @@ class YueduPlugin:
                 ch_url = self._make_absolute(ch_url, url)
             if urlparse(ch_url).scheme not in ("http", "https"):
                 continue
+            title = str(title or "").strip() or f"Chapter {chapter_num + 1}"
+            # Forum sources frequently model a post as a one-chapter book and
+            # intentionally return the same URL from ruleToc. Keep it as a
+            # fallback rather than discarding it as a book-detail URL.
+            if ch_url.rstrip("/") == url.rstrip("/"):
+                self_chapter_title = self_chapter_title or title
+                continue
             if not self._is_chapter_url(ch_url, url):
                 continue
-            title = str(title or "").strip() or f"Chapter {chapter_num + 1}"
             if (
                 title in ("目录", "简介", "上一章", "下一章", "返回目录", "首页", "开始阅读")
                 or title == book_title
@@ -484,6 +495,17 @@ class YueduPlugin:
                 chapter_number=chapter_num,
             ))
 
+        if not chapters and self_chapter_title:
+            chapters = [RemoteChapter(
+                source_chapter_id=url,
+                title=(
+                    self_chapter_title
+                    if self_chapter_title not in ("", "Chapter 1")
+                    else book_title
+                ),
+                url=url,
+                chapter_number=1,
+            )]
         if not chapters:
             chapters = generic["chapters"]
         chapters = self._dedupe_chapters(chapters, url)
@@ -1550,6 +1572,20 @@ class YueduPlugin:
                 if same_host:
                     return False
         path = urlparse(url).path.lower()
+        query = urlparse(url).query.lower()
+        # Forum sources commonly use an index.php route with a thread id for
+        # the book page, e.g. ``?app=forum&act=threadview&tid=123``.
+        query_params = dict(
+            part.split("=", 1) if "=" in part else (part, "")
+            for part in query.split("&") if part
+        )
+        if (
+            query_params.get("tid")
+            and query_params.get("act", "").lower() in {
+                "threadview", "thread", "viewthread",
+            }
+        ):
+            return True
         segments = [seg for seg in path.split("/") if seg]
         for prefix in ("novel", "book", "read", "detail", "xiaoshuo"):
             if prefix not in segments:
@@ -1806,13 +1842,15 @@ class YueduPlugin:
                 self._normalize_explore_item(item, page_url)
                 for item in usable_items
             ]
-            return [
+            filtered_items = [
                 item for item in normalized_items
                 if self._is_book_url(
                     self._explore_item_url(item),
                     require_pattern=True,
                 )
             ]
+            if filtered_items:
+                return filtered_items
 
         # Generic fallback for list/category pages whose configured rules no
         # longer match the live site.
@@ -2548,6 +2586,9 @@ class YueduPlugin:
         headers = self._build_headers({
             "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
         })
+        # Cover CDNs commonly reject a direct request without the book site's
+        # Referer. A source-defined Referer wins over this default.
+        headers.setdefault("Referer", self.base_url.rstrip("/") + "/")
 
         proxy_url = None
         try:
@@ -2599,6 +2640,7 @@ class YueduPlugin:
                 data, content_type = await _request(proxy)
                 if not data or len(data) < 128:
                     return None
+                data = self._decode_inline_cover_rule(data)
                 if self.engine:
                     decoded = self.engine.decode_cover(data)
                     if decoded:
@@ -2619,6 +2661,34 @@ class YueduPlugin:
         if last_error is not None:
             logger.warning("Failed to fetch cover {}: {}", url, last_error)
         return None
+
+    def _decode_inline_cover_rule(self, data: bytes) -> bytes:
+        """Support AES-CBC cover snippets exported by some YueDu sources."""
+        rule = str((self.config.get("ruleBookInfo") or {}).get("coverUrl") or "")
+        if "AES/CBC/PKCS5Padding" not in rule or "copyOfRange(raw, 0, 16)" not in rule:
+            return data
+
+        key_match = re.search(
+            r"String\(\s*(['\"])(.*?)\1\s*\)\.getBytes",
+            rule,
+            re.DOTALL,
+        )
+        if not key_match or len(data) <= 16:
+            return data
+        try:
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+            from cryptography.hazmat.primitives import padding
+
+            key = key_match.group(2).encode("utf-8")
+            decryptor = Cipher(
+                algorithms.AES(key), modes.CBC(data[:16])
+            ).decryptor()
+            padded = decryptor.update(data[16:]) + decryptor.finalize()
+            unpadder = padding.PKCS7(algorithms.AES.block_size).unpadder()
+            return unpadder.update(padded) + unpadder.finalize()
+        except Exception as exc:
+            logger.debug("Could not decode inline cover rule: {}", exc)
+            return data
 
     async def fetch_content_image(
         self,

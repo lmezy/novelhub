@@ -1,7 +1,10 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    # Docker compose keeps operational variables alongside application
+    # settings in .env. Ignore those unrelated keys in local test runs.
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
     PROJECT_NAME:str="NovelHub"
@@ -60,12 +63,6 @@ class Settings(BaseSettings):
     SYNC_WORKER_CONCURRENCY:int=3
     SYNC_PAGE_BATCH_SIZE:int=0
     SYNC_BATCH_INTERVAL_MS:int=5000
-
-
-    class Config:
-
-        env_file=".env"
-
 
 
 settings=Settings()

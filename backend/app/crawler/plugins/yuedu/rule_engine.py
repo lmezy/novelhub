@@ -298,6 +298,17 @@ class YueduRuleEngine:
     def parse_content(self, html_or_json: str) -> str:
         return self._extract_content(html_or_json, self.config.get("ruleContent", {}))
 
+    def set_page_url(self, url: str) -> None:
+        """Set the URL of the page currently being parsed.
+
+        Legado rules commonly use ``@js:baseUrl`` for forum-style sources,
+        where one post is both a book and its only chapter. ``baseUrl`` in
+        that context is the current response URL, rather than the source
+        homepage URL.
+        """
+        self._variables["baseUrl"] = url
+        self._variables["bookUrl"] = url
+
     def get_next_content_urls(
         self,
         html_or_json: str,
@@ -765,6 +776,15 @@ class YueduRuleEngine:
         Splits by <js>...</js> and @js: patterns so each fragment
         can be evaluated in sequence with output feeding the next.
         """
+        # ``@js:`` is allowed to contain multi-line JavaScript. Treating it
+        # as a single fragment preserves simple expression rules such as
+        # ``@js:\n\"https://site/book/{{$.id}}\"``.
+        js_start = rule.find("@js:")
+        if js_start >= 0:
+            before_js = rule[:js_start].strip()
+            js_fragment = rule[js_start:].strip()
+            return ([before_js] if before_js else []) + [js_fragment]
+
         fragments: list[str] = []
         js_iter = self.JS_PATTERN.finditer(rule)
         start = 0
@@ -990,6 +1010,32 @@ class YueduRuleEngine:
         """
         code = js_code.strip()
         if not code:
+            return raw
+
+        # Many exports use @js as a URL template expression, not a statement
+        # block. Node's function wrapper returns undefined for a bare string
+        # expression, while Legado uses the expression value.
+        try:
+            expression = json.loads(code)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            expression = None
+        if isinstance(expression, str):
+            return expression
+
+        # ``baseUrl`` is a Legado-provided page-context variable.
+        compact = code.rstrip(";").strip()
+        if compact in {"baseUrl", "(baseUrl)", "return baseUrl"}:
+            return self._variables.get("baseUrl", self.base_url)
+
+        # Android-only cover rules often fetch an encrypted image with OkHttp
+        # and decrypt it through ``Packages.javax.crypto``. NovelHub performs
+        # the request itself and handles the declarative AES-CBC portion in
+        # ``fetch_cover``; keep the preceding URL-rule result here.
+        if (
+            isinstance(raw, str)
+            and "AES/CBC/PKCS5Padding" in code
+            and "Packages.javax.crypto" in code
+        ):
             return raw
 
         # Fast path: try pattern-based evaluation first

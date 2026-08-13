@@ -24,8 +24,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.models import CrawlTask, Source, SourceChange, User
+from app.models import Cookie, CrawlTask, Source, SourceChange, User
 from app.services.auth import get_current_user
+from app.services.cookie_crypto import encrypt_cookie
 from app.services.proxy_config import get_proxy_config
 from app.services.task_queue import enqueue_crawl_all
 
@@ -759,6 +760,7 @@ class YueduImportRequest(BaseModel):
     url: str | None = None
     json_text: str | None = None
     is_r18: bool = False
+    cookie: str | None = None
     scope: str = "personal"
     show_contributor: bool = True
 
@@ -873,6 +875,7 @@ async def _submit_global_approvals(
         })
         approval_ids.append(change.id)
     await db.commit()
+
     return results, approval_ids
 
 
@@ -958,6 +961,27 @@ async def import_yuedu_sources(
 
     await db.commit()
 
+    # The plain import flow also exposes an optional Cookie field. Persist it
+    # after source creation/update so users do not need to run a crawl merely
+    # to save their login state. Existing entries are updated so a re-import
+    # can replace an expired cookie.
+    if payload.cookie and payload.cookie.strip():
+        encrypted_cookie = encrypt_cookie(payload.cookie.strip())
+        for item in results:
+            source_id = item["id"]
+            existing_cookie = await db.scalar(
+                select(Cookie).where(Cookie.source == source_id)
+            )
+            if existing_cookie is None:
+                db.add(Cookie(
+                    id=str(uuid4()),
+                    source=source_id,
+                    cookie_data=encrypted_cookie,
+                ))
+            else:
+                existing_cookie.cookie_data = encrypted_cookie
+        await db.commit()
+
     # Bookshelf URLs are detected lazily during sync, so import stays fast.
 
     return YueduImportResult(
@@ -1005,14 +1029,12 @@ async def import_yuedu_sources_as_tasks(
     """Import sources and enqueue one crawl task per source for progress tracking."""
     from uuid import uuid4
 
-    from app.models import Cookie
-    from app.services.cookie_crypto import encrypt_cookie
-
     import_result = await import_yuedu_sources(
         YueduImportRequest(
             url=payload.url,
             json_text=payload.json_text,
             is_r18=payload.is_r18,
+            cookie=payload.cookie,
             scope=payload.scope,
             show_contributor=payload.show_contributor,
         ),
@@ -1021,20 +1043,6 @@ async def import_yuedu_sources_as_tasks(
     )
     if import_result.status == "pending_approval":
         return YueduImportTaskResult(tasks=[])
-
-    if payload.cookie and payload.cookie.strip():
-        for src_info in import_result.sources:
-            source_id = src_info["id"]
-            existing_cookie = await db.scalar(
-                select(Cookie).where(Cookie.source == source_id)
-            )
-            if existing_cookie is None:
-                db.add(Cookie(
-                    id=str(uuid4()),
-                    source=source_id,
-                    cookie_data=encrypt_cookie(payload.cookie.strip()),
-                ))
-        await db.commit()
 
     tasks: list[dict[str, Any]] = []
     if payload.discover:
@@ -1086,8 +1094,6 @@ async def import_and_sync_all(
     5. Return comprehensive results
     """
     from uuid import uuid4
-    from app.models import Cookie
-    from app.services.cookie_crypto import encrypt_cookie
     from app.services.sync import SyncService
 
     # Step 1: Import sources
@@ -1096,6 +1102,7 @@ async def import_and_sync_all(
             url=payload.url,
             json_text=payload.json_text,
             is_r18=payload.is_r18,
+            cookie=payload.cookie,
             scope=payload.scope,
             show_contributor=payload.show_contributor,
         ),
@@ -1126,22 +1133,6 @@ async def import_and_sync_all(
         errors=[],
         details=[],
     )
-
-    # Step 2: Save cookie if provided
-    if payload.cookie and payload.cookie.strip():
-        for src_info in import_result.sources:
-            source_id = src_info["id"]
-            existing_cookie = await db.scalar(
-                select(Cookie).where(Cookie.source == source_id)
-            )
-            if existing_cookie is None:
-                cookie_obj = Cookie(
-                    id=str(uuid4()),
-                    source=source_id,
-                    cookie_data=encrypt_cookie(payload.cookie.strip()),
-                )
-                db.add(cookie_obj)
-        await db.commit()
 
     # Step 3 & 4: Sync bookshelf + discover for each imported source in parallel
     from app.core.config import settings, sync_thread_count

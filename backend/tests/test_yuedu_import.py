@@ -216,6 +216,31 @@ async def test_import_yuedu_sources_falls_back_to_url_when_json_text_is_cookie(m
 
 
 @pytest.mark.asyncio
+async def test_import_yuedu_sources_saves_cookie_for_new_source(mock_db):
+    source = {"bookSourceName": "Cookie source", "bookSourceUrl": "https://cookie.example"}
+    mock_db.scalar = AsyncMock(return_value=None)
+
+    with (
+        patch("app.api.routes.yuedu._fetch_sources_from_url", AsyncMock(return_value=[source])),
+        patch("app.api.routes.yuedu.encrypt_cookie", return_value="encrypted"),
+    ):
+        result = await import_yuedu_sources(
+            YueduImportRequest(
+                url="https://repo.example/json",
+                cookie="session=abc",
+            ),
+            SimpleNamespace(id="u1", role="user"),
+            mock_db,
+        )
+
+    assert result.imported == 1
+    saved_cookie = mock_db.add.call_args_list[-1].args[0]
+    assert saved_cookie.source == _make_source_id("Cookie source", "https://cookie.example", "u1")
+    assert saved_cookie.cookie_data == "encrypted"
+    assert mock_db.commit.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_preview_yuedu_sources_falls_back_to_url_when_json_text_is_cookie():
     source = {"bookSourceName": "Alice", "bookSourceUrl": "https://www.alicesw.com"}
     import_url = "https://www.yckceo.com/yuedu/shuyuan/json/id/7585.json"

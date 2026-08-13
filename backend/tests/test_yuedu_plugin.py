@@ -99,6 +99,47 @@ def test_substitute_inner_rules_keeps_rules_without_templates():
     assert plugin.engine._substitute_inner_rules("a@text", "<html></html>") == "a@text"
 
 
+def test_multiline_js_url_rule_preserves_the_full_expression():
+    plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
+
+    value = plugin.engine._eval_rule_first(
+        {"slug": "book-1"},
+        '@js:\n"https://example.com/novel/{{$.slug}}"',
+    )
+
+    assert value == "https://example.com/novel/book-1"
+
+
+def test_forum_thread_url_is_treated_as_a_book_detail():
+    plugin = YueduPlugin({"bookSourceUrl": "https://forum.example"})
+
+    assert plugin._is_book_url(
+        "https://forum.example/index.php?app=forum&act=threadview&tid=123",
+        require_pattern=True,
+    )
+
+
+def test_page_scoped_base_url_rule_returns_the_current_book_url():
+    plugin = YueduPlugin({"bookSourceUrl": "https://forum.example"})
+    current_url = "https://forum.example/index.php?act=threadview&tid=123"
+    plugin.engine.set_page_url(current_url)
+
+    assert plugin.engine._eval_rule_first("<html></html>", "@js:baseUrl") == current_url
+
+
+def test_android_inline_cover_rule_keeps_the_extracted_image_url():
+    plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
+    rule = (
+        "img@data-src@js:(function(){"
+        "var cipher = Packages.javax.crypto.Cipher.getInstance('AES/CBC/PKCS5Padding');"
+        "return result;})();"
+    )
+
+    assert plugin.engine._eval_rule_first(
+        '<img data-src="/cover.encrypted">', rule
+    ) == "/cover.encrypted"
+
+
 def test_css_rule_supports_single_pipe_or():
     plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
     html = '<html><body><div id="content"><p>Main text.</p></div></body></html>'
@@ -274,6 +315,31 @@ async def test_fetch_book_uses_generic_fallback():
 
     assert book.title == "书名"
     assert len(book.chapters) == 2
+
+
+@pytest.mark.asyncio
+async def test_fetch_book_keeps_forum_self_url_as_single_chapter():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://forum.example",
+        "ruleBookInfo": {"name": ".main-title@text", "tocUrl": "@js:baseUrl"},
+        "ruleToc": {
+            "chapterList": ".title-section",
+            "chapterName": ".main-title@text",
+            "chapterUrl": "@js:baseUrl",
+        },
+    })
+    url = "https://forum.example/index.php?app=forum&act=threadview&tid=123"
+    html = """
+    <html><body><h1 class="main-title">Forum Book</h1>
+    <div class="title-section"></div></body></html>
+    """
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        book = await plugin.fetch_book(url)
+
+    assert [(chapter.title, chapter.url) for chapter in book.chapters] == [
+        ("Forum Book", url),
+    ]
 
 
 @pytest.mark.asyncio

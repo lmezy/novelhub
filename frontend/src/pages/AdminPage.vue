@@ -598,9 +598,11 @@ async function yueduImport() {
     body.is_r18 = yueduIsR18.value
     body.scope = yueduScope.value
     body.show_contributor = yueduShowContributor.value
+    if (yueduCookie.value.trim()) body.cookie = yueduCookie.value.trim()
     yueduResult.value = await api.post("/yuedu/import", body)
     await loadSources()
     await loadCreds()
+    await loadCookies()
     if (
       yueduResult.value.status !== "pending_approval" &&
       yueduResult.value.sources?.length
