@@ -451,6 +451,7 @@ class SyncService:
         progress_cb: Callable[[dict], Awaitable[None]] | None = None,
         checkpoint_cb: Callable[[], Awaitable[None]] | None = None,
         is_r18_override: bool | None = None,
+        discovery_tags: list[str] | None = None,
     ) -> dict:
         source = await self.db.get(Source, source_id)
         if source is None or not source.enabled:
@@ -515,6 +516,10 @@ class SyncService:
             tag = str(tag).strip().lower()
             if tag:
                 source_tags.add(tag)
+        for tag in discovery_tags or []:
+            tag = str(tag).strip().lower()
+            if tag:
+                source_tags.add(tag)
         source_tags = self._clean_sync_tags(source_tags, book_title, author_name)
         await self._save_tags(
             book.id,
@@ -535,7 +540,7 @@ class SyncService:
                 "description": remote_book.description,
                 "status": remote_book.status,
                 "is_r18": is_r18,
-                "tags": remote_book.tags,
+                "tags": sorted(source_tags),
                 "cover": book.cover,
                 "cover_url": remote_cover_url,
             },
@@ -1288,7 +1293,11 @@ class SyncService:
                     })
                     continue
                 try:
-                    result = await self.sync_book(source_id, sb.url)
+                    result = await self.sync_book(
+                        source_id,
+                        sb.url,
+                        discovery_tags=sb.tags,
+                    )
                     details.append({
                         "title": sb.title,
                         "author": sb.author,
@@ -1422,6 +1431,7 @@ class SyncService:
                         sb.url,
                         progress_cb=_guarded_chapter_progress,
                         checkpoint_cb=checkpoint_cb,
+                        discovery_tags=sb.tags,
                     )
 
             async def _record_outcome(sb, outcome) -> None:
@@ -1500,6 +1510,7 @@ class SyncService:
                                 sb.url,
                                 progress_cb=chapter_progress_cb,
                                 checkpoint_cb=checkpoint_cb,
+                                discovery_tags=sb.tags,
                             )
                         except SyncPaused:
                             raise

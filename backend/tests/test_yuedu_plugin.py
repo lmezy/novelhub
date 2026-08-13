@@ -1175,6 +1175,80 @@ async def test_fetch_chapter_content_raises_on_empty_content():
 
 
 @pytest.mark.asyncio
+async def test_cool18_android_rules_fall_back_to_forum_post_content():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://forum.example",
+        "ruleBookInfo": {},
+        "ruleToc": {
+            "chapterList": "<js>org.jsoup.Jsoup.parse(result)</js>",
+        },
+        "ruleContent": {
+            "content": "<js>org.jsoup.Jsoup.parse(result).text()</js>",
+        },
+    })
+    html = """
+    <html><head><title>Photo post - Cool18</title></head><body>
+      <h1>Photo post</h1>
+      <div id="content-section" class="content-section"><pre>
+        First line
+        <img data-src="https://cdn.example.com/1.jpg" alt="page 1">
+        Last line
+      </pre></div>
+    </body></html>
+    """
+    url = "https://forum.example/index.php?app=forum&act=threadview&tid=1"
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        book = await plugin.fetch_book(url)
+        content = await plugin.fetch_chapter_content(book.chapters[0])
+
+    assert [(chapter.title, chapter.url) for chapter in book.chapters] == [
+        ("Photo post", url),
+    ]
+    assert "First line" in content
+    assert "![page 1](https://cdn.example.com/1.jpg)" in content
+
+
+@pytest.mark.asyncio
+async def test_discover_books_retains_explore_category_as_tag():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://forum.example",
+        "exploreUrl": "Photos::/photos",
+        "ruleExplore": {
+            "bookList": "a.post",
+            "bookName": "@text",
+            "bookUrl": "@href",
+        },
+    })
+    html = '<a class="post" href="/index.php?app=forum&act=threadview&tid=1">Set one</a>'
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        books = await plugin.discover_books()
+
+    assert len(books) == 1
+    assert books[0].tags == ["Photos"]
+
+
+@pytest.mark.asyncio
+async def test_empty_array_rules_from_yuedu_export_use_forum_fallback():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://forum.example",
+        "ruleBookInfo": [],
+        "ruleExplore": [],
+        "ruleContent": [],
+        "ruleToc": [],
+    })
+    html = '<h1>漫画图集</h1><div id="content-section"><pre>body</pre></div>'
+    url = "https://forum.example/index.php?app=forum&act=threadview&tid=1"
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        book = await plugin.fetch_book(url)
+
+    assert len(book.chapters) == 1
+    assert set(book.tags) == {"漫画", "图集"}
+
+
+@pytest.mark.asyncio
 async def test_fetch_book_uses_auto_detected_full_toc_and_filters_junk():
     plugin = YueduPlugin({
         "bookSourceUrl": "https://www.alicesw.com",

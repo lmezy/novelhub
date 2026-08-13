@@ -275,7 +275,7 @@ class YueduPlugin:
     _rate_state: dict[str, dict[str, float | int]] = {}
 
     def __init__(self, source_config: dict[str, Any] | None = None):
-        self.config: dict[str, Any] = source_config or {}
+        self.config = self._normalize_source_config(source_config)
         self.engine: YueduRuleEngine | None = None
         if self.config:
             self.engine = YueduRuleEngine(self.config)
@@ -295,9 +295,20 @@ class YueduPlugin:
         """Load a YueDu book source JSON configuration."""
         if not config:
             raise ValueError("YueduPlugin requires a valid book source JSON config")
-        self.config = config
-        self.engine = YueduRuleEngine(config)
-        self.base_url = config.get("bookSourceUrl", "")
+        self.config = self._normalize_source_config(config)
+        self.engine = YueduRuleEngine(self.config)
+        self.base_url = self.config.get("bookSourceUrl", "")
+
+    @staticmethod
+    def _normalize_source_config(
+        config: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Accept exported YueDu sources that use [] for an empty rule map."""
+        normalized = dict(config or {})
+        for field in ("ruleSearch", "ruleExplore", "ruleBookInfo", "ruleToc", "ruleContent"):
+            if not isinstance(normalized.get(field), dict):
+                normalized[field] = {}
+        return normalized
 
     async def _get_http_client(self, proxy: str | None) -> httpx.AsyncClient:
         """Reuse one AsyncClient per proxy so TLS/connections are pooled."""
@@ -440,9 +451,17 @@ class YueduPlugin:
         generic_tags = generic.get("tags") or []
         raw_kind = info.get("kind") or ""
         kind_tags = self._split_kind_text(raw_kind)
-        tags = list(dict.fromkeys([*kind_tags, *generic_tags]))
         book_title = self._clean_book_title(str(info.get("name") or "").strip()) or "Unknown"
         author = self._clean_author(str(info.get("author") or "").strip()) or "Unknown"
+        tags = list(dict.fromkeys([
+            *kind_tags,
+            *generic_tags,
+            *self._content_type_tags(
+                book_title,
+                info.get("intro"),
+                generic.get("description"),
+            ),
+        ]))
         tags = self._clean_tags(tags, book_title, author)
         info["kind"] = ",".join(tags)
         info["name"] = book_title
@@ -508,6 +527,15 @@ class YueduPlugin:
             )]
         if not chapters:
             chapters = generic["chapters"]
+        if not chapters and self._has_forum_content(html):
+            # Several Cool18-compatible sources use Android Jsoup in ruleToc.
+            # The page itself is a complete post, so retain it as one chapter.
+            chapters = [RemoteChapter(
+                source_chapter_id=url,
+                title=book_title,
+                url=url,
+                chapter_number=1,
+            )]
         chapters = self._dedupe_chapters(chapters, url)
         chapters = self._attach_next_urls(chapters)
 
@@ -525,6 +553,37 @@ class YueduPlugin:
             tags=tags,
             cover_url=cover_url or None,
         )
+
+    @staticmethod
+    def _has_forum_content(html: str) -> bool:
+        """Whether a forum post contains a readable post body."""
+        try:
+            return BeautifulSoup(html, "lxml").select_one(
+                "#content-section, .content-section"
+            ) is not None
+        except Exception:
+            return False
+
+    @staticmethod
+    def _content_type_tags(*values: Any) -> list[str]:
+        """Keep non-novel forum posts discoverable in the existing library."""
+        text = " ".join(str(value or "") for value in values).lower()
+        tags: list[str] = []
+        if "漫画" in text or "漫畫" in text:
+            tags.append("漫画")
+        if "写真" in text or "寫真" in text:
+            tags.append("写真")
+        if any(marker in text for marker in ("图集", "圖集", "图包", "圖包", "套图", "套圖")):
+            tags.append("图集")
+        return tags
+
+    def _uses_android_js_rule(self, section: str, field: str) -> bool:
+        """Identify Legado rules which require Android/JVM-only APIs."""
+        rule = (self.config.get(section) or {}).get(field, "")
+        text = str(rule or "")
+        return any(marker in text for marker in (
+            "org.jsoup", "Packages.", "java.", "javax.",
+        ))
 
     def _find_toc_url(self, html: str, book_url: str) -> str:
         """Find a full chapter-list URL from a book detail page.
@@ -1033,6 +1092,7 @@ class YueduPlugin:
             _normalize(author) if author and author.lower() != "unknown" else ""
         )
         markers = self._site_markers()
+        protected_tags = {"漫画", "漫畫", "写真", "寫真", "图集", "圖集"}
         noise = {
             "tags", "tag", "标签", "分类", "类别", "类型",
             "最新章节", "最新章节列表", "全文阅读", "免费阅读", "阅读更多",
@@ -1051,7 +1111,11 @@ class YueduPlugin:
             if title_norm:
                 if normalized == title_norm:
                     continue
-                if normalized in title_norm and len(normalized) >= 2:
+                if (
+                    normalized in title_norm
+                    and len(normalized) >= 2
+                    and tag not in protected_tags
+                ):
                     # Keywords commonly include fragments of the book title.
                     continue
                 if title_norm in normalized:
@@ -1138,12 +1202,16 @@ class YueduPlugin:
             html = await self._get_with_web_js(chapter.url, web_js)
         else:
             html = await self._get(chapter.url)
-        try:
-            content = self.engine.parse_content(html)
-        except Exception:
-            content = ""
-        if not content:
-            content = self._parse_chapter_content_generic(html)
+        generic_content = self._parse_chapter_content_generic(html)
+        if self._uses_android_js_rule("ruleContent", "content"):
+            content = generic_content
+        else:
+            try:
+                content = self.engine.parse_content(html)
+            except Exception:
+                content = ""
+            if not content or self._looks_like_rule_diagnostic(content, html):
+                content = generic_content
         parts = [content] if content else []
 
         # Follow nextContentUrl for multi-page chapters
@@ -1181,7 +1249,10 @@ class YueduPlugin:
             for next_url, next_html in zip(batch, htmls):
                 if pages_fetched >= max_pages:
                     break
-                next_part = self.engine.parse_content(next_html)
+                if self._uses_android_js_rule("ruleContent", "content"):
+                    next_part = self._parse_chapter_content_generic(next_html)
+                else:
+                    next_part = self.engine.parse_content(next_html)
                 if next_part and next_part != next_html:
                     parts.append(next_part)
                 pages_fetched += 1
@@ -1212,10 +1283,26 @@ class YueduPlugin:
             )
         return content
 
+    @staticmethod
+    def _looks_like_rule_diagnostic(content: str, html: str) -> bool:
+        """Do not persist failed script output as a chapter body."""
+        value = str(content or "").strip()
+        if not value:
+            return True
+        if value == str(html or "").strip():
+            return True
+        return any(marker in value for marker in (
+            "org.jsoup", "Packages.", "java.lang.", "ReferenceError:",
+        ))
+
     def _parse_chapter_content_generic(self, html: str) -> str:
         """Extract readable text when the configured content rule misses."""
         soup = BeautifulSoup(html, "lxml")
         content_selectors = (
+            "#content-section pre",
+            "#content-section",
+            ".content-section pre",
+            ".content-section",
             "#content",
             "#chapter-content",
             "article",
@@ -1231,26 +1318,7 @@ class YueduPlugin:
                 continue
             for tag in el.find_all(["script", "style", "ins", "nav", "header", "footer"]):
                 tag.decompose()
-            for img in el.find_all("img"):
-                src = (
-                    img.get("src")
-                    or img.get("data-src")
-                    or img.get("data-original")
-                    or ""
-                ).strip()
-                if not src:
-                    img.decompose()
-                    continue
-                alt = img.get("alt") or ""
-                img.replace_with(f"\n![{alt}]({src})\n")
-            paragraphs = [
-                p.get_text(strip=True)
-                for p in el.find_all(["p", "br"])
-                if p.get_text(strip=True)
-            ]
-            if paragraphs:
-                return "\n\n".join(paragraphs)
-            text = el.get_text("\n", strip=True)
+            text = self._content_text_preserving_images(str(el))
             if text:
                 return text
         return ""
@@ -1770,7 +1838,8 @@ class YueduPlugin:
         if url:
             explore_url = self._make_absolute(url, self.base_url)
             explore_url = self.engine._substitute(explore_url, page=str(page))
-            return await self._fetch_explore_url(explore_url)
+            explore_kind = self._explore_kind_for_url(explore_url, page)
+            return await self._fetch_explore_url(explore_url, explore_kind)
 
         kinds = self.get_explore_kinds()
         if kinds:
@@ -1785,7 +1854,10 @@ class YueduPlugin:
                 if not kind_url.startswith(("http://", "https://")):
                     continue
                 try:
-                    results.extend(await self._fetch_explore_url(kind_url))
+                    results.extend(await self._fetch_explore_url(
+                        kind_url,
+                        explore_kind=kind.get("title", ""),
+                    ))
                 except Exception as exc:
                     logger.warning(
                         f"Explore kind failed: {kind.get('title', kind_url)} ({exc})"
@@ -1818,9 +1890,32 @@ class YueduPlugin:
             return []
         return await self._fetch_explore_url(explore_url)
 
-    async def _fetch_explore_url(self, explore_url: str) -> list[dict[str, Any]]:
+    async def _fetch_explore_url(
+        self,
+        explore_url: str,
+        explore_kind: str = "",
+    ) -> list[dict[str, Any]]:
         html = await self._get(explore_url)
-        return self._explore_items_from_html(html, explore_url)
+        items = self._explore_items_from_html(html, explore_url)
+        if not explore_kind:
+            return items
+        return [
+            {**item, "exploreKind": explore_kind}
+            for item in items
+        ]
+
+    def _explore_kind_for_url(self, url: str, page: int) -> str:
+        """Recover a configured category when the caller selects one URL."""
+        selected = url.rstrip("/")
+        for kind in self.get_explore_kinds():
+            kind_url = str(kind.get("url") or "").strip()
+            if not kind_url:
+                continue
+            kind_url = self.engine._substitute(kind_url, page=str(page))
+            candidate = self._make_absolute(kind_url, self.base_url).rstrip("/")
+            if candidate == selected:
+                return str(kind.get("title") or "")
+        return ""
 
     def _explore_items_from_html(
         self,
@@ -1910,6 +2005,12 @@ class YueduPlugin:
                 author=self._clean_author(str(item.get("author") or "").strip()) or "Unknown",
                 url=full_url,
                 latest_chapter_title=item.get("latestChapterTitle"),
+                tags=self._clean_tags(
+                    self._split_kind_text(item.get("kind"))
+                    + self._split_kind_text(item.get("exploreKind")),
+                    str(item.get("name") or item.get("title") or ""),
+                    str(item.get("author") or ""),
+                ),
             ))
         return books
 

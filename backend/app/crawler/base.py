@@ -31,6 +31,9 @@ class RemoteShelfBook:
     author: str
     url: str
     latest_chapter_title: str | None = None
+    # Catalog sources can supply a category before the detail page is fetched.
+    # Keep it so sync can retain that classification when detail rules are sparse.
+    tags: list[str] = field(default_factory=list)
 
 
 class NovelSourcePlugin(Protocol):
