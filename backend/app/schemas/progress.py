@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from pydantic import BaseModel
 
 
@@ -14,6 +16,7 @@ class ReadingProgressOut(BaseModel):
     book_id: str
     chapter_id: str
     position: int
+    updated_at: datetime
 
     class Config:
         from_attributes = True

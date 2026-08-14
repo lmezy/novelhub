@@ -38,6 +38,26 @@ async def upsert_progress(payload: ReadingProgressUpsert, user: User = Depends(g
     await db.commit()
     await db.refresh(progress)
     return progress
+
+
+@router.get("/{book_id}", response_model=ReadingProgressOut | None)
+async def get_progress(
+    book_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the authenticated user's reading progress for a single book."""
+    book = await db.get(Book, book_id)
+    if not ensure_book_visible(user, book):
+        raise HTTPException(status_code=404, detail="Book not found")
+    return await db.scalar(
+        select(ReadingProgress).where(
+            ReadingProgress.user_id == user.id,
+            ReadingProgress.book_id == book_id,
+        )
+    )
+
+
 @router.get("", response_model=list[ReadingProgressOut])
 async def list_progress(
     user_id: str = Query(...),

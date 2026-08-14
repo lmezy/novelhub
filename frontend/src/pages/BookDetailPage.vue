@@ -351,8 +351,7 @@ onMounted(async () => {
     await loadAlternates()
     if (auth.user) {
       try {
-        const progress = await api.get<any[]>('/progress?user_id=' + auth.user.id)
-        const p = progress.find((p: any) => p.book_id === route.params.id)
+        const p = await api.get<any>('/progress/' + route.params.id)
         if (p) savedChapterId.value = p.chapter_id
       } catch { /* non-critical */ }
     }

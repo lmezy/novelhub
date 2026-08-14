@@ -55,6 +55,8 @@ const pageCount = ref(1)
 const pageMode = ref<MobilePageMode>(savedPageMode())
 const mobileScrollProgress = ref(0)
 const pendingPage = ref<number | "last" | null>(null)
+const pendingRestorePercent = ref<number | null>(null)
+const readLocation = ref<{ book_id: string; chapter_id: string } | null>(null)
 const pageContent = ref<HTMLElement | null>(null)
 const pageViewport = ref<HTMLElement | null>(null)
 const scrollViewport = ref<HTMLElement | null>(null)
@@ -71,6 +73,7 @@ let mediaListener: EventListener | null = null
 let scrollTimer: ReturnType<typeof setTimeout>
 let resizeTimer: ReturnType<typeof setTimeout>
 let progressTimer: ReturnType<typeof setTimeout>
+let chapterLoadSeq = 0
 let touchStartX = 0
 let touchStartY = 0
 let touchStartTime = 0
@@ -184,23 +187,28 @@ const mobileProgressLabel = computed(() => pageMode.value === "scroll"
   : `${currentPage.value + 1} / ${pageCount.value}`)
 
 function savePosition(position: number) {
-  if (!auth.user || !chapter.value) return
+  if (!auth.user || !chapter.value || !readLocation.value) return
   api.put("/progress", {
     user_id: auth.user.id,
-    book_id: bookId.value,
-    chapter_id: chapterId.value,
+    book_id: readLocation.value.book_id,
+    chapter_id: readLocation.value.chapter_id,
     position,
   }).catch(() => {})
 }
 
+function desktopScrollPercent(): number {
+  const max = document.documentElement.scrollHeight - window.innerHeight
+  if (max <= 0) return 100
+  return Math.round((window.scrollY / max) * 100)
+}
+function currentPosition(): number {
+  return isMobileLayout.value ? mobileProgress.value : desktopScrollPercent()
+}
 function onScroll() {
   clearTimeout(scrollTimer)
   scrollTimer = setTimeout(() => {
     if (!auth.user || isMobileLayout.value) return
-    const scrollPercent = Math.round(
-      (window.scrollY / (document.documentElement.scrollHeight - window.innerHeight)) * 100
-    )
-    savePosition(scrollPercent)
+    savePosition(desktopScrollPercent())
   }, 2000)
 }
 
@@ -326,7 +334,61 @@ function queuePageProgress() {
 
 function flushPageProgress() {
   clearTimeout(progressTimer)
-  if (isMobileLayout.value) savePosition(mobileProgress.value)
+  if (!auth.user || !chapter.value) return
+  savePosition(currentPosition())
+}
+async function restoreChapterProgress() {
+  pendingRestorePercent.value = null
+  if (!auth.user || !chapter.value) return
+  try {
+    const res = await api.get<any>("/progress/" + bookId.value)
+    if (
+      res &&
+      res.chapter_id === chapter.value.id &&
+      typeof res.position === "number"
+    ) {
+      pendingRestorePercent.value = Math.min(100, Math.max(0, res.position))
+    }
+  } catch {
+    /* no saved progress */
+  }
+}
+function applyRestoredPosition() {
+  const percent = pendingRestorePercent.value
+  if (percent === null || !chapter.value) return
+  if (isMobileLayout.value) {
+    if (pageMode.value === "scroll") {
+      const el = scrollViewport.value
+      if (el) {
+        el.scrollTop = (percent / 100) * Math.max(0, el.scrollHeight - el.clientHeight)
+        updateMobileScrollProgress()
+        pendingRestorePercent.value = null
+      }
+    } else if (pageCount.value > 1) {
+      currentPage.value = Math.min(
+        Math.round((percent / 100) * (pageCount.value - 1)),
+        pageCount.value - 1,
+      )
+      applyPageTransform()
+      pendingRestorePercent.value = null
+    }
+  } else {
+    const max = document.documentElement.scrollHeight - window.innerHeight
+    window.scrollTo(0, max > 0 ? (percent / 100) * max : 0)
+    pendingRestorePercent.value = null
+  }
+}
+function onContentLoad() {
+  if (pendingRestorePercent.value === null) return
+  applyRestoredPosition()
+}
+async function onMobileContentLoad() {
+  await refreshMobileLayout()
+  if (pendingRestorePercent.value !== null) applyRestoredPosition()
+}
+function onMobileScrollContentLoad() {
+  updateMobileScrollProgress()
+  if (pendingRestorePercent.value !== null) applyRestoredPosition()
 }
 
 function openChapter(id: string, page: number | "last" = 0, targetBookId = bookId.value) {
@@ -511,18 +573,34 @@ function onResize() {
 }
 
 async function loadChapter(id: string) {
+  const seq = ++chapterLoadSeq
+  flushPageProgress()
   loading.value = true
   error.value = ""
   currentPage.value = 0
   pageCount.value = 1
+  mobileScrollProgress.value = 0
+  pendingRestorePercent.value = null
   try {
-    chapter.value = await store.fetchChapter(id)
+    const loaded = await store.fetchChapter(id)
+    if (seq !== chapterLoadSeq) return
+    chapter.value = loaded
+    readLocation.value = { book_id: bookId.value, chapter_id: id }
     loading.value = false
+    const hasPendingPage = pendingPage.value !== null
     if (isMobileLayout.value) await refreshMobileLayout()
+    await nextTick()
+    if (seq !== chapterLoadSeq) return
+    if (!hasPendingPage) {
+      await restoreChapterProgress()
+      if (seq !== chapterLoadSeq) return
+      applyRestoredPosition()
+    }
   } catch (e) {
+    if (seq !== chapterLoadSeq) return
     error.value = e instanceof Error ? e.message : i18n.t('reader_failed_load_chapter')
   } finally {
-    loading.value = false
+    if (seq === chapterLoadSeq) loading.value = false
   }
 }
 
@@ -643,7 +721,7 @@ onUnmounted(() => {
           @touchstart.passive="onTouchStart"
           @touchend="onTouchEnd"
           @click="handleTap"
-          @load.capture="nextTick(refreshMobileLayout)"
+          @load.capture="onMobileContentLoad"
         >
           <div ref="pageViewport" class="page-viewport">
             <article ref="pageContent" class="page-columns" :style="readerFontStyle">
@@ -668,7 +746,7 @@ onUnmounted(() => {
           class="scroll-page-surface"
           @scroll.passive="onMobileScroll"
           @click="handleTap"
-          @load.capture="updateMobileScrollProgress"
+          @load.capture="onMobileScrollContentLoad"
         >
           <article class="scroll-page-content" :style="readerFontStyle">
             <h1 class="page-title">
@@ -940,6 +1018,7 @@ onUnmounted(() => {
           class="reader-content prose"
           :class="{ 'hide-content-images': !showContentImages }"
           :style="readerFontStyle"
+          @load.capture="onContentLoad"
         >
           <h1 class="text-2xl font-bold mb-8 text-center">
             {{ chapter.title || i18n.t('reader_chapter_fallback', { n: chapter.chapter_number }) }}
