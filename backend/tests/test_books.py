@@ -6,11 +6,13 @@ from types import SimpleNamespace
 
 from app.models import Book
 from app.api.routes.books import (
+    BatchDeleteByCategoryRequest,
     BatchDeleteBySourceRequest,
     SetBookCoverRequest,
     _book_cover_value,
     _normalize_book_title,
     batch_delete_books_by_source,
+    batch_delete_books_by_category,
     convert_book_to_r18,
     list_book_sources,
     remove_book_tag,
@@ -147,6 +149,22 @@ async def test_batch_delete_books_by_source_requires_existing_source():
         )
 
     assert exc_info.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_batch_delete_books_by_category_deletes_category_books():
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=SimpleNamespace(id="cat-1", name="都市"))
+    db.scalars = AsyncMock(return_value=["book-1", "book-2"])
+
+    with patch("app.api.routes.books.delete_books", new=AsyncMock(return_value=2)) as delete_mock:
+        result = await batch_delete_books_by_category(
+            BatchDeleteByCategoryRequest(category_id="cat-1"),
+            db,
+        )
+
+    assert result == {"category_id": "cat-1", "category_name": "都市", "deleted": 2}
+    delete_mock.assert_awaited_once_with(db, ["book-1", "book-2"])
 
 
 @pytest.mark.asyncio

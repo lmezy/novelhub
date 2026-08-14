@@ -133,6 +133,8 @@ async def run_crawl_task_async(task_id: str) -> dict:
                 checkpoint_cb=_wait_if_paused,
                 start_page=start_page,
                 page_batch_size=int(getattr(settings, "SYNC_PAGE_BATCH_SIZE", 0) or 0),
+                exclude_tags=list(getattr(task_obj, "exclude_tags", None) or []),
+                exclude_categories=list(getattr(task_obj, "exclude_categories", None) or []),
             )
             await db.refresh(task_obj)
             if task_obj.status == "paused":
@@ -154,6 +156,7 @@ async def run_crawl_task_async(task_id: str) -> dict:
                     "books_found": result.get("books_found", 0),
                     "books_synced": result.get("books_synced", 0),
                     "books_failed": result.get("books_failed", 0),
+                    "books_filtered": result.get("books_filtered", 0),
                     "chapters_created": result.get("chapters_created", 0),
                     "chapters_skipped": result.get("chapters_skipped", 0),
                     "chapters_failed": result.get("chapters_failed", 0),
@@ -176,6 +179,7 @@ async def run_crawl_task_async(task_id: str) -> dict:
                 "books_found": result.get("books_found", 0),
                 "books_synced": result.get("books_synced", 0),
                 "books_failed": result.get("books_failed", 0),
+                "books_filtered": result.get("books_filtered", 0),
                 "chapters_created": result.get("chapters_created", 0),
                 "chapters_skipped": result.get("chapters_skipped", 0),
                 "chapters_failed": result.get("chapters_failed", 0),

@@ -6,6 +6,24 @@ import { useAuthStore } from "../stores/auth"
 import { useI18nStore } from "../stores/i18n"
 import { api } from "../api/client"
 import AIChat from "../components/AIChat.vue"
+import {
+  DEFAULT_TAP_ACTIONS,
+  TAP_ACTIONS,
+  TAP_REGION_KEYS,
+  normalizeTapActions,
+  type ReaderTapAction,
+  type ReaderTapActions,
+  type ReaderTapRegion,
+} from "../utils/readerTapAreas"
+
+type MobilePageMode = "cover" | "slide" | "simulation" | "scroll" | "none"
+
+const mobilePageModes: MobilePageMode[] = ["cover", "slide", "simulation", "scroll", "none"]
+
+function savedPageMode(): MobilePageMode {
+  const value = localStorage.getItem("novelhub_page_mode") as MobilePageMode | null
+  return value && mobilePageModes.includes(value) ? value : "cover"
+}
 
 const route = useRoute()
 const router = useRouter()
@@ -34,9 +52,19 @@ const isMobileLayout = ref(false)
 const menuVisible = ref(false)
 const currentPage = ref(0)
 const pageCount = ref(1)
+const pageMode = ref<MobilePageMode>(savedPageMode())
+const mobileScrollProgress = ref(0)
 const pendingPage = ref<number | "last" | null>(null)
 const pageContent = ref<HTMLElement | null>(null)
 const pageViewport = ref<HTMLElement | null>(null)
+const scrollViewport = ref<HTMLElement | null>(null)
+const showPageModeMenu = ref(false)
+const showTapAreaMenu = ref(false)
+const selectedTapRegion = ref<ReaderTapRegion>("mc")
+const tapAreaDirty = ref(false)
+const tapAreaSaving = ref(false)
+const tapAreaSaved = ref(false)
+const tapAreaError = ref("")
 
 let mediaQuery: MediaQueryList | null = null
 let mediaListener: EventListener | null = null
@@ -61,6 +89,42 @@ const enFonts = computed(() => [
   { value: "sans", label: i18n.t('reader_font_sans') },
   { value: "mono", label: i18n.t('reader_font_mono') },
 ])
+const pageModeOptions = computed<{ value: MobilePageMode; label: string }[]>(() => [
+  { value: "cover", label: i18n.t("reader_page_mode_cover") },
+  { value: "slide", label: i18n.t("reader_page_mode_slide") },
+  { value: "simulation", label: i18n.t("reader_page_mode_simulation") },
+  { value: "scroll", label: i18n.t("reader_page_mode_scroll") },
+  { value: "none", label: i18n.t("reader_page_mode_none") },
+])
+
+function savedTapActions(): ReaderTapActions {
+  const raw = localStorage.getItem("novelhub_tap_actions")
+  if (raw) {
+    try {
+      return normalizeTapActions(JSON.parse(raw))
+    } catch {
+      /* fall back to defaults */
+    }
+  }
+  return { ...DEFAULT_TAP_ACTIONS }
+}
+
+const tapActions = ref<ReaderTapActions>(
+  auth.user?.settings?.tap_actions
+    ? normalizeTapActions(auth.user.settings.tap_actions)
+    : savedTapActions(),
+)
+
+const tapActionOptions = computed(() =>
+  TAP_ACTIONS.map((action) => ({
+    value: action,
+    label: i18n.t("reader_tap_action_" + action),
+  })),
+)
+
+function tapActionLabel(action: ReaderTapAction): string {
+  return i18n.t("reader_tap_action_" + action)
+}
 
 const cnFontStack: Record<string, string> = {
   default: "",
@@ -114,6 +178,10 @@ const pageProgress = computed(() => {
   if (pageCount.value <= 1) return 100
   return Math.round((currentPage.value / (pageCount.value - 1)) * 100)
 })
+const mobileProgress = computed(() => pageMode.value === "scroll" ? mobileScrollProgress.value : pageProgress.value)
+const mobileProgressLabel = computed(() => pageMode.value === "scroll"
+  ? `${mobileScrollProgress.value}%`
+  : `${currentPage.value + 1} / ${pageCount.value}`)
 
 function savePosition(position: number) {
   if (!auth.user || !chapter.value) return
@@ -144,24 +212,24 @@ function toggleDark() {
 
 function changeFontSize(delta: number) {
   fontSize.value = Math.min(26, Math.max(14, fontSize.value + delta))
-  if (isMobileLayout.value) nextTick(measurePages)
+  if (isMobileLayout.value) nextTick(refreshMobileLayout)
 }
 
 function setCnFont(f: string) {
   cnFont.value = f
   localStorage.setItem("novelhub_cn_font", f)
-  if (isMobileLayout.value) nextTick(measurePages)
+  if (isMobileLayout.value) nextTick(refreshMobileLayout)
 }
 
 function setEnFont(f: string) {
   enFont.value = f
   localStorage.setItem("novelhub_en_font", f)
-  if (isMobileLayout.value) nextTick(measurePages)
+  if (isMobileLayout.value) nextTick(refreshMobileLayout)
 }
 
 function applyPageTransform() {
   const el = pageContent.value
-  if (!el) return
+  if (!el || pageMode.value === "scroll") return
   const styles = getComputedStyle(el)
   const columnWidth = parseFloat(styles.columnWidth) || el.clientWidth
   const gap = parseFloat(styles.columnGap) || 32
@@ -171,7 +239,7 @@ function applyPageTransform() {
 async function measurePages() {
   await nextTick()
   const el = pageContent.value
-  if (!el || !isMobileLayout.value) return
+  if (!el || !isMobileLayout.value || pageMode.value === "scroll") return
   const styles = getComputedStyle(el)
   const columnWidth = parseFloat(styles.columnWidth) || el.clientWidth
   const gap = parseFloat(styles.columnGap) || 32
@@ -189,16 +257,76 @@ async function measurePages() {
   applyPageTransform()
 }
 
+async function refreshMobileLayout() {
+  await nextTick()
+  if (!isMobileLayout.value) return
+  if (pageMode.value === "scroll") {
+    const el = scrollViewport.value
+    if (!el) return
+    if (pendingPage.value === "last") el.scrollTop = el.scrollHeight
+    else if (typeof pendingPage.value === "number" && pendingPage.value > 0) {
+      el.scrollTop = (pendingPage.value / 100) * Math.max(0, el.scrollHeight - el.clientHeight)
+    }
+    pendingPage.value = null
+    updateMobileScrollProgress()
+    return
+  }
+  await measurePages()
+}
+
+function setPageMode(mode: MobilePageMode) {
+  if (pageMode.value === mode) {
+    showPageModeMenu.value = false
+    return
+  }
+  pageMode.value = mode
+  localStorage.setItem("novelhub_page_mode", mode)
+  currentPage.value = 0
+  mobileScrollProgress.value = 0
+  pendingPage.value = 0
+  showPageModeMenu.value = false
+  nextTick(refreshMobileLayout)
+}
+
+function updateMobileScrollProgress() {
+  const el = scrollViewport.value
+  if (!el || pageMode.value !== "scroll") return
+  const max = Math.max(0, el.scrollHeight - el.clientHeight)
+  mobileScrollProgress.value = max === 0 ? 100 : Math.round((el.scrollTop / max) * 100)
+}
+
+function onMobileScroll() {
+  updateMobileScrollProgress()
+  clearTimeout(progressTimer)
+  progressTimer = setTimeout(() => savePosition(mobileScrollProgress.value), 800)
+}
+
+function seekMobileProgress(event: Event) {
+  const value = Number((event.target as HTMLInputElement).value)
+  if (pageMode.value === "scroll") {
+    const el = scrollViewport.value
+    if (!el) return
+    el.scrollTop = (value / 100) * Math.max(0, el.scrollHeight - el.clientHeight)
+    updateMobileScrollProgress()
+  } else {
+    currentPage.value = pageCount.value <= 1
+      ? 0
+      : Math.round((value / 100) * (pageCount.value - 1))
+    applyPageTransform()
+  }
+  queuePageProgress()
+}
+
 function queuePageProgress() {
   clearTimeout(progressTimer)
   progressTimer = setTimeout(() => {
-    if (isMobileLayout.value) savePosition(pageProgress.value)
+    if (isMobileLayout.value) savePosition(mobileProgress.value)
   }, 800)
 }
 
 function flushPageProgress() {
   clearTimeout(progressTimer)
-  if (isMobileLayout.value) savePosition(pageProgress.value)
+  if (isMobileLayout.value) savePosition(mobileProgress.value)
 }
 
 function openChapter(id: string, page: number | "last" = 0, targetBookId = bookId.value) {
@@ -207,13 +335,22 @@ function openChapter(id: string, page: number | "last" = 0, targetBookId = bookI
   showAI.value = false
   pendingPage.value = page
   if (id === chapterId.value && targetBookId === bookId.value) {
-    if (isMobileLayout.value) nextTick(measurePages)
+    if (isMobileLayout.value) nextTick(refreshMobileLayout)
     return
   }
   router.replace("/books/" + targetBookId + "/chapters/" + id)
 }
 
 function nextPageOrChapter() {
+  if (pageMode.value === "scroll") {
+    const el = scrollViewport.value
+    if (el && el.scrollTop < el.scrollHeight - el.clientHeight - 4) {
+      el.scrollBy({ top: Math.max(120, el.clientHeight - 48), behavior: "smooth" })
+      return
+    }
+    if (nextChapter.value) openChapter(nextChapter.value.id, 0)
+    return
+  }
   if (currentPage.value < pageCount.value - 1) {
     currentPage.value += 1
     applyPageTransform()
@@ -224,6 +361,15 @@ function nextPageOrChapter() {
 }
 
 function prevPageOrChapter() {
+  if (pageMode.value === "scroll") {
+    const el = scrollViewport.value
+    if (el && el.scrollTop > 4) {
+      el.scrollBy({ top: -Math.max(120, el.clientHeight - 48), behavior: "smooth" })
+      return
+    }
+    if (prevChapter.value) openChapter(prevChapter.value.id, "last")
+    return
+  }
   if (currentPage.value > 0) {
     currentPage.value -= 1
     applyPageTransform()
@@ -242,22 +388,66 @@ function handleTap(event: MouseEvent) {
     suppressClick = false
     return
   }
+  const action = tapActionFor(event)
+  if (action === "prev_page") prevPageOrChapter()
+  else if (action === "next_page") nextPageOrChapter()
+  else if (action === "prev_chapter" && prevChapter.value) {
+    openChapter(prevChapter.value.id, pageMode.value === "scroll" ? "last" : 0)
+  } else if (action === "next_chapter" && nextChapter.value) {
+    openChapter(nextChapter.value.id)
+  } else if (action === "menu") {
+    menuVisible.value = true
+  }
+}
+
+function selectTapRegion(region: ReaderTapRegion) {
+  selectedTapRegion.value = region
+  tapAreaSaved.value = false
+}
+
+function setTapAction(action: ReaderTapAction) {
+  tapActions.value[selectedTapRegion.value] = action
+  tapAreaDirty.value = true
+  tapAreaSaved.value = false
+  tapAreaError.value = ""
+  localStorage.setItem("novelhub_tap_actions", JSON.stringify(tapActions.value))
+}
+
+function resetTapActions() {
+  tapActions.value = { ...DEFAULT_TAP_ACTIONS }
+  tapAreaDirty.value = true
+  tapAreaSaved.value = false
+  tapAreaError.value = ""
+  localStorage.setItem("novelhub_tap_actions", JSON.stringify(tapActions.value))
+  if (auth.user) saveTapActions()
+}
+
+async function saveTapActions() {
+  if (!auth.user) return
+  tapAreaSaving.value = true
+  tapAreaError.value = ""
+  try {
+    const actions = normalizeTapActions(tapActions.value)
+    tapActions.value = actions
+    localStorage.setItem("novelhub_tap_actions", JSON.stringify(actions))
+    const res = await api.put<any>("/auth/me/settings", { tap_actions: actions })
+    auth.user = res
+    tapAreaDirty.value = false
+    tapAreaSaved.value = true
+  } catch (e) {
+    tapAreaError.value = e instanceof Error ? e.message : i18n.t("reader_tap_area_save_failed")
+  } finally {
+    tapAreaSaving.value = false
+  }
+}
+
+function tapActionFor(event: MouseEvent): ReaderTapAction {
   const width = window.innerWidth || 1
   const height = window.innerHeight || 1
-  const xr = event.clientX / width
-  const yr = event.clientY / height
-  const left = xr < 1 / 3
-  const right = xr > 2 / 3
-  const middle = !left && !right
-  if (left || (middle && yr < 1 / 3)) {
-    prevPageOrChapter()
-    return
-  }
-  if (right || (middle && yr > 2 / 3)) {
-    nextPageOrChapter()
-    return
-  }
-  if (middle) menuVisible.value = true
+  const col = Math.min(2, Math.max(0, Math.floor((event.clientX / width) * 3)))
+  const row = Math.min(2, Math.max(0, Math.floor((event.clientY / height) * 3)))
+  const region = TAP_REGION_KEYS[row * 3 + col]
+  return tapActions.value[region]
 }
 
 function onTouchStart(event: TouchEvent) {
@@ -270,7 +460,7 @@ function onTouchStart(event: TouchEvent) {
 }
 
 function onTouchEnd(event: TouchEvent) {
-  if (menuVisible.value) return
+  if (menuVisible.value || pageMode.value === "scroll") return
   const touch = event.changedTouches[0]
   const dx = touch.clientX - touchStartX
   const dy = touch.clientY - touchStartY
@@ -289,6 +479,8 @@ function closeMenu() {
   menuVisible.value = false
   showFontMenu.value = false
   showSourceMenu.value = false
+  showPageModeMenu.value = false
+  showTapAreaMenu.value = false
 }
 
 function goBackToBook() {
@@ -301,20 +493,20 @@ function goBackToBook() {
 }
 
 function updateMobileLayout() {
-  const next = window.matchMedia("(pointer: coarse), (max-width: 820px)").matches
+  const next = window.matchMedia("(max-width: 900px) and (pointer: coarse), (max-width: 700px)").matches
   if (next === isMobileLayout.value) return
   isMobileLayout.value = next
   document.documentElement.classList.toggle("reader-locked", next)
   if (next) {
     currentPage.value = 0
-    nextTick(measurePages)
+    nextTick(refreshMobileLayout)
   }
 }
 
 function onResize() {
   clearTimeout(resizeTimer)
   resizeTimer = setTimeout(() => {
-    if (isMobileLayout.value) nextTick(measurePages)
+    if (isMobileLayout.value) nextTick(refreshMobileLayout)
   }, 150)
 }
 
@@ -326,7 +518,7 @@ async function loadChapter(id: string) {
   try {
     chapter.value = await store.fetchChapter(id)
     loading.value = false
-    if (isMobileLayout.value) await measurePages()
+    if (isMobileLayout.value) await refreshMobileLayout()
   } catch (e) {
     error.value = e instanceof Error ? e.message : i18n.t('reader_failed_load_chapter')
   } finally {
@@ -376,8 +568,18 @@ async function switchSource(alt: any) {
 }
 
 watch([fontSize, cnFont, enFont], () => {
-  if (isMobileLayout.value) nextTick(measurePages)
+  if (isMobileLayout.value) nextTick(refreshMobileLayout)
 })
+
+watch(
+  () => auth.user?.settings?.tap_actions,
+  (value) => {
+    if (!tapAreaDirty.value) {
+      tapActions.value = normalizeTapActions(value)
+      localStorage.setItem("novelhub_tap_actions", JSON.stringify(tapActions.value))
+    }
+  },
+)
 
 watch(
   () => route.params.chapterId,
@@ -394,7 +596,7 @@ watch(
       chapters.value = await store.fetchChapters(newId as string)
     } catch { /* non-fatal */ }
     await loadAlternates()
-    if (isMobileLayout.value) nextTick(measurePages)
+    if (isMobileLayout.value) nextTick(refreshMobileLayout)
   },
 )
 
@@ -402,7 +604,7 @@ onMounted(async () => {
   document.documentElement.classList.toggle("dark", isDark.value)
   window.addEventListener("scroll", onScroll, { passive: true })
   window.addEventListener("resize", onResize, { passive: true })
-  mediaQuery = window.matchMedia("(pointer: coarse), (max-width: 820px)")
+  mediaQuery = window.matchMedia("(max-width: 900px) and (pointer: coarse), (max-width: 700px)")
   mediaListener = () => updateMobileLayout()
   mediaQuery.addEventListener?.("change", mediaListener)
   updateMobileLayout()
@@ -426,7 +628,7 @@ onUnmounted(() => {
 
 <template>
   <div class="min-h-screen" :class="isDark ? 'bg-gray-950 text-gray-100' : 'bg-paper text-ink'">
-    <div v-if="isMobileLayout" class="mobile-reader">
+    <div v-if="isMobileLayout" class="mobile-reader" :class="isDark ? 'mobile-reader-dark' : 'mobile-reader-light'">
       <p
         v-if="loading"
         class="absolute inset-0 flex items-center justify-center text-sm text-muted dark:text-gray-400"
@@ -435,10 +637,13 @@ onUnmounted(() => {
 
       <template v-else-if="chapter">
         <div
+          v-if="pageMode !== 'scroll'"
           class="page-surface"
+          :class="'page-mode-' + pageMode"
           @touchstart.passive="onTouchStart"
           @touchend="onTouchEnd"
           @click="handleTap"
+          @load.capture="nextTick(refreshMobileLayout)"
         >
           <div ref="pageViewport" class="page-viewport">
             <article ref="pageContent" class="page-columns" :style="readerFontStyle">
@@ -458,118 +663,150 @@ onUnmounted(() => {
         </div>
 
         <div
+          v-else
+          ref="scrollViewport"
+          class="scroll-page-surface"
+          @scroll.passive="onMobileScroll"
+          @click="handleTap"
+          @load.capture="updateMobileScrollProgress"
+        >
+          <article class="scroll-page-content" :style="readerFontStyle">
+            <h1 class="page-title">
+              {{ chapter.title || i18n.t('reader_chapter_fallback', { n: chapter.chapter_number }) }}
+            </h1>
+            <div
+              class="page-body"
+              :class="{ 'hide-content-images': !showContentImages }"
+              v-html="chapterBodyHtml"
+            />
+          </article>
+          <div class="scroll-page-meta">{{ mobileScrollProgress }}%</div>
+        </div>
+
+        <div
           v-if="menuVisible"
           class="fixed inset-0 z-50 reader-menu-layer"
+          :class="isDark ? 'reader-menu-dark' : 'reader-menu-light'"
           @click.self="closeMenu"
         >
           <div
-            v-if="showFontMenu || showSourceMenu"
+            v-if="showFontMenu || showSourceMenu || showPageModeMenu || showTapAreaMenu"
             class="fixed inset-0"
             @click="closeMenu"
           />
           <header class="reader-topbar" @click.stop>
-            <button @click="goBackToBook" class="reader-icon-btn">&larr; {{ i18n.t('reader_book') }}</button>
-            <button @click="showToc = !showToc" class="reader-icon-btn">{{ i18n.t('reader_toc') }}</button>
-            <button
-              @click="showAI = !showAI"
-              class="reader-icon-btn"
-              :class="showAI ? 'text-accent' : ''"
-            >{{ i18n.t('reader_ai') }}</button>
+            <button @click="goBackToBook" class="reader-top-action" :title="i18n.t('reader_book')">&larr;</button>
             <span class="reader-top-title">
               {{ chapter.title || i18n.t('reader_chapter_fallback', { n: chapter.chapter_number }) }}
             </span>
             <button
+              v-if="alternates.length > 1"
+              @click="showSourceMenu = !showSourceMenu; showFontMenu = false; showPageModeMenu = false; showTapAreaMenu = false"
+              class="reader-top-action text-xs"
+              :class="showSourceMenu ? 'text-accent' : ''"
+              :title="i18n.t('reader_sources')"
+            >{{ i18n.t('reader_sources_short') }}</button>
+            <button
               v-if="auth.isAdmin"
               @click="resyncChapter"
               :disabled="chapterSyncing"
-              class="reader-icon-btn text-xs disabled:opacity-50"
-            >{{ chapterSyncing ? i18n.t('reader_chapter_syncing') : i18n.t('reader_chapter_resync') }}</button>
-            <button @click="closeMenu" class="reader-icon-btn">&times;</button>
+              class="reader-top-action disabled:opacity-50"
+              :title="chapterSyncing ? i18n.t('reader_chapter_syncing') : i18n.t('reader_chapter_resync')"
+            >&#8635;</button>
+            <button @click="closeMenu" class="reader-top-action" :title="i18n.t('reader_close')">&times;</button>
           </header>
 
           <footer class="reader-bottombar" @click.stop>
-            <div class="flex items-center gap-1">
+            <div v-if="showSourceMenu" class="reader-bottom-panel">
               <button
-                @click="changeFontSize(-2)"
-                class="reader-icon-btn"
-                :title="i18n.t('reader_smaller_font')"
-              >A-</button>
-              <button
-                @click="changeFontSize(2)"
-                class="reader-icon-btn"
-                :title="i18n.t('reader_larger_font')"
-              >A+</button>
-              <div v-if="alternates.length > 1" class="relative">
-                <button
-                  @click="showSourceMenu = !showSourceMenu"
-                  class="reader-icon-btn"
-                  :class="showSourceMenu ? 'text-accent' : ''"
-                  :title="i18n.t('reader_sources')"
-                >{{ i18n.t('reader_sources_short') }}</button>
-                <div
-                  v-if="showSourceMenu"
-                  class="absolute right-0 bottom-full mb-2 w-52 rounded-lg border shadow-lg p-2 z-10"
-                  :class="isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-border'"
-                >
-                  <button
-                    v-for="alt in alternates"
-                    :key="alt.id"
-                    @click="switchSource(alt)"
-                    class="w-full text-left px-2 py-1.5 rounded text-xs transition-colors"
-                    :class="alt.is_current
-                      ? 'bg-accent text-white font-medium'
-                      : isDark ? 'hover:bg-gray-700' : 'hover:bg-gray-100'"
-                  >
-                    {{ alt.source_name || alt.source_id || i18n.t('reader_unknown') }}
-                    <span v-if="alt.is_current" class="ml-1 opacity-70">{{ i18n.t('reader_current') }}</span>
-                  </button>
-                </div>
-              </div>
-              <div class="relative">
-                <button
-                  @click="showFontMenu = !showFontMenu"
-                  class="reader-icon-btn"
-                  :class="(cnFont !== 'default' || enFont !== 'default') ? 'text-accent' : ''"
-                  :title="i18n.t('reader_font_settings')"
-                >F</button>
-                <div
-                  v-if="showFontMenu"
-                  class="absolute right-0 bottom-full mb-2 w-56 rounded-lg border shadow-lg p-3 z-10"
-                  :class="isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-border'"
-                >
-                  <div class="text-xs font-medium mb-2 text-muted dark:text-gray-400">{{ i18n.t('reader_cn_font') }}</div>
-                  <div class="flex flex-wrap gap-1 mb-3">
-                    <button
-                      v-for="f in cnFonts"
-                      :key="f.value"
-                      @click="setCnFont(f.value)"
-                      class="text-xs px-2 py-1 rounded transition-colors"
-                      :class="cnFont === f.value
-                        ? 'bg-accent text-white'
-                        : isDark ? 'bg-gray-700 hover:bg-gray-600' : 'bg-gray-100 hover:bg-gray-200'"
-                    >{{ f.label }}</button>
-                  </div>
-                  <div class="text-xs font-medium mb-2 text-muted dark:text-gray-400">{{ i18n.t('reader_en_font') }}</div>
-                  <div class="flex flex-wrap gap-1">
-                    <button
-                      v-for="f in enFonts"
-                      :key="f.value"
-                      @click="setEnFont(f.value)"
-                      class="text-xs px-2 py-1 rounded transition-colors"
-                      :class="enFont === f.value
-                        ? 'bg-accent text-white'
-                        : isDark ? 'bg-gray-700 hover:bg-gray-600' : 'bg-gray-100 hover:bg-gray-200'"
-                    >{{ f.label }}</button>
-                  </div>
-                </div>
-              </div>
-              <button
-                @click="toggleDark"
-                class="reader-icon-btn"
-                :title="isDark ? i18n.t('reader_light_mode') : i18n.t('reader_dark_mode')"
-              >{{ isDark ? '\u2600' : '\u263e' }}</button>
+                v-for="alt in alternates"
+                :key="alt.id"
+                @click="switchSource(alt)"
+                class="reader-option-btn"
+                :class="alt.is_current ? 'reader-option-active' : ''"
+              >
+                {{ alt.source_name || alt.source_id || i18n.t('reader_unknown') }}
+                <span v-if="alt.is_current" class="ml-1 opacity-70">{{ i18n.t('reader_current') }}</span>
+              </button>
             </div>
-            <span class="text-xs opacity-70">{{ currentPage + 1 }} / {{ pageCount }}</span>
+
+            <div v-if="showFontMenu" class="reader-bottom-panel">
+              <div class="reader-font-size-row">
+                <button @click="changeFontSize(-2)" class="reader-size-btn" :title="i18n.t('reader_smaller_font')">A-</button>
+                <span class="text-sm">{{ fontSize }}px</span>
+                <button @click="changeFontSize(2)" class="reader-size-btn" :title="i18n.t('reader_larger_font')">A+</button>
+              </div>
+              <p class="reader-panel-label">{{ i18n.t('reader_cn_font') }}</p>
+              <div class="reader-option-grid">
+                <button v-for="f in cnFonts" :key="f.value" @click="setCnFont(f.value)" class="reader-option-btn" :class="cnFont === f.value ? 'reader-option-active' : ''">{{ f.label }}</button>
+              </div>
+              <p class="reader-panel-label">{{ i18n.t('reader_en_font') }}</p>
+              <div class="reader-option-grid">
+                <button v-for="f in enFonts" :key="f.value" @click="setEnFont(f.value)" class="reader-option-btn" :class="enFont === f.value ? 'reader-option-active' : ''">{{ f.label }}</button>
+              </div>
+            </div>
+
+            <div v-if="showPageModeMenu" class="reader-bottom-panel">
+              <p class="reader-panel-label">{{ i18n.t('reader_page_mode') }}</p>
+              <div class="reader-mode-grid">
+                <button v-for="mode in pageModeOptions" :key="mode.value" @click="setPageMode(mode.value)" class="reader-option-btn" :class="pageMode === mode.value ? 'reader-option-active' : ''">{{ mode.label }}</button>
+              </div>
+            </div>
+
+            <div v-if="showTapAreaMenu" class="reader-bottom-panel">
+              <p class="reader-panel-label">{{ i18n.t('reader_tap_area') }}</p>
+              <div class="tap-area-grid">
+                <button
+                  v-for="region in TAP_REGION_KEYS"
+                  :key="region"
+                  @click="selectTapRegion(region)"
+                  class="tap-area-cell"
+                  :class="[
+                    selectedTapRegion === region ? 'tap-area-cell-active' : '',
+                    tapActions[region] === 'menu' ? 'tap-area-cell-menu' : '',
+                    tapActions[region] === 'none' ? 'tap-area-cell-none' : '',
+                  ]"
+                >
+                  <span class="tap-area-cell-name">{{ region.toUpperCase() }}</span>
+                  <span class="tap-area-cell-action">{{ tapActionLabel(tapActions[region]) }}</span>
+                </button>
+              </div>
+              <p class="reader-panel-label">{{ i18n.t('reader_tap_area_action_for') }}</p>
+              <div class="tap-action-grid">
+                <button
+                  v-for="option in tapActionOptions"
+                  :key="option.value"
+                  @click="setTapAction(option.value)"
+                  class="reader-option-btn"
+                  :class="tapActions[selectedTapRegion] === option.value ? 'reader-option-active' : ''"
+                >{{ option.label }}</button>
+              </div>
+              <div class="tap-area-actions">
+                <button @click="resetTapActions" class="reader-tap-reset-btn">{{ i18n.t('reader_tap_area_reset') }}</button>
+                <button @click="saveTapActions" :disabled="tapAreaSaving || !tapAreaDirty || !auth.user" class="reader-tap-save-btn">{{ tapAreaSaving ? i18n.t('admin_saving') : i18n.t('reader_tap_area_save') }}</button>
+              </div>
+              <p v-if="tapAreaError" class="text-xs text-red-500 mt-2">{{ tapAreaError }}</p>
+              <p v-else-if="!auth.user && tapAreaDirty" class="text-xs text-muted mt-2">{{ i18n.t('reader_tap_area_login_required') }}</p>
+              <p v-else-if="tapAreaSaved" class="text-xs text-green-600 mt-2">{{ i18n.t('reader_tap_area_saved') }}</p>
+            </div>
+
+            <div class="reader-chapter-row">
+              <button @click="prevChapter && openChapter(prevChapter.id, pageMode === 'scroll' ? 'last' : 0)" :disabled="!prevChapter" class="reader-chapter-btn">{{ i18n.t('reader_previous_chapter') }}</button>
+              <div class="reader-progress-wrap">
+                <input type="range" min="0" max="100" :value="mobileProgress" @input="seekMobileProgress" class="reader-progress" :title="i18n.t('reader_reading_progress')" />
+                <span>{{ mobileProgressLabel }}</span>
+              </div>
+              <button @click="nextChapter && openChapter(nextChapter.id)" :disabled="!nextChapter" class="reader-chapter-btn">{{ i18n.t('reader_next_chapter') }}</button>
+            </div>
+
+            <nav class="reader-actions">
+              <button @click="showToc = true; closeMenu()" class="reader-action-btn"><span class="reader-action-icon">&#9776;</span><span>{{ i18n.t('reader_toc') }}</span></button>
+              <button @click="showAI = true; closeMenu()" class="reader-action-btn"><span class="reader-action-icon text-sm font-semibold">AI</span><span>{{ i18n.t('reader_ai') }}</span></button>
+              <button @click="showFontMenu = !showFontMenu; showPageModeMenu = false; showSourceMenu = false; showTapAreaMenu = false" class="reader-action-btn" :class="showFontMenu ? 'text-accent' : ''"><span class="reader-action-icon font-serif">Aa</span><span>{{ i18n.t('reader_interface') }}</span></button>
+              <button @click="showPageModeMenu = !showPageModeMenu; showFontMenu = false; showSourceMenu = false; showTapAreaMenu = false" class="reader-action-btn" :class="showPageModeMenu ? 'text-accent' : ''"><span class="reader-action-icon">&#8596;</span><span>{{ i18n.t('reader_page_mode') }}</span></button>
+              <button @click="showTapAreaMenu = !showTapAreaMenu; showFontMenu = false; showSourceMenu = false; showPageModeMenu = false" class="reader-action-btn" :class="showTapAreaMenu ? 'text-accent' : ''"><span class="reader-action-icon">&#9638;</span><span>{{ i18n.t('reader_tap_area_short') }}</span></button>
+              <button @click="toggleDark" class="reader-action-btn"><span class="reader-action-icon">{{ isDark ? '\u2600' : '\u263e' }}</span><span>{{ isDark ? i18n.t('reader_light_mode_short') : i18n.t('reader_dark_mode_short') }}</span></button>
+            </nav>
           </footer>
         </div>
       </template>
@@ -800,6 +1037,16 @@ onUnmounted(() => {
   overflow: hidden;
 }
 
+.mobile-reader-light {
+  background: #faf8f5;
+  color: #1f2937;
+}
+
+.mobile-reader-dark {
+  background: #111318;
+  color: #d1d5db;
+}
+
 .page-surface {
   position: absolute;
   inset: 0;
@@ -825,8 +1072,31 @@ onUnmounted(() => {
   column-width: 100vw;
   column-gap: 32px;
   column-fill: auto;
-  transition: transform 0.28s cubic-bezier(0.22, 1, 0.36, 1);
   will-change: transform;
+}
+
+.page-mode-cover .page-columns {
+  transition: transform 0.22s cubic-bezier(0.2, 0.7, 0.25, 1);
+  filter: drop-shadow(-12px 0 10px rgba(0, 0, 0, 0.08));
+}
+
+.page-mode-slide .page-columns {
+  transition: transform 0.3s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.page-mode-simulation .page-viewport {
+  perspective: 1200px;
+}
+
+.page-mode-simulation .page-columns {
+  transform-style: preserve-3d;
+  transform-origin: center right;
+  transition: transform 0.42s cubic-bezier(0.34, 0.03, 0.18, 1);
+  filter: drop-shadow(-16px 2px 12px rgba(0, 0, 0, 0.13));
+}
+
+.page-mode-none .page-columns {
+  transition: none;
 }
 
 .page-inner {
@@ -863,8 +1133,52 @@ onUnmounted(() => {
   pointer-events: none;
 }
 
+.scroll-page-surface {
+  position: absolute;
+  inset: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  -webkit-overflow-scrolling: touch;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.scroll-page-content {
+  box-sizing: border-box;
+  min-height: 100%;
+  padding: 24px 22px max(52px, env(safe-area-inset-bottom));
+  line-height: 1.9;
+}
+
+.scroll-page-meta {
+  position: sticky;
+  bottom: max(8px, env(safe-area-inset-bottom));
+  width: max-content;
+  margin: 0 auto;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: rgba(90, 90, 90, 0.12);
+  font-size: 11px;
+  opacity: 0.7;
+  pointer-events: none;
+}
+
 .reader-menu-layer {
   background: transparent;
+}
+
+.reader-menu-light .reader-topbar,
+.reader-menu-light .reader-bottombar,
+.reader-menu-light .reader-bottom-panel {
+  background: rgba(255, 255, 255, 0.97);
+  color: #1f2937;
+}
+
+.reader-menu-dark .reader-topbar,
+.reader-menu-dark .reader-bottombar,
+.reader-menu-dark .reader-bottom-panel {
+  background: rgba(24, 27, 33, 0.97);
+  color: #e5e7eb;
 }
 
 .reader-topbar,
@@ -874,35 +1188,42 @@ onUnmounted(() => {
   right: 0;
   display: flex;
   align-items: center;
-  gap: 0.25rem;
-  padding: 0.5rem 0.75rem;
-  backdrop-filter: blur(10px);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
 }
 
 .reader-topbar {
   top: 0;
+  min-height: 3.25rem;
+  gap: 0.25rem;
+  padding: max(0.45rem, env(safe-area-inset-top)) 0.75rem 0.45rem;
   border-bottom: 1px solid rgba(128, 128, 128, 0.25);
 }
 
 .reader-bottombar {
   bottom: 0;
-  justify-content: space-between;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+  padding-bottom: env(safe-area-inset-bottom);
   border-top: 1px solid rgba(128, 128, 128, 0.25);
 }
 
-.reader-icon-btn {
+.reader-top-action {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 2rem;
-  height: 2rem;
-  padding: 0 0.4rem;
-  border-radius: 0.375rem;
-  font-size: 0.8rem;
+  width: 2.25rem;
+  height: 2.25rem;
+  flex: 0 0 2.25rem;
+  border-radius: 4px;
+  font-size: 1.15rem;
   transition: background-color 0.15s ease;
 }
 
-.reader-icon-btn:hover {
+.reader-top-action:active,
+.reader-action-btn:active,
+.reader-chapter-btn:active {
   background: rgba(128, 128, 128, 0.12);
 }
 
@@ -915,5 +1236,226 @@ onUnmounted(() => {
   font-size: 0.8rem;
   opacity: 0.75;
   text-align: center;
+}
+
+.reader-bottom-panel {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  z-index: 2;
+  max-height: min(56vh, 28rem);
+  overflow-y: auto;
+  padding: 0.85rem 1rem 1rem;
+  border-top: 1px solid rgba(128, 128, 128, 0.25);
+  box-shadow: 0 -10px 25px rgba(0, 0, 0, 0.12);
+}
+
+.reader-chapter-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.7rem;
+  min-height: 3.25rem;
+  padding: 0.25rem 1rem;
+}
+
+.reader-chapter-btn {
+  min-width: 3.25rem;
+  min-height: 2.5rem;
+  font-size: 0.8rem;
+}
+
+.reader-chapter-btn:disabled {
+  opacity: 0.3;
+}
+
+.reader-progress-wrap {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 3.2rem;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+  font-size: 0.7rem;
+  text-align: center;
+  opacity: 0.75;
+}
+
+.reader-progress {
+  width: 100%;
+  min-width: 0;
+  accent-color: #8b5cf6;
+}
+
+.reader-actions {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  border-top: 1px solid rgba(128, 128, 128, 0.2);
+}
+
+.reader-action-btn {
+  display: flex;
+  min-width: 0;
+  min-height: 3.75rem;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.15rem;
+  padding: 0.35rem 0.1rem;
+  font-size: 0.65rem;
+}
+
+.reader-action-icon {
+  display: flex;
+  width: 1.5rem;
+  height: 1.5rem;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.1rem;
+  line-height: 1;
+}
+
+.reader-font-size-row {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 0.8rem;
+}
+
+.reader-size-btn {
+  height: 2.25rem;
+  border: 1px solid rgba(128, 128, 128, 0.3);
+  border-radius: 4px;
+}
+
+.reader-panel-label {
+  margin: 0.7rem 0 0.4rem;
+  font-size: 0.7rem;
+  opacity: 0.65;
+}
+
+.reader-option-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.35rem;
+}
+
+.reader-mode-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 0.3rem;
+}
+
+.tap-area-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.35rem;
+}
+
+.tap-area-cell {
+  display: flex;
+  min-height: 3.1rem;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.1rem;
+  overflow: hidden;
+  padding: 0.3rem 0.2rem;
+  border: 1px solid rgba(128, 128, 128, 0.3);
+  border-radius: 4px;
+}
+
+.tap-area-cell-active {
+  border-color: #8b5cf6;
+  box-shadow: inset 0 0 0 1px #8b5cf6;
+}
+
+.tap-area-cell-menu {
+  background: rgba(139, 92, 246, 0.14);
+}
+
+.tap-area-cell-none {
+  opacity: 0.55;
+}
+
+.tap-area-cell-name {
+  font-size: 0.6rem;
+  line-height: 1;
+  opacity: 0.6;
+}
+
+.tap-area-cell-action {
+  max-width: 100%;
+  font-size: 0.7rem;
+  line-height: 1.2;
+  text-align: center;
+}
+
+.tap-action-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.35rem;
+}
+
+.tap-area-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.7rem;
+}
+
+.reader-tap-reset-btn,
+.reader-tap-save-btn {
+  min-height: 2.1rem;
+  padding: 0.35rem 0.7rem;
+  border-radius: 4px;
+  font-size: 0.72rem;
+}
+
+.reader-tap-reset-btn {
+  border: 1px solid rgba(128, 128, 128, 0.3);
+}
+
+.reader-tap-save-btn {
+  background: #8b5cf6;
+  color: white;
+}
+
+.reader-tap-save-btn:disabled {
+  opacity: 0.4;
+}
+
+.reader-option-btn {
+  min-width: 0;
+  min-height: 2.25rem;
+  overflow: hidden;
+  padding: 0.35rem 0.4rem;
+  border: 1px solid rgba(128, 128, 128, 0.3);
+  border-radius: 4px;
+  font-size: 0.72rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reader-option-active {
+  border-color: #8b5cf6;
+  background: #8b5cf6;
+  color: white;
+}
+
+@media (max-width: 360px) {
+  .reader-chapter-row {
+    gap: 0.35rem;
+    padding-inline: 0.5rem;
+  }
+
+  .reader-progress-wrap {
+    grid-template-columns: minmax(0, 1fr) 2.7rem;
+  }
+
+  .reader-action-btn {
+    font-size: 0.6rem;
+  }
 }
 </style>

@@ -94,6 +94,27 @@ class BookOut(BaseModel):
     shelf_group_ids: list[str] = []
 
 
+class BookPageOut(BaseModel):
+    items: list[BookOut]
+    total: int
+    offset: int
+    limit: int
+
+
+class BookHomeSectionOut(BaseModel):
+    category_id: str
+    category_name: str
+    category_color: str | None = None
+    total: int
+    books: list[BookOut]
+
+
+class BookHomeOut(BaseModel):
+    total: int
+    latest: list[BookOut]
+    sections: list[BookHomeSectionOut]
+
+
 class BookSourceAlternate(BaseModel):
     id: str
     source_id: str | None = None

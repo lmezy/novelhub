@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.models import Book, BookFavorite, BookFavoriteGroup, BookTag, Chapter, Source, Tag, User
+from app.models import Book, BookCategory, BookFavorite, BookFavoriteGroup, BookTag, Category, Chapter, Source, Tag, User
 from app.services.book_enrichment import analyze_book_text
 from app.services.auth import get_current_user, require_admin
 from app.services.book_cleanup import delete_books
@@ -30,7 +30,10 @@ from app.services.visibility import (
 )
 from app.schemas.book import (
     BookCreate,
+    BookHomeOut,
+    BookHomeSectionOut,
     BookOut,
+    BookPageOut,
     BookSourceAlternate,
     BookSourceAlternatesOut,
     ManualAnalyzeRequest,
@@ -53,6 +56,10 @@ class BatchFavoriteRequest(BaseModel):
 
 class BatchDeleteBySourceRequest(BaseModel):
     source_id: str
+
+
+class BatchDeleteByCategoryRequest(BaseModel):
+    category_id: str
 
 
 class SetBookCoverRequest(BaseModel):
@@ -127,9 +134,7 @@ def _serialize_book(
     )
 
 
-@router.get("", response_model=list[BookOut])
-async def list_books(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    query = select(Book).options(selectinload(Book.tags)).order_by(Book.updated_at.desc())
+def _apply_book_visibility(query, user: User):
     if user.role not in ("admin", "super_admin"):
         query = query.where(or_(
             Book.owner_id.is_(None),
@@ -141,25 +146,144 @@ async def list_books(user: User = Depends(get_current_user), db: AsyncSession = 
         conditions.append(Book.is_r18 == False)
     if can_view_r18(user):
         conditions.append(Book.is_r18 == True)
-    query = query.where(or_(*conditions)) if conditions else query.where(Book.id == "__none__")
-    result = await db.scalars(query)
-    books = list(result)
+    return query.where(or_(*conditions)) if conditions else query.where(Book.id == "__none__")
+
+
+async def _serialize_books(db: AsyncSession, books: list[Book], user: User) -> list[BookOut]:
+    if not books:
+        return []
+    book_ids = [book.id for book in books]
     favorite_ids = set(
         await db.scalars(
-            select(BookFavorite.book_id).where(BookFavorite.user_id == user.id)
+            select(BookFavorite.book_id).where(
+                BookFavorite.user_id == user.id,
+                BookFavorite.book_id.in_(book_ids),
+            )
         )
     )
-    custom_tags = await list_book_custom_tags_map(
-        db,
-        [book.id for book in books],
-        user,
-    )
-    for book in books:
-        book.is_favorite = book.id in favorite_ids
+    custom_tags = await list_book_custom_tags_map(db, book_ids, user)
     return [
-        _serialize_book(book, user, book.is_favorite, custom_tags)
+        _serialize_book(book, user, book.id in favorite_ids, custom_tags)
         for book in books
     ]
+
+
+@router.get("", response_model=list[BookOut])
+async def list_books(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    query = _apply_book_visibility(
+        select(Book).options(selectinload(Book.tags), selectinload(Book.categories)),
+        user,
+    ).order_by(Book.updated_at.desc())
+    result = await db.scalars(query)
+    books = list(result.unique().all()) if hasattr(result, "unique") else list(result)
+    return await _serialize_books(db, books, user)
+
+
+@router.get("/home", response_model=BookHomeOut)
+async def get_books_home(
+    section_limit: int = Query(6, ge=1, le=12),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    total = int(await db.scalar(_apply_book_visibility(
+        select(func.count()).select_from(Book), user
+    )) or 0)
+    latest_rows = await db.scalars(
+        _apply_book_visibility(
+            select(Book).options(selectinload(Book.tags), selectinload(Book.categories)),
+            user,
+        ).order_by(Book.updated_at.desc()).limit(section_limit)
+    )
+    latest_books = list(latest_rows.unique().all())
+
+    category_query = select(Category).order_by(Category.name)
+    if not can_view_r18(user):
+        category_query = category_query.where(Category.is_r18 == False)
+    categories = list((await db.scalars(category_query)).all())
+    section_rows: list[tuple[Category, int, list[Book]]] = []
+    all_books = list(latest_books)
+    for category in categories:
+        count_query = _apply_book_visibility(
+            select(func.count()).select_from(Book).join(
+                BookCategory, BookCategory.book_id == Book.id
+            ).where(BookCategory.category_id == category.id),
+            user,
+        )
+        category_total = int(await db.scalar(count_query) or 0)
+        if not category_total:
+            continue
+        rows = await db.scalars(
+            _apply_book_visibility(
+                select(Book)
+                .join(BookCategory, BookCategory.book_id == Book.id)
+                .options(selectinload(Book.tags), selectinload(Book.categories))
+                .where(BookCategory.category_id == category.id),
+                user,
+            ).order_by(Book.updated_at.desc()).limit(section_limit)
+        )
+        books = list(rows.unique().all())
+        section_rows.append((category, category_total, books))
+        all_books.extend(books)
+
+    serialized = await _serialize_books(
+        db,
+        list({book.id: book for book in all_books}.values()),
+        user,
+    )
+    by_id = {book.id: book for book in serialized}
+    return BookHomeOut(
+        total=total,
+        latest=[by_id[book.id] for book in latest_books if book.id in by_id],
+        sections=[
+            BookHomeSectionOut(
+                category_id=category.id,
+                category_name=category.name,
+                category_color=category.color,
+                total=category_total,
+                books=[by_id[book.id] for book in books if book.id in by_id],
+            )
+            for category, category_total, books in section_rows
+        ],
+    )
+
+
+@router.get("/browse", response_model=BookPageOut)
+async def browse_books(
+    category: str | None = None,
+    source_id: str | None = None,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(24, ge=1, le=48),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    query = select(Book)
+    count_query = select(func.count()).select_from(Book)
+    if category:
+        query = query.join(BookCategory, BookCategory.book_id == Book.id).join(
+            Category, Category.id == BookCategory.category_id
+        ).where(Category.name == category)
+        count_query = count_query.join(
+            BookCategory, BookCategory.book_id == Book.id
+        ).join(Category, Category.id == BookCategory.category_id).where(
+            Category.name == category
+        )
+    if source_id:
+        query = query.where(Book.source_id == source_id)
+        count_query = count_query.where(Book.source_id == source_id)
+    total = int(await db.scalar(_apply_book_visibility(count_query, user)) or 0)
+    rows = await db.scalars(
+        _apply_book_visibility(
+            query.options(selectinload(Book.tags), selectinload(Book.categories)),
+            user,
+        ).order_by(Book.updated_at.desc()).offset(offset).limit(limit)
+    )
+    books = list(rows.unique().all())
+    return BookPageOut(
+        items=await _serialize_books(db, books, user),
+        total=total,
+        offset=offset,
+        limit=limit,
+    )
 
 
 @router.post("/batch-delete", dependencies=[Depends(require_admin)])
@@ -199,6 +323,28 @@ async def batch_delete_books_by_source(
     )
     deleted = await delete_books(db, book_ids)
     return {"source_id": source_id, "deleted": deleted}
+
+
+@router.post("/batch-delete-by-category", dependencies=[Depends(require_admin)])
+async def batch_delete_books_by_category(
+    payload: BatchDeleteByCategoryRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    category_id = payload.category_id.strip()
+    if not category_id:
+        raise HTTPException(status_code=400, detail="Category id is required")
+    category = await db.get(Category, category_id)
+    if category is None:
+        raise HTTPException(status_code=404, detail="Category not found")
+    book_ids = list(await db.scalars(
+        select(BookCategory.book_id).where(BookCategory.category_id == category_id)
+    ))
+    deleted = await delete_books(db, book_ids)
+    return {
+        "category_id": category_id,
+        "category_name": category.name,
+        "deleted": deleted,
+    }
 
 
 @router.post("/batch-favorite")

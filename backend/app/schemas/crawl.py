@@ -1,5 +1,5 @@
 ﻿from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Any
 
 
@@ -8,6 +8,8 @@ class CrawlTaskOut(BaseModel):
     source: str
     mode: str = "bookshelf"
     max_pages: int = 200
+    exclude_tags: list[str] = Field(default_factory=list)
+    exclude_categories: list[str] = Field(default_factory=list)
     priority: int = 0
     status: str
     started_at: datetime | None = None

@@ -1,402 +1,315 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue"
-import { useRouter } from "vue-router"
-import { useBooksStore, type Book } from "../stores/books"
-import { useAuthStore } from "../stores/auth"
-import { useI18nStore } from "../stores/i18n"
+import { computed, onMounted, ref, watch } from "vue"
+import { useRoute, useRouter } from "vue-router"
 import { api } from "../api/client"
+import BookCard from "../components/BookCard.vue"
 import NavBar from "../components/NavBar.vue"
+import { useAuthStore } from "../stores/auth"
+import type { Book } from "../stores/books"
+import { useBooksStore } from "../stores/books"
+import { useI18nStore } from "../stores/i18n"
 
-const store = useBooksStore()
-const auth = useAuthStore()
-const i18n = useI18nStore()
+type SearchField = "title" | "author" | "chapter_title" | "description" | "content" | "tags" | "category"
+
+interface CategoryItem { id: string; name: string; color?: string | null }
+interface SourceItem { id: string; name: string }
+interface HomeSection { category_id: string; category_name: string; category_color?: string | null; total: number; books: Book[] }
+interface HomeData { total: number; latest: Book[]; sections: HomeSection[] }
+interface BookPage { items: Book[]; total: number; offset: number; limit: number }
+interface SearchHit {
+  type: "book" | "chapter"
+  id: string
+  book_id?: string
+  title: string
+  book_title?: string
+  author?: string
+  snippet?: string
+  matched_fields?: string[]
+  matched_chapter?: { id: string; book_id: string; title: string; snippet?: string }
+}
+
+const route = useRoute()
 const router = useRouter()
+const auth = useAuthStore()
+const booksStore = useBooksStore()
+const i18n = useI18nStore()
+
+const categories = ref<CategoryItem[]>([])
+const sources = ref<SourceItem[]>([])
+const home = ref<HomeData | null>(null)
+const page = ref<BookPage>({ items: [], total: 0, offset: 0, limit: 24 })
+const results = ref<SearchHit[]>([])
+const searchTotal = ref(0)
+const loading = ref(false)
+const error = ref("")
 const selectedIds = ref<string[]>([])
-const batchDeleting = ref(false)
-const batchFavoriting = ref(false)
-const autoCategorizing = ref(false)
-const categories = ref<{ id: string; name: string; color?: string | null }[]>([])
-const selectedCategory = ref("")
-const newCategoryName = ref("")
-const newCategoryR18 = ref(false)
-const categoryCreating = ref(false)
-const categoryError = ref("")
-const sourceOptions = ref<{ id: string; name: string }[]>([])
-const selectedSource = ref("")
-const deletingSource = ref(false)
-const sourceError = ref("")
+const actionBusy = ref(false)
+const searchQuery = ref("")
+const searchField = ref<SearchField>("title")
 
-const filteredBooks = computed(() => {
-  return store.books.filter((book) =>
-    (!selectedCategory.value || book.category_names?.includes(selectedCategory.value)) &&
-    (!selectedSource.value || book.source_id === selectedSource.value)
-  )
-})
-
+const activeCategory = computed(() => String(route.query.category || ""))
+const activeSource = computed(() => String(route.query.source || ""))
+const currentOffset = computed(() => Math.max(0, Number(route.query.offset || 0) || 0))
+const isSearching = computed(() => Boolean(String(route.query.q || "").trim()))
+const isBrowsing = computed(() => !isSearching.value && Boolean(activeCategory.value || activeSource.value))
 const showCovers = computed(() => auth.user?.settings?.show_covers !== false)
+const sourceNameMap = computed<Record<string, string>>(() => Object.fromEntries(sources.value.map((source) => [source.id, source.name])))
+const activeCategoryItem = computed(() => categories.value.find((category) => category.name === activeCategory.value))
+const allSelected = computed(() => page.value.items.length > 0 && page.value.items.every((book) => selectedIds.value.includes(book.id)))
 
-const sourceNameMap = computed(() =>
-  Object.fromEntries(sourceOptions.value.map((s) => [s.id, s.name]))
-)
+const searchFields: { value: SearchField; label: string }[] = [
+  { value: "title", label: "search_field_title" },
+  { value: "author", label: "search_field_author" },
+  { value: "chapter_title", label: "search_field_chapter_title" },
+  { value: "description", label: "search_field_description" },
+  { value: "content", label: "search_field_content" },
+  { value: "tags", label: "search_field_tags" },
+  { value: "category", label: "search_field_category" },
+]
 
-const sourceBookCount = computed(() =>
-  selectedSource.value
-    ? store.books.filter((book) => book.source_id === selectedSource.value).length
-    : 0
-)
-
-const selectedSourceName = computed(() =>
-  sourceNameMap.value[selectedSource.value] || selectedSource.value || ""
-)
-
-const allSelected = computed(() =>
-  filteredBooks.value.length > 0 &&
-  filteredBooks.value.every((book) => selectedIds.value.includes(book.id))
-)
-
-function toggleSelect(id: string) {
-  selectedIds.value = selectedIds.value.includes(id)
-    ? selectedIds.value.filter((x) => x !== id)
-    : [...selectedIds.value, id]
+async function loadNavigation() {
+  const [categoryRows, sourceRows] = await Promise.all([
+    api.get<CategoryItem[]>("/categories"),
+    api.get<any[]>("/sources"),
+  ])
+  categories.value = categoryRows
+  sources.value = sourceRows.map((source) => ({ id: source.id, name: source.name || source.id }))
 }
 
-function selectAll() {
-  selectedIds.value = filteredBooks.value.map((book) => book.id)
+async function loadHome() {
+  home.value = await api.get<HomeData>("/books/home?section_limit=6")
 }
 
-function invertSelection() {
-  const selected = new Set(selectedIds.value)
-  selectedIds.value = filteredBooks.value
-    .filter((book) => !selected.has(book.id))
-    .map((book) => book.id)
+async function loadBrowse() {
+  const params = new URLSearchParams({ offset: String(currentOffset.value), limit: "24" })
+  if (activeCategory.value) params.set("category", activeCategory.value)
+  if (activeSource.value) params.set("source_id", activeSource.value)
+  page.value = await api.get<BookPage>(`/books/browse?${params}`)
 }
 
-function clearSelection() {
+async function loadSearch() {
+  const q = String(route.query.q || "").trim()
+  const field = (String(route.query.field || "title") as SearchField)
+  searchQuery.value = q
+  searchField.value = searchFields.some((item) => item.value === field) ? field : "title"
+  const fuzzyFields: SearchField[] = ["title", "author", "chapter_title", "description", "content"]
+  const response = await api.post<{ hits: SearchHit[]; total: number }>("/search/advanced", {
+    conditions: [{ field: searchField.value, mode: fuzzyFields.includes(searchField.value) ? "fuzzy" : "exact", value: q }],
+    match: "and",
+    scope: "all",
+    offset: 0,
+    limit: 40,
+  })
+  results.value = response.hits
+  searchTotal.value = response.total
+}
+
+async function loadCurrentView() {
+  loading.value = true
+  error.value = ""
   selectedIds.value = []
-}
-
-async function toggleFavorite(book: Book) {
-  await store.toggleFavorite(book)
-}
-
-async function deleteBook(id: string, title: string) {
-  if (!confirm(i18n.t('home_delete_confirm', { title }))) return
   try {
-    await api.delete('/books/' + id)
-    selectedIds.value = selectedIds.value.filter((x) => x !== id)
-    await store.fetchBooks()
+    if (isSearching.value) await loadSearch()
+    else if (isBrowsing.value) await loadBrowse()
+    else await loadHome()
   } catch (e) {
-    alert(e instanceof Error ? e.message : i18n.t('home_delete_failed'))
-  }
-}
-
-async function batchDelete() {
-  if (!selectedIds.value.length) return
-  if (!confirm(i18n.t('books_batch_delete_confirm', { n: selectedIds.value.length }))) return
-  batchDeleting.value = true
-  try {
-    await api.post('/books/batch-delete', { ids: selectedIds.value })
-    selectedIds.value = []
-    await store.fetchBooks()
-  } catch (e) {
-    alert(e instanceof Error ? e.message : i18n.t('books_batch_delete_failed'))
+    error.value = e instanceof Error ? e.message : i18n.t("search_failed")
   } finally {
-    batchDeleting.value = false
+    loading.value = false
   }
 }
 
-async function deleteSourceBooks() {
-  if (!selectedSource.value) return
-  const count = sourceBookCount.value
-  if (!count) return
-  if (!confirm(i18n.t('books_source_delete_confirm', { name: selectedSourceName.value, n: count }))) return
-  deletingSource.value = true
-  sourceError.value = ""
-  try {
-    const res = await api.post<{ deleted: number }>("/books/batch-delete-by-source", {
-      source_id: selectedSource.value,
-    })
-    selectedIds.value = []
-    selectedSource.value = ""
-    await store.fetchBooks()
-    alert(i18n.t('books_source_delete_done', { n: res.deleted }))
-  } catch (e) {
-    sourceError.value = e instanceof Error ? e.message : i18n.t('books_source_delete_failed')
-  } finally {
-    deletingSource.value = false
+function submitSearch() {
+  const q = searchQuery.value.trim()
+  if (!q) {
+    router.push({ path: "/books" })
+    return
   }
+  router.push({ path: "/books", query: { q, field: searchField.value } })
 }
 
-async function batchAddShelf() {
-  if (!selectedIds.value.length) return
-  batchFavoriting.value = true
-  try {
-    const res = await api.post('/books/batch-favorite', { ids: selectedIds.value }) as { added: number }
-    alert(i18n.t('books_batch_add_shelf_done', { n: res.added }))
-    selectedIds.value = []
-    await store.fetchBooks()
-  } catch (e) {
-    alert(e instanceof Error ? e.message : i18n.t('books_batch_add_shelf_failed'))
-  } finally {
-    batchFavoriting.value = false
-  }
+function openCategory(name: string) {
+  router.push({ path: "/books", query: { category: name } })
 }
 
-async function autoCategorizeAll() {
-  if (!confirm(i18n.t('books_auto_category_confirm'))) return
-  autoCategorizing.value = true
-  try {
-    const res = await api.post<{ total: number; categorized: number }>("/categories/auto")
-    alert(i18n.t('books_auto_category_done', { total: res.total, categorized: res.categorized }))
-    await store.fetchBooks()
-  } catch (e) {
-    alert(e instanceof Error ? e.message : i18n.t('books_auto_category_failed'))
-  } finally {
-    autoCategorizing.value = false
-  }
-}
-
-async function loadCategories() {
-  try {
-    categories.value = await api.get<{ id: string; name: string; color?: string | null }[]>("/categories")
-  } catch {
-    categories.value = []
-  }
-}
-
-async function loadSources() {
-  try {
-    const rows = await api.get<any[]>("/sources")
-    sourceOptions.value = rows.map((s) => ({ id: s.id, name: s.name || s.id }))
-  } catch {
-    sourceOptions.value = []
-  }
+function changeSource(event: Event) {
+  const source = (event.target as HTMLSelectElement).value
+  router.push({ path: "/books", query: { ...(activeCategory.value ? { category: activeCategory.value } : {}), ...(source ? { source } : {}) } })
 }
 
 function searchByField(field: "author" | "tags" | "category", value: string) {
-  router.push({ path: "/search", query: { field, q: value } })
+  router.push({ path: "/books", query: { field, q: value } })
 }
 
-async function createCategory() {
-  const name = newCategoryName.value.trim()
-  if (!name) return
-  categoryCreating.value = true
-  categoryError.value = ""
-  try {
-    await api.post("/categories", {
-      name,
-      is_r18: newCategoryR18.value,
-    })
-    newCategoryName.value = ""
-    newCategoryR18.value = false
-    await loadCategories()
-  } catch (e) {
-    categoryError.value = e instanceof Error ? e.message : i18n.t('book_category_create_failed')
-  } finally {
-    categoryCreating.value = false
-  }
+function goToHit(hit: SearchHit) {
+  if (hit.type === "book" && hit.matched_chapter) router.push(`/books/${hit.matched_chapter.book_id}/chapters/${hit.matched_chapter.id}`)
+  else if (hit.type === "book") router.push(`/books/${hit.id}`)
+  else if (hit.book_id) router.push(`/books/${hit.book_id}/chapters/${hit.id}`)
 }
+
+function toggleSelect(id: string) {
+  selectedIds.value = selectedIds.value.includes(id) ? selectedIds.value.filter((item) => item !== id) : [...selectedIds.value, id]
+}
+
+function toggleAll() {
+  selectedIds.value = allSelected.value ? [] : page.value.items.map((book) => book.id)
+}
+
+async function toggleFavorite(book: Book) {
+  await booksStore.toggleFavorite(book)
+}
+
+async function batchFavorite() {
+  if (!selectedIds.value.length) return
+  actionBusy.value = true
+  try {
+    await api.post("/books/batch-favorite", { ids: selectedIds.value })
+    await loadCurrentView()
+  } finally { actionBusy.value = false }
+}
+
+async function batchDelete() {
+  if (!selectedIds.value.length || !confirm(i18n.t("books_batch_delete_confirm", { n: selectedIds.value.length }))) return
+  actionBusy.value = true
+  try {
+    await api.post("/books/batch-delete", { ids: selectedIds.value })
+    await loadCurrentView()
+  } finally { actionBusy.value = false }
+}
+
+async function deleteCategoryBooks() {
+  const category = activeCategoryItem.value
+  if (!category || !confirm(i18n.t("books_category_delete_confirm", { name: category.name, n: page.value.total }))) return
+  actionBusy.value = true
+  try {
+    await api.post("/books/batch-delete-by-category", { category_id: category.id })
+    await router.push("/books")
+  } finally { actionBusy.value = false }
+}
+
+async function deleteSourceBooks() {
+  if (!activeSource.value || !confirm(i18n.t("books_source_delete_confirm", { name: sourceNameMap.value[activeSource.value] || activeSource.value, n: page.value.total }))) return
+  actionBusy.value = true
+  try {
+    await api.post("/books/batch-delete-by-source", { source_id: activeSource.value })
+    await router.push("/books")
+  } finally { actionBusy.value = false }
+}
+
+function changePage(offset: number) {
+  router.push({ path: "/books", query: { ...route.query, offset: String(Math.max(0, offset)) } })
+}
+
+watch(() => route.query, loadCurrentView, { deep: true })
 
 onMounted(async () => {
-  await loadCategories()
-  await loadSources()
-  await store.fetchBooks()
+  try { await loadNavigation() } catch { categories.value = []; sources.value = [] }
+  await loadCurrentView()
 })
 </script>
 
 <template>
-  <div class="min-h-screen bg-paper dark:bg-gray-950 dark:text-gray-100">
+  <div class="min-h-screen bg-paper text-ink dark:bg-gray-950 dark:text-gray-100">
     <NavBar />
 
-    <main class="max-w-5xl mx-auto px-4 py-8">
-      <section>
-        <div class="flex items-center justify-between mb-6">
+    <main class="mx-auto max-w-6xl px-4 pb-12 pt-7">
+      <header class="mb-6 text-center">
+        <h1 class="text-2xl font-bold">{{ i18n.t('books_title') }}</h1>
+        <p class="mt-1 text-sm text-muted dark:text-gray-400">{{ i18n.t('books_subtitle') }}</p>
+        <form @submit.prevent="submitSearch" class="mx-auto mt-5 flex max-w-2xl overflow-hidden rounded-lg border border-border bg-surface shadow-sm focus-within:border-accent dark:border-gray-700 dark:bg-gray-900">
+          <select v-model="searchField" class="border-r border-border bg-transparent px-3 text-xs outline-none dark:border-gray-700">
+            <option v-for="field in searchFields" :key="field.value" :value="field.value">{{ i18n.t(field.label) }}</option>
+          </select>
+          <input v-model="searchQuery" type="search" :placeholder="i18n.t('search_placeholder')" class="min-w-0 flex-1 bg-transparent px-4 py-3 text-sm outline-none" />
+          <button type="submit" class="flex w-12 items-center justify-center bg-accent text-lg text-white" :title="i18n.t('nav_search')">⌕</button>
+        </form>
+      </header>
+
+      <nav class="mb-7 flex items-center gap-2 overflow-x-auto border-y border-border py-3 dark:border-gray-800">
+        <button @click="router.push('/books')" class="shrink-0 rounded px-3 py-1.5 text-xs" :class="!activeCategory && !activeSource && !isSearching ? 'bg-accent text-white' : 'text-muted hover:bg-black/5 dark:text-gray-400 dark:hover:bg-white/5'">{{ i18n.t('books_all_categories') }}</button>
+        <button v-for="category in categories" :key="category.id" @click="openCategory(category.name)" class="shrink-0 rounded px-3 py-1.5 text-xs" :class="activeCategory === category.name ? 'bg-accent text-white' : 'text-muted hover:bg-black/5 dark:text-gray-400 dark:hover:bg-white/5'">{{ category.name }}</button>
+      </nav>
+
+      <p v-if="loading" class="py-16 text-center text-sm text-muted dark:text-gray-400">{{ i18n.t('home_loading') }}</p>
+      <p v-else-if="error" class="py-10 text-center text-sm text-red-600">{{ error }}</p>
+
+      <template v-else-if="isSearching">
+        <div class="mb-4 flex items-center justify-between">
           <div>
-            <h1 class="text-2xl font-bold">{{ i18n.t('books_title') }}</h1>
-            <p class="text-sm text-muted dark:text-gray-400 mt-1">{{ i18n.t('books_subtitle') }}</p>
-          </div>
-          <div class="flex items-center gap-3">
-            <span class="text-sm text-muted dark:text-gray-400">{{ i18n.t('home_books_count', { n: filteredBooks.length }) }}</span>
-            <button
-              v-if="auth.isAdmin"
-              @click="autoCategorizeAll"
-              :disabled="autoCategorizing"
-              class="text-xs px-3 py-1.5 rounded border border-accent/40 text-accent hover:bg-accent/5 disabled:opacity-50"
-            >{{ autoCategorizing ? i18n.t('books_auto_category_running') : i18n.t('books_auto_category') }}</button>
-            <button
-              v-if="selectedIds.length"
-              @click="batchAddShelf"
-              :disabled="batchFavoriting"
-              class="text-xs px-3 py-1.5 rounded bg-accent text-white hover:opacity-90 disabled:opacity-50"
-            >{{ i18n.t('books_batch_add_shelf') }} ({{ selectedIds.length }})</button>
-            <button
-              v-if="auth.isAdmin && selectedIds.length"
-              @click="batchDelete"
-              :disabled="batchDeleting"
-              class="text-xs px-3 py-1.5 rounded bg-red-500 text-white hover:bg-red-600 disabled:opacity-50"
-            >{{ i18n.t('books_batch_delete') }} ({{ selectedIds.length }})</button>
-            <button
-              v-if="auth.isAdmin && selectedSource"
-              @click="deleteSourceBooks"
-              :disabled="deletingSource || sourceBookCount === 0"
-              class="text-xs px-3 py-1.5 rounded bg-red-600 text-white hover:bg-red-700 disabled:opacity-50"
-            >{{ deletingSource ? i18n.t('books_deleting') : i18n.t('books_source_delete', { n: sourceBookCount }) }}</button>
-            <span v-if="sourceError" class="text-xs text-red-600">{{ sourceError }}</span>
+            <button @click="router.push('/books')" class="text-xs text-accent hover:underline">{{ i18n.t('books_back_home') }}</button>
+            <h2 class="mt-1 text-lg font-semibold">{{ i18n.t('search_results_count', { n: searchTotal }) }}</h2>
           </div>
         </div>
+        <p v-if="!results.length" class="py-12 text-center text-sm text-muted dark:text-gray-400">{{ i18n.t('search_no_results') }}</p>
+        <div v-else class="divide-y divide-border border-y border-border dark:divide-gray-800 dark:border-gray-800">
+          <button v-for="hit in results" :key="hit.type + '-' + hit.id" @click="goToHit(hit)" class="block w-full px-2 py-4 text-left transition-colors hover:bg-accent/5">
+            <div class="flex flex-wrap items-center gap-2">
+              <span class="rounded bg-accent/10 px-1.5 py-0.5 text-[10px] text-accent">{{ hit.type === 'book' ? i18n.t('search_books') : i18n.t('search_chapters') }}</span>
+              <h3 class="text-sm font-medium">{{ hit.type === 'book' ? hit.title : hit.book_title }}</h3>
+              <span v-for="field in hit.matched_fields || []" :key="field" class="text-[10px] text-muted dark:text-gray-500">{{ i18n.t('search_field_' + field) }}</span>
+            </div>
+            <p v-if="hit.type === 'chapter'" class="mt-1 text-xs font-medium">{{ hit.title }}</p>
+            <p v-if="hit.author" class="mt-1 text-xs text-muted dark:text-gray-400">{{ hit.author }}</p>
+            <p v-if="hit.snippet" class="mt-1 line-clamp-2 text-xs text-muted dark:text-gray-400">{{ hit.snippet }}</p>
+          </button>
+        </div>
+      </template>
 
-        <p v-if="store.loading" class="text-muted dark:text-gray-400">{{ i18n.t('home_loading') }}</p>
-          <p v-else-if="store.error" class="text-red-600">{{ store.error }}</p>
-
-        <div v-else-if="store.books.length === 0" class="text-center py-16">
-          <p class="text-muted dark:text-gray-400 text-lg mb-2">{{ i18n.t('books_empty') }}</p>
-          <router-link to="/admin" class="inline-block mt-4 text-sm text-accent hover:underline">{{ i18n.t('books_empty_hint') }}</router-link>
+      <template v-else-if="isBrowsing">
+        <div class="mb-5 flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <button @click="router.push('/books')" class="text-xs text-accent hover:underline">{{ i18n.t('books_back_home') }}</button>
+            <h2 class="mt-1 text-xl font-semibold">{{ activeCategory || sourceNameMap[activeSource] || i18n.t('books_title') }}</h2>
+            <p class="mt-1 text-xs text-muted dark:text-gray-400">{{ i18n.t('home_books_count', { n: page.total }) }}</p>
+          </div>
+          <select :value="activeSource" @change="changeSource" class="rounded border border-border bg-surface px-3 py-2 text-xs dark:border-gray-700 dark:bg-gray-900">
+            <option value="">{{ i18n.t('books_all_sources') }}</option>
+            <option v-for="source in sources" :key="source.id" :value="source.id">{{ source.name }}</option>
+          </select>
         </div>
 
-        <template v-else>
-          <div class="mb-3 flex flex-wrap items-center gap-2 text-xs">
-            <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
-              <span>{{ i18n.t('books_category_label') }}</span>
-              <select
-                v-model="selectedCategory"
-                class="px-2 py-1 rounded border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-xs focus:outline-none"
-              >
-                <option value="">{{ i18n.t('books_all_categories') }}</option>
-                <option v-for="cat in categories" :key="cat.id" :value="cat.name">{{ cat.name }}</option>
-              </select>
-            </label>
-            <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
-              <span>{{ i18n.t('books_source_label') }}</span>
-              <select
-                v-model="selectedSource"
-                class="px-2 py-1 rounded border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-xs focus:outline-none"
-              >
-                <option value="">{{ i18n.t('books_all_sources') }}</option>
-                <option v-for="s in sourceOptions" :key="s.id" :value="s.id">{{ s.name }}</option>
-              </select>
-            </label>
-            <template v-if="auth.isAdmin">
-              <span class="inline-flex items-center gap-1">
-                <input
-                  v-model="newCategoryName"
-                  :placeholder="i18n.t('book_category_name_placeholder')"
-                  @keyup.enter="createCategory"
-                  class="w-28 px-2 py-1 rounded border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-xs"
-                />
-                <label class="inline-flex items-center gap-1 text-muted dark:text-gray-400 cursor-pointer">
-                  <input type="checkbox" v-model="newCategoryR18" class="rounded" />
-                  {{ i18n.t('book_category_r18') }}
-                </label>
-                <button
-                  @click="createCategory"
-                  :disabled="categoryCreating"
-                  class="px-2 py-1 rounded bg-accent text-white text-xs disabled:opacity-50"
-                >{{ i18n.t('book_category_add') }}</button>
-              </span>
-              <span v-if="categoryError" class="text-red-600">{{ categoryError }}</span>
-            </template>
-            <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                :checked="allSelected"
-                @change="allSelected ? clearSelection() : selectAll()"
-                class="rounded"
-              />
-              <span>{{ i18n.t('books_select_all') }}</span>
-            </label>
-            <button
-              type="button"
-              @click="invertSelection"
-              class="px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5"
-            >{{ i18n.t('books_select_invert') }}</button>
-            <button
-              type="button"
-              @click="clearSelection"
-              class="px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5"
-            >{{ i18n.t('books_select_none') }}</button>
-            <span class="text-muted dark:text-gray-400">{{ i18n.t('books_selected_count', { n: selectedIds.length }) }}</span>
-          </div>
+        <div v-if="auth.isAdmin" class="mb-4 flex flex-wrap items-center gap-2 border-y border-border py-3 text-xs dark:border-gray-800">
+          <label class="inline-flex items-center gap-1.5"><input type="checkbox" :checked="allSelected" @change="toggleAll" class="rounded" />{{ i18n.t('books_select_all') }}</label>
+          <span class="text-muted dark:text-gray-400">{{ i18n.t('books_selected_count', { n: selectedIds.length }) }}</span>
+          <button v-if="selectedIds.length" @click="batchFavorite" :disabled="actionBusy" class="rounded border border-accent px-2 py-1 text-accent">{{ i18n.t('books_batch_add_shelf') }}</button>
+          <button v-if="selectedIds.length" @click="batchDelete" :disabled="actionBusy" class="rounded bg-red-600 px-2 py-1 text-white">{{ i18n.t('books_batch_delete') }}</button>
+          <button v-if="activeCategoryItem" @click="deleteCategoryBooks" :disabled="actionBusy || !page.total" class="ml-auto rounded border border-red-300 px-2 py-1 text-red-600 disabled:opacity-40">{{ i18n.t('books_category_delete') }}</button>
+          <button v-if="activeSource" @click="deleteSourceBooks" :disabled="actionBusy || !page.total" class="rounded border border-red-300 px-2 py-1 text-red-600 disabled:opacity-40">{{ i18n.t('books_source_delete', { n: page.total }) }}</button>
+        </div>
 
-          <p v-if="filteredBooks.length === 0" class="text-muted dark:text-gray-400 text-center py-10">
-            {{ i18n.t('books_filter_empty') }}
-          </p>
+        <p v-if="!page.items.length" class="py-12 text-center text-sm text-muted dark:text-gray-400">{{ i18n.t('books_filter_empty') }}</p>
+        <div v-else class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+          <BookCard v-for="book in page.items" :key="book.id" :book="book" :show-cover="showCovers" :source-name="book.source_id ? sourceNameMap[book.source_id] : ''" :selectable="auth.isAdmin" :selected="selectedIds.includes(book.id)" @select="toggleSelect" @favorite="toggleFavorite" @search="searchByField" />
+        </div>
+        <div v-if="page.total > page.limit" class="mt-8 flex items-center justify-center gap-3 text-xs">
+          <button @click="changePage(page.offset - page.limit)" :disabled="page.offset === 0" class="rounded border border-border px-3 py-2 disabled:opacity-40 dark:border-gray-700">{{ i18n.t('books_previous') }}</button>
+          <span>{{ Math.floor(page.offset / page.limit) + 1 }} / {{ Math.ceil(page.total / page.limit) }}</span>
+          <button @click="changePage(page.offset + page.limit)" :disabled="page.offset + page.limit >= page.total" class="rounded border border-border px-3 py-2 disabled:opacity-40 dark:border-gray-700">{{ i18n.t('books_next') }}</button>
+        </div>
+      </template>
 
-          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          <router-link
-            v-for="book in filteredBooks"
-            :key="book.id"
-            :to="'/books/' + book.id"
-            class="relative group block p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 hover:shadow-md hover:border-accent/30 transition-all duration-200 no-underline"
-          >
-            <input
-              type="checkbox"
-              :checked="selectedIds.includes(book.id)"
-              @click.stop="toggleSelect(book.id)"
-              class="absolute top-2 left-2 w-4 h-4 rounded border-border"
-            />
-            <button
-              @click.prevent.stop="toggleFavorite(book)"
-              class="absolute top-2 right-2 w-7 h-7 flex items-center justify-center rounded text-base"
-              :class="book.is_favorite ? 'text-amber-500' : 'text-muted hover:text-amber-500'"
-              :title="book.is_favorite ? i18n.t('books_favorite_on') : i18n.t('books_favorite_off')"
-            >{{ book.is_favorite ? '★' : '☆' }}</button>
-            <img
-              v-if="showCovers && book.cover"
-              :src="book.cover"
-              :alt="book.title"
-              class="w-full h-44 object-cover rounded-md mb-3 border border-border dark:border-gray-700"
-            />
-            <h3 class="font-semibold text-ink mb-1 truncate pr-6">{{ book.title }}</h3>
-            <button
-              v-if="book.author_name"
-              @click.prevent.stop="searchByField('author', book.author_name)"
-              :title="i18n.t('book_author_search')"
-              class="text-xs text-muted dark:text-gray-400 mb-1 hover:text-accent transition-colors"
-            >{{ book.author_name }}</button>
-            <div v-if="book.category_names?.length" class="flex flex-wrap gap-1 mb-1">
-              <button
-                v-for="cat in book.category_names"
-                :key="cat"
-                @click.prevent.stop="searchByField('category', cat)"
-                :title="i18n.t('book_category_search')"
-                class="text-xs px-2 py-0.5 rounded bg-accent/10 text-accent"
-              >{{ cat }}</button>
-            </div>
-            <div v-if="book.tag_names?.length || book.custom_tags?.length" class="flex flex-wrap gap-1 mb-2">
-              <button
-                v-for="tag in book.tag_names"
-                :key="tag"
-                @click.prevent.stop="searchByField('tags', tag)"
-                :title="i18n.t('book_tag_search')"
-                class="text-xs px-2 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-muted dark:text-gray-400"
-              >{{ tag }}</button>
-              <button
-                v-for="tag in book.custom_tags || []"
-                :key="tag.id"
-                @click.prevent.stop="searchByField('tags', tag.name)"
-                :title="i18n.t('book_tag_search')"
-                class="text-xs px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-900/60 text-amber-700 dark:text-amber-300"
-              >{{ tag.name }}<template v-if="tag.count > 1"> ×{{ tag.count }}</template></button>
-            </div>
-            <p class="text-sm text-muted dark:text-gray-400 line-clamp-2 mb-3">
-              {{ book.description || i18n.t('home_no_desc') }}
-            </p>
-            <div class="flex items-center gap-2">
-              <span
-                class="text-xs px-2 py-0.5 rounded-full"
-                :class="book.status === 'completed' ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'"
-              >{{ book.status === 'completed' ? i18n.t('home_completed') : book.status || i18n.t('home_ongoing') }}</span>
-              <span v-if="book.source_id" class="text-xs text-muted dark:text-gray-400 truncate max-w-[7rem]">
-                {{ sourceNameMap[book.source_id] || book.source_id }}
-              </span>
-              <span class="text-xs text-muted dark:text-gray-400 ml-auto">
-                {{ new Date(book.updated_at).toLocaleDateString() }}
-              </span>
-            </div>
-          </router-link>
+      <template v-else-if="home">
+        <section v-if="home.latest.length" class="mb-10">
+          <div class="mb-4 flex items-end justify-between">
+            <div><h2 class="text-lg font-semibold">{{ i18n.t('books_latest') }}</h2><p class="mt-1 text-xs text-muted dark:text-gray-400">{{ i18n.t('home_books_count', { n: home.total }) }}</p></div>
           </div>
-        </template>
-      </section>
+          <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+            <BookCard v-for="book in home.latest" :key="book.id" :book="book" :show-cover="showCovers" :source-name="book.source_id ? sourceNameMap[book.source_id] : ''" @favorite="toggleFavorite" @search="searchByField" />
+          </div>
+        </section>
+
+        <section v-for="section in home.sections" :key="section.category_id" class="mb-10 border-t border-border pt-6 dark:border-gray-800">
+          <div class="mb-4 flex items-center justify-between">
+            <div class="flex items-center gap-2"><span class="h-4 w-1 rounded" :style="{ backgroundColor: section.category_color || '#9b4a32' }"></span><h2 class="text-lg font-semibold">{{ section.category_name }}</h2><span class="text-xs text-muted dark:text-gray-500">{{ section.total }}</span></div>
+            <button @click="openCategory(section.category_name)" class="text-xs text-accent hover:underline">{{ i18n.t('books_view_all') }} ›</button>
+          </div>
+          <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+            <BookCard v-for="book in section.books" :key="book.id" :book="book" :show-cover="showCovers" :source-name="book.source_id ? sourceNameMap[book.source_id] : ''" @favorite="toggleFavorite" @search="searchByField" />
+          </div>
+        </section>
+
+        <div v-if="home.total === 0" class="py-16 text-center"><p class="text-muted dark:text-gray-400">{{ i18n.t('books_empty') }}</p><router-link to="/settings" class="mt-3 inline-block text-sm text-accent hover:underline">{{ i18n.t('books_empty_hint') }}</router-link></div>
+      </template>
     </main>
   </div>
 </template>

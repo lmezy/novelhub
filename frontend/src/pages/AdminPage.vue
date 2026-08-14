@@ -6,6 +6,12 @@ import { useI18nStore } from "../stores/i18n"
 import { useCrawlStore } from "../stores/crawl"
 import { useAuthStore } from "../stores/auth"
 import NavBar from "../components/NavBar.vue"
+import {
+  DEFAULT_TAP_ACTIONS,
+  TAP_ACTIONS,
+  TAP_REGION_KEYS,
+  normalizeTapActions,
+} from "../utils/readerTapAreas"
 
 const i18n = useI18nStore()
 const crawlStore = useCrawlStore()
@@ -62,6 +68,7 @@ const prefs = ref({
   theme: "light",
   show_covers: true,
   show_content_images: true,
+  tap_actions: { ...DEFAULT_TAP_ACTIONS },
 })
 const prefsSaving = ref(false)
 const prefsError = ref("")
@@ -70,7 +77,19 @@ const prefsSaved = ref(false)
 async function loadPrefs() {
   if (auth.user?.settings) {
     prefs.value = { ...prefs.value, ...auth.user.settings }
+    if (auth.user.settings.tap_actions) {
+      prefs.value.tap_actions = normalizeTapActions(auth.user.settings.tap_actions)
+    }
   }
+}
+
+function tapActionLabel(action: string): string {
+  return i18n.t("reader_tap_action_" + action)
+}
+
+function resetTapPrefs() {
+  prefs.value.tap_actions = { ...DEFAULT_TAP_ACTIONS }
+  prefsSaved.value = false
 }
 
 async function savePrefs() {
@@ -349,6 +368,8 @@ const bookshelfError = ref("")
 const bookshelfLoading = ref(false)
 
 const crawlAllSourceId = ref("")
+const crawlExcludeTags = ref("耽美, BL")
+const crawlExcludeCategories = ref("")
 const crawlTaskError = ref("")
 const crawlTaskLoading = ref(false)
 
@@ -373,9 +394,15 @@ const yueduDiscover = ref(true)
 const yueduIsR18 = ref(false)
 const yueduScope = ref("personal")
 const yueduShowContributor = ref(true)
+const yueduExcludeTags = ref("耽美, BL")
+const yueduExcludeCategories = ref("")
 const yueduSyncResult = ref<any>(null)
 const yueduSyncError = ref("")
 const expandedSourceId = ref("")
+
+function splitFilterText(value: string): string[] {
+  return [...new Set(value.split(/[,，、;；\n]+/).map((item) => item.trim()).filter(Boolean))]
+}
 
 const localPath = ref("")
 const localImporting = ref(false)
@@ -626,6 +653,8 @@ async function yueduImportAndSync() {
     const body: any = { discover: yueduDiscover.value, is_r18: yueduIsR18.value }
     body.scope = yueduScope.value
     body.show_contributor = yueduShowContributor.value
+    body.exclude_tags = splitFilterText(yueduExcludeTags.value)
+    body.exclude_categories = splitFilterText(yueduExcludeCategories.value)
     if (yueduUrl.value) body.url = yueduUrl.value
     if (yueduJsonText.value) body.json_text = yueduJsonText.value
     if (yueduCookie.value.trim()) body.cookie = yueduCookie.value.trim()
@@ -996,6 +1025,8 @@ async function startCrawlAll() {
     const task = await api.post<any>("/crawl/tasks", {
       source: crawlAllSourceId.value,
       max_pages: 0,
+      exclude_tags: splitFilterText(crawlExcludeTags.value),
+      exclude_categories: splitFilterText(crawlExcludeCategories.value),
     })
     await crawlStore.setTask(task)
   } catch (e) {
@@ -1556,6 +1587,16 @@ onUnmounted(() => {
           <div class="flex gap-3 mb-3">
             <input v-model="crawlAllSourceId" :placeholder="i18n.t('admin_placeholder_source')" class="flex-1 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
           </div>
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+            <label class="block">
+              <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_exclude_tags') }}</span>
+              <input v-model="crawlExcludeTags" :placeholder="i18n.t('admin_exclude_tags_placeholder')" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            </label>
+            <label class="block">
+              <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_exclude_categories') }}</span>
+              <input v-model="crawlExcludeCategories" :placeholder="i18n.t('admin_exclude_categories_placeholder')" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            </label>
+          </div>
           <p v-if="crawlTaskError" class="text-sm text-red-600 mb-2">{{ crawlTaskError }}</p>
           <button @click="startCrawlAll" :disabled="crawlTaskLoading" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">
             {{ crawlTaskLoading ? i18n.t('admin_starting_short') : i18n.t('admin_start_full_site') }}
@@ -1757,6 +1798,21 @@ onUnmounted(() => {
               <input type="checkbox" v-model="prefs.show_content_images" class="rounded" />
             </label>
           </div>
+          <div class="border-t border-border dark:border-gray-700 pt-4 mt-4">
+            <div class="flex items-center justify-between mb-2">
+              <h3 class="text-sm font-semibold">{{ i18n.t('admin_pref_tap_areas') }}</h3>
+              <button @click="resetTapPrefs" class="text-xs px-2 py-1 rounded border border-border dark:border-gray-700">{{ i18n.t('admin_pref_tap_reset') }}</button>
+            </div>
+            <p class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('admin_pref_tap_areas_hint') }}</p>
+            <div class="grid grid-cols-3 gap-2 max-w-sm">
+              <label v-for="region in TAP_REGION_KEYS" :key="region" class="block">
+                <span class="block text-center text-xs text-muted dark:text-gray-400 mb-1">{{ region.toUpperCase() }}</span>
+                <select v-model="prefs.tap_actions[region]" class="w-full px-2 py-1.5 rounded border border-border dark:border-gray-700 text-xs bg-paper dark:bg-gray-800">
+                  <option v-for="action in TAP_ACTIONS" :key="action" :value="action">{{ tapActionLabel(action) }}</option>
+                </select>
+              </label>
+            </div>
+          </div>
           <p v-if="prefsError" class="text-sm text-red-600 mb-2">{{ prefsError }}</p>
           <p v-else-if="prefsSaved" class="text-sm text-green-600 mb-2">{{ i18n.t('admin_pref_saved') }}</p>
           <button @click="savePrefs" :disabled="prefsSaving" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">{{ prefsSaving ? i18n.t('admin_saving') : i18n.t('admin_pref_save') }}</button>
@@ -1839,6 +1895,16 @@ onUnmounted(() => {
               <input type="checkbox" v-model="yueduDiscover" class="rounded" />
               {{ i18n.t('admin_yuedu_discover_label') }}
             </label>
+            <div v-if="yueduDiscover" class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <label class="block">
+                <span class="block text-xs font-medium mb-1.5">{{ i18n.t('admin_exclude_tags') }}</span>
+                <input v-model="yueduExcludeTags" :placeholder="i18n.t('admin_exclude_tags_placeholder')" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+              </label>
+              <label class="block">
+                <span class="block text-xs font-medium mb-1.5">{{ i18n.t('admin_exclude_categories') }}</span>
+                <input v-model="yueduExcludeCategories" :placeholder="i18n.t('admin_exclude_categories_placeholder')" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+              </label>
+            </div>
             <button
               @click="yueduImportAndSync"
               :disabled="yueduSyncImporting"

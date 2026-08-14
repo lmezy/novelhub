@@ -84,6 +84,45 @@ class UserSettingsUpdate(BaseModel):
     theme: str | None = None
     show_covers: bool | None = None
     show_content_images: bool | None = None
+    tap_actions: dict | None = None
+
+    @field_validator("tap_actions")
+    @classmethod
+    def _validate_tap_actions(cls, value: dict | None) -> dict | None:
+        if value is None:
+            return value
+        region_keys = ("tl", "tc", "tr", "ml", "mc", "mr", "bl", "bc", "br")
+        valid_actions = (
+            "none",
+            "menu",
+            "prev_page",
+            "next_page",
+            "prev_chapter",
+            "next_chapter",
+        )
+        defaults = {
+            "tl": "prev_page",
+            "tc": "prev_page",
+            "tr": "next_page",
+            "ml": "prev_page",
+            "mc": "menu",
+            "mr": "next_page",
+            "bl": "prev_page",
+            "bc": "next_page",
+            "br": "next_page",
+        }
+        normalized: dict[str, str] = {}
+        for key in region_keys:
+            raw = value.get(key)
+            action = str(raw).strip() if raw is not None else defaults[key]
+            if action not in valid_actions:
+                raise ValueError(
+                    f"tap_actions.{key} must be one of: {', '.join(valid_actions)}"
+                )
+            normalized[key] = action
+        if "menu" not in normalized.values():
+            normalized["mc"] = "menu"
+        return normalized
 
 
 class ChangePasswordRequest(BaseModel):

@@ -6,8 +6,7 @@ import re
 from typing import Iterable
 
 from app.services.auto_categorize import (
-    DEFAULT_CATEGORY_RULES,
-    R18_CATEGORY_NAMES,
+    classify_category_names,
 )
 from app.services.local_file_parser import analyze_name_author
 from app.services.r18 import detect_r18
@@ -175,19 +174,12 @@ def suggest_categories(
     is_r18: bool = False,
 ) -> list[str]:
     """Mirror AutoCategorizationService matching for previews."""
-    combined = " ".join([
-        *[str(tag or "").lower() for tag in tags],
-        str(title or "").lower(),
-        str(author or "").lower(),
-        str(description or "").lower(),
-    ])
-    matched: list[str] = []
-    for name, keywords in DEFAULT_CATEGORY_RULES.items():
-        if name in R18_CATEGORY_NAMES and not is_r18:
-            continue
-        if any(keyword.lower() in combined for keyword in keywords):
-            matched.append(name)
-    return matched or ["其他"]
+    return classify_category_names(
+        [str(tag or "") for tag in tags],
+        title=title,
+        description=description,
+        is_r18=is_r18,
+    )
 
 
 def enrich_book_metadata(

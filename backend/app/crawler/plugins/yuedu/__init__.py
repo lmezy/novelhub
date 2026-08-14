@@ -439,7 +439,12 @@ class YueduPlugin:
             info["name"] = generic["title"]
         rule_author = self._clean_author(str(info.get("author") or "").strip())
         generic_author = self._clean_author(str(generic.get("author") or "").strip())
-        if not rule_author or self._looks_like_invalid_author(rule_author):
+        labelled_author = self._clean_author(
+            self._extract_labelled_author(BeautifulSoup(html, "lxml"))
+        )
+        if labelled_author and not self._looks_like_invalid_author(labelled_author):
+            info["author"] = labelled_author
+        elif not rule_author or self._looks_like_invalid_author(rule_author):
             info["author"] = generic_author or rule_author
         else:
             info["author"] = rule_author
@@ -737,8 +742,13 @@ class YueduPlugin:
                 title = re.split(r"\s+[-_|]\s+", title, maxsplit=1)[0].strip()
         title = self._clean_book_title(title)
 
-        author = ""
+        # Prefer an explicitly labelled author from the page metadata/body.
+        # Forum sources often use meta[name=author] for the post submitter,
+        # while the novel's real author is embedded in the subject/description.
+        author = self._extract_author_from_text(soup)
         for selector in GENERIC_BOOK_AUTHOR_SELECTORS:
+            if author:
+                break
             el = soup.select_one(selector)
             if el is None:
                 continue
@@ -746,8 +756,6 @@ class YueduPlugin:
             if value:
                 author = str(value).strip()
                 break
-        if not author:
-            author = self._extract_author_from_text(soup)
         author = self._clean_author(author)
 
         description = ""
@@ -791,12 +799,33 @@ class YueduPlugin:
 
         tags: list[str] = []
         seen_tags: set[str] = set()
+        page_site_markers = list(self._site_markers())
+        site_name_meta = soup.select_one("meta[property='og:site_name']")
+        if site_name_meta and site_name_meta.get("content"):
+            page_site_markers.append(str(site_name_meta.get("content")).strip())
+        document_title = soup.find("title")
+        if document_title:
+            title_text = document_title.get_text(" ", strip=True)
+            if " - " in title_text:
+                page_site_markers.extend(
+                    part.strip()
+                    for part in re.split(r"\s+", title_text.rsplit(" - ", 1)[-1])
+                    if len(part.strip()) >= 2
+                )
+        normalized_site_markers = {
+            re.sub(r"[^\w\u3400-\u9fff]+", "", marker).lower()
+            for marker in page_site_markers
+            if marker
+        }
 
         def _add_tag(value: str) -> None:
             value = value.strip().strip("#").strip()
             if not value or len(value) > 20 or value.lower() in (
                 "tags", "tag", "标签", "分类", "类别", "类型", "最新章节",
             ):
+                return
+            normalized = re.sub(r"[^\w\u3400-\u9fff]+", "", value).lower()
+            if normalized in normalized_site_markers:
                 return
             if value not in seen_tags:
                 seen_tags.add(value)
@@ -820,6 +849,17 @@ class YueduPlugin:
         ):
             for link in soup.select(selector):
                 _add_tag(link.get_text(" ", strip=True))
+
+        # Legado forum sources commonly expose tags as plain text rather than
+        # links, for example: `标签：#奇幻 #后宫 #异世界`.
+        for match in re.finditer(
+            r"(?:标签|標籤|关键词|關鍵詞)\s*[:：]\s*([^\n\r]{1,240})",
+            soup.get_text("\n", strip=True),
+            re.IGNORECASE,
+        ):
+            raw_tags = match.group(1)
+            for part in re.split(r"[#＃,，、;；|\s]+", raw_tags):
+                _add_tag(part)
 
         for link in soup.select("a[href]"):
             href = (link.get("href") or "").strip()
@@ -895,6 +935,10 @@ class YueduPlugin:
             markers.append(host)
             if host.lower().startswith("www."):
                 markers.append(host[4:])
+            hostname = host[4:] if host.lower().startswith("www.") else host
+            domain_label = hostname.split(".", 1)[0].strip()
+            if len(domain_label) >= 3:
+                markers.append(domain_label)
         markers = [m for m in markers if len(m) >= 2]
         return sorted(set(markers), key=len, reverse=True)
 
@@ -921,15 +965,20 @@ class YueduPlugin:
             title,
             flags=re.IGNORECASE,
         ).strip()
+        title = re.sub(
+            r"\s+(?:作\s*者|著\s*者|author)\s*[:：].*$",
+            "",
+            title,
+            flags=re.IGNORECASE,
+        ).strip()
         return title
 
     @staticmethod
-    def _extract_author_from_text(soup: BeautifulSoup) -> str:
-        """Author extraction from structured meta, description, or visible text."""
+    def _extract_labelled_author(soup: BeautifulSoup) -> str:
+        """Extract an author that the page explicitly identifies as the work's author."""
         for meta in soup.select(
             "meta[property='og:novel:author'], "
             "meta[name='og:novel:author'], "
-            "meta[name='author'], "
             "meta[property='article:author']"
         ):
             content = (meta.get("content") or "").strip()
@@ -951,7 +1000,8 @@ class YueduPlugin:
         for meta in soup.select(
             "meta[name='description'], "
             "meta[property='og:description'], "
-            "meta[name='keywords']"
+            "meta[name='keywords'], "
+            "meta[property='og:title']"
         ):
             content = (meta.get("content") or "").strip()
             if content:
@@ -985,6 +1035,21 @@ class YueduPlugin:
             )
             if match:
                 return match.group(1).strip()
+
+        return ""
+
+    @staticmethod
+    def _extract_author_from_text(soup: BeautifulSoup) -> str:
+        """Author extraction with generic document-author metadata as fallback."""
+        labelled = YueduPlugin._extract_labelled_author(soup)
+        if labelled:
+            return labelled
+        # On forum pages this usually names the submitter, so it must lose to
+        # any explicitly labelled author in the title, description, or body.
+        for meta in soup.select("meta[name='author']"):
+            content = (meta.get("content") or "").strip()
+            if content:
+                return content.split(",")[0].strip()
         return ""
 
     def _clean_author(self, author: str | None) -> str:
@@ -1096,6 +1161,7 @@ class YueduPlugin:
         protected_tags = {"漫画", "漫畫", "写真", "寫真", "图集", "圖集"}
         noise = {
             "tags", "tag", "标签", "分类", "类别", "类型",
+            "论坛", "论坛帖子", "帖子", "书源", "书籍",
             "最新章节", "最新章节列表", "全文阅读", "免费阅读", "阅读更多",
             "书友正在看", "大家都在看", "上一章", "下一章", "目录",
             "返回目录", "首页", "开始阅读", "小说", "本站",
@@ -1111,13 +1177,6 @@ class YueduPlugin:
                 continue
             if title_norm:
                 if normalized == title_norm:
-                    continue
-                if (
-                    normalized in title_norm
-                    and len(normalized) >= 2
-                    and tag not in protected_tags
-                ):
-                    # Keywords commonly include fragments of the book title.
                     continue
                 if title_norm in normalized:
                     remainder = _normalize(normalized.replace(title_norm, ""))

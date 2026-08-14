@@ -4,15 +4,11 @@ Default mapping rules cover common Chinese novel genres. Admins can
 customize categories and rules through the API.
 """
 
-import re
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import Book, BookTag, Tag
-from app.models.book_category import BookCategory
-from app.models.category import Category
 from app.repositories.category import CategoryRepository
-from uuid import uuid4
 
 
 DEFAULT_CATEGORY_RULES: dict[str, list[str]] = {
@@ -50,6 +46,60 @@ R18_CATEGORY_NAMES = {
     "露出",
     "绿帽",
 }
+
+PRIMARY_CATEGORY_NAMES = set(DEFAULT_CATEGORY_RULES) - R18_CATEGORY_NAMES - {"其他"}
+
+
+def classify_category_names(
+    tags: list[str],
+    *,
+    title: str = "",
+    description: str = "",
+    is_r18: bool = False,
+) -> list[str]:
+    """Choose one primary genre plus any explicit R18 facets.
+
+    Source tags are stronger evidence than prose. This avoids assigning many
+    unrelated genres because a common word happens to occur in a synopsis.
+    """
+    tag_values = [str(tag or "").strip().lower() for tag in tags if str(tag or "").strip()]
+    title_text = str(title or "").lower()
+    description_text = str(description or "").lower()
+    scores: dict[str, int] = {}
+
+    for category, keywords in DEFAULT_CATEGORY_RULES.items():
+        if category == "其他" or (category in R18_CATEGORY_NAMES and not is_r18):
+            continue
+        score = 10 if category.lower() in tag_values else 0
+        for keyword in keywords:
+            needle = keyword.lower()
+            for tag in tag_values:
+                if tag == needle:
+                    score += 8
+                elif needle in tag:
+                    score += 4
+            if needle and needle in title_text:
+                score += 2
+            if needle and needle in description_text:
+                score += 1
+        if score:
+            scores[category] = score
+
+    primary = [name for name in PRIMARY_CATEGORY_NAMES if name in scores]
+    primary.sort(key=lambda name: (-scores[name], list(DEFAULT_CATEGORY_RULES).index(name)))
+    best_score = scores[primary[0]] if primary else 0
+    matched = [
+        name for name in primary
+        if scores[name] >= 8 and scores[name] >= best_score * 0.70
+    ][:2]
+    if not matched and primary:
+        matched = primary[:1]
+    matched.extend(
+        name
+        for name in DEFAULT_CATEGORY_RULES
+        if name in R18_CATEGORY_NAMES and name in scores
+    )
+    return matched or ["其他"]
 
 
 class AutoCategorizationService:
@@ -89,26 +139,16 @@ class AutoCategorizationService:
         tags = await db.scalars(
             select(Tag).join(BookTag).where(BookTag.book_id == book_id)
         )
-        tag_texts = [t.name.lower() for t in tags]
-        # Also check title and description
-        title_lower = (book.title or "").lower()
-        desc_lower = (book.description or "").lower()
-        combined = " ".join(tag_texts) + " " + title_lower + " " + desc_lower
-        if not combined.strip():
+        tag_texts = [t.name for t in tags]
+        if not tag_texts and not book.title and not book.description:
             logger.debug("No text for book {}, skipping auto-categorization", book_id)
             return []
-
-        matched_categories = []
-        for cat_name, keywords in DEFAULT_CATEGORY_RULES.items():
-            if cat_name in R18_CATEGORY_NAMES and not book.is_r18:
-                continue
-            for kw in keywords:
-                if kw.lower() in combined:
-                    matched_categories.append(cat_name)
-                    break
-
-        if not matched_categories:
-            matched_categories = ["其他"]
+        matched_categories = classify_category_names(
+            tag_texts,
+            title=book.title or "",
+            description=book.description or "",
+            is_r18=book.is_r18,
+        )
 
         if matched_categories:
             repo = CategoryRepository(db)

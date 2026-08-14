@@ -42,6 +42,18 @@ class CrawlTask(Base):
         default=200
     )
 
+    exclude_tags = Column(
+        JSONB,
+        default=list,
+        nullable=False
+    )
+
+    exclude_categories = Column(
+        JSONB,
+        default=list,
+        nullable=False
+    )
+
 
     priority = Column(
         Integer,

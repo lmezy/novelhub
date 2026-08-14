@@ -16,6 +16,19 @@ curl -X POST http://localhost:8088/api/crawl/tasks \
 
 `max_pages` 是“发现/分类页数”上限，不是书本数量；设为 `0` 表示不限制页数，任务会一直翻页直到书源没有下一页或没有新书为止。
 
+可在创建任务时传入排除标签和排除分类。匹配发生在书页元数据解析完成后、创建数据库记录和下载章节之前：
+
+```json
+{
+  "source": "source-id",
+  "max_pages": 0,
+  "exclude_tags": ["耽美", "BL"],
+  "exclude_categories": ["言情"]
+}
+```
+
+被过滤的书籍计入任务结果的 `books_filtered`，不计入失败数。管理页的“导入并同步”和“全站同步”表单也提供同样的排除输入框。
+
 3. 轮询任务状态：
 
 ```bash

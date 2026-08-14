@@ -1066,6 +1066,48 @@ async def test_discover_and_sync_all_dedupes_and_stops_on_empty():
 
 
 @pytest.mark.asyncio
+async def test_discover_and_sync_all_counts_filtered_books_without_failure():
+    db = _mock_db()
+    db.get.return_value = _source()
+    db.rollback = AsyncMock()
+    plugin = AsyncMock()
+    plugin.set_cookie = MagicMock()
+    plugin.discover_books.return_value = [
+        RemoteShelfBook(
+            source_book_id="bl.html",
+            title="Filtered",
+            author="Author",
+            url="https://example.com/bl.html",
+            tags=["BL"],
+        )
+    ]
+
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch.object(
+            SyncService,
+            "sync_book",
+            AsyncMock(return_value={
+                "filtered": True,
+                "filter_type": "tag",
+                "filter_value": "BL",
+                "title": "Filtered",
+                "author": "Author",
+            }),
+        ),
+    ):
+        result = await SyncService(db).discover_and_sync_all(
+            "src1",
+            max_pages=1,
+            exclude_tags=["BL"],
+        )
+
+    assert result["books_filtered"] == 1
+    assert result["books_synced"] == 0
+    assert result["books_failed"] == 0
+
+
+@pytest.mark.asyncio
 async def test_discover_and_sync_all_unlimited_continues_until_empty():
     db = _mock_db()
     db.get.return_value = _source()

@@ -31,10 +31,24 @@ from app.services.storage import BookStorage
 from app.services.search import search_service
 from app.services.cookie_crypto import safe_decrypt_cookie
 from app.services.r18 import detect_r18
+from app.services.auto_categorize import classify_category_names
 
 
 class SyncPaused(Exception):
     """Raised by a task checkpoint when a crawl task has been paused."""
+
+
+def _normalize_filter_value(value: str | None) -> str:
+    return re.sub(r"[\s\-_./|]+", "", str(value or "")).lower()
+
+
+def _matches_exclusion(values: list[str], exclusions: list[str]) -> str | None:
+    normalized_values = [_normalize_filter_value(value) for value in values]
+    for exclusion in exclusions:
+        needle = _normalize_filter_value(exclusion)
+        if needle and any(needle in value for value in normalized_values):
+            return exclusion
+    return None
 
 
 JUNK_CHAPTER_TITLES = {
@@ -452,6 +466,8 @@ class SyncService:
         checkpoint_cb: Callable[[], Awaitable[None]] | None = None,
         is_r18_override: bool | None = None,
         discovery_tags: list[str] | None = None,
+        exclude_tags: list[str] | None = None,
+        exclude_categories: list[str] | None = None,
     ) -> dict:
         source = await self.db.get(Source, source_id)
         if source is None or not source.enabled:
@@ -492,6 +508,36 @@ class SyncService:
             if is_r18_override is None
             else bool(is_r18_override)
         )
+
+        candidate_tags = self._clean_sync_tags(
+            [*remote_book.tags, *(discovery_tags or [])],
+            book_title,
+            author_name,
+        )
+        matched_tag = _matches_exclusion(candidate_tags, exclude_tags or [])
+        candidate_categories = classify_category_names(
+            candidate_tags,
+            title=book_title,
+            description=remote_book.description or "",
+            is_r18=is_r18,
+        )
+        matched_category = _matches_exclusion(
+            candidate_categories,
+            exclude_categories or [],
+        )
+        if matched_tag or matched_category:
+            return {
+                "filtered": True,
+                "filter_type": "tag" if matched_tag else "category",
+                "filter_value": matched_tag or matched_category,
+                "title": book_title,
+                "author": author_name,
+                "tags": candidate_tags,
+                "categories": candidate_categories,
+                "created_chapters": 0,
+                "skipped_chapters": 0,
+                "failed_chapters": [],
+            }
 
         author = await self._get_or_create_author(author_name)
         book, is_new = await self._get_or_create_book(
@@ -1343,6 +1389,8 @@ class SyncService:
         checkpoint_cb: Callable[[], Awaitable[None]] | None = None,
         start_page: int = 1,
         page_batch_size: int = 0,
+        exclude_tags: list[str] | None = None,
+        exclude_categories: list[str] | None = None,
     ) -> dict:
         """Discover every book across catalog pages and optionally sync them."""
         source = await self.db.get(Source, source_id)
@@ -1365,6 +1413,7 @@ class SyncService:
                 "books_found": 0,
                 "books_synced": 0,
                 "books_failed": 0,
+                "books_filtered": 0,
                 "chapters_created": 0,
                 "chapters_skipped": 0,
                 "chapters_failed": 0,
@@ -1376,6 +1425,7 @@ class SyncService:
         books_found = 0
         books_synced = 0
         books_failed = 0
+        books_filtered = 0
         chapters_created = 0
         chapters_skipped = 0
         chapters_failed = 0
@@ -1432,10 +1482,12 @@ class SyncService:
                         progress_cb=_guarded_chapter_progress,
                         checkpoint_cb=checkpoint_cb,
                         discovery_tags=sb.tags,
+                        exclude_tags=exclude_tags,
+                        exclude_categories=exclude_categories,
                     )
 
             async def _record_outcome(sb, outcome) -> None:
-                nonlocal books_synced, books_failed
+                nonlocal books_synced, books_failed, books_filtered
                 nonlocal chapters_created, chapters_skipped, chapters_failed
                 if isinstance(outcome, SyncPaused):
                     raise outcome
@@ -1459,6 +1511,20 @@ class SyncService:
                         "failed_chapters": [],
                     })
                 else:
+                    if outcome.get("filtered"):
+                        books_filtered += 1
+                        details.append({
+                            "title": outcome.get("title") or sb.title,
+                            "author": outcome.get("author") or sb.author,
+                            "url": sb.url,
+                            "synced": False,
+                            "filtered": True,
+                            "filter_type": outcome.get("filter_type"),
+                            "filter_value": outcome.get("filter_value"),
+                        })
+                        if progress_cb is not None:
+                            await progress_cb(pages_checked, books_found, books_synced, books_failed)
+                        return
                     details.append({
                         "title": sb.title,
                         "author": sb.author,
@@ -1511,6 +1577,8 @@ class SyncService:
                                 progress_cb=chapter_progress_cb,
                                 checkpoint_cb=checkpoint_cb,
                                 discovery_tags=sb.tags,
+                                exclude_tags=exclude_tags,
+                                exclude_categories=exclude_categories,
                             )
                         except SyncPaused:
                             raise
@@ -1570,6 +1638,7 @@ class SyncService:
             "books_found": books_found,
             "books_synced": books_synced,
             "books_failed": books_failed,
+            "books_filtered": books_filtered,
             "chapters_created": chapters_created,
             "chapters_skipped": chapters_skipped,
             "chapters_failed": chapters_failed,

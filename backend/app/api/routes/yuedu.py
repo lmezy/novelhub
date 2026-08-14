@@ -19,7 +19,7 @@ from bs4 import BeautifulSoup
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1002,6 +1002,8 @@ class YueduImportSyncRequest(BaseModel):
     max_discover_pages: int = 3
     scope: str = "personal"
     show_contributor: bool = True
+    exclude_tags: list[str] = Field(default_factory=list)
+    exclude_categories: list[str] = Field(default_factory=list)
 
 
 class YueduImportSyncResult(BaseModel):
@@ -1052,6 +1054,8 @@ async def import_yuedu_sources_as_tasks(
                 source=src_info["id"],
                 mode="discover_all",
                 max_pages=payload.max_discover_pages,
+                exclude_tags=[v.strip() for v in payload.exclude_tags if v.strip()],
+                exclude_categories=[v.strip() for v in payload.exclude_categories if v.strip()],
                 status="pending",
                 user_id=user.id,
             )
@@ -1172,6 +1176,8 @@ async def import_and_sync_all(
                     discover_result = await sync_service.discover_and_sync_all(
                         source_id,
                         max_pages=payload.max_discover_pages,
+                        exclude_tags=payload.exclude_tags,
+                        exclude_categories=payload.exclude_categories,
                     )
                     detail["discover"] = {
                         "pages_checked": discover_result["pages_checked"],

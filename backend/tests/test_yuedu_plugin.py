@@ -1066,6 +1066,67 @@ def test_parse_book_generic_extracts_author_from_meta_description():
     assert parsed["author"] == "rizzwhistleblower"
 
 
+def test_forum_page_prefers_labelled_novel_author_and_cleans_tags():
+    plugin = YueduPlugin({
+        "bookSourceName": "禁忌书屋",
+        "bookSourceUrl": "https://www.cool18.com/bbs4",
+    })
+    html = """
+    <html><head>
+      <title>【异世界冒险】（1-8） 作者：shy li - 禁忌书屋 cool18 酷18</title>
+      <meta name="author" content="发帖账号">
+      <meta name="description" content="【异世界冒险】（1-8） 作者：shy li">
+      <meta name="keywords" content="【异世界冒险】（1-8） 作者：shy li,酷18,cool18.com">
+    </head><body>
+      <h1>【异世界冒险】（1-8） 作者：shy li</h1>
+      <div>标签：#奇幻 #后宫 #异世界</div>
+    </body></html>
+    """
+
+    parsed = plugin._parse_book_generic(
+        html,
+        "https://www.cool18.com/bbs4/index.php?app=forum&act=threadview&tid=1",
+    )
+
+    assert parsed["title"] == "【异世界冒险】（1-8）"
+    assert parsed["author"] == "shy li"
+    assert parsed["tags"] == ["奇幻", "后宫", "异世界"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_forum_book_overrides_rule_document_author():
+    plugin = YueduPlugin({
+        "bookSourceName": "禁忌书屋",
+        "bookSourceUrl": "https://www.cool18.com/bbs4",
+        "ruleBookInfo": {
+            "name": ".main-title@text",
+            "author": "meta[name=author]@content",
+            "kind": "论坛帖子",
+        },
+        "ruleToc": {},
+    })
+    html = """
+    <html><head>
+      <title>【异世界冒险】 作者：shy li - 禁忌书屋 cool18 酷18</title>
+      <meta name="author" content="发帖账号">
+      <meta name="description" content="【异世界冒险】 作者：shy li">
+    </head><body>
+      <h1 class="main-title">【异世界冒险】 作者：shy li</h1>
+      <div>标签：#奇幻 #异世界</div>
+    </body></html>
+    """
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        book = await plugin.fetch_book(
+            "https://www.cool18.com/bbs4/index.php?app=forum&act=threadview&tid=1"
+        )
+
+    assert book.title == "【异世界冒险】"
+    assert book.author == "shy li"
+    assert "论坛帖子" not in book.tags
+    assert book.tags == ["奇幻", "异世界"]
+
+
 def test_split_kind_text_splits_metadata_labels():
     plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
 

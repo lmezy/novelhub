@@ -26,8 +26,7 @@ const router = createRouter({
     },
     {
       path: "/search",
-      name: "search",
-      component: () => import("../pages/SearchPage.vue"),
+      redirect: (to) => ({ path: "/books", query: to.query }),
     },
     {
       path: "/sync",

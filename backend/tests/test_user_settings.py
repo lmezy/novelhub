@@ -16,6 +16,7 @@ from app.schemas.user import (
     UserSettingsUpdate,
 )
 from fastapi import HTTPException
+from pydantic import ValidationError
 from app.services.security import hash_password, verify_password
 
 
@@ -52,6 +53,41 @@ async def test_update_my_settings_saves_image_display_flags():
 
     assert result is user
     assert user.settings == {"show_covers": False, "show_content_images": False}
+
+
+@pytest.mark.asyncio
+async def test_update_my_settings_saves_tap_actions():
+    user = SimpleNamespace(id="u1", settings={})
+    db = AsyncMock()
+    db.commit = AsyncMock()
+    db.refresh = AsyncMock()
+
+    result = await update_my_settings(
+        UserSettingsUpdate(tap_actions={"tl": "next_page", "mc": "prev_page"}),
+        user,
+        db,
+    )
+
+    assert result is user
+    assert user.settings["tap_actions"] == {
+        "tl": "next_page",
+        "tc": "prev_page",
+        "tr": "next_page",
+        "ml": "prev_page",
+        "mc": "menu",
+        "mr": "next_page",
+        "bl": "prev_page",
+        "bc": "next_page",
+        "br": "next_page",
+    }
+    assert db.commit.await_count == 1
+
+
+def test_tap_actions_rejects_invalid_values():
+    with pytest.raises(ValidationError):
+        UserSettingsUpdate(tap_actions={"tl": "jump"})
+    with pytest.raises(ValidationError):
+        UserSettingsUpdate(tap_actions={"tc": 123})
 
 
 @pytest.mark.asyncio

@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,6 +36,16 @@ class CrawlTaskCreateRequest(BaseModel):
     source: str
     max_pages: int = 0
     priority: int = 0
+    exclude_tags: list[str] = Field(default_factory=list)
+    exclude_categories: list[str] = Field(default_factory=list)
+
+
+def _clean_filter_values(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(
+        value.strip()
+        for value in values
+        if value and value.strip()
+    ))
 
 
 @router.post("/tasks", response_model=CrawlTaskOut, status_code=202)
@@ -56,6 +66,8 @@ async def create_crawl_task(
         source=payload.source,
         mode="discover_all",
         max_pages=payload.max_pages,
+        exclude_tags=_clean_filter_values(payload.exclude_tags),
+        exclude_categories=_clean_filter_values(payload.exclude_categories),
         priority=payload.priority,
         status="pending",
         user_id=user.id,
