@@ -704,6 +704,7 @@ class SyncService:
         remaining = len(producers)
         # Make sure the book row really exists before chapter inserts begin.
         book_row_verified = await self._ensure_book_row(book_id, book_values)
+        consecutive_blocked = 0
         try:
             while remaining > 0:
                 remote_chapter, content, error, chapter_db_id = await results_queue.get()
@@ -711,7 +712,28 @@ class SyncService:
                 await _checkpoint()
                 if error is not None:
                     if "anti-bot" in str(error).lower() or "rate-limit" in str(error).lower():
-                        raise error
+                        consecutive_blocked += 1
+                        failed_chapters.append({
+                            "chapter_number": remote_chapter.chapter_number,
+                            "title": remote_chapter.title,
+                            "url": remote_chapter.url,
+                            "error": str(error)[:300],
+                        })
+                        logger.warning(
+                            "Chapter {} blocked by anti-bot/captcha ({}): {}",
+                            remote_chapter.title,
+                            remote_chapter.url,
+                            error,
+                        )
+                        await _report_progress(remote_chapter)
+                        if consecutive_blocked >= 5:
+                            raise RuntimeError(
+                                "同步被网站反爬拦截（验证码/限流页面），已连续 "
+                                f"{consecutive_blocked} 章失败。请稍后重试、更换代理节点，"
+                                "或检查源站是否要求人工验证。"
+                            ) from error
+                        continue
+                    consecutive_blocked = 0
                     failed_chapters.append({
                         "chapter_number": remote_chapter.chapter_number,
                         "title": remote_chapter.title,
@@ -1009,8 +1031,25 @@ class SyncService:
         await self.db.flush()
         return set(by_id)
 
+    # Content markers that indicate an anti-bot / captcha page was saved
+    # instead of real chapter text.  Chapters matching these are dropped on
+    # re-sync so a later attempt can refetch real content.
+    BLOCK_CONTENT_MARKERS = (
+        "输入验证码后可继续访问",
+        "系统检测到您访问异常",
+        "访问异常",
+        "limit_box",
+        "请完成验证",
+        "人机验证",
+        "滑动验证",
+        "安全验证",
+        "访问过于频繁",
+        "请求过于频繁",
+    )
+
     def _chapter_has_real_content(self, chapter: Chapter) -> bool:
-        """Return False only when we can read the file and it is effectively empty."""
+        """Return False for empty or anti-bot/captcha junk chapters so a
+        re-sync refetches them."""
         try:
             content = self.storage.read_chapter(chapter.content_path)
         except Exception:
@@ -1018,7 +1057,12 @@ class SyncService:
         if not isinstance(content, str):
             return True
         body = re.sub(r"^#.*(?:\r?\n|$)", "", content, flags=re.M).strip()
-        return len(body) >= 20
+        if len(body) < 20:
+            return False
+        lowered = body.lower()
+        return not any(
+            marker in lowered for marker in self.BLOCK_CONTENT_MARKERS
+        )
 
     @staticmethod
     def _looks_like_junk_chapter(chapter: Chapter, remote_hosts: set[str]) -> bool:

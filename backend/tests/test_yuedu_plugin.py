@@ -1374,3 +1374,120 @@ async def test_fetch_book_uses_auto_detected_full_toc_and_filters_junk():
         ("第一章", "https://www.alicesw.com/book/1/a.html"),
         ("第二章", "https://www.alicesw.com/book/1/b.html"),
     ]
+
+# ---------------- Anti-bot / captcha page handling ----------------
+
+def test_is_blocked_page_detects_captcha_verification_page():
+    html = (
+        '<div class="limit_box">系统检测到您访问异常'
+        ' 输入验证码后可继续访问 输入验证码'
+        ' 每一个搬山人的付出，都值得被珍视。</div>'
+    )
+    assert YueduPlugin._is_blocked_page(html) is True
+
+
+def test_is_blocked_page_detects_rate_limit_page():
+    html = '<div>请求过于频繁，请稍后再试</div>'
+    assert YueduPlugin._is_blocked_page(html) is True
+
+
+def test_is_blocked_page_weak_marker_needs_confirmation():
+    # 访问异常 alone is not enough; a normal page mentioning it should pass.
+    assert YueduPlugin._is_blocked_page(
+        "<html>普通页面</html>"
+    ) is False
+    assert YueduPlugin._is_blocked_page(
+        '<html><p>访问异常？</p></html>'
+    ) is False
+    assert YueduPlugin._is_blocked_page(
+        '<html><p>访问异常 请稍后再试</p></html>'
+    ) is True
+
+
+def test_is_blocked_page_normal_chapter_page_not_flagged():
+    # The real chapter page loads captcha assets but is NOT a block page.
+    html = (
+        '<html><head>'
+        '<link rel="stylesheet" href="captcha.css">'
+        '<script src="captcha.min.js"></script>'
+        '</head><body>正文内容</body></html>'
+    )
+    assert YueduPlugin._is_blocked_page(html) is False
+
+
+def test_content_is_blocked_rejects_captcha_text():
+    text = "系统检测到您访问异常\n输入验证码后可继续访问\n输入验证码"
+    assert YueduPlugin._content_is_blocked(text) is True
+    assert YueduPlugin._content_is_blocked("正常的正文内容") is False
+
+
+def test_clean_extracted_text_drops_comment_counters():
+    text = (
+        "第一段\n0\n第二段\n12\n第三段\n999\n"
+        "1999年的故事\n"
+    )
+    cleaned = YueduPlugin._clean_extracted_text(text)
+    assert "第一段" in cleaned
+    assert "第二段" in cleaned
+    assert "第三段" in cleaned
+    assert "\n0\n" not in cleaned
+    assert "\n12\n" not in cleaned
+    assert "\n999\n" not in cleaned
+    # 4-digit numbers (years) are preserved.
+    assert "1999年的故事" in cleaned
+
+
+@pytest.mark.asyncio
+async def test_fetch_chapter_content_rejects_anti_bot_page():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "ruleContent": {},
+    })
+    block_html = (
+        '<html><body><div class="content">'
+        "系统检测到您访问异常 输入验证码后可继续访问 输入验证码"
+        '</div></body></html>'
+    )
+    url = "https://example.com/book/1/1.html"
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=block_html)):
+        with pytest.raises(RuntimeError, match="anti-bot"):
+            await plugin.fetch_chapter_content(
+                SimpleNamespace(
+                    source_chapter_id=url,
+                    title="第一章",
+                    url=url,
+                    chapter_number=1,
+                )
+            )
+
+
+@pytest.mark.asyncio
+async def test_fetch_chapter_content_keeps_real_content_with_counters():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "ruleContent": {},
+    })
+    html = (
+        '<div class="chapter_content_box">'
+        "<p>第一段<span class=\"z count_0\">0</span></p>"
+        "<p>第二段<span class=\"z count_1\">12</span></p>"
+        "</div>"
+    )
+    url = "https://example.com/book/1/1.html"
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        content = await plugin.fetch_chapter_content(
+            SimpleNamespace(
+                source_chapter_id=url,
+                title="第一章",
+                url=url,
+                chapter_number=1,
+            )
+        )
+
+    assert "第一段" in content
+    assert "第二段" in content
+    # Comment counters must not leak into the stored text.
+    assert "\n0" not in content
+    assert "\n12" not in content

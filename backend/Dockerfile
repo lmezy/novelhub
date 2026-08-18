@@ -4,6 +4,11 @@ FROM mcr.microsoft.com/playwright/python:v1.52.0-noble
 WORKDIR /app
 
 # Playwright and Chromium are already in the base image.
+# Node.js powers the YueDu JS rule runtime (org.jsoup shim).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
 # Only need to install our Python dependencies.
 COPY requirements.txt .
 RUN pip install --no-cache-dir \

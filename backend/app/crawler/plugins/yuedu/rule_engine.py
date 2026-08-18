@@ -1038,16 +1038,33 @@ class YueduRuleEngine:
         ):
             return raw
 
-        # Fast path: try pattern-based evaluation first
-        pattern_result = try_eval_js_pattern(code, raw)
+        # Fast path: try pattern-based evaluation first.  Only simple
+        # expressions qualify; full scripts (statements, variables,
+        # org.jsoup / java calls) go straight to the JS runtime so a
+        # pattern like ``String(result)`` cannot swallow the whole rule.
+        is_simple = not re.search(
+            r"[;{}]|\bvar\b|\bfunction\b|\bif\b|\bfor\b|\bwhile\b|org\.|java\.|Packages\.|jsoup",
+            code,
+        )
+        pattern_result = None
+        if is_simple:
+            pattern_result = try_eval_js_pattern(code, raw)
+        if pattern_result is not None:
+            return pattern_result
         if pattern_result is not None:
             return pattern_result
 
         # If pattern failed, try the real JS runtime for complex expressions
         try:
             runtime = self._get_js_runtime()
-            loop = asyncio.get_event_loop()
-            result = loop.run_until_complete(runtime.eval_js(code, raw))
+            result = runtime.eval_js_sync(
+                code,
+                raw,
+                context={
+                    "baseUrl": self._variables.get("baseUrl", self.base_url),
+                    "bookUrl": self._variables.get("bookUrl", self.base_url),
+                },
+            )
             if result is not None:
                 return result
         except Exception:
@@ -1060,8 +1077,7 @@ class YueduRuleEngine:
         """Synchronous wrapper for real JS evaluation."""
         try:
             runtime = self._get_js_runtime()
-            loop = asyncio.get_event_loop()
-            return loop.run_until_complete(runtime.eval_js(js_code, input_value))
+            return runtime.eval_js_sync(js_code, input_value)
         except Exception:
             return None
     
@@ -1079,8 +1095,14 @@ class YueduRuleEngine:
         # Real JS runtime
         try:
             runtime = self._get_js_runtime()
-            loop = asyncio.get_event_loop()
-            result = loop.run_until_complete(runtime.eval_js(code, value))
+            result = runtime.eval_js_sync(
+                code,
+                value,
+                context={
+                    "baseUrl": self._variables.get("baseUrl", self.base_url),
+                    "bookUrl": self._variables.get("bookUrl", self.base_url),
+                },
+            )
             if isinstance(result, str):
                 return result
         except Exception:
@@ -1097,8 +1119,7 @@ class YueduRuleEngine:
         # For login check, use real JS runtime
         try:
             runtime = self._get_js_runtime()
-            loop = asyncio.get_event_loop()
-            result = loop.run_until_complete(runtime.eval_js(code, html))
+            result = runtime.eval_js_sync(code, html)
             if result is not None:
                 result_str = str(result).strip().lower()
                 if any(w in result_str for w in ("login", "logout", "redirect", "false", "0", "null", "undefined")):
@@ -1311,8 +1332,7 @@ class YueduRuleEngine:
 
         try:
             runtime = self._get_js_runtime()
-            loop = asyncio.get_event_loop()
-            result = loop.run_until_complete(runtime.eval_bytes(code, image_bytes))
+            result = runtime.eval_bytes_sync(code, image_bytes)
             if result is not None:
                 return result
         except Exception:
@@ -1338,8 +1358,7 @@ class YueduRuleEngine:
 
         try:
             runtime = self._get_js_runtime()
-            loop = asyncio.get_event_loop()
-            result = loop.run_until_complete(runtime.eval_bytes(code, image_bytes))
+            result = runtime.eval_bytes_sync(code, image_bytes)
             if result is not None:
                 return result
         except Exception:
@@ -1365,10 +1384,7 @@ class YueduRuleEngine:
 
         try:
             runtime = self._get_js_runtime()
-            loop = asyncio.get_event_loop()
-            result = loop.run_until_complete(
-                runtime.eval_js_with_context(code, book_data)
-            )
+            result = runtime.eval_js_with_context_sync(code, book_data)
             if isinstance(result, dict):
                 return result
         except Exception:
@@ -1387,8 +1403,7 @@ class YueduRuleEngine:
 
         try:
             runtime = self._get_js_runtime()
-            loop = asyncio.get_event_loop()
-            result = loop.run_until_complete(runtime.eval_js(js_code, page_html))
+            result = runtime.eval_js_sync(js_code, page_html)
             if isinstance(result, str):
                 return result
         except Exception:

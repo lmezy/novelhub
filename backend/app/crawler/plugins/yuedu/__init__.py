@@ -258,11 +258,31 @@ TOC_NOISE_TITLES = {
     "开始阅读",
 }
 
-BLOCK_PAGE_MARKERS = (
-    "访问异常",
+STRONG_BLOCK_MARKERS = (
+    "输入验证码后可继续访问",
+    "验证码后可继续访问",
+    "请完成验证",
+    "安全验证",
+    "人机验证",
+    "滑动验证",
+    "limit_box",
+    "challenge-platform",
+    "cf-chl",
     "访问过于频繁",
     "请求过于频繁",
     "操作过于频繁",
+    "访问频率过高",
+    "请求频率过高",
+    "请稍后再试",
+)
+
+# Weak markers need a confirmation phrase to avoid false positives on
+# normal pages (e.g. a login dialog mentioning a captcha code).
+WEAK_BLOCK_MARKERS = (
+    "访问异常",
+    "访问频繁",
+    "请求频繁",
+    "限流",
 )
 
 
@@ -584,11 +604,17 @@ class YueduPlugin:
         return tags
 
     def _uses_android_js_rule(self, section: str, field: str) -> bool:
-        """Identify Legado rules which require Android/JVM-only APIs."""
+        """Identify Legado rules that need Android/JVM-only APIs.
+
+        ``org.jsoup`` is emulated by the Node shim and ``java.*`` has a
+        stub, so only raw ``Packages.*`` JVM calls remain unsupported.
+        """
         rule = (self.config.get(section) or {}).get(field, "")
         text = str(rule or "")
+        if "Packages." in text and "org.jsoup" not in text:
+            return True
         return any(marker in text for marker in (
-            "org.jsoup", "Packages.", "java.", "javax.",
+            "android.", "androidx.", "javax.swing.", "org.json.JSONObject",
         ))
 
     def _find_toc_url(self, html: str, book_url: str) -> str:
@@ -1334,6 +1360,11 @@ class YueduPlugin:
         if not content:
             content = self._parse_chapter_content_generic(html)
         content = content.strip()
+        if self._content_is_blocked(content):
+            raise RuntimeError(
+                "Chapter content looks like an anti-bot/captcha page "
+                f"(site asked for verification): {chapter.url}"
+            )
         replace_rules = (self.config.get("ruleContent") or {}).get("replaceRegex", [])
         if replace_rules:
             content = self.engine._apply_replace_regex(content, replace_rules).strip()
@@ -1342,6 +1373,52 @@ class YueduPlugin:
                 f"Chapter returned empty content: {chapter.url}"
             )
         return content
+
+    @staticmethod
+    def _content_is_blocked(text: str) -> bool:
+        """Reject extracted chapter text that is really an anti-bot page."""
+        if not text:
+            return False
+        lowered = text.lower()
+        strong = (
+            "输入验证码后可继续访问",
+            "请完成验证",
+            "安全验证",
+            "人机验证",
+            "滑动验证",
+            "验证码后可继续访问",
+            "limit_box",
+            "访问过于频繁",
+            "请求过于频繁",
+            "操作过于频繁",
+            "请稍后再试",
+        )
+        if any(marker in lowered for marker in strong):
+            return True
+        if "访问异常" in lowered:
+            return any(confirm in lowered for confirm in (
+                "验证码", "继续访问", "稍后", "频繁", "限流",
+            ))
+        return False
+
+    @staticmethod
+    def _clean_extracted_text(text: str) -> str:
+        """Drop comment-count artifacts (lines that are pure short digits).
+
+        Many chapter sites render a ``<span class=\"z count_N\">0</span>``
+        comment counter inside every paragraph; ``get_text`` would include
+        the counter as its own line.  A real novel paragraph is never just
+        a 1-3 digit number, so such lines are dropped.
+        """
+        kept = []
+        for line in str(text or "").split("\n"):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if re.fullmatch(r"\d{1,3}", stripped):
+                continue
+            kept.append(stripped)
+        return "\n".join(kept).strip()
 
     @staticmethod
     def _looks_like_rule_diagnostic(content: str, html: str) -> bool:
@@ -1379,7 +1456,9 @@ class YueduPlugin:
                 continue
             for tag in el.find_all(["script", "style", "ins", "nav", "header", "footer"]):
                 tag.decompose()
-            text = self._content_text_preserving_images(str(el))
+            text = self._clean_extracted_text(
+                self._content_text_preserving_images(str(el))
+            )
             if text:
                 return text
         return ""
@@ -1404,7 +1483,7 @@ class YueduPlugin:
                 continue
             alt = img.get("alt") or ""
             img.replace_with(f"![{alt}]({src})")
-        return soup.get_text("\n", strip=True)
+        return YueduPlugin._clean_extracted_text(soup.get_text("\n", strip=True))
 
     # ---- Required: fetch_bookshelf ----
 
@@ -2610,8 +2689,12 @@ class YueduPlugin:
                     resp.raise_for_status()
                     self._capture_cookie_jar(resp)
                     if self._is_blocked_page(resp.text):
+                        if attempt == 0:
+                            headers = self._with_403_fallback(headers)
+                            await asyncio.sleep(1.0 + random.uniform(0.5, 1.5))
+                            continue
                         raise RuntimeError(
-                            f"Site returned an anti-bot/rate-limit page: {url}"
+                            f"Site returned an anti-bot/captcha page: {url}"
                         )
                     return resp.text
                 except httpx.HTTPError as exc:
@@ -2646,10 +2729,29 @@ class YueduPlugin:
         raise RuntimeError(f"Request failed after retries: {url}")
 
     @staticmethod
+    @staticmethod
     def _is_blocked_page(html: str) -> bool:
-        """Detect the common Chinese novel-site anti-bot / rate-limit page."""
+        """Detect Chinese novel-site anti-bot / captcha / rate-limit pages.
+
+        Many sites serve a ``limit_box`` / captcha page with HTTP 200 when
+        they consider the request suspicious.  Both strong single markers
+        (``输入验证码后可继续访问``, ``limit_box``, ...) and weak markers paired
+        with a confirmation phrase (``访问异常`` + ``验证码``) are recognized
+        so the page is never persisted as chapter content.
+        """
         if not html:
             return False
+        lowered = html.lower()
+        if any(marker in lowered for marker in STRONG_BLOCK_MARKERS):
+            return True
+        confirmations = (
+            "验证码", "继续访问", "稍后再试", "后再试", "频繁", "限流",
+            "captcha", "challenge", "security",
+        )
+        for marker in WEAK_BLOCK_MARKERS:
+            if marker in lowered:
+                return any(confirm in lowered for confirm in confirmations)
+        return False
         lowered = html.lower()
         if not any(marker in lowered for marker in BLOCK_PAGE_MARKERS):
             return False
@@ -2702,8 +2804,12 @@ class YueduPlugin:
                     resp.raise_for_status()
                     self._capture_cookie_jar(resp)
                     if self._is_blocked_page(resp.text):
+                        if attempt == 0:
+                            headers = self._with_403_fallback(headers)
+                            await asyncio.sleep(1.0 + random.uniform(0.5, 1.5))
+                            continue
                         raise RuntimeError(
-                            f"Site returned an anti-bot/rate-limit page: {url}"
+                            f"Site returned an anti-bot/captcha page: {url}"
                         )
                     return resp.text
                 except httpx.HTTPError as exc:

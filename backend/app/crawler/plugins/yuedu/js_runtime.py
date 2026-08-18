@@ -18,9 +18,19 @@ import json
 import logging
 import re
 import subprocess
+import threading
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# jsoup / java.* shim loaded into the Node.js bootstrap so exported YueDu
+# sources using org.jsoup / java.* APIs work without a real JVM.
+_JSOUP_SHIM_PATH = Path(__file__).resolve().parent / "jsoup_shim.js"
+try:
+    _JSOUP_SHIM = _JSOUP_SHIM_PATH.read_text(encoding="utf-8")
+except Exception:
+    _JSOUP_SHIM = ""
 
 # JS wrapper template that receives code + data, executes, and returns result
 _EVAL_WRAPPER = r"""
@@ -67,8 +77,47 @@ class JsRuntime:
     def __init__(self):
         self._proc: subprocess.Popen | None = None
         self._ready: bool = False
-        self._session_lock = asyncio.Lock()
+        self._session_lock: asyncio.Lock | None = None
+        # The runtime owns a dedicated event loop so eval methods can be
+        # bridged from any caller context: sync code, or an already-running
+        # asyncio loop where ``loop.run_until_complete`` would fail.
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._loop.run_forever,
+            name="yuedu-js-runtime",
+            daemon=True,
+        )
+        self._thread.start()
 
+    def _get_lock(self) -> asyncio.Lock:
+        if self._session_lock is None:
+            self._session_lock = asyncio.Lock()
+        return self._session_lock
+
+    def _submit(self, coro: Any) -> Any:
+        """Schedule a coroutine on the runtime's dedicated loop."""
+        return asyncio.run_coroutine_threadsafe(coro, self._loop)
+
+    def _run_sync(self, coro_factory: Any, timeout: float = 120.0) -> Any:
+        """Run a coroutine on the dedicated loop and block for the result."""
+        future = self._submit(coro_factory())
+        try:
+            return future.result(timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("JsRuntime call timed out")
+            return None
+
+    def start_sync(self) -> bool:
+        try:
+            return bool(self._run_sync(lambda: self._start_impl()))
+        except Exception:
+            return False
+
+    def stop_sync(self) -> None:
+        try:
+            self._run_sync(self._stop_impl, timeout=30)
+        except Exception:
+            pass
     @classmethod
     def get_instance(cls) -> "JsRuntime":
         """Get or create the singleton JsRuntime."""
@@ -81,24 +130,20 @@ class JsRuntime:
         """Reset the singleton (useful for testing/restart)."""
         if cls._instance is not None:
             try:
-                loop = asyncio.get_event_loop()
-                loop.run_until_complete(cls._instance.stop())
-            except RuntimeError:
+                cls._instance.stop_sync()
+            except Exception:
                 pass
         cls._instance = None
 
     async def start(self) -> bool:
-        """Start the Node.js subprocess if not already running."""
-        async with self._session_lock:
-            if self._ready and self._proc is not None and self._proc.returncode is None:
-                return True
-            return await self._start_impl()
+        """Async alias of start_sync() for await-based callers."""
+        return await asyncio.to_thread(self.start_sync)
 
     async def _start_impl(self) -> bool:
         try:
             # A persistent Node.js process that reads eval commands from stdin
             # and writes results to stdout.
-            bootstrap = (
+            bootstrap = _JSOUP_SHIM + (
                 'var _buf="";'
                 'process.stdin.on("data",function(c){'
                 '_buf+=c.toString();'
@@ -149,11 +194,15 @@ class JsRuntime:
             return False
         return False
 
-    async def stop(self) -> None:
-        """Stop the Node.js subprocess."""
-        async with self._session_lock:
+    async def _stop_impl(self) -> None:
+        """Stop the Node.js subprocess (runs on the dedicated loop)."""
+        async with self._get_lock():
             await self._kill_proc()
             self._ready = False
+
+    async def stop(self) -> None:
+        """Async alias of stop_sync() for await-based callers."""
+        await asyncio.to_thread(self.stop_sync)
 
     async def _kill_proc(self) -> None:
         if self._proc:
@@ -168,7 +217,12 @@ class JsRuntime:
                 pass
             self._proc = None
 
-    async def eval_js(self, js_code: str, input_value: Any = None) -> Any:
+    async def _eval_js_impl(
+        self,
+        js_code: str,
+        input_value: Any = None,
+        context: dict[str, Any] | None = None,
+    ) -> Any:
         """Evaluate a JavaScript expression/code against an input value.
 
         Args:
@@ -179,12 +233,7 @@ class JsRuntime:
         Returns:
             The JS evaluation result, or None if execution failed.
         """
-        if not self._ready:
-            started = await self.start()
-            if not started:
-                return None
-
-        async with self._session_lock:
+        async with self._get_lock():
             if not self._ready or self._proc is None or self._proc.returncode is not None:
                 # Process died, try restart
                 await self._start_impl()
@@ -192,14 +241,27 @@ class JsRuntime:
                     return None
 
             try:
-                # Wrap the user code: inject input as 'result' and execute
+                # Wrap the user code: inject input as 'result' and execute.
+                # Legado rules communicate through the ``result`` variable,
+                # so append a return unless the script returns explicitly.
                 input_json = json.dumps(input_value)
                 user_code = js_code.strip()
-                # Build the full eval snippet
+                context_js = ""
+                if context:
+                    for key in ("baseUrl", "bookUrl", "sourceUrl"):
+                        value = context.get(key)
+                        if value:
+                            context_js += (
+                                f"var {key}={json.dumps(str(value))};"
+                            )
+                has_return = re.search(r"(^|\n)\s*return\b", user_code)
+                tail = "" if has_return else "return result;"
                 snippet = (
                     f'(function(){{'
+                    f'{context_js}'
                     f'var result={input_json};'
                     f'{user_code}'
+                    f'{tail}'
                     f'}})()'
                 )
                 cmd = snippet + "\n__CODEX_EVAL_END__\n"
@@ -217,19 +279,41 @@ class JsRuntime:
                 logger.warning(f"JsRuntime eval error: {e}")
                 return None
 
-    async def eval_bytes(self, js_code: str, raw_bytes: bytes) -> bytes | None:
+    def eval_js_sync(
+        self,
+        js_code: str,
+        input_value: Any = None,
+        context: dict[str, Any] | None = None,
+    ) -> Any:
+        """Blocking eval for sync callers (rule engine)."""
+        if not self._ready and not self.start_sync():
+            return None
+        try:
+            return self._run_sync(
+                lambda: self._eval_js_impl(js_code, input_value, context)
+            )
+        except Exception:
+            return None
+
+    async def eval_js(
+        self,
+        js_code: str,
+        input_value: Any = None,
+        context: dict[str, Any] | None = None,
+    ) -> Any:
+        """Async alias of eval_js_sync() for await-based callers."""
+        return await asyncio.to_thread(
+            self.eval_js_sync, js_code, input_value, context,
+        )
+
+    async def _eval_bytes_impl(self, js_code: str, raw_bytes: bytes) -> bytes | None:
         """Evaluate JS code that operates on byte arrays.
 
         The JS code receives an ``inputBytes`` variable (Node.js Buffer)
         and should return either a Buffer/Uint8Array or a string.
         Returns decoded bytes, or None on failure.
         """
-        if not self._ready:
-            started = await self.start()
-            if not started:
-                return None
-
-        async with self._session_lock:
+        async with self._get_lock():
             if not self._ready or self._proc is None or self._proc.returncode is not None:
                 await self._start_impl()
                 if not self._ready:
@@ -269,19 +353,29 @@ class JsRuntime:
                 logger.warning(f"JsRuntime bytes eval error: {e}")
                 return None
 
-    async def eval_js_with_context(
+    def eval_bytes_sync(self, js_code: str, raw_bytes: bytes) -> bytes | None:
+        """Blocking bytes eval for sync callers."""
+        if not self._ready and not self.start_sync():
+            return None
+        try:
+            return self._run_sync(
+                lambda: self._eval_bytes_impl(js_code, raw_bytes)
+            )
+        except Exception:
+            return None
+
+    async def eval_bytes(self, js_code: str, raw_bytes: bytes) -> bytes | None:
+        """Async alias of eval_bytes_sync() for await-based callers."""
+        return await asyncio.to_thread(self.eval_bytes_sync, js_code, raw_bytes)
+
+    async def _eval_js_with_context_impl(
         self, js_code: str, context: dict[str, Any]
     ) -> Any:
         """Evaluate JS with a multi-variable context.
 
         The JS code can reference context keys as global variables.
         """
-        if not self._ready:
-            started = await self.start()
-            if not started:
-                return None
-
-        async with self._session_lock:
+        async with self._get_lock():
             if not self._ready or self._proc is None or self._proc.returncode is not None:
                 await self._start_impl()
                 if not self._ready:
@@ -292,8 +386,14 @@ class JsRuntime:
                 for key, value in context.items():
                     var_decls.append(f"var {key}={json.dumps(value)};")
                 var_block = " ".join(var_decls)
+                result_json = json.dumps(context)
                 snippet = (
-                    f'(function(){{{var_block}(function(){{{js_code}}})();}})()'
+                    f'(function(){{'
+                    f'{var_block}'
+                    f'var result={result_json};'
+                    f'(function(){{{js_code}}})();'
+                    f'return result;'
+                    f'}})()'
                 )
                 cmd = snippet + "\n__CODEX_EVAL_END__\n"
                 self._proc.stdin.write(cmd.encode("utf-8"))
@@ -304,6 +404,25 @@ class JsRuntime:
             except Exception as e:
                 logger.warning(f"JsRuntime context eval error: {e}")
                 return None
+
+    def eval_js_with_context_sync(
+        self, js_code: str, context: dict[str, Any]
+    ) -> Any:
+        """Blocking context eval for sync callers."""
+        if not self._ready and not self.start_sync():
+            return None
+        try:
+            return self._run_sync(
+                lambda: self._eval_js_with_context_impl(js_code, context)
+            )
+        except Exception:
+            return None
+
+    async def eval_js_with_context(
+        self, js_code: str, context: dict[str, Any]
+    ) -> Any:
+        """Async alias of eval_js_with_context_sync()."""
+        return await asyncio.to_thread(self.eval_js_with_context_sync, js_code, context)
 
     async def eval_login_js(
         self, js_code: str, login_info: str, password: str,
@@ -551,6 +670,8 @@ console.log('__CODEX_RESULT_END__');
         if not lines:
             return None
         raw = "\n".join(lines)
+        if raw.strip() == "undefined":
+            return None
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
