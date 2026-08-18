@@ -18,7 +18,7 @@ async def test_delete_books_removes_related_rows_and_search_documents():
 
     assert deleted == 2
     assert db.commit.await_count == 1
-    assert db.execute.await_count == 12
+    assert db.execute.await_count == 14
     calls = db.execute.call_args_list
     progress_index = next(
         i for i, c in enumerate(calls)

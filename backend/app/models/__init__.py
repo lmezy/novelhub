@@ -23,6 +23,8 @@ from .cookie import Cookie
 
 from .reading_progress import ReadingProgress
 
+from .bookmark import Bookmark
+
 from .book_version import BookVersion
 from .source_change import SourceChange
 from .app_setting import AppSetting
@@ -56,6 +58,8 @@ __all__=[
     "Cookie",
 
     "ReadingProgress",
+
+    "Bookmark",
 
     "BookVersion",
 

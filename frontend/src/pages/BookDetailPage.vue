@@ -18,6 +18,16 @@ const chapters = ref<Chapter[]>([])
 const loading = ref(true)
 const error = ref("")
 const savedChapterId = ref<string | null>(null)
+interface BookmarkItem {
+  id: string
+  book_id: string
+  chapter_id: string
+  position: number
+  note?: string | null
+  chapter_title?: string | null
+  chapter_number?: number | null
+}
+const bookmarks = ref<BookmarkItem[]>([])
 const syncing = ref(false)
 const favorite = ref(false)
 const alternates = ref<any[]>([])
@@ -260,6 +270,28 @@ async function resetCover() {
   }
 }
 
+async function loadBookmarks() {
+  if (!book.value) return
+  try {
+    bookmarks.value = await api.get<BookmarkItem[]>("/bookmarks?book_id=" + book.value.id)
+  } catch {
+    bookmarks.value = []
+  }
+}
+
+async function removeBookmark(id: string) {
+  try {
+    await api.delete("/bookmarks/" + id)
+    bookmarks.value = bookmarks.value.filter((b) => b.id !== id)
+  } catch { /* non-critical */ }
+}
+
+function startReading() {
+  if (!book.value) return
+  const target = savedChapterId.value || (chapters.value.length ? chapters.value[0].id : null)
+  if (target) router.push("/books/" + book.value.id + "/chapters/" + target)
+}
+
 async function loadShelfGroups() {
   try {
     shelfGroups.value = await api.get<ShelfGroup[]>("/bookshelf/groups")
@@ -355,6 +387,7 @@ onMounted(async () => {
         if (p) savedChapterId.value = p.chapter_id
       } catch { /* non-critical */ }
     }
+    await loadBookmarks()
   } catch (e) {
     error.value = e instanceof Error ? e.message : i18n.t('book_load_failed')
   } finally {
@@ -377,11 +410,13 @@ onMounted(async () => {
       <p v-else-if="error" class="text-red-600">{{ error }}</p>
 
       <template v-else-if="book">
-        <router-link
-          v-if="savedChapterId"
-          :to="'/books/' + book.id + '/chapters/' + savedChapterId"
-          class="inline-flex items-center gap-1 px-4 py-2 mb-6 rounded-lg bg-accent/10 text-accent text-sm font-medium hover:bg-accent/20 transition-colors no-underline"
-        >{{ i18n.t('book_continue') }} &rarr;</router-link>
+        <div class="mb-6 flex flex-wrap items-center gap-2">
+          <button
+            @click="startReading"
+            :disabled="chapters.length === 0"
+            class="inline-flex items-center gap-1 px-5 py-2.5 rounded-lg bg-accent text-white text-sm font-medium hover:opacity-90 transition-opacity disabled:opacity-40 no-underline"
+          >{{ savedChapterId ? i18n.t('book_continue_reading') : i18n.t('book_start_reading') }} &rarr;</button>
+        </div>
 
         <header class="mb-8">
           <div class="mb-4">
@@ -644,6 +679,29 @@ onMounted(async () => {
             class="px-3 py-1.5 rounded bg-accent text-white text-xs font-medium hover:opacity-90 disabled:opacity-50"
           >{{ i18n.t('book_group_save') }}</button>
           <p v-if="groupError" class="text-xs text-red-600 mt-2">{{ groupError }}</p>
+        </section>
+
+        <section class="mb-8">
+          <h2 class="text-lg font-semibold mb-3">{{ i18n.t('book_bookmarks_title') }} ({{ bookmarks.length }})</h2>
+          <p v-if="bookmarks.length === 0" class="text-xs text-muted dark:text-gray-400">{{ i18n.t('book_bookmarks_empty') }}</p>
+          <div v-else class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900">
+            <div v-for="bm in bookmarks" :key="bm.id" class="flex items-center gap-2 px-4 py-2.5">
+              <router-link
+                :to="'/books/' + book.id + '/chapters/' + bm.chapter_id"
+                class="min-w-0 flex-1 no-underline"
+              >
+                <span class="block truncate text-sm hover:text-accent">
+                  {{ bm.chapter_title || i18n.t('reader_bookmark_chapter', { n: bm.chapter_number || '' }) }}
+                </span>
+                <span class="block text-xs text-muted dark:text-gray-400">{{ i18n.t('reader_bookmark_position', { p: bm.position }) }}</span>
+              </router-link>
+              <button
+                @click="removeBookmark(bm.id)"
+                class="shrink-0 text-xs text-red-400 hover:text-red-600 px-1.5"
+                :title="i18n.t('reader_bookmark_delete')"
+              >&times;</button>
+            </div>
+          </div>
         </section>
 
         <section>

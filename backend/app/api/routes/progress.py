@@ -23,18 +23,25 @@ async def upsert_progress(payload: ReadingProgressUpsert, user: User = Depends(g
     book = await db.get(Book, payload.book_id)
     if not ensure_book_visible(user, book):
         raise HTTPException(status_code=404, detail="Book not found")
+    # Always scope progress to the authenticated user; ignore any client-supplied user_id.
     progress = await db.scalar(
         select(ReadingProgress).where(
-            ReadingProgress.user_id == payload.user_id,
+            ReadingProgress.user_id == user.id,
             ReadingProgress.book_id == payload.book_id,
         )
     )
     if progress is None:
-        progress = ReadingProgress(id=str(uuid4()), **payload.model_dump())
+        progress = ReadingProgress(
+            id=str(uuid4()),
+            user_id=user.id,
+            book_id=payload.book_id,
+            chapter_id=payload.chapter_id,
+            position=max(0, min(100, int(payload.position))),
+        )
         db.add(progress)
     else:
         progress.chapter_id = payload.chapter_id
-        progress.position = payload.position
+        progress.position = max(0, min(100, int(payload.position)))
     await db.commit()
     await db.refresh(progress)
     return progress
@@ -87,4 +94,3 @@ async def list_progress(
     query = query.where(or_(*conditions)) if conditions else query.where(Book.id == "__none__")
     result = await db.scalars(query)
     return list(result)
-

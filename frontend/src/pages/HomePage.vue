@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import { computed, onMounted, ref } from "vue"
 import { useRouter } from "vue-router"
 import { useBooksStore, type Book, type ShelfGroup } from "../stores/books"
@@ -12,6 +12,7 @@ const auth = useAuthStore()
 const i18n = useI18nStore()
 const router = useRouter()
 const recentReads = ref<Book[]>([])
+const recentReadsChapter = ref<Record<string, string>>({})
 const favoriteBooks = ref<Book[]>([])
 const favoriteLoading = ref(false)
 const favoriteError = ref("")
@@ -313,9 +314,19 @@ onMounted(async () => {
       const progress = await api.get<any[]>('/progress?user_id=' + auth.user.id)
       if (progress.length > 0) {
         const results = await Promise.all(
-          progress.map((p: any) => store.fetchBook(p.book_id).catch(() => null))
+          progress.map(async (p: any) => {
+            try {
+              const book = await store.fetchBook(p.book_id)
+              return { book, chapterId: p.chapter_id }
+            } catch {
+              return null
+            }
+          })
         )
-        recentReads.value = results.filter(Boolean) as Book[]
+        recentReads.value = results.filter(Boolean).map((r: any) => r.book) as Book[]
+        recentReadsChapter.value = Object.fromEntries(
+          results.filter(Boolean).map((r: any) => [r.book.id, r.chapterId])
+        )
       }
     } catch { /* non-critical */ }
   }
@@ -369,7 +380,7 @@ onMounted(async () => {
           <router-link
             v-for="b in recentReads.slice(0, 4)"
             :key="b.id"
-            :to="'/books/' + b.id"
+            :to="recentReadsChapter[b.id] ? '/books/' + b.id + '/chapters/' + recentReadsChapter[b.id] : '/books/' + b.id"
             class="p-3 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 hover:shadow-sm hover:border-accent/30 transition-all no-underline"
           >
             <p class="text-sm font-medium truncate">{{ b.title }}</p>

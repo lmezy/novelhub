@@ -11,6 +11,7 @@ from app.models import (
     BookFavoriteGroup,
     BookTag,
     BookVersion,
+    Bookmark,
     Chapter,
     ChapterEmbedding,
     ReadingProgress,
@@ -73,6 +74,9 @@ async def delete_books(
         await db.execute(
             delete(ReadingProgress).where(ReadingProgress.chapter_id.in_(chunk))
         )
+        await db.execute(
+            delete(Bookmark).where(Bookmark.chapter_id.in_(chunk))
+        )
 
     for chunk in _chunks(unique_ids):
         await db.execute(
@@ -80,6 +84,9 @@ async def delete_books(
         )
         await db.execute(
             delete(ReadingProgress).where(ReadingProgress.book_id.in_(chunk))
+        )
+        await db.execute(
+            delete(Bookmark).where(Bookmark.book_id.in_(chunk))
         )
         await db.execute(delete(Chapter).where(Chapter.book_id.in_(chunk)))
         await db.execute(delete(BookTag).where(BookTag.book_id.in_(chunk)))

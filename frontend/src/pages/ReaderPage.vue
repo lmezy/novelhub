@@ -56,6 +56,24 @@ const pageMode = ref<MobilePageMode>(savedPageMode())
 const mobileScrollProgress = ref(0)
 const pendingPage = ref<number | "last" | null>(null)
 const pendingRestorePercent = ref<number | null>(null)
+interface BookmarkItem {
+  id: string
+  book_id: string
+  chapter_id: string
+  position: number
+  note?: string | null
+  chapter_title?: string | null
+  chapter_number?: number | null
+}
+
+const bookmarks = ref<BookmarkItem[]>([])
+const bookmarkBusy = ref(false)
+const bookmarkToast = ref("")
+const tocTab = ref<"toc" | "bookmarks">("toc")
+const pendingBookmarkPosition = ref<number | null>(null)
+const desktopProgress = ref(0)
+let bookmarkToastTimer: ReturnType<typeof setTimeout>
+
 const readLocation = ref<{ book_id: string; chapter_id: string } | null>(null)
 const pageContent = ref<HTMLElement | null>(null)
 const pageViewport = ref<HTMLElement | null>(null)
@@ -205,6 +223,7 @@ function currentPosition(): number {
   return isMobileLayout.value ? mobileProgress.value : desktopScrollPercent()
 }
 function onScroll() {
+  desktopProgress.value = desktopScrollPercent()
   clearTimeout(scrollTimer)
   scrollTimer = setTimeout(() => {
     if (!auth.user || isMobileLayout.value) return
@@ -336,6 +355,94 @@ function flushPageProgress() {
   clearTimeout(progressTimer)
   if (!auth.user || !chapter.value) return
   savePosition(currentPosition())
+}
+
+// Keepalive flush used on page hide so progress survives tab/browser close.
+function flushPageProgressKeepalive() {
+  clearTimeout(progressTimer)
+  if (!auth.user || !chapter.value || !readLocation.value) return
+  const payload = JSON.stringify({
+    user_id: auth.user.id,
+    book_id: readLocation.value.book_id,
+    chapter_id: readLocation.value.chapter_id,
+    position: Math.round(currentPosition()),
+  })
+  try {
+    fetch("/api/progress", {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + (localStorage.getItem("novelhub_token") || ""),
+      },
+      body: payload,
+      keepalive: true,
+    }).catch(() => {})
+  } catch { /* ignore */ }
+}
+
+// ---------------- bookmarks ----------------
+
+async function loadBookmarks() {
+  if (!auth.user) return
+  try {
+    bookmarks.value = await api.get<BookmarkItem[]>("/bookmarks?book_id=" + encodeURIComponent(bookId.value))
+  } catch {
+    bookmarks.value = []
+  }
+}
+
+function currentBookmark(): BookmarkItem | null {
+  return bookmarks.value.find((b) => b.chapter_id === chapterId.value) || null
+}
+
+function showBookmarkToast(msg: string) {
+  bookmarkToast.value = msg
+  clearTimeout(bookmarkToastTimer)
+  bookmarkToastTimer = setTimeout(() => { bookmarkToast.value = "" }, 1800)
+}
+
+async function toggleBookmark() {
+  if (!auth.user || !chapter.value || bookmarkBusy.value) return
+  const existing = currentBookmark()
+  bookmarkBusy.value = true
+  try {
+    if (existing) {
+      await api.delete("/bookmarks/" + existing.id)
+      bookmarks.value = bookmarks.value.filter((b) => b.id !== existing.id)
+      showBookmarkToast(i18n.t("reader_bookmark_removed"))
+    } else {
+      const created = await api.post<BookmarkItem>("/bookmarks", {
+        book_id: bookId.value,
+        chapter_id: chapterId.value,
+        position: Math.round(currentPosition()),
+      })
+      bookmarks.value = [created, ...bookmarks.value.filter((b) => b.id !== created.id)]
+      showBookmarkToast(i18n.t("reader_bookmark_added"))
+    }
+  } catch { /* non-critical */ } finally {
+    bookmarkBusy.value = false
+  }
+}
+
+async function removeBookmark(id: string) {
+  try {
+    await api.delete("/bookmarks/" + id)
+    bookmarks.value = bookmarks.value.filter((b) => b.id !== id)
+  } catch { /* non-critical */ }
+}
+
+function jumpToBookmark(bm: BookmarkItem) {
+  showToc.value = false
+  closeMenu()
+  const target = Math.min(100, Math.max(0, bm.position))
+  if (bm.chapter_id === chapterId.value) {
+    // Same chapter: restore the position directly.
+    pendingRestorePercent.value = target
+    applyRestoredPosition()
+    return
+  }
+  pendingBookmarkPosition.value = target
+  openChapter(bm.chapter_id, 0)
 }
 async function restoreChapterProgress() {
   pendingRestorePercent.value = null
@@ -595,6 +702,11 @@ async function loadChapter(id: string) {
       await restoreChapterProgress()
       if (seq !== chapterLoadSeq) return
       applyRestoredPosition()
+    } else if (pendingBookmarkPosition.value !== null) {
+      pendingRestorePercent.value = Math.min(100, Math.max(0, pendingBookmarkPosition.value))
+      pendingBookmarkPosition.value = null
+      if (seq !== chapterLoadSeq) return
+      applyRestoredPosition()
     }
   } catch (e) {
     if (seq !== chapterLoadSeq) return
@@ -674,6 +786,7 @@ watch(
       chapters.value = await store.fetchChapters(newId as string)
     } catch { /* non-fatal */ }
     await loadAlternates()
+    await loadBookmarks()
     if (isMobileLayout.value) nextTick(refreshMobileLayout)
   },
 )
@@ -690,7 +803,9 @@ onMounted(async () => {
     chapters.value = await store.fetchChapters(bookId.value)
   } catch { /* non-fatal */ }
   await loadAlternates()
+  await loadBookmarks()
   await loadChapter(chapterId.value)
+  window.addEventListener("pagehide", flushPageProgressKeepalive)
 })
 
 onUnmounted(() => {
@@ -700,12 +815,18 @@ onUnmounted(() => {
   document.documentElement.classList.remove("reader-locked")
   clearTimeout(scrollTimer)
   clearTimeout(resizeTimer)
+  window.removeEventListener("pagehide", flushPageProgressKeepalive)
   flushPageProgress()
 })
 </script>
 
 <template>
   <div class="min-h-screen" :class="isDark ? 'bg-gray-950 text-gray-100' : 'bg-paper text-ink'">
+    <div
+      v-if="bookmarkToast"
+      class="bookmark-toast"
+      :class="isDark ? 'bookmark-toast-dark' : 'bookmark-toast-light'"
+    >{{ bookmarkToast }}</div>
     <div v-if="isMobileLayout" class="mobile-reader" :class="isDark ? 'mobile-reader-dark' : 'mobile-reader-light'">
       <p
         v-if="loading"
@@ -784,6 +905,13 @@ onUnmounted(() => {
               :class="showSourceMenu ? 'text-accent' : ''"
               :title="i18n.t('reader_sources')"
             >{{ i18n.t('reader_sources_short') }}</button>
+            <button
+              @click="toggleBookmark"
+              :disabled="bookmarkBusy"
+              class="reader-top-action disabled:opacity-50"
+              :class="currentBookmark() ? 'text-amber-400' : ''"
+              :title="currentBookmark() ? i18n.t('reader_bookmark_remove') : i18n.t('reader_bookmark_add')"
+            >{{ currentBookmark() ? '\u2605' : '\u2606' }}</button>
             <button
               v-if="auth.isAdmin"
               @click="resyncChapter"
@@ -947,6 +1075,17 @@ onUnmounted(() => {
               </button>
             </div>
           </div>
+          <span
+            class="text-xs text-muted dark:text-gray-400 w-12 text-right tabular-nums"
+            :title="i18n.t('reader_reading_progress')"
+          >{{ i18n.t('reader_reading_position', { n: desktopProgress }) }}</span>
+          <button
+            @click="toggleBookmark"
+            :disabled="bookmarkBusy || !chapter"
+            class="w-7 h-7 flex items-center justify-center rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors text-sm disabled:opacity-50"
+            :class="currentBookmark() ? 'text-amber-400' : ''"
+            :title="currentBookmark() ? i18n.t('reader_bookmark_remove') : i18n.t('reader_bookmark_add')"
+          >{{ currentBookmark() ? '\u2605' : '\u2606' }}</button>
           <button
             @click="changeFontSize(-2)"
             class="w-7 h-7 flex items-center justify-center rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors text-sm"
@@ -1058,20 +1197,53 @@ onUnmounted(() => {
           :class="isDark ? 'bg-gray-900' : 'bg-surface'"
         >
           <div class="flex items-center justify-between mb-4">
-            <h3 class="font-semibold text-sm">{{ i18n.t('reader_toc_title') }}</h3>
+            <div class="flex items-center gap-1">
+              <button
+                @click="tocTab = 'toc'"
+                class="px-2 py-1 text-xs rounded transition-colors"
+                :class="tocTab === 'toc' ? 'bg-accent text-white' : (isDark ? 'text-gray-400 hover:bg-gray-800' : 'text-muted hover:bg-gray-100')"
+              >{{ i18n.t('reader_toc_tab_toc') }}</button>
+              <button
+                @click="tocTab = 'bookmarks'"
+                class="px-2 py-1 text-xs rounded transition-colors"
+                :class="tocTab === 'bookmarks' ? 'bg-accent text-white' : (isDark ? 'text-gray-400 hover:bg-gray-800' : 'text-muted hover:bg-gray-100')"
+              >{{ i18n.t('reader_toc_tab_bookmarks') }} ({{ bookmarks.length }})</button>
+            </div>
             <button @click="showToc = false" class="text-muted text-lg">&times;</button>
           </div>
-          <button
-            v-for="ch in chapters"
-            :key="ch.id"
-            @click="openChapter(ch.id)"
-            class="block w-full text-left py-1.5 text-sm truncate"
-            :class="
-              ch.id === chapterId
-                ? 'text-accent font-medium'
-                : isDark ? 'text-gray-400 hover:text-gray-200' : 'text-muted hover:text-ink'
-            "
-          >{{ ch.chapter_number }}. {{ ch.title || i18n.t('reader_chapter_fallback', { n: ch.chapter_number }) }}</button>
+
+          <template v-if="tocTab === 'toc'">
+            <button
+              v-for="ch in chapters"
+              :key="ch.id"
+              @click="openChapter(ch.id)"
+              class="block w-full text-left py-1.5 text-sm truncate"
+              :class="
+                ch.id === chapterId
+                  ? 'text-accent font-medium'
+                  : isDark ? 'text-gray-400 hover:text-gray-200' : 'text-muted hover:text-ink'
+              "
+            >{{ ch.chapter_number }}. {{ ch.title || i18n.t('reader_chapter_fallback', { n: ch.chapter_number }) }}</button>
+          </template>
+
+          <template v-else>
+            <p v-if="bookmarks.length === 0" class="text-xs text-muted dark:text-gray-400 py-6 text-center">{{ i18n.t('reader_bookmark_empty') }}</p>
+            <div v-for="bm in bookmarks" :key="bm.id" class="flex items-center gap-2 py-1.5 border-b border-border dark:border-gray-700 last:border-0">
+              <button
+                @click="jumpToBookmark(bm)"
+                class="min-w-0 flex-1 text-left"
+                :class="isDark ? 'text-gray-300 hover:text-accent' : 'text-ink hover:text-accent'"
+              >
+                <span class="block truncate text-sm">{{ bm.chapter_title || i18n.t('reader_bookmark_chapter', { n: bm.chapter_number || '' }) }}</span>
+                <span class="block text-xs text-muted dark:text-gray-400">{{ i18n.t('reader_bookmark_position', { p: bm.position }) }}</span>
+              </button>
+              <button
+                @click="removeBookmark(bm.id)"
+                class="shrink-0 text-xs text-red-400 hover:text-red-600 px-1.5"
+                :title="i18n.t('reader_bookmark_delete')"
+              >&times;</button>
+            </div>
+          </template>
         </div>
         <div class="flex-1" @click="showToc = false" />
       </div>
@@ -1521,6 +1693,30 @@ onUnmounted(() => {
   border-color: #8b5cf6;
   background: #8b5cf6;
   color: white;
+}
+
+.bookmark-toast {
+  position: fixed;
+  top: 14%;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 90;
+  padding: 8px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+}
+
+.bookmark-toast-light {
+  background: rgba(31, 41, 55, 0.92);
+  color: #f9fafb;
+}
+
+.bookmark-toast-dark {
+  background: rgba(243, 244, 246, 0.92);
+  color: #111827;
 }
 
 @media (max-width: 360px) {

@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.routes import admin, ai, auth, backup, books, bookshelf, chapters, cookies, crawl, credentials, custom_tags, health, invites, manual_login, progress, rag, search, source_changes, sources, sync, tags, tokens, yuedu
+from app.api.routes import admin, ai, auth, backup, bookmarks, books, bookshelf, chapters, cookies, crawl, credentials, custom_tags, health, invites, manual_login, progress, rag, search, source_changes, sources, sync, tags, tokens, yuedu
 from app.api.routes import categories
 
 
@@ -18,6 +18,7 @@ router.include_router(cookies.router)
 router.include_router(crawl.router)
 router.include_router(custom_tags.router)
 router.include_router(progress.router)
+router.include_router(bookmarks.router)
 router.include_router(rag.router)
 router.include_router(search.router)
 router.include_router(source_changes.router)
