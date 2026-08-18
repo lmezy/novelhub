@@ -52,6 +52,8 @@ async def _fetch_response(
                 follow_redirects=True,
                 proxy=proxy,
                 trust_env=False,
+                # Proxy (Clash) TLS interception uses a local CA cert.
+                verify=False,
             ) as client:
                 resp = await client.get(url, headers=headers)
                 resp.raise_for_status()

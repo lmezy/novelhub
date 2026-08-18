@@ -340,6 +340,9 @@ class YueduPlugin:
                     follow_redirects=True,
                     proxy=proxy,
                     trust_env=False,
+                    # Proxy (Clash) TLS interception uses a local CA cert;
+                    # browsers accept it interactively but httpx cannot.
+                    verify=False,
                 )
                 self.__class__._clients[proxy] = client
             return client
@@ -1288,6 +1291,11 @@ class YueduPlugin:
             html = await self._get_with_web_js(chapter.url, web_js)
         else:
             html = await self._get(chapter.url)
+        self.engine.set_chapter_context({
+            "title": str(getattr(chapter, "title", "") or ""),
+            "url": chapter.url,
+            "tag": str(getattr(chapter, "tags", "") or ""),
+        })
         generic_content = self._parse_chapter_content_generic(html)
         if self._uses_android_js_rule("ruleContent", "content"):
             content = generic_content
@@ -1915,7 +1923,9 @@ class YueduPlugin:
         """Parse exploreUrl to get discover categories.
 
         Returns list of {title, url} dicts. Ported from
-        BookSourceExtensions.exploreKinds().
+        BookSourceExtensions.exploreKinds().  JS-based exploreUrl rules
+        (``<js>`` / ``@js:``) are evaluated first so sources like 菠萝猫 /
+        UAA that generate their category list in JavaScript work.
         """
         explore_url = self.config.get("exploreUrl", "")
         if not explore_url or not explore_url.strip():
@@ -1923,9 +1933,10 @@ class YueduPlugin:
 
         rule_str = explore_url.strip()
 
-        # If it starts with <js> or @js:, it's JS that returns JSON
+        # If it starts with <js> or @js:, evaluate the script and parse
+        # the returned JSON array of {title, url} kinds.
         if rule_str.startswith("<js>") or rule_str.startswith("@js:"):
-            return self._parse_explore_json(rule_str)
+            return self._parse_explore_js(rule_str)
 
         # Try to parse as JSON array directly
         if rule_str.startswith("["):
@@ -1945,6 +1956,51 @@ class YueduPlugin:
             else:
                 # Header/separator lines have no URL; fetch_explore skips them.
                 kinds.append({"title": line, "url": ""})
+        return kinds
+
+    def _parse_explore_js(self, text: str) -> list[dict[str, str]]:
+        """Evaluate a <js>/@js: exploreUrl script into a kinds array.
+
+        Never raises: unsupported JS returns an empty list so the caller
+        falls through to the generic ranking-page fallback instead of
+        failing the whole discover task with an 'Unsupported URL' error.
+        """
+        if text.startswith("<js>") and text.endswith("</js>"):
+            code = text[4:-5].strip()
+        elif text.startswith("<js"):
+            code = text[4:].strip()
+        elif text.startswith("@js:"):
+            code = text[4:].strip()
+        else:
+            code = text
+        try:
+            result = self.engine._try_eval_js(
+                code, None, extra_context={"page": "1"},
+            )
+        except Exception:
+            return []
+        if result is None:
+            return []
+        if isinstance(result, str):
+            result = result.strip()
+            if not result:
+                return []
+            try:
+                parsed = json.loads(result)
+            except (ValueError, TypeError):
+                return []
+            if not isinstance(parsed, list):
+                return []
+            result = parsed
+        if not isinstance(result, list):
+            return []
+        kinds = []
+        for item in result:
+            if isinstance(item, dict) and item.get("url"):
+                kinds.append({
+                    "title": str(item.get("title", "")),
+                    "url": str(item.get("url", "")),
+                })
         return kinds
 
     def _parse_explore_json(self, text: str) -> list[dict[str, str]]:
@@ -1972,12 +2028,16 @@ class YueduPlugin:
         Ported from WebBook.exploreBookAwait. Uses ruleExplore
         (or falls back to ruleSearch) for parsing.
         If no explore URL is configured, tries common ranking pages.
+        JS-based explore URLs are resolved so a source whose exploreUrl is
+        a ``<js>`` / ``@js:`` script never crashes with an unsupported URL.
         """
         if not self.engine:
             raise RuntimeError("YueduPlugin not configured")
         if url:
-            explore_url = self._make_absolute(url, self.base_url)
-            explore_url = self.engine._substitute(explore_url, page=str(page))
+            explore_url = self.engine._substitute(url, page=str(page))
+            explore_url = self._resolve_kind_url(explore_url, page)
+            if not explore_url:
+                return []
             explore_kind = self._explore_kind_for_url(explore_url, page)
             return await self._fetch_explore_url(explore_url, explore_kind)
 
@@ -1985,18 +2045,21 @@ class YueduPlugin:
         if kinds:
             results = []
             for kind in kinds:
-                kind_url = kind.get("url", "").strip()
+                kind_url = str(kind.get("url", "")).strip()
                 if not kind_url:
                     continue
-                kind_url = self.engine._substitute(kind_url, page=str(page))
-                if not kind_url.startswith(("http://", "https://")):
-                    kind_url = self._make_absolute(kind_url, self.base_url)
-                if not kind_url.startswith(("http://", "https://")):
+                try:
+                    resolved, options = self._resolve_kind(kind_url, page)
+                except Exception as exc:
+                    logger.warning(f"Explore kind URL failed: {kind_url} ({exc})")
+                    continue
+                if not resolved:
                     continue
                 try:
                     results.extend(await self._fetch_explore_url(
-                        kind_url,
+                        resolved,
                         explore_kind=kind.get("title", ""),
+                        options=options,
                     ))
                 except Exception as exc:
                     logger.warning(
@@ -2028,15 +2091,129 @@ class YueduPlugin:
                     continue
             logger.warning(f"No explore URL for {self.display_name}")
             return []
+        explore_url = self._resolve_kind_url(explore_url, page)
+        if not explore_url:
+            logger.warning(f"Explore URL unresolved for {self.display_name}")
+            return []
         return await self._fetch_explore_url(explore_url)
+
+    def _resolve_kind_url(self, kind_url: str, page: int) -> str:
+        """Resolve an explore/search URL that may be a JS template or carry
+        a Legado URL-options suffix (`,{...}`).  Returns a plain http(s)
+        URL or "" when the value cannot be resolved."""
+        resolved, _options = self._resolve_kind(kind_url, page)
+        return resolved
+
+    def _resolve_kind(
+        self,
+        kind_url: str,
+        page: int,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Resolve an explore/search URL into (request URL, URL options).
+
+        Handles ``<js>`` / ``@js:`` templates (evaluated with ``page`` in
+        scope), ``{{page}}`` placeholders, and the Legado ``,{...}`` option
+        suffix so webView / method / headers options survive resolution.
+        """
+        text = str(kind_url or "").strip()
+        if not text:
+            return "", None
+        if text.startswith("<js>") or text.startswith("@js:"):
+            text = self._resolve_url_template(text, page=page)
+            if not text:
+                return "", None
+        options = self._parse_url_options(text)
+        request_url = options["url"] if options else text
+        request_url = self.engine._substitute(request_url, page=str(page))
+        if not request_url.startswith(("http://", "https://")):
+            request_url = self._make_absolute(request_url, self.base_url)
+        if not request_url.startswith(("http://", "https://")):
+            return "", None
+        return request_url, options
+
+    def _resolve_url_template(
+        self,
+        template: str,
+        key: str = "",
+        page: int = 1,
+        raw: Any = None,
+    ) -> str:
+        """Resolve a Legado URL template that may be a plain URL or JS.
+
+        ``<js>`` / ``@js:`` templates are evaluated with ``key`` and ``page``
+        in scope (like Legado's search/explore URL scripts).  The result may
+        be a single URL, a JSON array of URLs (first is used), or a JSON
+        object with a ``url`` field.
+        """
+        text = str(template or "").strip()
+        if not text:
+            return ""
+        code = None
+        if text.startswith("<js>") and text.endswith("</js>"):
+            code = text[4:-5].strip()
+        elif text.startswith("<js"):
+            code = text[4:].strip()
+        elif text.startswith("@js:"):
+            code = text[4:].strip()
+        if code is not None:
+            try:
+                result = self.engine._try_eval_js(
+                    code,
+                    raw,
+                    extra_context={"key": key, "page": int(page)},
+                )
+            except Exception:
+                return ""
+            if result is None:
+                return ""
+            if isinstance(result, list):
+                for item in result:
+                    if isinstance(item, str) and item.strip():
+                        return item.strip()
+                    if isinstance(item, dict) and item.get("url"):
+                        return str(item["url"]).strip()
+                return ""
+            resolved = str(result).strip()
+            if not resolved:
+                return ""
+            if resolved.startswith("["):
+                try:
+                    parsed = json.loads(resolved)
+                except (ValueError, TypeError):
+                    parsed = None
+                if isinstance(parsed, list):
+                    for item in parsed:
+                        if isinstance(item, dict) and item.get("url"):
+                            return str(item["url"]).strip()
+                        if isinstance(item, str) and item.strip():
+                            return item.strip()
+                    return ""
+            return resolved
+        return self.engine._substitute(text, key=key, page=str(page))
 
     async def _fetch_explore_url(
         self,
         explore_url: str,
         explore_kind: str = "",
+        options: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        html = await self._get(explore_url)
-        items = self._explore_items_from_html(html, explore_url)
+        if options is None:
+            options = self._parse_url_options(explore_url)
+        request_url = options["url"] if options else explore_url
+        if options and (options.get("web_view") or options.get("web_js")):
+            html = await self._get_with_web_js(
+                request_url,
+                options.get("web_js") or self.engine.get_web_js(),
+            )
+        elif options and str(options.get("method", "GET")).upper() == "POST":
+            html = await self._post(
+                request_url,
+                body=options.get("body"),
+                headers=options.get("headers") or {},
+            )
+        else:
+            html = await self._get(request_url)
+        items = self._explore_items_from_html(html, request_url)
         if not explore_kind:
             return items
         return [
@@ -2051,9 +2228,11 @@ class YueduPlugin:
             kind_url = str(kind.get("url") or "").strip()
             if not kind_url:
                 continue
-            kind_url = self.engine._substitute(kind_url, page=str(page))
-            candidate = self._make_absolute(kind_url, self.base_url).rstrip("/")
-            if candidate == selected:
+            try:
+                resolved, _options = self._resolve_kind(kind_url, page)
+            except Exception:
+                continue
+            if resolved and resolved.rstrip("/") == selected:
                 return str(kind.get("title") or "")
         return ""
 
@@ -2173,6 +2352,14 @@ class YueduPlugin:
             return []
 
         search_url = self.engine.build_search_url(keyword, page)
+        if search_url.startswith("<js>") or search_url.startswith("@js:"):
+            search_url = self._resolve_url_template(
+                search_url,
+                key=keyword,
+                page=page,
+            )
+            if not search_url:
+                return []
         options = self._parse_url_options(search_url)
         request_url = options["url"] if options else search_url
 

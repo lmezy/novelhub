@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -1244,7 +1245,7 @@ async def test_cool18_android_rules_fall_back_to_forum_post_content():
             "chapterList": "<js>org.jsoup.Jsoup.parse(result)</js>",
         },
         "ruleContent": {
-            "content": "<js>org.jsoup.Jsoup.parse(result).text()</js>",
+            "content": "<js>Packages.org.jsoup.Jsoup.parse(result).text()</js>",
         },
     })
     html = """
@@ -1491,3 +1492,208 @@ async def test_fetch_chapter_content_keeps_real_content_with_counters():
     # Comment counters must not leak into the stored text.
     assert "\n0" not in content
     assert "\n12" not in content
+
+# ---- JS-based explore / search URL support ----
+
+def test_get_explore_kinds_evaluates_js_explore_url():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.boluomao.com",
+        "exploreUrl": (
+            "@js:\n"
+            "var r=[{title:'男频',url:'/gender/boy/page/{{page}}/'},"
+            "{title:'女频',url:'/gender/girl/page/{{page}}/'}];\n"
+            "JSON.stringify(r);"
+        ),
+    })
+    plugin.engine._try_eval_js = lambda code, raw=None, extra_context=None: (
+        '[{"title":"男频","url":"/gender/boy/page/{{page}}/"},'
+        '{"title":"女频","url":"/gender/girl/page/{{page}}/"}]'
+    )
+    kinds = plugin.get_explore_kinds()
+    assert len(kinds) == 2
+    assert kinds[0] == {"title": "男频", "url": "/gender/boy/page/{{page}}/"}
+    assert kinds[1] == {"title": "女频", "url": "/gender/girl/page/{{page}}/"}
+
+
+def test_get_explore_kinds_js_failure_returns_empty():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.boluomao.com",
+        "exploreUrl": "@js:throw new Error('boom')",
+    })
+    plugin.engine._try_eval_js = lambda code, raw=None, extra_context=None: None
+    assert plugin.get_explore_kinds() == []
+
+
+def test_get_explore_kinds_plain_text_format_still_works():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "exploreUrl": "玄幻::/fenlei/1.html\n都市::/fenlei/2.html",
+    })
+    kinds = plugin.get_explore_kinds()
+    assert len(kinds) == 2
+    assert kinds[0]["url"] == "/fenlei/1.html"
+
+
+def test_resolve_kind_url_strips_legado_options_suffix():
+    plugin = YueduPlugin({"bookSourceUrl": "https://www.boluomao.com"})
+    resolved = plugin._resolve_kind_url(
+        "/gender/boy/page/{{page}}/,{\"webView\":true}", 2
+    )
+    assert resolved == "https://www.boluomao.com/gender/boy/page/2/"
+
+
+def test_resolve_kind_url_evaluates_js_template():
+    plugin = YueduPlugin({"bookSourceUrl": "https://www.boluomao.com"})
+    def _eval(code, raw=None, extra_context=None):
+        return "" if "''" in code else "https://www.boluomao.com/tag/x/"
+    plugin.engine._try_eval_js = _eval
+    assert plugin._resolve_kind_url("@js:1+1", 1) == (
+        "https://www.boluomao.com/tag/x/"
+    )
+    assert plugin._resolve_kind_url("@js:return ''", 1) == ""
+
+
+def test_fetch_explore_uses_resolved_js_kind_url():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.boluomao.com",
+        "bookUrlPattern": "https?://www\\.boluomao\\.com/book/\\d+\\.html",
+        "exploreUrl": "@js:var r=[{title:'男频',url:'/gender/boy/page/{{page}}/'}];JSON.stringify(r);",
+    })
+    html = '<div class="book-list"><a href="/book/123.html">书名</a></div>'
+
+    async def fake_get(url):
+        assert url == "https://www.boluomao.com/gender/boy/page/1/"
+        return html
+
+    plugin._get = fake_get
+    items = asyncio.run(plugin.fetch_explore(page=1))
+    assert items
+    urls = [str(i.get("bookUrl") or i.get("url") or "") for i in items]
+    assert any(u.endswith("/book/123.html") for u in urls)
+
+
+def test_search_books_with_js_search_url():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.boluomao.com",
+        "bookUrlPattern": "https?://www\\.boluomao\\.com/book/\\d+\\.html",
+        "searchUrl": "@js:(function(){return 'https://www.boluomao.com/search?q=' + key;})()",
+        "ruleSearch": {
+            "bookList": ".[?(@.title)]",
+            "name": "title",
+            "author": "author",
+            "bookUrl": "url",
+        },
+    })
+
+    def fake_eval(code, raw=None, extra_context=None):
+        key = (extra_context or {}).get("key", "")
+        return "https://www.boluomao.com/search?q=" + key
+
+    plugin.engine._try_eval_js = fake_eval
+
+    async def fake_get(url):
+        assert "q=测试" in url
+        return (
+            '[{"title":"测试书","author":"作者A",'
+            '"url":"https://www.boluomao.com/book/100.html"}]'
+        )
+
+    plugin._get = fake_get
+    results = asyncio.run(plugin.search_books("测试"))
+    assert results
+    assert results[0]["name"] == "测试书"
+    assert results[0]["bookUrl"].endswith("/book/100.html")
+
+
+def test_search_books_js_url_failure_returns_empty():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "searchUrl": "@js:throw new Error('no signing')",
+    })
+    plugin.engine._try_eval_js = lambda code, raw=None, extra_context=None: None
+    assert asyncio.run(plugin.search_books("keyword")) == []
+
+
+def test_jsonpath_filter_expression():
+    engine = YueduRuleEngine({"bookSourceUrl": "https://example.com"})
+    data = [
+        {"title": "A", "vip": True, "price": 10},
+        {"title": "B", "vip": False, "price": 0},
+        {"title": "C", "vip": True, "price": 5},
+    ]
+    assert [i["title"] for i in engine._jsonpath(data, ".[?(@.title)]")] == ["A", "B", "C"]
+    assert [i["title"] for i in engine._jsonpath(data, "$[?(@.vip == true)]")] == ["A", "C"]
+    assert [i["title"] for i in engine._jsonpath(data, "$[?(@.price > 3)]")] == ["A", "C"]
+    assert [i["title"] for i in engine._jsonpath(data, ".[?(@.title == 'B')]")] == ["B"]
+
+
+def test_chapter_context_provided_to_rule_engine():
+    from types import SimpleNamespace
+
+    plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
+    chapter = SimpleNamespace(title="第1章", url="https://example.com/1.html", tags="")
+    plugin.engine.set_chapter_context(
+        {"title": chapter.title, "url": chapter.url, "tag": chapter.tags}
+    )
+    ctx = plugin.engine._build_js_context()
+    assert ctx["chapter"]["title"] == "第1章"
+    assert ctx["chapter"]["url"] == chapter.url
+    assert ctx["url"] == "https://example.com"
+
+
+def test_js_runtime_shim_supports_legado_apis():
+    """Integration: the Node.js jsoup shim must handle the APIs used by
+    sources like 菠萝猫 (jsoup toArray/text) and UAA (cache/Get/Put,
+    java.md5Encode/hexDecodeToString, expression completion values)."""
+    import shutil
+
+    from app.crawler.plugins.yuedu.js_runtime import JsRuntime
+
+    if shutil.which("node") is None:
+        pytest.skip("Node.js not available")
+    rt = JsRuntime.get_instance()
+    try:
+        if not rt.start_sync():
+            pytest.skip("Node.js runtime failed to start")
+        ctx = {
+            "baseUrl": "https://www.boluomao.com",
+            "bookSourceUrl": "https://www.boluomao.com",
+            "bookSourceName": "菠萝猫",
+            "key": "测试",
+            "page": 2,
+        }
+        r = rt.eval_js_sync(
+            "var doc = org.jsoup.Jsoup.parse(result);"
+            "var ps = doc.select('div.content p').toArray();"
+            "var t=[]; for (var i=0;i<ps.length;i++){ t.push(ps[i].text()); }"
+            "t.join('\\n');",
+            "<div class='content'><p>一</p><p>二</p></div>",
+            context=ctx,
+        )
+        assert r == "一\n二"
+        r = rt.eval_js_sync(
+            "Put('k','v9');"
+            "cache.put('tmp','1',10);"
+            "var a = cache.get('tmp'); cache.delete('tmp');"
+            "var b = cache.get('tmp');"
+            "java.md5Encode('abc') + '|' + java.hexDecodeToString('6869') "
+            "+ '|' + Get('k') + '|' + a + '|' + b;",
+            None,
+            context=ctx,
+        )
+        assert r == "900150983cd24fb0d6963f7d28e17f72|hi|v9|1|"
+        r = rt.eval_js_sync(
+            "var res = java.get('https://www.boluomao.com/', "
+            "{'User-Agent':'x'}); typeof res.body;",
+            None,
+            context=ctx,
+        )
+        assert r == "function"
+        r = rt.eval_js_sync(
+            "var x = [{title:'A',url:'/a/'}]; JSON.stringify(x);",
+            None,
+            context=ctx,
+        )
+        assert r == '[{"title":"A","url":"/a/"}]'
+    finally:
+        JsRuntime.reset_instance()

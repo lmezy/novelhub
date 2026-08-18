@@ -16,9 +16,11 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import re
 import subprocess
 import threading
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -76,6 +78,7 @@ class JsRuntime:
 
     def __init__(self):
         self._proc: subprocess.Popen | None = None
+        self._bootstrap_path: Path | None = None
         self._ready: bool = False
         self._session_lock: asyncio.Lock | None = None
         # The runtime owns a dedicated event loop so eval methods can be
@@ -139,11 +142,31 @@ class JsRuntime:
         """Async alias of start_sync() for await-based callers."""
         return await asyncio.to_thread(self.start_sync)
 
+    def _subprocess_env(self) -> dict:
+        """Build the Node subprocess env, forwarding the configured proxy.
+
+        The jsoup shim (Reload / java.get / java.ajax) performs its own
+        synchronous curl requests; pointing them at the same proxy keeps
+        behavior consistent with the Python httpx client."""
+        env = dict(os.environ)
+        try:
+            from app.services.proxy_config import get_proxy_config
+            cfg = get_proxy_config()
+            if cfg.enabled:
+                proxy = cfg.https_proxy or cfg.http_proxy
+                if proxy:
+                    env["DSH_HTTP_PROXY"] = proxy
+        except Exception:
+            pass
+        return env
+
     async def _start_impl(self) -> bool:
         try:
             # A persistent Node.js process that reads eval commands from stdin
             # and writes results to stdout.
-            bootstrap = _JSOUP_SHIM + (
+            # The shim plus eval loop is too large for a Windows
+            # command line (WinError 206), so persist it to a temp file.
+            bootstrap_code = _JSOUP_SHIM + (
                 'var _buf="";'
                 'process.stdin.on("data",function(c){'
                 '_buf+=c.toString();'
@@ -162,11 +185,15 @@ class JsRuntime:
                 '}}});'
                 'console.log("__CODEX_READY__")'
             )
+            self._bootstrap_path = Path(tempfile.gettempdir()) / (
+                f"novelhub_yuedu_bootstrap_{os.getpid()}.js"
+            )
+            self._bootstrap_path.write_text(bootstrap_code, encoding="utf-8")
             self._proc = await asyncio.create_subprocess_exec(
                 "node",
                 "--no-warnings",
-                "-e",
-                bootstrap,
+                str(self._bootstrap_path),
+                env=self._subprocess_env(),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -216,6 +243,12 @@ class JsRuntime:
             except Exception:
                 pass
             self._proc = None
+        if self._bootstrap_path is not None:
+            try:
+                self._bootstrap_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            self._bootstrap_path = None
 
     async def _eval_js_impl(
         self,
@@ -248,20 +281,35 @@ class JsRuntime:
                 user_code = js_code.strip()
                 context_js = ""
                 if context:
-                    for key in ("baseUrl", "bookUrl", "sourceUrl"):
-                        value = context.get(key)
-                        if value:
-                            context_js += (
-                                f"var {key}={json.dumps(str(value))};"
-                            )
-                has_return = re.search(r"(^|\n)\s*return\b", user_code)
-                tail = "" if has_return else "return result;"
+                    # Inject every context key as a JS variable so rules can
+                    # reference baseUrl / bookUrl / url / key / page / chapter
+                    # directly, and seed the shim stores (Get/Put and source.*).
+                    for key, value in context.items():
+                        if isinstance(value, (dict, list, bool, int, float)) or value is None:
+                            encoded = json.dumps(value, ensure_ascii=False)
+                        else:
+                            encoded = json.dumps(str(value), ensure_ascii=False)
+                        context_js += f"var {key}={encoded};"
+                    ctx_json = json.dumps(context, ensure_ascii=False)
+                    context_js += (
+                        "if(globalThis.__nhSetVars){globalThis.__nhSetVars(" + 
+                        ctx_json + ");}"
+                        "if(globalThis.__nhSetSourceConfig){globalThis.__nhSetSourceConfig(" + 
+                        ctx_json + ");}"
+                    )
+                src_json = json.dumps(user_code, ensure_ascii=False)
                 snippet = (
                     f'(function(){{'
                     f'{context_js}'
                     f'var result={input_json};'
-                    f'{user_code}'
-                    f'{tail}'
+                    f'var __codex_src__={src_json};'
+                    f'var __codex_out__;'
+                    f'try{{__codex_out__=eval(__codex_src__);}}'
+                    f'catch(e){{'
+                    f'{user_code};\n'
+                    f'__codex_out__=result;'
+                    f'}}'
+                    f'return __codex_out__===undefined?result:__codex_out__;'
                     f'}})()'
                 )
                 cmd = snippet + "\n__CODEX_EVAL_END__\n"
@@ -386,10 +434,18 @@ class JsRuntime:
                 for key, value in context.items():
                     var_decls.append(f"var {key}={json.dumps(value)};")
                 var_block = " ".join(var_decls)
+                ctx_json = json.dumps(context, ensure_ascii=False)
+                seed_js = (
+                    "if(globalThis.__nhSetVars){globalThis.__nhSetVars(" + 
+                    ctx_json + ");}"
+                    "if(globalThis.__nhSetSourceConfig){globalThis.__nhSetSourceConfig(" + 
+                    ctx_json + ");}"
+                )
                 result_json = json.dumps(context)
                 snippet = (
                     f'(function(){{'
                     f'{var_block}'
+                    f'{seed_js}'
                     f'var result={result_json};'
                     f'(function(){{{js_code}}})();'
                     f'return result;'

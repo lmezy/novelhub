@@ -177,6 +177,10 @@ async function deleteSource(id: string) {
 }
 async function createSource() {
   sourceError.value = ""
+  if (!sourceForm.value.name.trim()) {
+    sourceError.value = i18n.t('admin_source_name_required')
+    return
+  }
   let config: any = null
   if (sourceConfigText.value.trim()) {
     try {

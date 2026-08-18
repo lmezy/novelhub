@@ -245,6 +245,7 @@ class YueduRuleEngine:
         self.config = source_config
         self.base_url: str = source_config.get("bookSourceUrl", "")
         self._variables: dict[str, str] = {}
+        self._chapter_context: dict[str, Any] | None = None
         self._is_json_context: bool = False
         self._js_runtime: "JsRuntime | None" = None
 
@@ -253,8 +254,29 @@ class YueduRuleEngine:
             self._js_runtime = JsRuntime.get_instance()
         return self._js_runtime
 
-    # ---- Public API ----
+    def set_chapter_context(self, chapter: dict[str, Any] | None) -> None:
+        """Provide the current chapter object so content JS can read
+        fields like ``chapter.title`` / ``chapter.tag`` (Legado passes
+        the chapter into content rule evaluation)."""
+        self._chapter_context = dict(chapter) if chapter else None
 
+    def _build_js_context(self, extra_context: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Assemble the variable context injected into JS evaluation."""
+        base_url = self._variables.get("baseUrl", self.base_url)
+        book_url = self._variables.get("bookUrl", self.base_url)
+        context: dict[str, Any] = {
+            "baseUrl": base_url,
+            "bookUrl": book_url,
+            "sourceUrl": self.base_url,
+            "url": self._variables.get("url", book_url),
+        }
+        if self._chapter_context:
+            context["chapter"] = self._chapter_context
+        if extra_context:
+            context.update(extra_context)
+        return context
+
+    # ---- Public API ----
     def build_search_url(self, keyword: str, page: int = 1) -> str:
         template = self.config.get("searchUrl", "")
         if not template:
@@ -1002,7 +1024,7 @@ class YueduRuleEngine:
                 return text
         return text
 
-    def _try_eval_js(self, js_code: str, raw: Any) -> Any:
+    def _try_eval_js(self, js_code: str, raw: Any, extra_context: dict | None = None) -> Any:
         """Evaluate JavaScript against raw input.
         
         Uses real Node.js JS runtime when available; falls back to
@@ -1060,10 +1082,7 @@ class YueduRuleEngine:
             result = runtime.eval_js_sync(
                 code,
                 raw,
-                context={
-                    "baseUrl": self._variables.get("baseUrl", self.base_url),
-                    "bookUrl": self._variables.get("bookUrl", self.base_url),
-                },
+                context=self._build_js_context(extra_context),
             )
             if result is not None:
                 return result
@@ -1271,6 +1290,12 @@ class YueduRuleEngine:
             path = "$" + path[2:]
         elif path.startswith("@"):
             path = "$" + path[1:]
+        filter_match = re.match(r"^[.$]?\s*\[\?\s*\((.*)\)\s*\]\s*$", path.strip())
+        if filter_match:
+            expr = filter_match.group(1)
+            if isinstance(obj, list):
+                return [item for item in obj if self._jsonpath_filter(item, expr)]
+            return []
         if path == "$" or path == "$.":
             return obj
         if path.startswith("$."):
@@ -1323,6 +1348,52 @@ class YueduRuleEngine:
         return current
 
     # ---- JS runtime support for book source JS fields ----
+    def _jsonpath_filter(self, item: Any, expr: str) -> bool:
+        """Evaluate a JSONPath filter expression like ``@.title`` or
+        ``@.vip == true`` against a single list item."""
+        expr = expr.strip()
+        if not expr:
+            return bool(item)
+        for part in re.split(r"\s*&&\s*", expr):
+            part = part.strip()
+            if not part:
+                continue
+            if not self._jsonpath_filter_atom(item, part):
+                return False
+        return True
+
+    def _jsonpath_filter_atom(self, item: Any, expr: str) -> bool:
+        if not isinstance(item, dict):
+            return bool(item)
+        m = re.match(r"@\s*(?:\.([A-Za-z_][\w]*)|\[\s*'([^']+)'\s*\]|\[\s*\"([^\"]+)\"\s*\])", expr)
+        if not m:
+            return bool(item)
+        key = m.group(1) or m.group(2) or m.group(3)
+        rest = expr[m.end():].strip()
+        value = item.get(key)
+        if not rest:
+            return bool(value)
+        opm = re.match(r"(!=|==|>=|<=|>|<|=)\s*(.+)", rest)
+        if not opm:
+            return bool(value)
+        op, rhs = opm.group(1), opm.group(2).strip().strip("\'\"")
+        if rhs in ("true", "false"):
+            rhs_val = rhs == "true"
+        elif re.fullmatch(r"-?\d+(\.\d+)?", rhs):
+            rhs_val = float(rhs)
+        else:
+            rhs_val = rhs
+        try:
+            if op in ("==", "="): return value == rhs_val
+            if op == "!=": return value != rhs_val
+            if op == ">": return value > rhs_val
+            if op == ">=": return value >= rhs_val
+            if op == "<": return value < rhs_val
+            if op == "<=": return value <= rhs_val
+        except TypeError:
+            return False
+        return False
+
 
     def decode_cover(self, image_bytes: bytes) -> bytes | None:
         """Execute coverDecodeJs on cover image bytes."""
@@ -1384,7 +1455,10 @@ class YueduRuleEngine:
 
         try:
             runtime = self._get_js_runtime()
-            result = runtime.eval_js_with_context_sync(code, book_data)
+            context_data = dict(book_data)
+            if "url" not in context_data:
+                context_data["url"] = book_data.get("bookUrl", "")
+            result = runtime.eval_js_with_context_sync(code, context_data)
             if isinstance(result, dict):
                 return result
         except Exception:

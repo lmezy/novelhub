@@ -5,6 +5,8 @@ from sqlalchemy.orm import selectinload
 
 from app.core.database import get_db
 from app.crawler.registry import get_plugin
+from uuid import uuid4
+from app.crawler.registry import get_plugin
 from app.models import Source, Book, Cookie, CrawlTask, CrawlLog, User
 from app.models.source_credential import SourceCredential
 from app.schemas.source import (
@@ -71,7 +73,12 @@ async def create_source(
     if scope == "global" and user.role not in ("admin", "super_admin"):
         raise HTTPException(status_code=403, detail="Only admins can create global sources")
     owner_id = None if scope == "global" else user.id
-    source_id = payload.id
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="Source name is required")
+    source_id = (payload.id or "").strip()
+    if not source_id:
+        source_id = f"source:{uuid4().hex[:12]}"
     if owner_id and await db.get(Source, source_id):
         source_id = f"user:{user.id}:{source_id}"
     if await db.get(Source, source_id):

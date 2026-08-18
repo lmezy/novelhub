@@ -198,6 +198,7 @@ function __nhElements(arr) {
   els.html = function () { var t = []; for (var i = 0; i < els.length; i++) t.push(els[i].html()); return t.join(''); };
   els.outerHtml = function () { var t = []; for (var i = 0; i < els.length; i++) t.push(els[i].outerHtml()); return t.join(''); };
   els.toString = function () { return els.outerHtml(); };
+  els.toArray = function () { return els.slice(); };
   return els;
 }
 
@@ -722,41 +723,23 @@ __nhConnection.prototype.method = function (m) { this.methodName = String(m).toU
 __nhConnection.prototype.data = function (k, v) { this.dataObj[k] = v; return this; };
 __nhConnection.prototype.userAgent = function (ua) { this.headers['User-Agent'] = ua; return this; };
 __nhConnection.prototype.execute = function () {
-  var execSync = require('child_process').execSync;
-  var args = [];
-  for (var k in this.headers) {
-    var hv = String(this.headers[k]).replace(/'/g, "'\\''");
-    args.push("-H '" + k + ': ' + hv + "'");
-  }
+  var headers = {};
+  for (var k in this.headers) headers[k] = this.headers[k];
   if (Object.keys(this.cookies).length) {
     var cs = Object.keys(this.cookies).map(function (k) { return k + '=' + this.cookies[k]; }.bind(this)).join('; ');
-    args.push("-H 'Cookie: " + cs.replace(/'/g, "'\\''") + "'");
+    headers['Cookie'] = cs;
   }
   var body = '';
   if (this.methodName === 'POST' && Object.keys(this.dataObj).length) {
     var parts = [];
     for (var dk in this.dataObj) parts.push(encodeURIComponent(dk) + '=' + encodeURIComponent(this.dataObj[dk]));
     body = parts.join('&');
-    args.push("-H 'Content-Type: application/x-www-form-urlencoded'");
-    args.push("--data '" + body.replace(/'/g, "'\\''") + "'");
+    headers['Content-Type'] = 'application/x-www-form-urlencoded';
   }
   var timeout = Math.max(5, Math.ceil(this.timeoutMs / 1000));
-  var cmd = 'curl -s -L --max-time ' + timeout + (this.methodName === 'POST' ? ' -X POST' : '') +
-    (args.length ? ' ' + args.join(' ') : '') + ' "' + this.url + '"';
-  var out;
-  try {
-    out = execSync(cmd, { maxBuffer: 64 * 1024 * 1024, timeout: this.timeoutMs + 10000 });
-  } catch (e) {
-    out = Buffer.from('');
-  }
-  var text = out.toString('utf-8');
-  return {
-    body: function () { return text; },
-    statusCode: 200,
-    headers: function () { return {}; },
-    cookie: function () { return ''; },
-    url: this.url,
-  };
+  var text = __nhCurlRaw(this.url, this.methodName, body || null, headers, timeout);
+  if (text === null) text = '';
+  return new __nhResponse(this.url, text, 200, {});
 };
 
 var org = {
@@ -770,52 +753,248 @@ var org = {
   },
 };
 
-// ---------------- java / cookie / cache shims ----------------
+// ---------------- java / cookie / cache / Legado globals shims ----------------
 var __nhCache = {};
 var __nhCookieJar = [];
-function __nhCurl(url, method, body, headers) {
+var __nhVars = {};
+var __nhSourceConfig = {};
+var __nhProxy = (typeof process !== 'undefined' && process.env && process.env.DSH_HTTP_PROXY) || '';
+
+function __nhCurlRaw(url, method, body, headers, timeoutSec) {
   var execSync = require('child_process').execSync;
   var args = [];
+  if (__nhProxy) {
+    args.push("-x '" + String(__nhProxy).replace(/'/g, "'\\''") + "' -k");
+  } else {
+    args.push('-k');
+  }
   if (headers) {
     for (var k in headers) {
+      if (k == null) continue;
       var hv = String(headers[k]).replace(/'/g, "'\\''");
-      args.push("-H '" + k + ': ' + hv + "'");
+      args.push("-H '" + String(k) + ': ' + hv + "'");
     }
   }
-  var cmd = 'curl -s -L --max-time 30' + (method === 'POST' ? ' -X POST' : '') +
+  var t = parseInt(timeoutSec, 10) || 30;
+  var cmd = 'curl -s -L --max-time ' + t +
+    (method === 'POST' ? ' -X POST' : '') +
     (body ? " --data '" + String(body).replace(/'/g, "'\\''") + "'" : '') +
-    (args.length ? ' ' + args.join(' ') : '') + ' "' + url + '"';
+    (args.length ? ' ' + args.join(' ') : '') + ' "' + String(url).replace(/"/g, '\\"') + '"';
   try {
-    return execSync(cmd, { maxBuffer: 64 * 1024 * 1024, timeout: 40000 }).toString('utf-8');
+    return execSync(cmd, { maxBuffer: 64 * 1024 * 1024, timeout: (t + 10) * 1000 }).toString('utf-8');
   } catch (e) {
     return null;
   }
 }
+
+function __nhResponse(url, text, status, headers) {
+  this._url = url || '';
+  this._text = text == null ? '' : text;
+  this._status = status || 200;
+  this._headers = headers || {};
+}
+__nhResponse.prototype.body = function () { return this._text; };
+__nhResponse.prototype.string = function () { return this._text; };
+__nhResponse.prototype.url = function () { return this._url; };
+__nhResponse.prototype.code = function () { return this._status; };
+__nhResponse.prototype.statusCode = function () { return this._status; };
+__nhResponse.prototype.isSuccess = function () { return this._status >= 200 && this._status < 300; };
+__nhResponse.prototype.header = function (name) {
+  if (!name) return null;
+  var lower = String(name).toLowerCase();
+  for (var k in this._headers) {
+    if (String(k).toLowerCase() === lower) return this._headers[k];
+  }
+  return null;
+};
+__nhResponse.prototype.headers = function () { return this._headers; };
+__nhResponse.prototype.json = function () { try { return JSON.parse(this._text); } catch (e) { return null; } };
+__nhResponse.prototype.cookie = function () { return ''; };
+__nhResponse.prototype.toString = function () { return this._text; };
+
+function __nhCacheGet(k) {
+  k = String(k);
+  var item = __nhCache[k];
+  if (!item) return '';
+  if (item.expires && Date.now() > item.expires) { delete __nhCache[k]; return ''; }
+  return item.value;
+}
+function __nhMd5(s) {
+  try {
+    var crypto = require('crypto');
+    return crypto.createHash('md5').update(String(s), 'utf-8').digest('hex');
+  } catch (e) { return ''; }
+}
+
 var java = {
-  get: function (url) { return __nhCurl(url, 'GET', null, null); },
-  post: function (url, body, headers) { return __nhCurl(url, 'POST', body, headers); },
-  ajax: function (opts) {
-    opts = opts || {};
-    return __nhCurl(opts.url, (opts.method || 'GET').toUpperCase(), opts.body || null, opts.headers || {});
+  // ---- HTTP: Legado java.get / java.post return a Response object ----
+  get: function (url, headers) {
+    return new __nhResponse(url, __nhCurlRaw(url, 'GET', null, headers), 200, {});
   },
-  put: function (k, v) { __nhCache[k] = String(v); return v; },
-  get: function (k) { return __nhCache[k] || ''; },
+  post: function (url, body, headers) {
+    return new __nhResponse(url, __nhCurlRaw(url, 'POST', body, headers), 200, {});
+  },
+  // ---- java.ajax: accepts "url,{json options}" (Legado) or an object ----
+  ajax: function (opts) {
+    if (typeof opts === 'string') {
+      var text = opts;
+      var url = text;
+      var option = {};
+      var m = text.match(/^(\S+?)\s*,\s*(\{.*\})\s*$/s);
+      if (m) {
+        url = m[1].trim();
+        try { option = JSON.parse(m[2]); } catch (e) { option = {}; }
+      }
+      return __nhCurlRaw(url, (option.method || 'GET').toUpperCase(),
+        option.body != null ? option.body : null, option.headers || {});
+    }
+    opts = opts || {};
+    return __nhCurlRaw(opts.url, (opts.method || 'GET').toUpperCase(),
+      opts.body != null ? opts.body : null, opts.headers || {});
+  },
+  // ---- legacy variable store (kept for compatibility) ----
+  put: function (k, v) { __nhCache[String(k)] = { value: v, expires: 0 }; return v; },
+  get: function (url, headers) { return java.httpGet(url, headers); },
+  httpGet: function (url, headers) {
+    return new __nhResponse(url, __nhCurlRaw(url, 'GET', null, headers), 200, {});
+  },
   getCookie: function () { return __nhCookieJar.join('; '); },
-  setCookie: function (c) { if (c) __nhCookieJar.push(c); },
+  setCookie: function (c) { if (c) __nhCookieJar.push(String(c)); return c; },
+  getCookies: function () { return __nhCookieJar.slice(); },
   getLoginInfo: function () { return null; },
+  getLoginInfoMap: function () { return null; },
   startBrowserAwait: function (url, msg) {
     throw new Error('startBrowserAwait: 页面需要浏览器验证/输入验证码，无法自动处理: ' + msg);
   },
-  stringToBase64: function (s) { return Buffer.from(String(s)).toString('base64'); },
+  getVerificationCode: function (url) {
+    throw new Error('getVerificationCode: 该章节需要人工输入验证码，服务器端无法自动处理: ' + url);
+  },
+  stringToBase64: function (s) { return Buffer.from(String(s), 'utf-8').toString('base64'); },
   base64ToString: function (s) { try { return Buffer.from(String(s), 'base64').toString('utf-8'); } catch (e) { return ''; } },
+  base64Encode: function (s) { return java.stringToBase64(s); },
+  base64Decode: function (s) { return java.base64ToString(s); },
+  hexDecodeToString: function (hex) {
+    try {
+      var clean = String(hex).replace(/\s+/g, '');
+      if (clean.length % 2 !== 0) clean = clean.slice(0, -1);
+      return Buffer.from(clean, 'hex').toString('utf-8');
+    } catch (e) { return ''; }
+  },
+  stringToHex: function (s) { return Buffer.from(String(s), 'utf-8').toString('hex'); },
+  md5Encode: function (s) { return __nhMd5(s); },
+  md5: function (s) { return __nhMd5(s); },
+  encodeURI: function (s) { return encodeURIComponent(String(s)); },
+  encodeURIComponent: function (s) { return encodeURIComponent(String(s)); },
+  decodeURI: function (s) { try { return decodeURIComponent(String(s)); } catch (e) { return String(s); } },
+  longToast: function (msg) { return null; },
+  toast: function (msg) { return null; },
+  log: function (msg) { return null; },
+  showDialog: function (msg) { return null; },
+  refreshTocUrl: function () { return null; },
+  random: function (min, max) {
+    if (max === undefined) { max = min; min = 0; }
+    return Math.floor(Math.random() * (max - min)) + min;
+  },
 };
-var source = java;
+
+var source = {
+  getVariable: function () { return JSON.stringify(__nhVars); },
+  put: function (k, v) { __nhVars[String(k)] = v; return v; },
+  get: function (k) { var v = __nhVars[String(k)]; return v === undefined ? '' : v; },
+  remove: function (k) { delete __nhVars[String(k)]; },
+  getLoginInfo: function () { return null; },
+  getLoginInfoMap: function () { return null; },
+  getCookie: function () { return __nhCookieJar.join('; '); },
+  setCookie: function (c) { if (c) __nhCookieJar.push(String(c)); return c; },
+};
+['bookSourceUrl', 'bookSourceName', 'bookSourceGroup', 'bookSourceType',
+ 'bookUrlPattern', 'customOrder', 'loginUrl', 'header', 'searchUrl'].forEach(function (key) {
+  Object.defineProperty(source, key, {
+    get: function () { return __nhSourceConfig[key] || ''; },
+    configurable: true,
+  });
+});
+
 var cookie = {
-  getCookie: function () { return java.getCookie(); },
-  setCookie: function (c) { java.setCookie(c); },
+  getCookie: function () { return __nhCookieJar.join('; '); },
+  setCookie: function (c) { if (c) __nhCookieJar.push(String(c)); return c; },
+  getCookies: function () { return __nhCookieJar.slice(); },
 };
+
 var cache = {
-  put: function (k, v) { java.put(k, v); return v; },
-  get: function (k) { return java.get(k); },
+  get: function (k) { return __nhCacheGet(k); },
+  put: function (k, v, ttl) {
+    var expires = 0;
+    if (ttl) { var n = parseFloat(ttl); if (n > 0) expires = Date.now() + n * 1000; }
+    __nhCache[String(k)] = { value: v, expires: expires };
+    return v;
+  },
+  delete: function (k) { delete __nhCache[String(k)]; return true; },
+  deleteMemory: function (k) { delete __nhCache[String(k)]; return true; },
+  remove: function (k) { delete __nhCache[String(k)]; return true; },
+  contains: function (k) { return __nhCacheGet(k) !== ''; },
+  getMemory: function (k) { return __nhCacheGet(k); },
+  putMemory: function (k, v) { return cache.put(k, v); },
+  getLongMemory: function (k) { return __nhCacheGet(k); },
+  putLongMemory: function (k, v) { return cache.put(k, v); },
 };
-function Url() { return typeof baseUrl !== 'undefined' ? baseUrl : ''; }
+
+// ---- Legado globals ----
+function Get(key) {
+  key = String(key);
+  if (key in __nhVars && __nhVars[key] !== undefined) return __nhVars[key];
+  return '';
+}
+function Put(key, value) { __nhVars[String(key)] = value; return value; }
+function Set(key, value) { return Put(key, value); }
+function sleep(ms) {
+  ms = parseInt(ms, 10) || 0;
+  if (ms <= 0) return;
+  try {
+    var sab = new SharedArrayBuffer(4);
+    var ia = new Int32Array(sab);
+    Atomics.wait(ia, 0, 0, ms);
+  } catch (e) {
+    var end = Date.now() + ms;
+    while (Date.now() < end) { /* busy wait */ }
+  }
+}
+function Rate() { return 800; }
+function Reload(url) {
+  var headers = {
+    'User-Agent': 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+  };
+  if (__nhSourceConfig.bookSourceUrl) headers['Referer'] = __nhSourceConfig.bookSourceUrl;
+  var text = __nhCurlRaw(url, 'GET', null, headers, 40);
+  return text == null ? '' : text;
+}
+function Url() {
+  return (typeof baseUrl !== 'undefined' && baseUrl) ? baseUrl : (__nhVars.baseUrl || '');
+}
+
+function __nhSetSourceConfig(cfg) {
+  if (!cfg) return;
+  for (var k in cfg) { if (cfg[k] !== undefined) __nhSourceConfig[k] = cfg[k]; }
+}
+function __nhSetVars(vars) {
+  if (!vars) return;
+  for (var k in vars) { if (vars[k] !== undefined) __nhVars[k] = vars[k]; }
+}
+
+if (typeof globalThis !== 'undefined') {
+  globalThis.__nhVars = __nhVars;
+  globalThis.__nhSetSourceConfig = __nhSetSourceConfig;
+  globalThis.__nhSetVars = __nhSetVars;
+  globalThis.__nhSourceConfig = __nhSourceConfig;
+  globalThis.java = java;
+  globalThis.source = source;
+  globalThis.cookie = cookie;
+  globalThis.cache = cache;
+  globalThis.Get = Get;
+  globalThis.Put = Put;
+  globalThis.Set = Set;
+  globalThis.Reload = Reload;
+  globalThis.sleep = sleep;
+  globalThis.Rate = Rate;
+  globalThis.Url = Url;
+}
