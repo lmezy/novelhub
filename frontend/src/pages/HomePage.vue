@@ -5,6 +5,7 @@ import { useBooksStore, type Book, type ShelfGroup } from "../stores/books"
 import { useAuthStore } from "../stores/auth"
 import { useI18nStore } from "../stores/i18n"
 import { api } from "../api/client"
+import BookCard from "../components/BookCard.vue"
 import NavBar from "../components/NavBar.vue"
 
 const store = useBooksStore()
@@ -33,8 +34,13 @@ const inviteCopiedId = ref<string | null>(null)
 const invites = ref<any[]>([])
 const inviteCreating = ref(false)
 const inviteError = ref("")
+interface SourceItem { id: string; name: string }
+interface SourceSection { source: SourceItem; total: number; books: Book[] }
+const sources = ref<SourceItem[]>([])
+const homeSources = ref<SourceSection[]>([])
+const homeSourcesLoading = ref(false)
 
-function searchByField(field: "author" | "tags", value: string) {
+function searchByField(field: "author" | "tags" | "category", value: string) {
   router.push({ path: "/search", query: { field, q: value } })
 }
 
@@ -45,8 +51,13 @@ const allSelected = computed(() =>
   selectedIds.value.length === favoriteBooks.value.length
 )
 
+
 const groupNameMap = computed(() =>
   Object.fromEntries(groups.value.map((g) => [g.id, g.name]))
+)
+
+const sourceNameMap = computed<Record<string, string>>(() =>
+  Object.fromEntries(sources.value.map((s) => [s.id, s.name]))
 )
 
 async function copyText(text: string): Promise<boolean> {
@@ -122,6 +133,40 @@ async function loadGroups() {
     groups.value = await api.get<ShelfGroup[]>("/bookshelf/groups")
   } catch {
     groups.value = []
+  }
+}
+
+async function loadHomeSources() {
+  try {
+    sources.value = await api.get<any[]>("/sources").then((rows) =>
+      rows.map((s: any) => ({ id: s.id, name: s.name || s.id }))
+    )
+  } catch {
+    sources.value = []
+    homeSources.value = []
+    return
+  }
+  if (!sources.value.length) {
+    homeSources.value = []
+    return
+  }
+  homeSourcesLoading.value = true
+  try {
+    const results = await Promise.all(
+      sources.value.map(async (source) => {
+        try {
+          const res = await api.get<{ items: Book[]; total: number }>(
+            "/books/browse?source_id=" + encodeURIComponent(source.id) + "&limit=6"
+          )
+          return { source, total: res.total, books: res.items }
+        } catch {
+          return { source, total: 0, books: [] }
+        }
+      })
+    )
+    homeSources.value = results.filter((r) => r.total > 0)
+  } finally {
+    homeSourcesLoading.value = false
   }
 }
 
@@ -308,6 +353,7 @@ async function toggleSelfVisibility(key: "r18_enabled" | "non_r18_enabled") {
 onMounted(async () => {
   await loadGroups()
   await loadFavorites()
+  await loadHomeSources()
   if (auth.user) {
     await loadInvites()
     try {
@@ -598,6 +644,40 @@ onMounted(async () => {
               </div>
             </div>
             <button @click="managingGroups = false" class="mt-4 px-3 py-1.5 rounded border border-border dark:border-gray-700 text-xs">{{ i18n.t('home_close') }}</button>
+          </div>
+        </div>
+      </section>
+
+      <section v-if="homeSources.length" class="mt-10 border-t border-border pt-6 dark:border-gray-800">
+        <div class="flex items-center justify-between mb-6">
+          <div>
+            <h2 class="text-lg font-semibold">{{ i18n.t('home_by_source') }}</h2>
+            <p class="mt-1 text-xs text-muted dark:text-gray-400">{{ i18n.t('home_source_all') }}</p>
+          </div>
+          <button
+            @click="router.push('/books')"
+            class="text-xs text-accent hover:underline"
+          >{{ i18n.t('books_view_all') }} ›</button>
+        </div>
+        <p v-if="homeSourcesLoading" class="text-sm text-muted dark:text-gray-400">{{ i18n.t('home_loading') }}</p>
+        <div v-for="section in homeSources" :key="section.source.id" class="mb-8">
+          <div class="mb-3 flex items-center justify-between">
+            <h3 class="text-sm font-semibold text-muted dark:text-gray-400">{{ section.source.name }}</h3>
+            <button
+              @click="router.push({ path: '/books', query: { source: section.source.id } })"
+              class="text-xs text-accent hover:underline"
+            >{{ i18n.t('books_view_all_source') }} ({{ section.total }}) ›</button>
+          </div>
+          <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+            <BookCard
+              v-for="book in section.books"
+              :key="book.id"
+              :book="book"
+              :show-cover="showCovers"
+              :source-name="book.source_id ? sourceNameMap[book.source_id] : ''"
+              @favorite="toggleFavorite"
+              @search="searchByField"
+            />
           </div>
         </div>
       </section>

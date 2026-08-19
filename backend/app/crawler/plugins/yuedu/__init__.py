@@ -1,4 +1,4 @@
-﻿"""YueDu book source plugin -- interprets YueDu (Legado) source JSON to crawl novels.
+"""YueDu book source plugin -- interprets YueDu (Legado) source JSON to crawl novels.
 
 Each instance is configured with a single YueDu book source JSON. The plugin
 translates YueDu's rule-based definitions (JSONPath, CSS selectors, URL templates)
@@ -274,6 +274,21 @@ STRONG_BLOCK_MARKERS = (
     "访问频率过高",
     "请求频率过高",
     "请稍后再试",
+    # GoEdge WAF captcha gate (used by boluomao.com etc.)
+    "goedge_waf",
+    "goedge-waf",
+    "请输入上面的验证码",
+    "身份验证",
+    # Generic WAF / challenge gates
+    "waf_captcha",
+    "captcha-gate",
+    "verify/captcha",
+    "安全网关",
+    "访问被拒绝",
+    "已被限制",
+    "被限制访问",
+    "ip 已被限制",
+    "ip已被限制",
 )
 
 # Weak markers need a confirmation phrase to avoid false positives on
@@ -293,6 +308,17 @@ class YueduPlugin:
     _clients: dict[str | None, httpx.AsyncClient] = {}
     _rate_locks: dict[str, asyncio.Lock] = {}
     _rate_state: dict[str, dict[str, float | int]] = {}
+    # DoH (DNS over HTTPS) cache for bypassing polluted system DNS.
+    # {host: {"ip": ip, "expires": epoch_seconds}}
+    _doh_cache: dict[str, dict[str, float | str]] = {}
+    _doh_lock = asyncio.Lock()
+    _doh_providers = (
+        # Tencent public DNS works from CN networks; try it first.
+        "https://doh.pub/dns-query",
+        "https://cloudflare-dns.com/dns-query",
+        "https://dns.google/resolve",
+    )
+    _doh_ttl = 300
 
     def __init__(self, source_config: dict[str, Any] | None = None):
         self.config = self._normalize_source_config(source_config)
@@ -1977,9 +2003,23 @@ class YueduPlugin:
             result = self.engine._try_eval_js(
                 code, None, extra_context={"page": "1"},
             )
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "exploreUrl JS evaluation failed for %s: %s",
+                self.config.get("bookSourceName", self.config.get("bookSourceUrl", "?")),
+                exc,
+            )
             return []
         if result is None:
+            # A Legado JS exploreUrl that needs the full Android runtime
+            # (window/document/jsoup/remote obfuscated scripts) evaluates to
+            # nothing here. Surface that instead of silently returning an
+            # empty discovery result.
+            logger.warning(
+                "exploreUrl JS for %s produced no result; the source may "
+                "require the full Legado JS runtime (remote <js>/@js: rules)",
+                self.config.get("bookSourceName", self.config.get("bookSourceUrl", "?")),
+            )
             return []
         if isinstance(result, str):
             result = result.strip()
@@ -2044,6 +2084,8 @@ class YueduPlugin:
         kinds = self.get_explore_kinds()
         if kinds:
             results = []
+            blocked_errors: list[str] = []
+            js_errors: list[str] = []
             for kind in kinds:
                 kind_url = str(kind.get("url", "")).strip()
                 if not kind_url:
@@ -2062,10 +2104,38 @@ class YueduPlugin:
                         options=options,
                     ))
                 except Exception as exc:
+                    message = str(exc)
+                    if (
+                        "anti-bot" in message.lower()
+                        or "captcha" in message.lower()
+                        or "验证码" in message
+                        or "身份验证" in message
+                    ):
+                        blocked_errors.append(message)
                     logger.warning(
                         f"Explore kind failed: {kind.get('title', kind_url)} ({exc})"
                     )
+            if not results and blocked_errors:
+                # Every discover category was gated by an anti-bot / captcha
+                # page. Surface the first one so crawl tasks show a real
+                # error instead of a misleading "0 books found".
+                raise RuntimeError(blocked_errors[0])
             return results
+
+        explore_url_rule = str(self.config.get("exploreUrl", "") or "").strip()
+        if (
+            explore_url_rule
+            and (explore_url_rule.startswith("<js") or explore_url_rule.startswith("@js:"))
+        ):
+            # A JS exploreUrl that produced no kinds: either the script needs
+            # the full Legado Android runtime, or it failed to evaluate.
+            # Report it so the user is not left wondering why 0 books were
+            # discovered.
+            raise RuntimeError(
+                "该书源的发现规则是 Legado JS 脚本（<js>/@js:），当前环境无法执行；"
+                "请在 Legado 中搜索书籍后通过书源搜索/手动链接同步，"
+                f"或更换该网站的其他书源。source={self.display_name}"
+            )
 
         explore_url = self.engine.build_explore_url(page=page)
         if not explore_url:
@@ -2686,6 +2756,97 @@ class YueduPlugin:
         fallback.setdefault("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
         return fallback
 
+    @staticmethod
+    def _looks_polluted(host: str) -> bool:
+        """Whether the system-resolved address for host is a loopback/placeholder.
+
+        Chinese sites blocked by the GFW frequently resolve to 127.0.0.1 or
+        0.0.0.0 (DNS poisoning). Treating those as unreachable triggers the
+        DoH fallback in _get.
+        """
+        try:
+            import socket
+            for info in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM):
+                ip = info[4][0]
+                if ip in ("127.0.0.1", "0.0.0.0", "::1"):
+                    return True
+                if ip.startswith("127."):
+                    return True
+            return False
+        except Exception:
+            return False
+
+    async def _resolve_via_doh(self, host: str) -> str | None:
+        """Resolve a host through public DoH providers, with in-process cache.
+
+        Returns the first A record found, or None when every provider fails.
+        """
+        async with self.__class__._doh_lock:
+            cached = self.__class__._doh_cache.get(host)
+            now = time.time()
+            if cached and float(cached.get("expires", 0)) > now:
+                return str(cached.get("ip") or "")
+
+        import httpx as _httpx
+
+        last_error: Exception | None = None
+        for provider in self.__class__._doh_providers:
+            try:
+                params = {"name": host, "type": "A"}
+                headers = {"accept": "application/dns-json"}
+                async with _httpx.AsyncClient(
+                    timeout=_httpx.Timeout(8.0),
+                    verify=False,
+                    trust_env=False,
+                ) as client:
+                    resp = await client.get(provider, params=params, headers=headers)
+                    if resp.status_code != 200:
+                        continue
+                    payload = resp.json()
+                    answers = payload.get("Answer") or []
+                    for answer in answers:
+                        data = str(answer.get("data", ""))
+                        if data and data not in ("127.0.0.1", "0.0.0.0", "::1"):
+                            async with self.__class__._doh_lock:
+                                self.__class__._doh_cache[host] = {
+                                    "ip": data,
+                                    "expires": now + self.__class__._doh_ttl,
+                                }
+                            logger.info(
+                                "DoH %s resolved %s -> %s",
+                                provider,
+                                host,
+                                data,
+                            )
+                            return data
+            except Exception as exc:
+                last_error = exc
+                continue
+        if last_error is not None:
+            logger.warning("DoH resolution failed for %s: %s", host, last_error)
+        return None
+
+    def _doh_rewrite(self, url: str) -> tuple[str, str] | None:
+        """Rewrite a URL to its DoH-resolved IP, keeping the original host.
+
+        Returns (rewritten_url, original_host) or None when no cached IP
+        exists (callers resolve via _resolve_via_doh first).
+        """
+        parts = urlparse(url)
+        cached = self.__class__._doh_cache.get(parts.hostname or "")
+        if not cached:
+            return None
+        ip = str(cached.get("ip") or "")
+        if not ip:
+            return None
+        port = ":" + str(parts.port) if parts.port else ""
+        rewritten = parts.scheme + "://" + ip + port + (parts.path or "")
+        if parts.query:
+            rewritten += "?" + parts.query
+        if parts.fragment:
+            rewritten += "#" + parts.fragment
+        return rewritten, parts.hostname or ""
+
     def _parse_concurrent_rate(self) -> tuple[str, int, int] | None:
         """Parse Legado concurrentRate: "interval" or "count/window"."""
         rate = str(self.config.get("concurrentRate", "") or "").strip()
@@ -2881,7 +3042,9 @@ class YueduPlugin:
                             await asyncio.sleep(1.0 + random.uniform(0.5, 1.5))
                             continue
                         raise RuntimeError(
-                            f"Site returned an anti-bot/captcha page: {url}"
+                            "Site returned an anti-bot/captcha page (网站要求验证码/人机验证，"
+                            "请在浏览器中访问该网站通过验证后，把 Cookie 导入书源再同步): "
+                            + url
                         )
                     return resp.text
                 except httpx.HTTPError as exc:
@@ -2971,10 +3134,18 @@ class YueduPlugin:
         async def _request(proxy: str | None) -> str:
             nonlocal headers
             last_error: httpx.HTTPError | None = None
+            # Set when a polluted system DNS forced a DoH-resolved IP rewrite.
+            doh_target: tuple[str, str] | None = None
             for attempt in range(3):
                 try:
                     client = await self._get_http_client(proxy)
-                    resp = await client.get(url, headers=headers)
+                    req_url = url
+                    req_headers = headers
+                    if doh_target is not None:
+                        req_url, original_host = doh_target
+                        req_headers = dict(headers)
+                        req_headers["Host"] = original_host
+                    resp = await client.get(req_url, headers=req_headers)
                     if resp.status_code == 403 and attempt == 0:
                         headers = self._with_403_fallback(headers)
                         await asyncio.sleep(1.0 + random.uniform(0.5, 1.0))
@@ -2996,9 +3167,43 @@ class YueduPlugin:
                             await asyncio.sleep(1.0 + random.uniform(0.5, 1.5))
                             continue
                         raise RuntimeError(
-                            f"Site returned an anti-bot/captcha page: {url}"
+                            "Site returned an anti-bot/captcha page (网站要求验证码/人机验证，"
+                            "请在浏览器中访问该网站通过验证后，把 Cookie 导入书源再同步): "
+                            + url
                         )
                     return resp.text
+                except httpx.ConnectError as exc:
+                    # DNS pollution bypass: when the direct connect fails and
+                    # the system resolver is poisoned (or the site is simply
+                    # unreachable by name), resolve via DoH and retry with the
+                    # real IP plus an explicit Host header. Only used without
+                    # a proxy, since a proxy resolves the name itself.
+                    if (
+                        proxy is None
+                        and doh_target is None
+                        and isinstance(exc, httpx.ConnectError)
+                    ):
+                        hostname = urlparse(url).hostname or ""
+                        needs_doh = bool(hostname) and (
+                            self._looks_polluted(hostname)
+                            or "Name or service not known" in str(exc)
+                            or "getaddrinfo failed" in str(exc)
+                            or "Temporary failure in name resolution" in str(exc)
+                        )
+                        if needs_doh:
+                            ip = await self._resolve_via_doh(hostname)
+                            rewritten = self._doh_rewrite(url) if ip else None
+                            if rewritten:
+                                doh_target = rewritten
+                                logger.warning(
+                                    "DNS pollution detected for %s; retrying via %s",
+                                    hostname,
+                                    rewritten[0],
+                                )
+                                continue
+                    last_error = exc
+                    if attempt < 2:
+                        await asyncio.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
                 except httpx.HTTPError as exc:
                     last_error = exc
                     if attempt < 2:

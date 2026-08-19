@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 import json
+import time
 from bs4 import BeautifulSoup
 
 from app.crawler.plugins.yuedu import YueduPlugin
@@ -1697,3 +1698,122 @@ def test_js_runtime_shim_supports_legado_apis():
         assert r == '[{"title":"A","url":"/a/"}]'
     finally:
         JsRuntime.reset_instance()
+
+
+# ---------- DNS pollution bypass & anti-bot page detection ----------
+
+GOEDGE_CAPTCHA_HTML = """
+<!DOCTYPE html><html><head><title>身份验证</title></head><body>
+<form method="POST" id="captcha-form">
+<input type="hidden" name="GOEDGE_WAF_CAPTCHA_ID" value="dd27afc513cc36d5"/>
+<div class="ui-image"><img id="ui-captcha-image" src="/WAF/VERIFY/CAPTCHA?info=xxx"/></div>
+<p class="ui-prompt">请输入上面的验证码</p>
+<input type="text" name="GOEDGE_WAF_CAPTCHA_CODE" id="GOEDGE_WAF_CAPTCHA_CODE"/>
+</form><address>请求ID: 123456</address></body></html>
+"""
+
+
+def test_is_blocked_page_detects_goedge_waf_captcha():
+    assert YueduPlugin._is_blocked_page(GOEDGE_CAPTCHA_HTML) is True
+
+
+def test_is_blocked_page_detects_generic_identity_verification():
+    html = "<html><head><title>身份验证</title></head><body>请输入上面的验证码</body></html>"
+    assert YueduPlugin._is_blocked_page(html) is True
+
+
+def test_is_blocked_page_does_not_flag_normal_page():
+    html = "<html><head><title>乱伦小说</title></head><body><div class='list'>book</div></body></html>"
+    assert YueduPlugin._is_blocked_page(html) is False
+
+
+def test_looks_polluted_detects_loopback_resolution():
+    # 127.0.0.1 / ::1 / 0.0.0.0 are the classic GFW poisoning answers.
+    assert YueduPlugin._looks_polluted("localhost") is True
+    assert YueduPlugin._looks_polluted("127.0.0.1") is True
+
+
+def test_doh_rewrite_uses_cached_ip():
+    plugin = YueduPlugin({"bookSourceUrl": "https://www.alicesw.com"})
+    plugin.__class__._doh_cache["www.alicesw.com"] = {
+        "ip": "38.46.217.34",
+        "expires": time.time() + 100,
+    }
+    rewritten = plugin._doh_rewrite("https://www.alicesw.com/lists/65.html")
+    assert rewritten == (
+        "https://38.46.217.34/lists/65.html",
+        "www.alicesw.com",
+    )
+
+
+def test_doh_rewrite_returns_none_without_cache():
+    plugin = YueduPlugin({"bookSourceUrl": "https://www.example.com"})
+    assert plugin._doh_rewrite("https://www.example.com/a.html") is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_via_doh_caches_and_skips_poisoned_answers():
+    plugin = YueduPlugin({"bookSourceUrl": "https://www.example.com"})
+    plugin.__class__._doh_cache.pop("www.example.com", None)
+
+    calls = {"n": 0}
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self._closed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            self._closed = True
+
+        async def get(self, url, params=None, headers=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # First provider returns only poisoned answers.
+                return FakeResponse({"Answer": [{"data": "127.0.0.1"}]})
+            return FakeResponse({"Answer": [{"data": "93.184.216.34"}]})
+
+    with patch("httpx.AsyncClient", FakeClient):
+        ip = await plugin._resolve_via_doh("www.example.com")
+    assert ip == "93.184.216.34"
+    assert calls["n"] == 2
+    # Second call hits the cache.
+    with patch("httpx.AsyncClient", FakeClient):
+        ip2 = await plugin._resolve_via_doh("www.example.com")
+    assert ip2 == "93.184.216.34"
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_fetch_explore_propagates_blocked_kind_error():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.boluomao.com",
+        "exploreUrl": "男生::/gender/boy/page/{{page}}/",
+    })
+
+    async def fake_get(url):
+        raise RuntimeError("Site returned an anti-bot/captcha page: " + url)
+
+    with patch.object(plugin, "_get", fake_get):
+        with pytest.raises(RuntimeError, match="anti-bot"):
+            await plugin.fetch_explore(page=1)
+
+
+@pytest.mark.asyncio
+async def test_fetch_explore_reports_js_explore_url_without_kinds():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "UAA小说xh",
+        "exploreUrl": "<js>\neval(String(Reload('https://qyyuapi.com/qt/js/UAA小说/exploreUrl.js')));\n</js>",
+    })
+    with pytest.raises(RuntimeError, match="Legado"):
+        await plugin.fetch_explore(page=1)
