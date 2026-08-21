@@ -1494,6 +1494,32 @@ async def test_fetch_chapter_content_keeps_real_content_with_counters():
     assert "\n0" not in content
     assert "\n12" not in content
 
+@pytest.mark.asyncio
+async def test_concurrent_chapters_keep_independent_page_context():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "ruleContent": {"content": "@js:baseUrl"},
+    })
+    first_url = "https://example.com/book/1/first.html"
+    second_url = "https://example.com/book/1/second.html"
+
+    async def fake_get(url):
+        # Force the first request to resume after the second request has
+        # already entered the parser, reproducing the shared-engine race.
+        if url == first_url:
+            await asyncio.sleep(0.02)
+        return "<html><body>chapter</body></html>"
+
+    plugin._get = fake_get
+    first, second = await asyncio.gather(
+        plugin.fetch_chapter_content(SimpleNamespace(url=first_url, title="一")),
+        plugin.fetch_chapter_content(SimpleNamespace(url=second_url, title="二")),
+    )
+
+    assert first == first_url
+    assert second == second_url
+
+
 # ---- JS-based explore / search URL support ----
 
 def test_get_explore_kinds_evaluates_js_explore_url():

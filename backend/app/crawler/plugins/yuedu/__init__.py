@@ -1312,16 +1312,18 @@ class YueduPlugin:
         if not self.engine:
             raise RuntimeError("YueduPlugin not configured")
 
-        # Content rules such as @js:baseUrl must see the actual chapter page.
-        # fetch_book leaves the engine scoped to the TOC URL, so update it here
-        # before evaluating the chapter rule and before following next pages.
-        self.engine.set_page_url(chapter.url)
-        web_js = self.engine.get_web_js()
+        # A plugin can fetch several chapters concurrently. The shared engine
+        # stores page-scoped variables (baseUrl/bookUrl), so sharing it here
+        # lets one in-flight request overwrite another chapter's context.
+        # Use a private engine for the complete parse of this chapter.
+        chapter_engine = YueduRuleEngine(self.config)
+        chapter_engine.set_page_url(chapter.url)
+        web_js = chapter_engine.get_web_js()
         if web_js:
             html = await self._get_with_web_js(chapter.url, web_js)
         else:
             html = await self._get(chapter.url)
-        self.engine.set_chapter_context({
+        chapter_engine.set_chapter_context({
             "title": str(getattr(chapter, "title", "") or ""),
             "url": chapter.url,
             "tag": str(getattr(chapter, "tags", "") or ""),
@@ -1331,7 +1333,7 @@ class YueduPlugin:
             content = generic_content
         else:
             try:
-                content = self.engine.parse_content(html)
+                content = chapter_engine.parse_content(html)
             except Exception:
                 content = ""
             if not content or self._looks_like_rule_diagnostic(content, html):
@@ -1345,11 +1347,13 @@ class YueduPlugin:
 
         async def _fetch_content_page(page_url: str) -> str:
             async with content_semaphore:
+                if web_js:
+                    return await self._get_with_web_js(page_url, web_js)
                 return await self._get(page_url)
 
         pending_content_urls = [
             url
-            for url in self.engine.get_next_content_urls(html, chapter.url)
+            for url in chapter_engine.get_next_content_urls(html, chapter.url)
             if url not in seen_content_urls
         ]
         seen_content_urls.update(pending_content_urls)
@@ -1373,12 +1377,12 @@ class YueduPlugin:
             for next_url, next_html in zip(batch, htmls):
                 if pages_fetched >= max_pages:
                     break
-                self.engine.set_page_url(next_url)
+                chapter_engine.set_page_url(next_url)
                 if self._uses_android_js_rule("ruleContent", "content"):
                     next_part = self._parse_chapter_content_generic(next_html)
                 else:
                     try:
-                        next_part = self.engine.parse_content(next_html)
+                        next_part = chapter_engine.parse_content(next_html)
                     except Exception:
                         next_part = ""
                     if not next_part or self._looks_like_rule_diagnostic(next_part, next_html):
@@ -1388,7 +1392,7 @@ class YueduPlugin:
                 pages_fetched += 1
                 pending_content_urls.extend(
                     url
-                    for url in self.engine.get_next_content_urls(next_html, next_url)
+                    for url in chapter_engine.get_next_content_urls(next_html, next_url)
                     if url not in seen_content_urls
                 )
             seen_content_urls.update(pending_content_urls)
@@ -1411,7 +1415,7 @@ class YueduPlugin:
             )
         replace_rules = (self.config.get("ruleContent") or {}).get("replaceRegex", [])
         if replace_rules:
-            content = self.engine._apply_replace_regex(content, replace_rules).strip()
+            content = chapter_engine._apply_replace_regex(content, replace_rules).strip()
         if not content:
             raise RuntimeError(
                 f"Chapter returned empty content: {chapter.url}"
@@ -2664,17 +2668,19 @@ class YueduPlugin:
 
                     await page.goto(url, wait_until="networkidle", timeout=30000)
 
-                    # Execute the webJs and get the page content
-                    # webJs typically modifies the DOM; we capture innerHTML after execution
+                    # Legado webJs may mutate the DOM or return the rendered
+                    # HTML directly. Preserve both forms instead of discarding
+                    # the script result.
                     try:
-                        await page.evaluate(
-                            f"(function(){{ var result=document.documentElement.outerHTML; {web_js}; }})()"
+                        html = await page.evaluate(
+                            f"(function(){{ var result=document.documentElement.outerHTML; "
+                            f"var value=(function(){{ {web_js} }})(); "
+                            f"return (typeof value === 'string' && value.trim()) "
+                            f"? value : document.documentElement.outerHTML; }})()"
                         )
                     except Exception as e:
                         logger.warning(f"webJs execution error: {e}")
-
-                    # Get the full page HTML after JS execution
-                    html = await page.content()
+                        html = await page.content()
 
                     await context.close()
                     return html

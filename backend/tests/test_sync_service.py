@@ -820,6 +820,21 @@ async def test_chapter_has_real_content_rejects_anti_bot_text():
 
 
 @pytest.mark.asyncio
+async def test_chapter_without_storage_path_is_not_healthy():
+    service = SyncService(AsyncMock())
+    chapter = Chapter(
+        id="c-empty",
+        book_id="book-1",
+        chapter_number=1,
+        source_chapter_id="https://example.com/book/1/a.html",
+        title="第一章",
+        content_path=None,
+    )
+
+    assert service._chapter_has_real_content(chapter) is False
+
+
+@pytest.mark.asyncio
 async def test_ensure_book_row_restores_missing_book():
     db = AsyncMock()
     db.scalar = AsyncMock(return_value=None)

@@ -1050,10 +1050,10 @@ class SyncService:
     def _chapter_has_real_content(self, chapter: Chapter) -> bool:
         """Return False for empty or anti-bot/captcha junk chapters so a
         re-sync refetches them."""
-        # Legacy ORM rows in migrations/tests may not have storage metadata.
-        # Keep those rows eligible for normal source-id reconciliation.
+        # A missing storage path means the historical chapter has no usable
+        # body. Treat it as stale so the next sync can fetch it again.
         if not chapter.content_path:
-            return True
+            return False
         try:
             content = self.storage.read_chapter(chapter.content_path)
         except Exception:
