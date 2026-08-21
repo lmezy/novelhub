@@ -1451,18 +1451,7 @@ class SyncService:
             plugin.set_cookie(safe_decrypt_cookie(cookie_record.cookie_data))
 
         if not hasattr(plugin, "discover_books"):
-            return {
-                "source_id": source_id,
-                "pages_checked": 0,
-                "books_found": 0,
-                "books_synced": 0,
-                "books_failed": 0,
-                "books_filtered": 0,
-                "chapters_created": 0,
-                "chapters_skipped": 0,
-                "chapters_failed": 0,
-                "details": [],
-            }
+            raise ValueError("当前书源不支持发现书籍，无法执行全站同步。")
 
         seen: set[str] = set()
         details: list[dict] = []
@@ -1675,6 +1664,15 @@ class SyncService:
 
         if before_step is not None:
             await before_step()
+
+        # A first-page empty result must remain visible as a failed task.
+        if pages_checked == 0 and books_found == 0 and done:
+            config = source.config if isinstance(source.config, dict) else {}
+            if any("<js>" in str(config.get(key) or "") for key in ("ruleExplore", "exploreUrl", "searchUrl")):
+                raise ValueError(
+                    "该书源的发现规则依赖 Legado JS，当前环境未能执行；请更换书源或导入可执行的规则。"
+                )
+            raise ValueError("书源未返回可同步的书籍，请检查书源规则、Cookie 或站点验证状态。")
 
         return {
             "source_id": source_id,

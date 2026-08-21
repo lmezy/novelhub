@@ -38,6 +38,7 @@ class AdvancedSearchRequest(BaseModel):
     match: Literal["and", "or"] = "and"
     scope: Literal["all", "books", "chapters"] = "all"
     tag: str | None = None
+    source_id: str | None = None
     offset: int = Field(default=0, ge=0)
     limit: int = Field(default=20, ge=1, le=100)
 
@@ -136,6 +137,7 @@ async def advanced_search(
         match=payload.match,
         scope=payload.scope,
         tag=payload.tag,
+        source_id=payload.source_id,
         offset=payload.offset,
         limit=payload.limit,
         allow_r18=allow_r18,

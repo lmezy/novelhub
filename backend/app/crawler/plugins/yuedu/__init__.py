@@ -1372,7 +1372,12 @@ class YueduPlugin:
                 if self._uses_android_js_rule("ruleContent", "content"):
                     next_part = self._parse_chapter_content_generic(next_html)
                 else:
-                    next_part = self.engine.parse_content(next_html)
+                    try:
+                        next_part = self.engine.parse_content(next_html)
+                    except Exception:
+                        next_part = ""
+                    if not next_part or self._looks_like_rule_diagnostic(next_part, next_html):
+                        next_part = self._parse_chapter_content_generic(next_html)
                 if next_part and next_part != next_html:
                     parts.append(next_part)
                 pages_fetched += 1
@@ -1483,6 +1488,15 @@ class YueduPlugin:
             ".read-content",
             ".reader-content",
             ".article",
+            "main",
+            ".post-content",
+            ".entry-content",
+            ".article-content",
+            ".read-main",
+            "#read-content",
+            ".book-content",
+            ".text-content",
+            ".novel-content",
         )
         for selector in content_selectors:
             el = soup.select_one(selector)

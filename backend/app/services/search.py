@@ -141,6 +141,7 @@ class SearchService:
         allow_r18: bool,
         allow_all_ages: bool,
         tag: str | None,
+        source_id: str | None = None,
     ) -> str | None:
         parts = []
         r18_filter = self._visibility_filter(allow_r18, allow_all_ages)
@@ -149,6 +150,9 @@ class SearchService:
         tag_part = self._tag_filter(tag)
         if tag_part:
             parts.append(tag_part)
+        if source_id:
+            safe_source = source_id.replace("\\", "\\\\").replace('"', '\\"')
+            parts.append(f'source_id = "{safe_source}"')
         return " AND ".join(parts) if parts else None
 
     def search_books(
@@ -160,6 +164,7 @@ class SearchService:
         allow_r18: bool = True,
         allow_all_ages: bool = True,
         tag: str | None = None,
+        source_id: str | None = None,
     ) -> dict:
         self._ensure_index(self.INDEX_BOOKS)
         self._ensure_index(self.INDEX_CHAPTERS)
@@ -174,7 +179,7 @@ class SearchService:
                 "category_names",
             ],
         }
-        filters = self._combined_filter(allow_r18, allow_all_ages, tag)
+        filters = self._combined_filter(allow_r18, allow_all_ages, tag, source_id)
         if filters:
             options["filter"] = filters
         try:
@@ -192,6 +197,7 @@ class SearchService:
         allow_r18: bool = True,
         allow_all_ages: bool = True,
         tag: str | None = None,
+        source_id: str | None = None,
     ) -> dict:
         self._ensure_index(self.INDEX_BOOKS)
         self._ensure_index(self.INDEX_CHAPTERS)
@@ -208,7 +214,7 @@ class SearchService:
                 "category_names",
             ],
         }
-        filters = self._combined_filter(allow_r18, allow_all_ages, tag)
+        filters = self._combined_filter(allow_r18, allow_all_ages, tag, source_id)
         if filters:
             options["filter"] = filters
         try:

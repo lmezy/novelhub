@@ -172,7 +172,11 @@ async def run_crawl_task_async(task_id: str) -> dict:
                     "task_id": task_id,
                     "next_page": result.get("next_page", start_page),
                 }
-            task_obj.status = "completed"
+            task_obj.status = (
+                "completed_with_errors"
+                if result.get("books_failed", 0) or result.get("chapters_failed", 0)
+                else "completed"
+            )
             task_obj.result = result
             task_obj.progress = {
                 "pages_checked": result.get("pages_checked", 0),

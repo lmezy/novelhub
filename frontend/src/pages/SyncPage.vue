@@ -335,7 +335,7 @@ onMounted(async () => {
             <h2 class="text-sm font-semibold">{{ i18n.t('sync_selected_task') }}</h2>
             <p class="text-xs text-muted dark:text-gray-400 mt-1">{{ sourceName(activeTask) }} ({{ activeTask.id }})</p>
           </div>
-          <span class="text-xs px-2 py-1 rounded-full" :class="activeTask.status === 'running' ? 'bg-blue-100 text-blue-700' : activeTask.status === 'paused' ? 'bg-amber-100 text-amber-700' : 'bg-gray-100 text-gray-600'">{{ statusText(activeTask.status) }}</span>
+          <span class="text-xs px-2 py-1 rounded-full" :class="activeTask.status === 'running' ? 'bg-blue-100 text-blue-700' : activeTask.status === 'paused' ? 'bg-amber-100 text-amber-700' : activeTask.status === 'completed_with_errors' ? 'bg-amber-100 text-amber-700' : activeTask.status === 'failed' ? 'bg-red-100 text-red-700' : 'bg-gray-100 text-gray-600'">{{ statusText(activeTask.status) }}</span>
         </div>
         <div class="h-2 rounded bg-gray-200 dark:bg-gray-700 overflow-hidden mb-2">
           <div class="h-full bg-accent transition-all" :style="{ width: activeProgress + '%' }"></div>
@@ -394,7 +394,7 @@ onMounted(async () => {
             <div class="flex items-center justify-between mb-1 gap-2">
               <span class="text-sm font-medium">{{ sourceName(task) }}</span>
               <div class="flex items-center gap-2 shrink-0">
-                <span class="text-xs px-2 py-0.5 rounded-full" :class="task.status === 'completed' ? 'bg-green-100 text-green-700' : task.status === 'failed' || task.status === 'cancelled' ? 'bg-red-100 text-red-700' : 'bg-blue-100 text-blue-700'">{{ statusText(task.status) }}</span>
+                <span class="text-xs px-2 py-0.5 rounded-full" :class="task.status === 'completed' ? 'bg-green-100 text-green-700' : task.status === 'completed_with_errors' ? 'bg-amber-100 text-amber-700' : task.status === 'failed' || task.status === 'cancelled' ? 'bg-red-100 text-red-700' : 'bg-blue-100 text-blue-700'">{{ statusText(task.status) }}</span>
                 <button v-if="task.status === 'running' || task.status === 'pending'" @click.stop="taskAction(task, 'pause')" class="text-xs px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5">{{ i18n.t('sync_pause') }}</button>
                 <button v-if="task.status === 'paused'" @click.stop="taskAction(task, 'resume')" class="text-xs px-2 py-1 rounded border border-green-600 text-green-700 dark:text-green-400 hover:bg-green-50 dark:hover:bg-green-950">{{ i18n.t('sync_resume') }}</button>
                 <button v-if="task.status === 'pending' || task.status === 'paused'" @click.stop="moveTaskFront(task)" class="text-xs px-2 py-1 rounded border border-accent text-accent hover:bg-accent/10">{{ i18n.t('sync_top') }}</button>
@@ -412,6 +412,19 @@ onMounted(async () => {
             <div class="h-1 rounded bg-gray-200 dark:bg-gray-700 overflow-hidden mt-2">
               <div class="h-full bg-accent" :style="{ width: Math.min(100, Math.round(((task.max_pages > 0 ? (task.progress?.pages_checked || 0) / task.max_pages : 0)) * 100)) + '%' }"></div>
             </div>
+            <div v-if="task.error" class="mt-2 text-xs text-red-600 dark:text-red-400">{{ task.error }}</div>
+            <details v-if="task.result?.details?.length" class="mt-2 text-xs" @click.stop>
+              <summary class="cursor-pointer text-accent">同步书籍明细（{{ task.result.details.length }}）</summary>
+              <div class="mt-2 space-y-1 pl-3 border-l border-border dark:border-gray-700">
+                <div v-for="detail in task.result.details" :key="detail.url || detail.title" class="flex flex-wrap gap-x-2 gap-y-1">
+                  <span :class="detail.filtered ? 'text-gray-500' : detail.synced === false || detail.failed_chapters?.length ? 'text-red-600 dark:text-red-400' : 'text-green-700 dark:text-green-400'">{{ detail.filtered ? '已过滤' : detail.synced === false ? '失败' : detail.failed_chapters?.length ? '部分失败' : '成功' }}</span>
+                  <span>{{ detail.title || detail.name || detail.url }}</span>
+                  <span v-if="detail.error" class="text-red-600 dark:text-red-400">{{ detail.error }}</span>
+                  <span v-if="detail.filtered" class="text-gray-500">{{ detail.filter_type }}: {{ detail.filter_value }}</span>
+                  <span v-if="detail.failed_chapters?.length" class="text-red-600 dark:text-red-400">章节失败 {{ detail.failed_chapters.length }}</span>
+                </div>
+              </div>
+            </details>
           </div>
         </div>
       </section>

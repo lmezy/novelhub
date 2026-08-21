@@ -90,7 +90,7 @@ const remoteSearching = ref(false)
 const syncingUrl = ref("")
 
 const activeCategory = computed(() => String(route.query.category || ""))
-const activeSource = computed(() => String(route.query.source || ""))
+const activeSource = computed(() => String(route.query.source || route.query.source_id || ""))
 const currentOffset = computed(() => Math.max(0, Number(route.query.offset || 0) || 0))
 const isSearching = computed(() => Boolean(String(route.query.q || "").trim()))
 const isBrowsing = computed(() => !isSearching.value && Boolean(activeCategory.value || activeSource.value))
