@@ -1136,7 +1136,7 @@ async function loadStatus() {
 }
 
 async function loadLogs() {
-  logs.value = await api.get<any[]>("/crawl/tasks")
+  logs.value = await api.get<any[]>("/crawl/tasks?limit=100")
   const active = logs.value.find((t) => ["pending", "running", "paused"].includes(t.status))
   if (active && (!crawlStore.activeTask || crawlStore.activeTask.id !== active.id)) {
     await crawlStore.setTask(active)
@@ -1666,13 +1666,23 @@ onUnmounted(() => {
           <div v-for="log in logs" :key="log.id" class="px-4 py-3">
             <div class="flex items-center gap-2 mb-1">
               <span class="text-sm font-medium">{{ log.source }}</span>
-              <span class="text-xs px-1.5 py-0.5 rounded-full" :class="log.status === 'completed' ? 'bg-green-100 text-green-700' : log.status === 'failed' ? 'bg-red-100 text-red-700' : 'bg-yellow-100 text-yellow-700'">{{ log.status }}</span>
+              <span class="text-xs px-1.5 py-0.5 rounded-full" :class="log.status === 'completed' ? 'bg-green-100 text-green-700' : log.status === 'completed_with_errors' || log.status === 'failed' ? 'bg-red-100 text-red-700' : 'bg-yellow-100 text-yellow-700'">{{ log.status }}</span>
             </div>
             <p class="text-xs text-muted dark:text-gray-400">
               {{ i18n.t('admin_started') }}: {{ log.started_at ? new Date(log.started_at).toLocaleString() : '-' }}
               &middot; {{ i18n.t('admin_finished') }}: {{ log.finished_at ? new Date(log.finished_at).toLocaleString() : '-' }}
             </p>
             <p v-if="log.error" class="text-xs text-red-600 mt-1">{{ log.error }}</p>
+            <div v-if="log.result?.details?.length" class="mt-3 space-y-1.5">
+              <div v-for="(item, index) in log.result.details" :key="log.id + '-detail-' + index" class="rounded border border-border px-2.5 py-2 text-xs dark:border-gray-700">
+                <div class="flex items-center justify-between gap-2">
+                  <span class="font-medium truncate">{{ item.title || item.name || item.url }}</span>
+                  <span :class="item.synced ? 'text-green-600' : item.filtered ? 'text-gray-500' : 'text-red-600'">{{ item.synced ? i18n.t('sync_synced') : item.filtered ? i18n.t('sync_filtered') : i18n.t('sync_failed') }}</span>
+                </div>
+                <p v-if="item.error || item.filter_reason" class="mt-1 text-red-600">{{ item.error || item.filter_reason }}</p>
+                <p v-if="item.chapters_failed" class="mt-1 text-red-600">{{ i18n.t('sync_chapters_failed') }}: {{ item.chapters_failed }}</p>
+              </div>
+            </div>
           </div>
           <p v-if="logs.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">{{ i18n.t('admin_no_logs') }}</p>
         </div>

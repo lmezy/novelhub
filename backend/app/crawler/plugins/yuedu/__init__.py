@@ -1312,6 +1312,10 @@ class YueduPlugin:
         if not self.engine:
             raise RuntimeError("YueduPlugin not configured")
 
+        # Content rules such as @js:baseUrl must see the actual chapter page.
+        # fetch_book leaves the engine scoped to the TOC URL, so update it here
+        # before evaluating the chapter rule and before following next pages.
+        self.engine.set_page_url(chapter.url)
         web_js = self.engine.get_web_js()
         if web_js:
             html = await self._get_with_web_js(chapter.url, web_js)
@@ -1369,6 +1373,7 @@ class YueduPlugin:
             for next_url, next_html in zip(batch, htmls):
                 if pages_fetched >= max_pages:
                     break
+                self.engine.set_page_url(next_url)
                 if self._uses_android_js_rule("ruleContent", "content"):
                     next_part = self._parse_chapter_content_generic(next_html)
                 else:
@@ -1497,6 +1502,11 @@ class YueduPlugin:
             ".book-content",
             ".text-content",
             ".novel-content",
+            ".readContent",
+            ".Readarea",
+            "#chapter",
+            ".chapter",
+            ".txt",
         )
         for selector in content_selectors:
             el = soup.select_one(selector)

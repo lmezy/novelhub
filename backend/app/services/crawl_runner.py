@@ -147,19 +147,27 @@ async def run_crawl_task_async(task_id: str) -> dict:
                 task_obj.finished_at = _naive_utcnow()
                 await db.commit()
                 raise TaskCancelled("Task cancelled")
+            # Preserve every page result when a task is resumed in batches.
+            previous = task_obj.result if isinstance(task_obj.result, dict) else {}
+            merged = dict(result)
+            for key in ("books_found", "books_synced", "books_failed", "books_filtered", "chapters_created", "chapters_skipped", "chapters_failed"):
+                merged[key] = int(previous.get(key, 0) or 0) + int(result.get(key, 0) or 0)
+            merged["pages_checked"] = max(int(previous.get("pages_checked", 0) or 0), int(result.get("pages_checked", 0) or 0))
+            merged["details"] = [*(previous.get("details") or []), *(result.get("details") or [])]
+            merged["done"] = bool(result.get("done"))
             batch_size = int(getattr(settings, "SYNC_PAGE_BATCH_SIZE", 0) or 0)
             if batch_size > 0 and not result.get("done"):
                 task_obj.status = "pending"
-                task_obj.result = result
+                task_obj.result = merged
                 task_obj.progress = {
-                    "pages_checked": result.get("pages_checked", 0),
-                    "books_found": result.get("books_found", 0),
-                    "books_synced": result.get("books_synced", 0),
-                    "books_failed": result.get("books_failed", 0),
-                    "books_filtered": result.get("books_filtered", 0),
-                    "chapters_created": result.get("chapters_created", 0),
-                    "chapters_skipped": result.get("chapters_skipped", 0),
-                    "chapters_failed": result.get("chapters_failed", 0),
+                    "pages_checked": merged.get("pages_checked", 0),
+                    "books_found": merged.get("books_found", 0),
+                    "books_synced": merged.get("books_synced", 0),
+                    "books_failed": merged.get("books_failed", 0),
+                    "books_filtered": merged.get("books_filtered", 0),
+                    "chapters_created": merged.get("chapters_created", 0),
+                    "chapters_skipped": merged.get("chapters_skipped", 0),
+                    "chapters_failed": merged.get("chapters_failed", 0),
                     "next_page": result.get("next_page", start_page),
                 }
                 task_obj.finished_at = None
@@ -174,19 +182,19 @@ async def run_crawl_task_async(task_id: str) -> dict:
                 }
             task_obj.status = (
                 "completed_with_errors"
-                if result.get("books_failed", 0) or result.get("chapters_failed", 0)
+                if merged.get("books_failed", 0) or merged.get("chapters_failed", 0)
                 else "completed"
             )
-            task_obj.result = result
+            task_obj.result = merged
             task_obj.progress = {
-                "pages_checked": result.get("pages_checked", 0),
-                "books_found": result.get("books_found", 0),
-                "books_synced": result.get("books_synced", 0),
-                "books_failed": result.get("books_failed", 0),
-                "books_filtered": result.get("books_filtered", 0),
-                "chapters_created": result.get("chapters_created", 0),
-                "chapters_skipped": result.get("chapters_skipped", 0),
-                "chapters_failed": result.get("chapters_failed", 0),
+                "pages_checked": merged.get("pages_checked", 0),
+                "books_found": merged.get("books_found", 0),
+                "books_synced": merged.get("books_synced", 0),
+                "books_failed": merged.get("books_failed", 0),
+                "books_filtered": merged.get("books_filtered", 0),
+                "chapters_created": merged.get("chapters_created", 0),
+                "chapters_skipped": merged.get("chapters_skipped", 0),
+                "chapters_failed": merged.get("chapters_failed", 0),
                 "done": True,
             }
             task_obj.finished_at = _naive_utcnow()

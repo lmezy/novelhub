@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue"
+import { computed, onMounted, onUnmounted, ref } from "vue"
 import { api } from "../api/client"
 import { useAuthStore } from "../stores/auth"
 import { useCrawlStore } from "../stores/crawl"
@@ -22,6 +22,7 @@ const autoSyncSaved = ref(false)
 const autoSyncError = ref("")
 const bookshelfSyncing = ref(false)
 const bookshelfResults = ref<any[]>([])
+let taskRefreshTimer: number | null = null
 
 const activeTask = computed(() => crawlStore.activeTask)
 const enabledSources = computed(() => sources.value.filter((s: any) => s.enabled))
@@ -69,14 +70,17 @@ async function loadTasks() {
   loadingTasks.value = true
   pageError.value = ""
   try {
-    tasks.value = await api.get<any[]>("/crawl/tasks?limit=50")
+    tasks.value = await api.get<any[]>("/crawl/tasks?limit=100")
     const active = tasks.value.find((t) => ["pending", "running", "paused"].includes(t.status))
     const selectedStillHere = crawlStore.activeTask?.id
       ? tasks.value.some((t) => t.id === crawlStore.activeTask.id)
       : false
-    if (!selectedStillHere && active) {
+    if (selectedStillHere) {
+      const current = tasks.value.find((t) => t.id === crawlStore.activeTask?.id)
+      if (current) crawlStore.activeTask = current
+    } else if (active) {
       await crawlStore.setTask(active)
-    } else if (!selectedStillHere) {
+    } else {
       crawlStore.clear()
     }
   } catch (e) {
@@ -238,6 +242,16 @@ onMounted(async () => {
   await loadTasks()
   if (crawlStore.activeTask?.id && !terminal.includes(crawlStore.activeTask.status)) {
     crawlStore.startPolling(crawlStore.activeTask.id)
+  }
+  taskRefreshTimer = window.setInterval(() => {
+    if (!loadingTasks.value) void loadTasks()
+  }, 2000)
+})
+
+onUnmounted(() => {
+  if (taskRefreshTimer !== null) {
+    window.clearInterval(taskRefreshTimer)
+    taskRefreshTimer = null
   }
 })
 </script>

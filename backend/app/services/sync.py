@@ -1050,13 +1050,22 @@ class SyncService:
     def _chapter_has_real_content(self, chapter: Chapter) -> bool:
         """Return False for empty or anti-bot/captcha junk chapters so a
         re-sync refetches them."""
+        # Legacy ORM rows in migrations/tests may not have storage metadata.
+        # Keep those rows eligible for normal source-id reconciliation.
+        if not chapter.content_path:
+            return True
         try:
             content = self.storage.read_chapter(chapter.content_path)
         except Exception:
-            return True
+            # A missing or unreadable storage object must be fetched again.
+            return False
         if not isinstance(content, str):
-            return True
+            return False
         body = re.sub(r"^#.*(?:\r?\n|$)", "", content, flags=re.M).strip()
+        # Markdown image references and HTML wrappers are not chapter text.
+        body = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", body)
+        body = re.sub(r"<[^>]+>", " ", body)
+        body = re.sub(r"\s+", " ", body).strip()
         if len(body) < 20:
             return False
         lowered = body.lower()

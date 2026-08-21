@@ -138,9 +138,11 @@ async function loadGroups() {
 
 async function loadHomeSources() {
   try {
-    sources.value = await api.get<any[]>("/sources").then((rows) =>
-      rows.map((s: any) => ({ id: s.id, name: s.name || s.id }))
-    )
+    if (!sources.value.length) {
+      sources.value = await api.get<any[]>("/sources").then((rows) =>
+        rows.map((s: any) => ({ id: s.id, name: s.name || s.id }))
+      )
+    }
   } catch {
     sources.value = []
     homeSources.value = []
@@ -236,6 +238,21 @@ async function batchDelete() {
     alert(e instanceof Error ? e.message : i18n.t('home_batch_delete_failed'))
   } finally {
     batchDeleting.value = false
+  }
+}
+
+
+
+async function deleteSourceBooks(source: SourceItem, total: number) {
+  if (!auth.isAdmin || !total) return
+  if (!confirm(i18n.t("books_source_delete_confirm", { name: source.name, n: total }))) return
+  try {
+    await api.post("/books/batch-delete-by-source", { source_id: source.id })
+    await loadHomeSources()
+    await loadFavorites()
+    await loadGroups()
+  } catch (e) {
+    alert(e instanceof Error ? e.message : i18n.t("books_source_delete"))
   }
 }
 
@@ -663,10 +680,17 @@ onMounted(async () => {
         <div v-for="section in homeSources" :key="section.source.id" class="mb-8">
           <div class="mb-3 flex items-center justify-between">
             <h3 class="text-sm font-semibold text-muted dark:text-gray-400">{{ section.source.name }}</h3>
-            <button
-              @click="router.push({ path: '/books', query: { source: section.source.id } })"
-              class="text-xs text-accent hover:underline"
-            >{{ i18n.t('books_view_all_source') }} ({{ section.total }}) ›</button>
+            <div class="flex items-center gap-3">
+              <button
+                @click="router.push({ path: '/books', query: { source: section.source.id } })"
+                class="text-xs text-accent hover:underline"
+              >{{ i18n.t('books_view_all_source') }} ({{ section.total }}) ›</button>
+              <button
+                v-if="auth.isAdmin"
+                @click="deleteSourceBooks(section.source, section.total)"
+                class="text-xs text-red-600 hover:underline"
+              >{{ i18n.t('books_source_delete', { n: section.total }) }}</button>
+            </div>
           </div>
           <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
             <BookCard
