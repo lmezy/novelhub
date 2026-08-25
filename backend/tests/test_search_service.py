@@ -95,6 +95,20 @@ def test_search_books_applies_tag_filter():
     assert options["filter"] == 'tags = "wuxia"'
 
 
+def test_advanced_search_applies_source_filter():
+    service, books_index, _ = _service_with_indexes()
+    books_index.search.return_value = {"hits": []}
+
+    service.advanced_search(
+        [{"field": "title", "mode": "exact", "value": "西游记"}],
+        scope="books",
+        source_id='source"with-quote',
+    )
+
+    options = books_index.search.call_args.args[1]
+    assert options["filter"] == 'source_id = "source\\"with-quote"'
+
+
 def _service_with_indexes():
     client = MagicMock()
     books_index = MagicMock()

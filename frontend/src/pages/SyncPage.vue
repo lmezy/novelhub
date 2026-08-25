@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue"
+import { computed, onMounted, ref } from "vue"
 import { api } from "../api/client"
 import { useAuthStore } from "../stores/auth"
 import { useCrawlStore } from "../stores/crawl"
@@ -22,7 +22,6 @@ const autoSyncSaved = ref(false)
 const autoSyncError = ref("")
 const bookshelfSyncing = ref(false)
 const bookshelfResults = ref<any[]>([])
-let taskRefreshTimer: number | null = null
 
 const activeTask = computed(() => crawlStore.activeTask)
 const enabledSources = computed(() => sources.value.filter((s: any) => s.enabled))
@@ -242,16 +241,6 @@ onMounted(async () => {
   await loadTasks()
   if (crawlStore.activeTask?.id && !terminal.includes(crawlStore.activeTask.status)) {
     crawlStore.startPolling(crawlStore.activeTask.id)
-  }
-  taskRefreshTimer = window.setInterval(() => {
-    if (!loadingTasks.value) void loadTasks()
-  }, 2000)
-})
-
-onUnmounted(() => {
-  if (taskRefreshTimer !== null) {
-    window.clearInterval(taskRefreshTimer)
-    taskRefreshTimer = null
   }
 })
 </script>

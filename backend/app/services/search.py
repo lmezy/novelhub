@@ -583,6 +583,7 @@ class SearchService:
         match: str = "and",
         scope: str = "all",
         tag: str | None = None,
+        source_id: str | None = None,
         offset: int = 0,
         limit: int = 20,
         allow_r18: bool = True,
@@ -600,7 +601,9 @@ class SearchService:
                 active.append({"field": field, "mode": mode, "value": value})
         if not active:
             if tag:
-                filters = self._combined_filter(allow_r18, allow_all_ages, tag)
+                filters = self._combined_filter(
+                    allow_r18, allow_all_ages, tag, source_id,
+                )
                 if scope in ("all", "books"):
                     result = self._search_all_with_filter(self.INDEX_BOOKS, filters)
                     hits = [
@@ -649,7 +652,9 @@ class SearchService:
                 else "books"
             )
 
-        filters = self._combined_filter(allow_r18, allow_all_ages, tag)
+        filters = self._combined_filter(
+            allow_r18, allow_all_ages, tag, source_id,
+        )
         book_cond_maps: dict[int, dict[str, tuple[int, dict]]] = {}
         chapter_cond_maps: dict[int, dict[str, tuple[int, dict]]] = {}
         for i, cond in enumerate(active):
