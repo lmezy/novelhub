@@ -159,7 +159,7 @@ async function loadSearch() {
     conditions: [{ field: searchField.value, mode: fuzzyFields.includes(searchField.value) ? "fuzzy" : "exact", value: q }],
     match: "and",
     scope: "all",
-    offset: 0,
+    offset: currentOffset.value,
     limit: 40,
   })
   results.value = response.hits
@@ -182,6 +182,10 @@ async function loadCurrentView() {
   } finally {
     loading.value = false
   }
+}
+
+function changeSearchPage(offset: number) {
+  router.push({ path: "/books", query: { q: String(route.query.q || ""), field: String(route.query.field || "title"), offset: String(Math.max(0, offset)) } })
 }
 
 function submitSearch() {
@@ -577,6 +581,11 @@ onMounted(async () => {
             <p v-if="hit.author" class="mt-1 text-xs text-muted dark:text-gray-400">{{ hit.author }}</p>
             <p v-if="hit.snippet" class="mt-1 line-clamp-2 text-xs text-muted dark:text-gray-400">{{ hit.snippet }}</p>
           </button>
+        </div>
+        <div v-if="searchTotal > 40" class="mt-6 flex items-center justify-center gap-3 text-xs">
+          <button @click="changeSearchPage(currentOffset - 40)" :disabled="currentOffset === 0" class="rounded border border-border px-3 py-2 disabled:opacity-40 dark:border-gray-700">{{ i18n.t("books_previous") }}</button>
+          <span>{{ Math.floor(currentOffset / 40) + 1 }} / {{ Math.ceil(searchTotal / 40) }}</span>
+          <button @click="changeSearchPage(currentOffset + 40)" :disabled="currentOffset + 40 >= searchTotal" class="rounded border border-border px-3 py-2 disabled:opacity-40 dark:border-gray-700">{{ i18n.t("books_next") }}</button>
         </div>
       </template>
 

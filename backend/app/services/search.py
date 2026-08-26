@@ -657,24 +657,33 @@ class SearchService:
         )
         book_cond_maps: dict[int, dict[str, tuple[int, dict]]] = {}
         chapter_cond_maps: dict[int, dict[str, tuple[int, dict]]] = {}
+        has_chapter_fields = any(
+            cond["field"] in self.CHAPTER_FIELD_ATTRS for cond in active
+        )
         for i, cond in enumerate(active):
             field = cond["field"]
             if field in self.BOOK_FIELD_ATTRS:
-                book_cond_maps[i] = self._collect_condition(
-                    self.INDEX_BOOKS,
-                    self.BOOK_FIELD_ATTRS[field],
-                    cond["value"],
-                    cond["mode"],
-                    filters,
-                )
-                chapter_cond_maps[i] = self._collect_condition(
-                    self.INDEX_CHAPTERS,
-                    self.CHAPTER_BOOK_FIELD_ATTRS[field],
-                    cond["value"],
-                    cond["mode"],
-                    filters,
-                )
-            else:
+                if effective_scope in ("all", "books"):
+                    book_cond_maps[i] = self._collect_condition(
+                        self.INDEX_BOOKS,
+                        self.BOOK_FIELD_ATTRS[field],
+                        cond["value"],
+                        cond["mode"],
+                        filters,
+                    )
+                # A book-scoped query with a chapter condition still needs
+                # chapter metadata to aggregate the chapter match into a book.
+                if effective_scope in ("chapters", "all") or (
+                    effective_scope == "books" and has_chapter_fields
+                ):
+                    chapter_cond_maps[i] = self._collect_condition(
+                        self.INDEX_CHAPTERS,
+                        self.CHAPTER_BOOK_FIELD_ATTRS[field],
+                        cond["value"],
+                        cond["mode"],
+                        filters,
+                    )
+            elif effective_scope in ("books", "chapters", "all"):
                 chapter_cond_maps[i] = self._collect_condition(
                     self.INDEX_CHAPTERS,
                     self.CHAPTER_FIELD_ATTRS[field],

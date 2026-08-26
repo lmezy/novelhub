@@ -2666,7 +2666,13 @@ class YueduPlugin:
                             self._parse_cookies_for_playwright()
                         )
 
-                    await page.goto(url, wait_until="networkidle", timeout=30000)
+                    # WAF-protected sites often keep analytics sockets open forever;
+                    # waiting for networkidle turns a usable page into a timeout.
+                    await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                    try:
+                        await page.wait_for_timeout(1200)
+                    except Exception:
+                        pass
 
                     # Legado webJs may mutate the DOM or return the rendered
                     # HTML directly. Preserve both forms instead of discarding
@@ -2704,7 +2710,6 @@ class YueduPlugin:
         cookies = []
         if not self._cookie:
             return cookies
-        domain = urlparse(self.base_url).netloc or "localhost"
         for part in self._cookie.split(";"):
             part = part.strip()
             if "=" in part:
@@ -2712,8 +2717,8 @@ class YueduPlugin:
                 cookies.append({
                     "name": name.strip(),
                     "value": value.strip(),
-                    "domain": domain,
-                    "path": "/",
+                    # Let Playwright derive the host, including www/non-www.
+                    "url": self.base_url.rstrip("/") + "/",
                 })
         return cookies
 

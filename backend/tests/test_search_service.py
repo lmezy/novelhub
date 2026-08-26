@@ -71,6 +71,10 @@ def test_search_books_restricts_attributes():
     ]
 
 
+def test_candidate_limit_is_bounded_for_fast_advanced_search():
+    assert SearchService.CANDIDATE_LIMIT == 5000
+
+
 def test_chapter_buffer_flushes_in_batches():
     service, client = _make_service()
     index = client.index.return_value

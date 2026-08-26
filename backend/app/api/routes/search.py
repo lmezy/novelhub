@@ -118,7 +118,11 @@ async def search(
     hits = await _filter_visible_hits(user, db, result["hits"])
     return SearchResult(
         hits=hits,
-        total=len(hits),
+        total=(
+            int(result.get("total", result.get("estimatedTotalHits", len(hits))))
+            if user.role in ("admin", "super_admin")
+            else len(hits)
+        ),
         offset=result.get("offset", offset),
         limit=result.get("limit", limit),
     )
@@ -144,7 +148,10 @@ async def advanced_search(
         allow_all_ages=allow_all_ages,
     )
     result["hits"] = await _filter_visible_hits(user, db, result["hits"])
-    result["total"] = len(result["hits"])
+    # Admins can use the complete index count; private users must not see
+    # counts for books hidden by visibility rules.
+    if user.role not in ("admin", "super_admin"):
+        result["total"] = len(result["hits"])
     return SearchResult(**result)
 
 

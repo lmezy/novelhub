@@ -1,4 +1,4 @@
-﻿"""YueDu auto-login implementation.
+"""YueDu auto-login implementation.
 
 Parses the loginUrl JavaScript from YueDu book sources to extract
 login API endpoints and execute HTTP-based authentication.
@@ -161,7 +161,7 @@ class YueduLoginParser:
                     logger.info(f"Playwright form login: trying {url}")
 
                     try:
-                        await page.goto(url, wait_until="networkidle", timeout=15000)
+                        await page.goto(url, wait_until="domcontentloaded", timeout=15000)
                     except Exception:
                         continue
 
@@ -361,8 +361,8 @@ class YueduLoginParser:
     async def _wait_for_login_result(self, page) -> None:
         """Wait for login to complete (URL change, cookie set, or element change)."""
         try:
-            # Wait for navigation or network idle
-            await page.wait_for_load_state("networkidle", timeout=15000)
+            # WAF pages keep background connections open; DOM readiness is enough.
+            await page.wait_for_load_state("domcontentloaded", timeout=8000)
         except Exception:
             pass
 
