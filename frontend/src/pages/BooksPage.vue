@@ -89,6 +89,23 @@ const remoteTotal = ref(0)
 const remoteSearching = ref(false)
 const syncingUrl = ref("")
 
+const SEARCH_CACHE_KEY = "novelhub:books-search-cache"
+const ADVANCED_CACHE_KEY = "novelhub:advanced-search-cache"
+const isAdvancedRoute = computed(() => String(route.query.advanced || "") === "1")
+
+function readSessionCache<T>(key: string): T | null {
+  try {
+    const raw = sessionStorage.getItem(key)
+    return raw ? (JSON.parse(raw) as T) : null
+  } catch {
+    return null
+  }
+}
+
+function writeSessionCache(key: string, value: unknown) {
+  try { sessionStorage.setItem(key, JSON.stringify(value)) } catch { /* storage is optional */ }
+}
+
 const activeCategory = computed(() => String(route.query.category || ""))
 const activeSource = computed(() => String(route.query.source || route.query.source_id || ""))
 const currentOffset = computed(() => Math.max(0, Number(route.query.offset || 0) || 0))
@@ -155,6 +172,13 @@ async function loadSearch() {
   const field = (String(route.query.field || "title") as SearchField)
   searchQuery.value = q
   searchField.value = searchFields.some((item) => item.value === field) ? field : "title"
+  const cacheKey = `${q}|${searchField.value}|${currentOffset.value}`
+  const cached = readSessionCache<{ key: string; hits: SearchHit[]; total: number }>(SEARCH_CACHE_KEY)
+  if (cached?.key === cacheKey) {
+    results.value = cached.hits
+    searchTotal.value = cached.total
+    return
+  }
   const response = await api.post<{ hits: SearchHit[]; total: number }>("/search/advanced", {
     conditions: [{ field: searchField.value, mode: fuzzyFields.includes(searchField.value) ? "fuzzy" : "exact", value: q }],
     match: "and",
@@ -164,6 +188,7 @@ async function loadSearch() {
   })
   results.value = response.hits
   searchTotal.value = response.total
+  writeSessionCache(SEARCH_CACHE_KEY, { key: cacheKey, hits: response.hits, total: response.total })
 }
 
 async function loadCurrentView() {
@@ -171,11 +196,20 @@ async function loadCurrentView() {
   error.value = ""
   selectedIds.value = []
   // URL navigation resets the local advanced/source search views
-  advancedActive.value = false
-  if (isSearching.value || isBrowsing.value) searchTab.value = "local"
+  if (!isAdvancedRoute.value) advancedActive.value = false
+  if (isSearching.value || isBrowsing.value || isAdvancedRoute.value) searchTab.value = "local"
   try {
     if (isSearching.value) await loadSearch()
-    else if (isBrowsing.value) await loadBrowse()
+    else if (isAdvancedRoute.value) {
+      const cached = readSessionCache<{ conditions: Condition[]; match: "and" | "or"; results: SearchHit[]; total: number; offset: number }>(ADVANCED_CACHE_KEY)
+      if (cached) {
+        conditions.value = cached.conditions
+        match.value = cached.match
+        advancedResults.value = cached.results
+        advancedTotal.value = cached.total
+        advancedActive.value = true
+      }
+    } else if (isBrowsing.value) await loadBrowse()
     else await loadHome()
   } catch (e) {
     error.value = e instanceof Error ? e.message : i18n.t("search_failed")
@@ -271,6 +305,16 @@ function changePage(offset: number) {
   router.push({ path: "/books", query: { ...route.query, offset: String(Math.max(0, offset)) } })
 }
 
+function changeAdvancedPage(offset: number) {
+  const nextOffset = Math.max(0, offset)
+  const cached = readSessionCache<{ conditions: Condition[]; match: "and" | "or" }>(ADVANCED_CACHE_KEY)
+  if (cached) {
+    conditions.value = cached.conditions
+    match.value = cached.match
+  }
+  void runAdvancedSearch(nextOffset)
+}
+
 // ---------- advanced search ----------
 
 function toggleAdvanced() {
@@ -294,7 +338,7 @@ function removeCondition(index: number) {
   conditions.value.splice(index, 1)
 }
 
-async function runAdvancedSearch() {
+async function runAdvancedSearch(offset = 0) {
   const conds = activeConditions()
   if (conds.length === 0) {
     advancedError.value = i18n.t("search_condition_placeholder")
@@ -307,12 +351,14 @@ async function runAdvancedSearch() {
       conditions: conds,
       match: match.value,
       scope: "all",
-      offset: 0,
+      offset,
       limit: 40,
     })
     advancedResults.value = res.hits
     advancedTotal.value = res.total
     advancedActive.value = true
+    writeSessionCache(ADVANCED_CACHE_KEY, { conditions: conditions.value, match: match.value, results: res.hits, total: res.total, offset })
+    await router.replace({ path: "/books", query: { advanced: "1", offset: String(offset) } })
   } catch (e) {
     advancedError.value = e instanceof Error ? e.message : i18n.t("search_failed")
   } finally {
@@ -364,6 +410,13 @@ async function syncRemoteBook(item: RemoteBook) {
 watch(() => route.query, loadCurrentView, { deep: true })
 
 onMounted(async () => {
+  if (isSearching.value || isAdvancedRoute.value) {
+    await Promise.all([
+      loadNavigation().catch(() => { categories.value = []; sources.value = [] }),
+      loadCurrentView(),
+    ])
+    return
+  }
   try { await loadNavigation() } catch { categories.value = []; sources.value = [] }
   await loadCurrentView()
 })
@@ -464,7 +517,7 @@ onMounted(async () => {
               type="search"
               :placeholder="i18n.t('search_condition_placeholder')"
               class="flex-1 min-w-[180px] px-3 py-1.5 rounded-md border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-sm focus:outline-none focus:ring-2 focus:ring-accent/30"
-              @keydown.enter="runAdvancedSearch"
+              @keydown.enter="runAdvancedSearch()"
             />
             <button
               v-if="conditions.length > 1"
@@ -480,7 +533,7 @@ onMounted(async () => {
             class="text-xs px-3 py-2 rounded-lg border border-accent/40 text-accent hover:bg-accent/5 transition-colors"
           >{{ i18n.t('search_conditions_add') }}</button>
           <button
-            @click="runAdvancedSearch"
+            @click="runAdvancedSearch()"
             :disabled="advancedSearching"
             class="text-xs px-4 py-2 rounded-lg bg-accent text-white hover:opacity-90 transition-opacity disabled:opacity-50"
           >{{ i18n.t('search_button') }}</button>
@@ -558,6 +611,11 @@ onMounted(async () => {
               <p v-if="hit.matched_chapter.snippet" class="mt-0.5 line-clamp-2 text-xs text-muted dark:text-gray-400">{{ hit.matched_chapter.snippet }}</p>
             </div>
           </button>
+        </div>
+        <div v-if="advancedTotal > 40" class="mt-6 flex items-center justify-center gap-3 text-xs">
+          <button @click="changeAdvancedPage(currentOffset - 40)" :disabled="currentOffset === 0 || advancedSearching" class="rounded border border-border px-3 py-2 disabled:opacity-40 dark:border-gray-700">{{ i18n.t("books_previous") }}</button>
+          <span>{{ Math.floor(currentOffset / 40) + 1 }} / {{ Math.ceil(advancedTotal / 40) }}</span>
+          <button @click="changeAdvancedPage(currentOffset + 40)" :disabled="currentOffset + 40 >= advancedTotal || advancedSearching" class="rounded border border-border px-3 py-2 disabled:opacity-40 dark:border-gray-700">{{ i18n.t("books_next") }}</button>
         </div>
       </template>
 
