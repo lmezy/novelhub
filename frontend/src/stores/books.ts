@@ -38,6 +38,12 @@ export interface ChapterContent extends Chapter {
   content: string
 }
 
+export interface ChapterContentChunk extends ChapterContent {
+  offset: number
+  next_offset: number | null
+  total_length: number
+}
+
 export interface CustomTagUser {
   id: string
   username: string
@@ -53,9 +59,66 @@ export interface CustomTagOnBook {
   users: CustomTagUser[]
 }
 
-// Keep recently opened chapters in the browser process and prefetch the next
-// chapter. This avoids making every page turn wait for the API/storage read.
+// Keep recently opened chapters in memory and IndexedDB. IndexedDB is used
+// because a novel chapter can exceed localStorage's quota.
 const chapterCache = new Map<string, ChapterContent>()
+const CHAPTER_CACHE_DB = "novelhub-reader-cache"
+const CHAPTER_CACHE_STORE = "chapters"
+
+function openChapterCache(): Promise<IDBDatabase | null> {
+  if (typeof indexedDB === "undefined") return Promise.resolve(null)
+  return new Promise((resolve) => {
+    const request = indexedDB.open(CHAPTER_CACHE_DB, 1)
+    request.onupgradeneeded = () => {
+      request.result.createObjectStore(CHAPTER_CACHE_STORE, { keyPath: "key" })
+    }
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => resolve(null)
+  })
+}
+
+async function readCachedChapter(key: string): Promise<any | null> {
+  const db = await openChapterCache()
+  if (!db) return null
+  return new Promise((resolve) => {
+    const tx = db.transaction(CHAPTER_CACHE_STORE, "readonly")
+    const request = tx.objectStore(CHAPTER_CACHE_STORE).get(key)
+    request.onsuccess = () => resolve(request.result?.value || null)
+    request.onerror = () => resolve(null)
+  })
+}
+
+async function writeCachedChapter(key: string, value: any): Promise<void> {
+  const db = await openChapterCache()
+  if (!db) return
+  await new Promise<void>((resolve) => {
+    const tx = db.transaction(CHAPTER_CACHE_STORE, "readwrite")
+    tx.objectStore(CHAPTER_CACHE_STORE).put({ key, value })
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => resolve()
+    tx.onabort = () => resolve()
+  })
+}
+
+async function deleteCachedChapter(chapterId: string): Promise<void> {
+  const db = await openChapterCache()
+  if (!db) return
+  await new Promise<void>((resolve) => {
+    const tx = db.transaction(CHAPTER_CACHE_STORE, "readwrite")
+    const store = tx.objectStore(CHAPTER_CACHE_STORE)
+    store.delete(`chapter:${chapterId}`)
+    const cursor = store.openCursor()
+    cursor.onsuccess = () => {
+      const current = cursor.result
+      if (!current) return
+      if (String(current.key).startsWith(`chunk:${chapterId}:`)) current.delete()
+      current.continue()
+    }
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => resolve()
+    tx.onabort = () => resolve()
+  })
+}
 
 export interface ShelfGroup {
   id: string
@@ -93,16 +156,43 @@ export const useBooksStore = defineStore("books", () => {
   async function fetchChapter(chapterId: string): Promise<ChapterContent> {
     const cached = chapterCache.get(chapterId)
     if (cached) return cached
+    const persistent = await readCachedChapter(`chapter:${chapterId}`) as ChapterContent | null
+    if (persistent) {
+      chapterCache.set(chapterId, persistent)
+      return persistent
+    }
     const loaded = await api.get<ChapterContent>(`/chapters/${chapterId}`)
     chapterCache.set(chapterId, loaded)
+    void writeCachedChapter(`chapter:${chapterId}`, loaded)
+    return loaded
+  }
+
+  async function fetchChapterChunk(
+    chapterId: string,
+    offset = 0,
+    limit = 200_000,
+  ): Promise<ChapterContentChunk> {
+    const key = `chunk:${chapterId}:${offset}:${limit}`
+    const persistent = await readCachedChapter(key) as ChapterContentChunk | null
+    if (persistent) return persistent
+    const loaded = await api.get<ChapterContentChunk>(
+      `/chapters/${chapterId}/content?offset=${offset}&limit=${limit}`,
+    )
+    void writeCachedChapter(key, loaded)
     return loaded
   }
 
   async function prefetchChapter(chapterId: string): Promise<void> {
     if (chapterCache.has(chapterId)) return
     try {
+      const persistent = await readCachedChapter(`chapter:${chapterId}`) as ChapterContent | null
+      if (persistent) {
+        chapterCache.set(chapterId, persistent)
+        return
+      }
       const loaded = await api.get<ChapterContent>(`/chapters/${chapterId}`)
       chapterCache.set(chapterId, loaded)
+      void writeCachedChapter(`chapter:${chapterId}`, loaded)
     } catch {
       // Prefetch is best effort; the normal navigation request reports errors.
     }
@@ -110,6 +200,7 @@ export const useBooksStore = defineStore("books", () => {
 
   function invalidateChapter(chapterId: string): void {
     chapterCache.delete(chapterId)
+    void deleteCachedChapter(chapterId)
   }
 
   async function fetchFavorites(groupId?: string): Promise<Book[]> {
@@ -128,5 +219,5 @@ export const useBooksStore = defineStore("books", () => {
     return next
   }
 
-  return { books, loading, error, fetchBooks, fetchBook, fetchChapters, fetchChapter, prefetchChapter, invalidateChapter, fetchFavorites, toggleFavorite }
+  return { books, loading, error, fetchBooks, fetchBook, fetchChapters, fetchChapter, fetchChapterChunk, prefetchChapter, invalidateChapter, fetchFavorites, toggleFavorite }
 })

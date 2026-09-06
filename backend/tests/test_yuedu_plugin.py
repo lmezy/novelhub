@@ -1585,6 +1585,15 @@ def test_resolve_kind_url_strips_legado_options_suffix():
     assert resolved == "https://www.boluomao.com/gender/boy/page/2/"
 
 
+def test_resolve_kind_updates_options_url_after_page_substitution():
+    plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
+    resolved, options = plugin._resolve_kind(
+        "/sort/{{page}}/,{\"webView\":true}", 3
+    )
+    assert resolved == "https://example.com/sort/3/"
+    assert options["url"] == resolved
+
+
 def test_resolve_kind_url_evaluates_js_template():
     plugin = YueduPlugin({"bookSourceUrl": "https://www.boluomao.com"})
     def _eval(code, raw=None, extra_context=None):
@@ -1848,6 +1857,23 @@ async def test_fetch_explore_propagates_blocked_kind_error():
 
     with patch.object(plugin, "_get", fake_get):
         with pytest.raises(RuntimeError, match="anti-bot"):
+            await plugin.fetch_explore(page=1)
+
+
+@pytest.mark.asyncio
+async def test_fetch_explore_reports_upstream_catalog_error():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "exploreUrl": "最新::/sort/{{page}}/",
+    })
+
+    async def fake_get(url):
+        request = httpx.Request("GET", url)
+        response = httpx.Response(403, request=request)
+        raise httpx.HTTPStatusError("403 Forbidden", request=request, response=response)
+
+    with patch.object(plugin, "_get", fake_get):
+        with pytest.raises(RuntimeError, match="目录暂时不可访问"):
             await plugin.fetch_explore(page=1)
 
 

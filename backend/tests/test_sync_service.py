@@ -35,6 +35,14 @@ def test_normalize_title_for_match():
     assert SyncService._normalize_title_for_match(" 剑来 ") == "剑来"
 
 
+def test_upstream_blocked_includes_http_status_errors():
+    assert SyncService._is_upstream_blocked(
+        SimpleNamespace(response=SimpleNamespace(status_code=403))
+    )
+    assert SyncService._is_upstream_blocked(RuntimeError("验证码/限流"))
+    assert not SyncService._is_upstream_blocked(RuntimeError("解析失败"))
+
+
 def test_clean_sync_tags_drops_title_and_author_fragments():
     tags = {
         "官路之谁与争锋(卷帘西风666)",

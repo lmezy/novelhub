@@ -175,6 +175,17 @@ async function deleteSource(id: string) {
     sourceError.value = e instanceof Error ? e.message : i18n.t('admin_delete_source_failed')
   }
 }
+
+function parseSourceConfig(value: string): any {
+  let parsed: any = JSON.parse(value)
+  // Some old source records were serialized twice before being written to
+  // JSONB. Unwrap those values so editing does not save a quoted JSON blob.
+  for (let i = 0; i < 2 && typeof parsed === "string"; i += 1) {
+    parsed = JSON.parse(parsed)
+  }
+  return parsed
+}
+
 async function createSource() {
   sourceError.value = ""
   if (!sourceForm.value.name.trim()) {
@@ -184,7 +195,10 @@ async function createSource() {
   let config: any = null
   if (sourceConfigText.value.trim()) {
     try {
-      config = JSON.parse(sourceConfigText.value)
+      config = parseSourceConfig(sourceConfigText.value)
+      if (!config || typeof config !== "object" || Array.isArray(config)) {
+        throw new Error("source config must be a JSON object")
+      }
     } catch {
       sourceError.value = i18n.t('admin_config_json_invalid')
       return
@@ -238,7 +252,7 @@ function editSource(s: Source) {
   // invalid JSON such as a quoted JSON document.
   if (typeof s.config === "string") {
     try {
-      sourceConfigText.value = JSON.stringify(JSON.parse(s.config), null, 2)
+      sourceConfigText.value = JSON.stringify(parseSourceConfig(s.config), null, 2)
     } catch {
       sourceConfigText.value = s.config
     }

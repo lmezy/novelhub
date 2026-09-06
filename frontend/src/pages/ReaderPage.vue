@@ -56,6 +56,9 @@ const pageMode = ref<MobilePageMode>(savedPageMode())
 const mobileScrollProgress = ref(0)
 const pendingPage = ref<number | "last" | null>(null)
 const pendingRestorePercent = ref<number | null>(null)
+const nextContentOffset = ref<number | null>(null)
+const contentChunkLoading = ref(false)
+const contentTotalLength = ref(0)
 interface BookmarkItem {
   id: string
   book_id: string
@@ -224,6 +227,9 @@ function currentPosition(): number {
 }
 function onScroll() {
   desktopProgress.value = desktopScrollPercent()
+  if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 900) {
+    void loadNextContentChunk()
+  }
   clearTimeout(scrollTimer)
   scrollTimer = setTimeout(() => {
     if (!auth.user || isMobileLayout.value) return
@@ -324,6 +330,10 @@ function updateMobileScrollProgress() {
 
 function onMobileScroll() {
   updateMobileScrollProgress()
+  const el = scrollViewport.value
+  if (el && el.scrollTop + el.clientHeight >= el.scrollHeight - 900) {
+    void loadNextContentChunk()
+  }
   clearTimeout(progressTimer)
   progressTimer = setTimeout(() => savePosition(mobileScrollProgress.value), 800)
 }
@@ -517,6 +527,10 @@ function nextPageOrChapter() {
       el.scrollBy({ top: Math.max(120, el.clientHeight - 48), behavior: "smooth" })
       return
     }
+    if (nextContentOffset.value !== null) {
+      void loadNextContentChunk()
+      return
+    }
     if (nextChapter.value) openChapter(nextChapter.value.id, 0)
     return
   }
@@ -524,6 +538,17 @@ function nextPageOrChapter() {
     currentPage.value += 1
     applyPageTransform()
     queuePageProgress()
+    return
+  }
+  if (nextContentOffset.value !== null) {
+    const previousLastPage = pageCount.value - 1
+    void loadNextContentChunk().then((loaded) => {
+      if (loaded) {
+        currentPage.value = Math.min(previousLastPage + 1, pageCount.value - 1)
+        applyPageTransform()
+        queuePageProgress()
+      }
+    })
     return
   }
   if (nextChapter.value) openChapter(nextChapter.value.id, 0)
@@ -679,6 +704,28 @@ function onResize() {
   }, 150)
 }
 
+async function loadNextContentChunk(): Promise<boolean> {
+  const offset = nextContentOffset.value
+  if (offset === null || contentChunkLoading.value || !chapter.value) return false
+  contentChunkLoading.value = true
+  try {
+    const chunk = await store.fetchChapterChunk(chapter.value.id, offset)
+    if (!chapter.value || chapter.value.id !== chunk.id) return false
+    chapter.value = {
+      ...chapter.value,
+      content: chapter.value.content + chunk.content,
+    }
+    nextContentOffset.value = chunk.next_offset
+    contentTotalLength.value = chunk.total_length
+    if (isMobileLayout.value) await refreshMobileLayout()
+    return true
+  } catch {
+    return false
+  } finally {
+    contentChunkLoading.value = false
+  }
+}
+
 async function loadChapter(id: string) {
   const seq = ++chapterLoadSeq
   flushPageProgress()
@@ -688,10 +735,14 @@ async function loadChapter(id: string) {
   pageCount.value = 1
   mobileScrollProgress.value = 0
   pendingRestorePercent.value = null
+  nextContentOffset.value = null
+  contentTotalLength.value = 0
   try {
-    const loaded = await store.fetchChapter(id)
+    const loaded = await store.fetchChapterChunk(id, 0)
     if (seq !== chapterLoadSeq) return
     chapter.value = loaded
+    nextContentOffset.value = loaded.next_offset
+    contentTotalLength.value = loaded.total_length
     readLocation.value = { book_id: bookId.value, chapter_id: id }
     loading.value = false
     // Warm the next chapter while the reader lays out the current one.

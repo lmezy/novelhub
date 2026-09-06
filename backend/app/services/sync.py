@@ -150,13 +150,26 @@ class SyncService:
                 return await plugin.fetch_chapter_content(remote_chapter)
             except Exception as exc:
                 last_error = exc
-                if "anti-bot" in str(exc).lower() or "rate-limit" in str(exc).lower():
+                if SyncService._is_upstream_blocked(exc):
                     raise
                 if attempt < attempts - 1:
                     await asyncio.sleep((2 ** attempt) + 0.5)
         if last_error is not None:
             raise last_error
         raise RuntimeError("Chapter fetch failed")
+
+    @staticmethod
+    def _is_upstream_blocked(exc: BaseException) -> bool:
+        """Recognize WAF/rate-limit responses even when HTTPX exposes only a
+        status line (for example ``403 Forbidden``) rather than the HTML
+        anti-bot marker returned by the source.
+        """
+        message = str(exc).lower()
+        if any(marker in message for marker in ("anti-bot", "captcha", "验证码", "rate-limit", "限流")):
+            return True
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        return status in {403, 408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524}
 
     @staticmethod
     def _chapter_concurrency(config: dict | None) -> int:
@@ -711,7 +724,7 @@ class SyncService:
                 remaining -= 1
                 await _checkpoint()
                 if error is not None:
-                    if "anti-bot" in str(error).lower() or "rate-limit" in str(error).lower():
+                    if self._is_upstream_blocked(error):
                         consecutive_blocked += 1
                         failed_chapters.append({
                             "chapter_number": remote_chapter.chapter_number,
@@ -1013,7 +1026,12 @@ class SyncService:
         stale_ids: list[str] = []
         for source_id, chapter in list(by_id.items()):
             if source_id in remote_ids:
-                if not self._chapter_has_real_content(chapter):
+                # Rows created by older migrations/tests may not have a
+                # content path yet; keep those identities so URL migration
+                # and normal incremental sync can still reconcile them.
+                # A persisted path, on the other hand, means we can safely
+                # remove a known empty/anti-bot artifact.
+                if chapter.content_path and not self._chapter_has_real_content(chapter):
                     stale_ids.append(source_id)
             elif self._looks_like_junk_chapter(chapter, remote_hosts):
                 stale_ids.append(source_id)
@@ -1534,7 +1552,7 @@ class SyncService:
                 if isinstance(outcome, SyncPaused):
                     raise outcome
                 if isinstance(outcome, BaseException):
-                    if "anti-bot" in str(outcome).lower() or "rate-limit" in str(outcome).lower():
+                    if self._is_upstream_blocked(outcome):
                         raise outcome
                     await self.db.rollback()
                     books_failed += 1

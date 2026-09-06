@@ -2113,7 +2113,7 @@ class YueduPlugin:
         if kinds:
             results = []
             blocked_errors: list[str] = []
-            js_errors: list[str] = []
+            unavailable_errors: list[str] = []
             for kind in kinds:
                 kind_url = str(kind.get("url", "")).strip()
                 if not kind_url:
@@ -2140,6 +2140,13 @@ class YueduPlugin:
                         or "身份验证" in message
                     ):
                         blocked_errors.append(message)
+                    response = getattr(exc, "response", None)
+                    status_code = getattr(response, "status_code", None)
+                    if status_code is not None or any(
+                        marker in message.lower()
+                        for marker in ("403", "404", "408", "429", "500", "502", "503", "504", "520")
+                    ):
+                        unavailable_errors.append(message)
                     logger.warning(
                         f"Explore kind failed: {kind.get('title', kind_url)} ({exc})"
                     )
@@ -2148,6 +2155,10 @@ class YueduPlugin:
                 # page. Surface the first one so crawl tasks show a real
                 # error instead of a misleading "0 books found".
                 raise RuntimeError(blocked_errors[0])
+            if not results and unavailable_errors:
+                raise RuntimeError(
+                    "书源目录暂时不可访问：" + unavailable_errors[0]
+                )
             return results
 
         explore_url_rule = str(self.config.get("exploreUrl", "") or "").strip()
@@ -2227,6 +2238,11 @@ class YueduPlugin:
             request_url = self._make_absolute(request_url, self.base_url)
         if not request_url.startswith(("http://", "https://")):
             return "", None
+        # Keep URL options in sync with the resolved URL. Otherwise
+        # _fetch_explore_url uses the original ``{{page}}`` value from the
+        # options object and httpx sends it as ``%7B%7Bpage%7D%7D``.
+        if options is not None:
+            options["url"] = request_url
         return request_url, options
 
     def _resolve_url_template(
