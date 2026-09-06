@@ -233,7 +233,18 @@ function editSource(s: Source) {
   if (!auth.isAdmin && !s.owner_id) {
     sourceForm.value.scope = "personal"
   }
-  sourceConfigText.value = s.config ? JSON.stringify(s.config, null, 2) : ""
+  // Older records may contain the JSONB config as a serialized string.
+  // Normalize it before putting it in the editor so editing never produces
+  // invalid JSON such as a quoted JSON document.
+  if (typeof s.config === "string") {
+    try {
+      sourceConfigText.value = JSON.stringify(JSON.parse(s.config), null, 2)
+    } catch {
+      sourceConfigText.value = s.config
+    }
+  } else {
+    sourceConfigText.value = s.config ? JSON.stringify(s.config, null, 2) : ""
+  }
   window.scrollTo({ top: 0, behavior: "smooth" })
 }
 

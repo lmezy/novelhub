@@ -694,6 +694,9 @@ async function loadChapter(id: string) {
     chapter.value = loaded
     readLocation.value = { book_id: bookId.value, chapter_id: id }
     loading.value = false
+    // Warm the next chapter while the reader lays out the current one.
+    const next = chapters.value.find((item) => item.chapter_number > loaded.chapter_number)
+    if (next) void store.prefetchChapter(next.id)
     const hasPendingPage = pendingPage.value !== null
     if (isMobileLayout.value) await refreshMobileLayout()
     await nextTick()
@@ -721,6 +724,7 @@ async function resyncChapter() {
   chapterSyncing.value = true
   try {
     await api.post('/chapters/' + chapter.value.id + '/sync')
+    store.invalidateChapter(chapter.value.id)
     await loadChapter(chapter.value.id)
     alert(i18n.t('reader_chapter_synced'))
   } catch (e) {

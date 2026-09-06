@@ -53,6 +53,10 @@ export interface CustomTagOnBook {
   users: CustomTagUser[]
 }
 
+// Keep recently opened chapters in the browser process and prefetch the next
+// chapter. This avoids making every page turn wait for the API/storage read.
+const chapterCache = new Map<string, ChapterContent>()
+
 export interface ShelfGroup {
   id: string
   name: string
@@ -87,7 +91,25 @@ export const useBooksStore = defineStore("books", () => {
   }
 
   async function fetchChapter(chapterId: string): Promise<ChapterContent> {
-    return api.get<ChapterContent>(`/chapters/${chapterId}`)
+    const cached = chapterCache.get(chapterId)
+    if (cached) return cached
+    const loaded = await api.get<ChapterContent>(`/chapters/${chapterId}`)
+    chapterCache.set(chapterId, loaded)
+    return loaded
+  }
+
+  async function prefetchChapter(chapterId: string): Promise<void> {
+    if (chapterCache.has(chapterId)) return
+    try {
+      const loaded = await api.get<ChapterContent>(`/chapters/${chapterId}`)
+      chapterCache.set(chapterId, loaded)
+    } catch {
+      // Prefetch is best effort; the normal navigation request reports errors.
+    }
+  }
+
+  function invalidateChapter(chapterId: string): void {
+    chapterCache.delete(chapterId)
   }
 
   async function fetchFavorites(groupId?: string): Promise<Book[]> {
@@ -106,5 +128,5 @@ export const useBooksStore = defineStore("books", () => {
     return next
   }
 
-  return { books, loading, error, fetchBooks, fetchBook, fetchChapters, fetchChapter, fetchFavorites, toggleFavorite }
+  return { books, loading, error, fetchBooks, fetchBook, fetchChapters, fetchChapter, prefetchChapter, invalidateChapter, fetchFavorites, toggleFavorite }
 })

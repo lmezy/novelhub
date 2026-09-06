@@ -96,6 +96,19 @@ def test_substitute_page_expressions():
     ) == "https://example.com/sort/3.html"
 
 
+def test_substitute_url_encoded_legado_placeholders():
+    engine = YueduRuleEngine({"bookSourceUrl": "https://example.com"})
+
+    assert engine._substitute(
+        "https://example.com/sort/%7B%7Bpage%7D%7D/", page="2"
+    ) == "https://example.com/sort/2/"
+    assert engine._substitute(
+        "https://example.com/search?q=%7B%7BsearchKey%7D%7D&p=%7B%7BsearchPage%7D%7D",
+        key="三体",
+        page="3",
+    ) == "https://example.com/search?q=三体&p=3"
+
+
 def test_substitute_inner_rules_keeps_rules_without_templates():
     plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
     assert plugin.engine._substitute_inner_rules("a@text", "<html></html>") == "a@text"

@@ -1228,6 +1228,19 @@ class YueduRuleEngine:
 
     def _substitute(self, template: str, **kwargs: str) -> str:
         result = template
+        # Imported sources sometimes URL-encode Legado placeholders.
+        # Decode only known placeholders so legitimate encoded URL values
+        # remain unchanged.
+        encoded_placeholders = {
+            "%7B%7Bpage%7D%7D": "{{page}}",
+            "%7b%7bpage%7d%7d": "{{page}}",
+            "%7B%7BsearchPage%7D%7D": "{{searchPage}}",
+            "%7b%7bsearchpage%7d%7d": "{{searchPage}}",
+            "%7B%7BsearchKey%7D%7D": "{{searchKey}}",
+            "%7b%7bsearchkey%7d%7d": "{{searchKey}}",
+        }
+        for encoded, placeholder in encoded_placeholders.items():
+            result = result.replace(encoded, placeholder)
         result = result.replace("{{Url()}}", self.base_url)
         result = result.replace("{{baseUrl}}", self.base_url)
         for k, v in kwargs.items():
