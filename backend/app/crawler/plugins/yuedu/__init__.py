@@ -12,13 +12,14 @@ Usage:
 
 import asyncio
 import base64
+import codecs
 import json
 import logging
 import random
 import re
 import time
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup, Tag
@@ -1491,6 +1492,8 @@ class YueduPlugin:
             ".chapter_content_box",
             "#content",
             "#chapter-content",
+            ".page-content pre",
+            ".page-content",
             "article",
             "div.content",
             ".chapter-content",
@@ -1830,7 +1833,10 @@ class YueduPlugin:
         pattern = self.config.get("bookUrlPattern", "")
         if pattern and pattern.strip():
             try:
-                if re.search(pattern, url):
+                if any(
+                    re.search(pattern, candidate)
+                    for candidate in self._url_host_aliases(url)
+                ):
                     return True
             except re.error:
                 pass
@@ -1864,6 +1870,36 @@ class YueduPlugin:
             if len(tail) == 1 and tail[0]:
                 return True
         return False
+
+    @staticmethod
+    def _url_host_aliases(url: str) -> list[str]:
+        """Return the URL plus its www/non-www host equivalent.
+
+        A number of exported sources use one spelling in ``bookUrlPattern``
+        while the site redirects links to the other spelling.  Matching the
+        equivalent host keeps discovery from dropping otherwise valid books.
+        """
+        parsed = urlparse(url)
+        hostname = parsed.hostname or ""
+        if not hostname:
+            return [url]
+        aliases = [hostname]
+        if hostname.lower().startswith("www."):
+            aliases.append(hostname[4:])
+        else:
+            aliases.append("www." + hostname)
+        result: list[str] = []
+        for alias in aliases:
+            netloc = alias
+            if parsed.port:
+                netloc += f":{parsed.port}"
+            if parsed.username:
+                credentials = parsed.username
+                if parsed.password:
+                    credentials += f":{parsed.password}"
+                netloc = f"{credentials}@{netloc}"
+            result.append(urlunparse(parsed._replace(netloc=netloc)))
+        return list(dict.fromkeys(result))
 
     def _is_chapter_url(self, url: str, book_url: str) -> bool:
         """Filter out book-page, category, navigation, and ad links from a TOC."""
@@ -2314,19 +2350,25 @@ class YueduPlugin:
         if options is None:
             options = self._parse_url_options(explore_url)
         request_url = options["url"] if options else explore_url
+        request_url = self._make_absolute(request_url, self.base_url)
         if options and (options.get("web_view") or options.get("web_js")):
             html = await self._get_with_web_js(
                 request_url,
                 options.get("web_js") or self.engine.get_web_js(),
             )
         elif options and str(options.get("method", "GET")).upper() == "POST":
-            html = await self._post(
-                request_url,
-                body=options.get("body"),
-                headers=options.get("headers") or {},
-            )
+            post_kwargs = {
+                "body": options.get("body"),
+                "headers": options.get("headers") or {},
+            }
+            if options.get("charset"):
+                post_kwargs["charset"] = options["charset"]
+            html = await self._post(request_url, **post_kwargs)
         else:
-            html = await self._get(request_url)
+            if options and options.get("charset"):
+                html = await self._get(request_url, charset=options["charset"])
+            else:
+                html = await self._get(request_url)
         items = self._explore_items_from_html(html, request_url)
         if not explore_kind:
             return items
@@ -2476,19 +2518,25 @@ class YueduPlugin:
                 return []
         options = self._parse_url_options(search_url)
         request_url = options["url"] if options else search_url
+        request_url = self._make_absolute(request_url, self.base_url)
 
         if options and str(options.get("method", "GET")).upper() == "POST":
-            html = await self._post(
-                request_url,
-                body=options.get("body"),
-                headers=options.get("headers") or {},
-            )
+            post_kwargs = {
+                "body": options.get("body"),
+                "headers": options.get("headers") or {},
+            }
+            if options.get("charset"):
+                post_kwargs["charset"] = options["charset"]
+            html = await self._post(request_url, **post_kwargs)
         else:
             web_js = (options or {}).get("web_js") or self.engine.get_web_js()
             if web_js or (options or {}).get("web_view"):
                 html = await self._get_with_web_js(request_url, web_js)
             else:
-                html = await self._get(request_url)
+                if options and options.get("charset"):
+                    html = await self._get(request_url, charset=options["charset"])
+                else:
+                    html = await self._get(request_url)
 
         items = self.engine.parse_search_results(html)
         results = self._normalize_search_items(items, request_url)
@@ -2590,6 +2638,7 @@ class YueduPlugin:
             "method": str(option.get("method", "GET")),
             "headers": {str(k): str(v) for k, v in headers.items()},
             "body": body,
+            "charset": option.get("charset") or option.get("encoding"),
             "web_view": bool(option.get("webView")),
             "web_js": option.get("webJs") or "",
         }
@@ -3031,11 +3080,77 @@ class YueduPlugin:
                 existing[part.split("=", 1)[0]] = part
         self._cookie = "; ".join(existing.values())
 
+    def _request_charset(self, charset: str | None = None) -> str | None:
+        """Get the source-declared response encoding, if one exists."""
+        value = charset or self.config.get("charset") or self.config.get("pageCharset")
+        if not value:
+            value = self.config.get("encoding")
+        value = str(value or "").strip()
+        return value or None
+
+    @staticmethod
+    def _response_text(response: Any, charset: str | None = None) -> str:
+        """Decode HTML using YueDu's charset option and response metadata.
+
+        ``httpx.Response.text`` assumes UTF-8 for many responses without a
+        charset header.  That turns the GBK/Big5 pages used by older Chinese
+        sources into replacement characters before the rule engine sees them.
+        Decode the raw bytes here while preserving UTF-8 as the normal path.
+        """
+        raw = getattr(response, "content", None)
+        if isinstance(raw, str):
+            return raw
+        if not isinstance(raw, (bytes, bytearray)):
+            return str(getattr(response, "text", "") or "")
+        raw = bytes(raw)
+        if not raw:
+            return ""
+
+        candidates: list[str] = []
+        if charset:
+            candidates.append(str(charset).strip())
+
+        headers = getattr(response, "headers", {})
+        content_type = str(headers.get("content-type", "") or "")
+        header_match = re.search(r"charset\s*=\s*[\"']?([^;\"'\s]+)", content_type, re.I)
+        if header_match:
+            candidates.append(header_match.group(1))
+
+        if raw.startswith(codecs.BOM_UTF8):
+            candidates.insert(0, "utf-8-sig")
+        elif raw.startswith(codecs.BOM_UTF16_LE) or raw.startswith(codecs.BOM_UTF16_BE):
+            candidates.insert(0, "utf-16")
+        else:
+            meta_match = re.search(
+                rb"(?:charset\s*=\s*|content-type[^>]*charset\s*=\s*)[\"']?([a-zA-Z0-9._-]+)",
+                raw[:8192],
+                re.I,
+            )
+            if meta_match:
+                candidates.append(meta_match.group(1).decode("ascii", errors="ignore"))
+
+        candidates.extend(("utf-8", "gb18030", "big5"))
+        seen: set[str] = set()
+        for candidate in candidates:
+            try:
+                codec = codecs.lookup(candidate).name
+            except (LookupError, TypeError):
+                continue
+            if codec in seen:
+                continue
+            seen.add(codec)
+            try:
+                return raw.decode(codec)
+            except UnicodeDecodeError:
+                continue
+        return raw.decode("utf-8", errors="replace")
+
     async def _post(
         self,
         url: str,
         body: Any = None,
         headers: dict[str, str] | None = None,
+        charset: str | None = None,
     ) -> str:
         """HTTP POST with the same retry/proxy behavior as _get."""
         import asyncio
@@ -3087,7 +3202,8 @@ class YueduPlugin:
                         continue
                     resp.raise_for_status()
                     self._capture_cookie_jar(resp)
-                    if self._is_blocked_page(resp.text):
+                    text = self._response_text(resp, self._request_charset(charset))
+                    if self._is_blocked_page(text):
                         if attempt == 0:
                             headers = self._with_403_fallback(headers)
                             await asyncio.sleep(1.0 + random.uniform(0.5, 1.5))
@@ -3097,7 +3213,7 @@ class YueduPlugin:
                             "请在浏览器中访问该网站通过验证后，把 Cookie 导入书源再同步): "
                             + url
                         )
-                    return resp.text
+                    return text
                 except httpx.HTTPError as exc:
                     last_error = exc
                     if attempt < 2:
@@ -3163,7 +3279,7 @@ class YueduPlugin:
             or "请求频繁" in lowered
         )
 
-    async def _get(self, url: str) -> str:
+    async def _get(self, url: str, charset: str | None = None) -> str:
         """HTTP GET with cookie, headers from config, rate limiting, and cookie jar."""
         import asyncio
         import httpx
@@ -3212,7 +3328,8 @@ class YueduPlugin:
                         continue
                     resp.raise_for_status()
                     self._capture_cookie_jar(resp)
-                    if self._is_blocked_page(resp.text):
+                    text = self._response_text(resp, self._request_charset(charset))
+                    if self._is_blocked_page(text):
                         if attempt == 0:
                             headers = self._with_403_fallback(headers)
                             await asyncio.sleep(1.0 + random.uniform(0.5, 1.5))
@@ -3222,7 +3339,7 @@ class YueduPlugin:
                             "请在浏览器中访问该网站通过验证后，把 Cookie 导入书源再同步): "
                             + url
                         )
-                    return resp.text
+                    return text
                 except httpx.ConnectError as exc:
                     # DNS pollution bypass: when the direct connect fails and
                     # the system resolver is poisoned (or the site is simply

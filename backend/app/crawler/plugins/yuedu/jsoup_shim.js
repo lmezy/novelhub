@@ -758,6 +758,7 @@ var __nhCache = {};
 var __nhCookieJar = [];
 var __nhVars = {};
 var __nhSourceConfig = {};
+var __nhContent = '';
 var __nhProxy = (typeof process !== 'undefined' && process.env && process.env.DSH_HTTP_PROXY) || '';
 
 function __nhCurlRaw(url, method, body, headers, timeoutSec) {
@@ -826,6 +827,36 @@ function __nhMd5(s) {
   } catch (e) { return ''; }
 }
 
+function __nhSetContent(value) {
+  if (value && typeof value.body === 'function') value = value.body();
+  __nhContent = value == null ? '' : String(value);
+  return value;
+}
+
+function __nhGetString(rule) {
+  var parts = String(rule || '').split('@').filter(function (p) { return p.trim(); });
+  if (!parts.length) return '';
+  var current = new __nhDocument(__nhContent);
+  var first = parts.shift().trim();
+  current = current.select(first).first();
+  if (!current) return '';
+  for (var i = 0; i < parts.length; i++) {
+    var part = parts[i].trim();
+    if (part === 'text') return current.text();
+    if (part === 'html') return current.html();
+    if (part === 'outerHtml') return current.outerHtml();
+    if (part === 'ownText') return current.ownText();
+    if (part.indexOf('attr.') === 0) return current.attr(part.slice(5));
+    var tag = part.match(/^tag\.([^\.]+)(?:\.(\d+))?$/);
+    if (tag) {
+      var children = current.select(tag[1]);
+      current = children.get(tag[2] ? parseInt(tag[2], 10) : 0);
+      if (!current) return '';
+    }
+  }
+  return current.text();
+}
+
 var java = {
   // ---- HTTP: Legado java.get / java.post return a Response object ----
   get: function (url, headers) {
@@ -852,6 +883,9 @@ var java = {
     return __nhCurlRaw(opts.url, (opts.method || 'GET').toUpperCase(),
       opts.body != null ? opts.body : null, opts.headers || {});
   },
+  // ---- Content helpers used by older YueDu source scripts ----
+  setContent: function (value) { return __nhSetContent(value); },
+  getString: function (rule) { return __nhGetString(rule); },
   // ---- legacy variable store (kept for compatibility) ----
   put: function (k, v) { __nhCache[String(k)] = { value: v, expires: 0 }; return v; },
   get: function (url, headers) { return java.httpGet(url, headers); },
@@ -985,6 +1019,7 @@ if (typeof globalThis !== 'undefined') {
   globalThis.__nhVars = __nhVars;
   globalThis.__nhSetSourceConfig = __nhSetSourceConfig;
   globalThis.__nhSetVars = __nhSetVars;
+  globalThis.__nhSetContent = __nhSetContent;
   globalThis.__nhSourceConfig = __nhSourceConfig;
   globalThis.java = java;
   globalThis.source = source;

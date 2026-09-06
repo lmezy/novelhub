@@ -302,6 +302,7 @@ class JsRuntime:
                     f'(function(){{'
                     f'{context_js}'
                     f'var result={input_json};'
+                    f'if(globalThis.__nhSetContent){{globalThis.__nhSetContent(result);}}'
                     f'var __codex_src__={src_json};'
                     f'var __codex_out__;'
                     f'try{{__codex_out__=eval(__codex_src__);}}'

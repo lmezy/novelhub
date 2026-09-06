@@ -964,6 +964,56 @@ async def test_search_books_posts_json_body_with_legacy_placeholders():
     ]
 
 
+@pytest.mark.asyncio
+async def test_search_books_resolves_relative_post_url_and_preserves_charset():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://yaoluku.example/",
+        "searchUrl": '/search/,{"method":"POST","charset":"gbk","body":"searchkey={{key}}"}',
+        "ruleSearch": {
+            "bookList": "div.result",
+            "name": "a@text",
+            "bookUrl": "a@href",
+        },
+        "bookUrlPattern": r"https?://yaoluku\.example/book/\d+/",
+        "concurrentRate": "0",
+    })
+    captured: dict[str, object] = {}
+
+    async def fake_post(url, body=None, headers=None, charset=None):
+        captured.update(url=url, body=body, headers=headers, charset=charset)
+        return '<div class="result"><a href="/book/1/">Book</a></div>'
+
+    with patch.object(plugin, "_post", fake_post):
+        items = await plugin.search_books("hello")
+
+    assert captured["url"] == "https://yaoluku.example/search/"
+    assert captured["charset"] == "gbk"
+    assert captured["body"] == "searchkey=hello"
+    assert items[0]["bookUrl"] == "https://yaoluku.example/book/1/"
+
+
+def test_response_text_honors_source_charset_before_utf8_fallback():
+    request = httpx.Request("GET", "https://example.com")
+    response = httpx.Response(
+        200,
+        content="繁體中文書名".encode("big5"),
+        headers={"content-type": "text/html"},
+        request=request,
+    )
+    assert YueduPlugin._response_text(response, "big5") == "繁體中文書名"
+
+
+def test_book_url_pattern_accepts_www_alias():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://yaoluku.example",
+        "bookUrlPattern": r"https?://yaoluku\.example/book/\d+/",
+    })
+    assert plugin._is_book_url(
+        "https://www.yaoluku.example/book/123/",
+        require_pattern=True,
+    ) is True
+
+
 def test_search_books_requires_search_url():
     plugin = YueduPlugin({
         "bookSourceUrl": "https://example.com",
@@ -1723,6 +1773,12 @@ def test_js_runtime_shim_supports_legado_apis():
             context=ctx,
         )
         assert r == "一\n二"
+        r = rt.eval_js_sync(
+            "java.setContent(result); java.getString('.page-content@tag.p.0@html');",
+            "<div class='page-content'><p>正文</p></div>",
+            context=ctx,
+        )
+        assert r == "正文"
         r = rt.eval_js_sync(
             "Put('k','v9');"
             "cache.put('tmp','1',10);"
