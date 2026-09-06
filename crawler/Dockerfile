@@ -2,7 +2,9 @@ FROM python:3.13-slim
 
 WORKDIR /app
 
-# Install Chromium system dependencies for Playwright
+# Install Chromium system dependencies for Playwright.
+# Node.js powers the YueDu JS rule runtime (org.jsoup shim) and curl is used by
+# that shim's synchronous java.ajax/post/get helpers.
 # Use a China mirror for Debian packages so builds don't stall on deb.debian.org
 RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' \
         /etc/apt/sources.list \
@@ -10,6 +12,7 @@ RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' \
     2>/dev/null || true \
     && export DEBIAN_FRONTEND=noninteractive \
     && apt-get update && apt-get install -y --no-install-recommends \
+    curl nodejs \
     libnss3 libnspr4 libatk-bridge2.0-0t64 libatk1.0-0t64 \
     libcups2t64 libdrm2 libdbus-1-3 libxkbcommon0 \
     libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \

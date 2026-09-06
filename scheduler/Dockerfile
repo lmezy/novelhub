@@ -2,6 +2,13 @@
 
 WORKDIR /app
 
+# Node.js powers the YueDu JS rule runtime (org.jsoup shim) and curl is used
+# by that shim's synchronous java.ajax/post/get helpers.
+RUN export DEBIAN_FRONTEND=noninteractive \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    curl nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY backend/requirements.txt ./backend_req.txt
 COPY scheduler/requirements.txt ./scheduler_req.txt
 RUN pip install --no-cache-dir \

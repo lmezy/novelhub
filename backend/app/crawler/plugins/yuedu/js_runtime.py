@@ -212,7 +212,13 @@ class JsRuntime:
                 await self._kill_proc()
                 return False
         except FileNotFoundError:
-            logger.warning("Node.js not found; JS evaluation will use pattern fallback")
+            logger.warning(
+                "Node.js binary not found; JS rule evaluation will be severely "
+                "limited (pattern fallback only).  Sources that use <js>/@js: "
+                "rules (e.g. 御宅屋/第一版主/要撸/風月) need Node.js to parse "
+                "content.  Make sure the crawler/scheduler image installs "
+                "nodejs (and curl for the java.ajax shim)."
+            )
             self._ready = False
             return False
         except Exception as e:
