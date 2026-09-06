@@ -962,6 +962,40 @@ async def test_post_uses_browser_fallback_for_http_block_response():
     assert captured["options"]["fallback_http"] is False
 
 
+def test_split_options_suffix_extracts_webview():
+    plugin = YueduPlugin({"bookSourceUrl": "https://yaoluku.example.com"})
+    clean, options = plugin._split_options_suffix(
+        "https://yaoluku.example.com/book/123/,{\"webView\":true}"
+    )
+    assert clean == "https://yaoluku.example.com/book/123/"
+    assert options is not None
+    assert options["web_view"] is True
+    # A plain URL is untouched.
+    assert plugin._split_options_suffix("https://yaoluku.example.com/book/123/") == (
+        "https://yaoluku.example.com/book/123/",
+        None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_dispatches_webview_suffix_to_browser():
+    plugin = YueduPlugin({"bookSourceUrl": "https://yaoluku.example.com"})
+    captured: dict[str, object] = {}
+
+    async def fake_browser(url, web_js="", **kwargs):
+        captured.update(url=url, web_js=web_js, kwargs=kwargs)
+        return "<html><body>ok</body></html>"
+
+    with patch.object(plugin, "_get_with_web_js", fake_browser):
+        html = await plugin._get(
+            "https://yaoluku.example.com/book/123/,{\"webView\":true}"
+        )
+
+    assert html == "<html><body>ok</body></html>"
+    # The suffix must not be part of the requested URL.
+    assert captured["url"] == "https://yaoluku.example.com/book/123/"
+
+
 SEARCH_SOURCE = {
     "bookSourceUrl": "https://example.com",
     "bookUrlPattern": r"https?://example\.com/novel/\d+\.html",

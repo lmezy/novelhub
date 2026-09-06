@@ -2658,6 +2658,22 @@ class YueduPlugin:
             "web_js": option.get("webJs") or "",
         }
 
+    def _split_options_suffix(self, url: str) -> tuple[str, dict[str, Any] | None]:
+        """Return ``(clean_url, options)`` after splitting a Legado ``,{...}``
+        URL-options suffix off a request URL.
+
+        Sources commonly append ``,{"webView":true}`` (or ``,{"method":"POST",
+        "body":...}``) to book/chapter/search URLs.  The consumer must not send
+        that suffix as part of the path, so every fetch entry point funnels the
+        URL through here and dispatches on the parsed options instead.
+        """
+        if not url:
+            return url, None
+        options = self._parse_url_options(url)
+        if not options:
+            return url, None
+        return options.get("url", url), options
+
     async def update_book(self, url: str) -> RemoteBook | None:
         """Re-fetch a book to check for new chapters."""
         try:
@@ -2722,6 +2738,15 @@ class YueduPlugin:
         import asyncio
 
         web_js = str(web_js or "").strip()
+        clean_url, url_options = self._split_options_suffix(url)
+        if url_options:
+            if url_options.get("web_js") and not web_js:
+                web_js = str(url_options.get("web_js"))
+            if url_options.get("headers"):
+                merged_headers = dict(request_headers or {})
+                merged_headers.update(url_options.get("headers"))
+                request_headers = merged_headers
+            url = clean_url
 
         # Try Playwright first
         try:
@@ -2751,7 +2776,17 @@ class YueduPlugin:
                         launch_kwargs["proxy"] = proxy
                 except Exception:
                     pass
-                browser = await pw.chromium.launch(**launch_kwargs)
+                # Prefer the full Chromium build (new headless) over the
+                # lightweight headless shell: Cloudflare/WAF fingerprint checks
+                # pass far more often against a full browser.  If it is not
+                # available, fall back to Playwright's default launch.
+                try:
+                    browser = await pw.chromium.launch(
+                        **launch_kwargs,
+                        channel="chromium",
+                    )
+                except Exception:
+                    browser = await pw.chromium.launch(**launch_kwargs)
                 try:
                     headers = dict(request_headers or self._build_headers())
                     user_agent = headers.pop("User-Agent", None)
@@ -2767,6 +2802,17 @@ class YueduPlugin:
                         **({"user_agent": user_agent} if user_agent else {}),
                         extra_http_headers=headers,
                     )
+                    # Mask common automation fingerprints so challenge pages
+                    # do not immediately classify the browser as a headless bot.
+                    try:
+                        await context.add_init_script(
+                            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                            "window.chrome=window.chrome||{runtime:{}};"
+                            "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});"
+                            "Object.defineProperty(navigator,'languages',{get:()=>['zh-CN','zh','en']});"
+                        )
+                    except Exception:
+                        pass
                     page = await context.new_page()
 
                     # Apply cookies if set
@@ -3283,6 +3329,22 @@ class YueduPlugin:
 
         if not url.startswith(("http://", "https://")):
             raise ValueError(f"Unsupported URL: {url}")
+        clean_url, url_options = self._split_options_suffix(url)
+        if url_options:
+            if url_options.get("headers"):
+                merged = dict(headers or {})
+                merged.update(url_options.get("headers"))
+                headers = merged
+            if url_options.get("body") is not None:
+                body = url_options.get("body")
+            if url_options.get("charset"):
+                charset = url_options.get("charset")
+            method = str(url_options.get("method", "GET")).upper()
+            if method != "POST":
+                # A URL option that isn't a POST should go through the matching
+                # helper (GET / webView) rather than being force-POSTed.
+                return await self._get(clean_url, charset=charset)
+            url = clean_url
         await self._sleep_rate_limit()
         headers = self._build_headers(headers)
 
@@ -3522,11 +3584,25 @@ class YueduPlugin:
                 self._capture_playwright_cookies(await context.cookies())
             except Exception:
                 pass
-            if last_html and not self._is_challenge_page(last_html):
+            if last_html and not (
+                self._is_challenge_page(last_html)
+                or self._is_blocked_page(last_html)
+            ):
                 return last_html
             if time.monotonic() >= deadline:
                 return last_html
             await page.wait_for_timeout(1500)
+            # Turnstile / slider challenges auto-solve only after the user widget
+            # is ticked.  Best-effort click on the challenge checkbox.
+            if "turnstile" in (last_html or "").lower():
+                for frame in page.frames:
+                    try:
+                        checkbox = frame.query_selector("input[type=checkbox]")
+                        if checkbox:
+                            await checkbox.click(timeout=3000)
+                            break
+                    except Exception:
+                        pass
             # After a grace period issue a single reload.  Cloudflare's challenge
             # runs once then reloads with the clearance cookie; an explicit reload
             # unblocks the rare case where the auto-reload navigation is missed.
@@ -3547,6 +3623,27 @@ class YueduPlugin:
 
         if not url.startswith(("http://", "https://")):
             raise ValueError(f"Unsupported URL: {url}")
+        # A source may append ``,{"webView":true}`` / ``,{"method":"POST",...}``
+        # to the URL.  Split that off and honor it instead of sending the suffix
+        # as part of the path (which breaks /book/123/,{"webView":true} URLs).
+        clean_url, url_options = self._split_options_suffix(url)
+        if url_options:
+            if url_options.get("web_view") or url_options.get("web_js"):
+                return await self._get_with_web_js(
+                    clean_url,
+                    str(url_options.get("web_js") or ""),
+                    request_headers=url_options.get("headers") or None,
+                )
+            if str(url_options.get("method", "GET")).upper() == "POST":
+                return await self._post(
+                    clean_url,
+                    body=url_options.get("body"),
+                    headers=url_options.get("headers") or None,
+                    charset=url_options.get("charset") or charset,
+                )
+            url = clean_url
+            if url_options.get("charset"):
+                charset = url_options.get("charset")
         await self._sleep_rate_limit()
         headers = self._build_headers()
 
