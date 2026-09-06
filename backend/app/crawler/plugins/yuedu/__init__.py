@@ -290,6 +290,21 @@ STRONG_BLOCK_MARKERS = (
     "被限制访问",
     "ip 已被限制",
     "ip已被限制",
+    # Cloudflare / Turnstile / generic JS challenge gates.  The rendered body
+    # of a Cloudflare "Just a moment..." page carries these markers (and often
+    # ``cf-chl``), so treat them as a hard block until the browser has a chance
+    # to solve the challenge and reload.
+    "just a moment",
+    "managed challenge",
+    "verify you are human",
+    "cf-turnstile",
+    "cf-challenge",
+    "attention required",
+    "请启用javascript",
+    "请开启javascript",
+    "浏览器安全检查",
+    "正在验证您的浏览器",
+    "正在检查您的浏览器",
 )
 
 # Weak markers need a confirmation phrase to avoid false positives on
@@ -2688,7 +2703,14 @@ class YueduPlugin:
 
     # ---- Helpers ----
 
-    async def _get_with_web_js(self, url: str, web_js: str) -> str:
+    async def _get_with_web_js(
+        self,
+        url: str,
+        web_js: str = "",
+        *,
+        request_headers: dict[str, str] | None = None,
+        fallback_http: bool = True,
+    ) -> str:
         """Fetch a page that requires JavaScript rendering (webJs).
 
         Uses Playwright to load the page in a headless browser,
@@ -2699,9 +2721,7 @@ class YueduPlugin:
         """
         import asyncio
 
-        web_js = web_js.strip()
-        if not web_js:
-            return await self._get(url)
+        web_js = str(web_js or "").strip()
 
         # Try Playwright first
         try:
@@ -2710,48 +2730,102 @@ class YueduPlugin:
             logger.warning(
                 "playwright not installed; falling back to plain HTTP for webJs"
             )
+            if not fallback_http:
+                raise RuntimeError(f"Playwright is not installed: {url}")
             return await self._get(url)
 
         try:
             async with async_playwright() as pw:
-                browser = await pw.chromium.launch(
-                    headless=True,
-                    args=["--no-sandbox", "--disable-setuid-sandbox"],
-                )
+                launch_kwargs: dict[str, Any] = {
+                    "headless": True,
+                    "args": [
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                        "--disable-blink-features=AutomationControlled",
+                    ],
+                }
                 try:
+                    from app.services.proxy_config import get_playwright_proxy
+                    proxy = get_playwright_proxy()
+                    if proxy:
+                        launch_kwargs["proxy"] = proxy
+                except Exception:
+                    pass
+                browser = await pw.chromium.launch(**launch_kwargs)
+                try:
+                    headers = dict(request_headers or self._build_headers())
+                    user_agent = headers.pop("User-Agent", None)
+                    # Cookie is installed through the browser cookie jar below.
+                    cookie_header = self._merge_cookie_strings(
+                        headers.pop("Cookie", ""),
+                        self._cookie,
+                    )
+                    headers.pop("Connection", None)
                     context = await browser.new_context(
                         viewport={"width": 1280, "height": 720},
                         locale="zh-CN",
+                        **({"user_agent": user_agent} if user_agent else {}),
+                        extra_http_headers=headers,
                     )
                     page = await context.new_page()
 
                     # Apply cookies if set
-                    if self._cookie:
+                    if cookie_header:
                         await context.add_cookies(
-                            self._parse_cookies_for_playwright()
+                            self._parse_cookies_for_playwright(cookie_header)
                         )
 
                     # WAF-protected sites often keep analytics sockets open forever;
                     # waiting for networkidle turns a usable page into a timeout.
                     await page.goto(url, wait_until="domcontentloaded", timeout=20000)
-                    try:
-                        await page.wait_for_timeout(1200)
-                    except Exception:
-                        pass
+                    # Cloudflare / WAF challenge pages ("Just a moment…") return
+                    # before the JS challenge has solved itself.  Wait for the
+                    # real page (and the resolved session cookies) before running
+                    # any webJs or parsing the content.
+                    rendered = await self._wait_for_challenge(
+                        context,
+                        page,
+                        url,
+                        timeout=25.0,
+                    )
+                    if not rendered:
+                        raise RuntimeError(
+                            "Site returned an empty browser page (网站返回了空白页): "
+                            + url
+                        )
+                    if self._is_blocked_page(rendered):
+                        # Even after waiting the challenge never cleared; surface
+                        # a clear hint instead of parsing the WAF gate as content.
+                        raise RuntimeError(
+                            "Site returned an anti-bot/captcha page (网站要求验证码/人机验证，"
+                            "请在浏览器中访问该网站通过验证后，把 Cookie 导入书源再同步): "
+                            + url
+                        )
+                    self._capture_playwright_cookies(await context.cookies())
 
                     # Legado webJs may mutate the DOM or return the rendered
                     # HTML directly. Preserve both forms instead of discarding
                     # the script result.
-                    try:
-                        html = await page.evaluate(
-                            f"(function(){{ var result=document.documentElement.outerHTML; "
-                            f"var value=(function(){{ {web_js} }})(); "
-                            f"return (typeof value === 'string' && value.trim()) "
-                            f"? value : document.documentElement.outerHTML; }})()"
+                    if web_js:
+                        try:
+                            html = await page.evaluate(
+                                f"(function(){{ var result=document.documentElement.outerHTML; "
+                                f"var value=(function(){{ {web_js} }})(); "
+                                f"return (typeof value === 'string' && value.trim()) "
+                                f"? value : document.documentElement.outerHTML; }})()"
+                            )
+                        except Exception as e:
+                            logger.warning(f"webJs execution error: {e}")
+                            html = rendered
+                    else:
+                        html = rendered
+
+                    if self._is_blocked_page(html):
+                        raise RuntimeError(
+                            "Site returned an anti-bot/captcha page (网站要求验证码/人机验证，"
+                            "请在浏览器中访问该网站通过验证后，把 Cookie 导入书源再同步): "
+                            + url
                         )
-                    except Exception as e:
-                        logger.warning(f"webJs execution error: {e}")
-                        html = await page.content()
 
                     await context.close()
                     return html
@@ -2761,8 +2835,13 @@ class YueduPlugin:
             logger.warning(
                 f"Playwright webJs fetch failed for {url}: {e}; falling back to HTTP"
             )
+            if not fallback_http and "anti-bot/captcha" in str(e):
+                raise
 
         # Fallback: try evaluating webJs on plain HTTP response
+        if not fallback_http:
+            raise RuntimeError(f"Browser request failed: {url}")
+
         html = await self._get(url)
         if self.engine:
             result = self.engine.eval_web_js(web_js, html)
@@ -2770,12 +2849,17 @@ class YueduPlugin:
                 return result
         return html
 
-    def _parse_cookies_for_playwright(self) -> list[dict[str, Any]]:
+    def _parse_cookies_for_playwright(
+        self,
+        cookie_header: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Parse cookie string into Playwright cookie format."""
         cookies = []
-        if not self._cookie:
+        cookie_header = str(cookie_header or self._cookie or "")
+        if not cookie_header:
             return cookies
-        for part in self._cookie.split(";"):
+        cookie_url = self.base_url.split("##", 1)[0].rstrip("/") + "/"
+        for part in cookie_header.split(";"):
             part = part.strip()
             if "=" in part:
                 name, value = part.split("=", 1)
@@ -2783,9 +2867,30 @@ class YueduPlugin:
                     "name": name.strip(),
                     "value": value.strip(),
                     # Let Playwright derive the host, including www/non-www.
-                    "url": self.base_url.rstrip("/") + "/",
+                    "url": cookie_url,
                 })
         return cookies
+
+    def _capture_playwright_cookies(self, cookies: list[dict[str, Any]]) -> None:
+        """Merge cookies set by a browser page into the in-memory cookie string.
+
+        This runs regardless of ``enabledCookieJar`` so that a Cloudflare
+        ``cf_clearance`` (and any other session cookie a challenge sets) is
+        reused by subsequent plain-HTTP requests.  The merge only mutates the
+        in-memory ``self._cookie``; it never writes to the DB cookie store.
+        """
+        existing = dict(
+            (part.split("=", 1)[0].strip(), part.strip())
+            for part in self._cookie.split(";")
+            if "=" in part
+        )
+        for cookie in cookies:
+            name = str(cookie.get("name") or "").strip()
+            if not name:
+                continue
+            value = str(cookie.get("value") or "")
+            existing[name] = f"{name}={value}"
+        self._cookie = "; ".join(existing.values())
 
     def _build_headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         """Build request headers from source config, cookies, and per-request extras."""
@@ -2843,7 +2948,27 @@ class YueduPlugin:
 
         if extra:
             headers.update(extra)
+        if self._cookie or headers.get("Cookie"):
+            headers["Cookie"] = self._merge_cookie_strings(
+                headers.get("Cookie", ""),
+                self._cookie,
+            )
         return headers
+
+    @staticmethod
+    def _merge_cookie_strings(*values: str) -> str:
+        """Merge Cookie header values without dropping a session cookie."""
+        merged: dict[str, str] = {}
+        for value in values:
+            for part in str(value or "").split(";"):
+                part = part.strip()
+                if "=" not in part:
+                    continue
+                name, cookie_value = part.split("=", 1)
+                name = name.strip()
+                if name:
+                    merged[name] = f"{name}={cookie_value.strip()}"
+        return "; ".join(merged.values())
 
     def _with_403_fallback(self, headers: dict[str, str]) -> dict[str, str]:
         """Retry 403 responses with a desktop UA and site Referer."""
@@ -3187,10 +3312,40 @@ class YueduPlugin:
                     else:
                         resp = await client.post(url, json=body, headers=headers)
 
-                    if resp.status_code == 403 and attempt == 0:
-                        headers = self._with_403_fallback(headers)
-                        await asyncio.sleep(1.0 + random.uniform(0.5, 1.0))
-                        continue
+                    if resp.status_code in (403, 520):
+                        if attempt < 2:
+                            headers = self._with_403_fallback(headers)
+                            await asyncio.sleep(1.0 + random.uniform(0.5, 1.0))
+                            continue
+                        try:
+                            browser_html = await self._get_with_web_js(
+                                url,
+                                request_headers=headers,
+                                fallback_http=False,
+                            )
+                        except RuntimeError as exc:
+                            if "anti-bot/captcha" in str(exc):
+                                raise
+                            browser_html = None
+                            logger.warning(
+                                "Browser fallback failed for %s: %s",
+                                url,
+                                exc,
+                            )
+                        except Exception as exc:
+                            browser_html = None
+                            logger.warning(
+                                "Browser fallback failed for %s: %s",
+                                url,
+                                exc,
+                            )
+                        if browser_html:
+                            return browser_html
+                        raise RuntimeError(
+                            "Site returned an anti-bot/captcha page (网站要求验证码/人机验证，"
+                            "请在浏览器中访问该网站通过验证后，把 Cookie 导入书源再同步): "
+                            + url
+                        )
                     if resp.status_code in (429, 500, 502, 503, 504):
                         retry_after = resp.headers.get("Retry-After", "")
                         wait = (
@@ -3208,6 +3363,30 @@ class YueduPlugin:
                             headers = self._with_403_fallback(headers)
                             await asyncio.sleep(1.0 + random.uniform(0.5, 1.5))
                             continue
+                        try:
+                            browser_html = await self._get_with_web_js(
+                                url,
+                                request_headers=headers,
+                                fallback_http=False,
+                            )
+                        except RuntimeError as exc:
+                            if "anti-bot/captcha" in str(exc):
+                                raise
+                            browser_html = None
+                            logger.warning(
+                                "Browser fallback failed for %s: %s",
+                                url,
+                                exc,
+                            )
+                        except Exception as exc:
+                            browser_html = None
+                            logger.warning(
+                                "Browser fallback failed for %s: %s",
+                                url,
+                                exc,
+                            )
+                        if browser_html:
+                            return browser_html
                         raise RuntimeError(
                             "Site returned an anti-bot/captcha page (网站要求验证码/人机验证，"
                             "请在浏览器中访问该网站通过验证后，把 Cookie 导入书源再同步): "
@@ -3240,12 +3419,19 @@ class YueduPlugin:
                     proxy_url,
                     exc,
                 )
+            except httpx.HTTPStatusError as exc:
+                if proxy is None:
+                    raise
+                last_error = exc
+                logger.warning(
+                    "Configured proxy returned HTTP %s; retrying direct",
+                    exc.response.status_code if exc.response is not None else "error",
+                )
 
         if last_error is not None:
             raise last_error
         raise RuntimeError(f"Request failed after retries: {url}")
 
-    @staticmethod
     @staticmethod
     def _is_blocked_page(html: str) -> bool:
         """Detect Chinese novel-site anti-bot / captcha / rate-limit pages.
@@ -3269,15 +3455,90 @@ class YueduPlugin:
             if marker in lowered:
                 return any(confirm in lowered for confirm in confirmations)
         return False
-        lowered = html.lower()
-        if not any(marker in lowered for marker in BLOCK_PAGE_MARKERS):
+
+    @classmethod
+    def _is_challenge_page(cls, html: str) -> bool:
+        """Detect a Cloudflare / generic JS challenge gate that may still be
+        solving itself.  Unlike :meth:`_is_blocked_page`, this is lenient and
+        deliberately looks for Cloudflare's own markers so we know to wait for
+        the challenge (and the resulting ``cf_clearance`` cookie) to resolve.
+        It deliberately does **not** fall back to the strict WAF/anti-bot
+        markers: a rate-limit or captcha gate will never solve itself, so we
+        only wait for JS challenges that can auto-clear.  The caller applies
+        :meth:`_is_blocked_page` after the wait to reject truly blocked pages.
+        """
+        if not html:
             return False
-        return (
-            "请稍后再试" in lowered
-            or "后再试" in lowered
-            or "访问频繁" in lowered
-            or "请求频繁" in lowered
-        )
+        lowered = html.lower()
+        # Cloudflare sets the title to "Just a moment..." while a challenge runs.
+        if re.search(r"<title[^>]*>\s*just a moment", lowered):
+            return True
+        if any(
+            marker in lowered
+            for marker in (
+                "cf-chl",
+                "cf-challenge",
+                "cf-turnstile",
+                "cf_chl_opt",
+                "challenge-platform",
+                "managed challenge",
+                "verify you are human",
+                "attention required",
+                "browser check",
+            )
+        ):
+            return True
+        return False
+
+    async def _wait_for_challenge(
+        self,
+        context: Any,
+        page: Any,
+        url: str,
+        timeout: float = 25.0,
+    ) -> str:
+        """Wait for a Cloudflare/WAF JS challenge page to resolve itself.
+
+        Cloudflare serves "Just a moment..." and then runs a JS challenge,
+        sets a ``cf_clearance`` cookie, and reloads the page.  A single
+        ``page.goto(..., "domcontentloaded")`` returns before that finishes, so
+        plain ``page.content()`` captures the challenge gate.  This helper polls
+        the live page until either the real content appears (challenge cleared)
+        or the deadline passes.  It also performs one explicit ``reload()`` after
+        a grace period, which is enough for most challenge flows.
+        """
+        start = time.monotonic()
+        deadline = start + timeout
+        last_html = ""
+        reloaded = False
+        while True:
+            try:
+                last_html = await page.content()
+            except Exception:
+                last_html = ""
+            # Capture session cookies (cf_clearance etc.) as soon as they appear
+            # so later plain-HTTP requests can reuse the cleared session.
+            try:
+                self._capture_playwright_cookies(await context.cookies())
+            except Exception:
+                pass
+            if last_html and not self._is_challenge_page(last_html):
+                return last_html
+            if time.monotonic() >= deadline:
+                return last_html
+            await page.wait_for_timeout(1500)
+            # After a grace period issue a single reload.  Cloudflare's challenge
+            # runs once then reloads with the clearance cookie; an explicit reload
+            # unblocks the rare case where the auto-reload navigation is missed.
+            if not reloaded and (time.monotonic() - start) >= 8.0:
+                try:
+                    await page.reload(
+                        wait_until="domcontentloaded",
+                        timeout=20000,
+                    )
+                    reloaded = True
+                except Exception:
+                    pass
 
     async def _get(self, url: str, charset: str | None = None) -> str:
         """HTTP GET with cookie, headers from config, rate limiting, and cookie jar."""
@@ -3313,10 +3574,43 @@ class YueduPlugin:
                         req_headers = dict(headers)
                         req_headers["Host"] = original_host
                     resp = await client.get(req_url, headers=req_headers)
-                    if resp.status_code == 403 and attempt == 0:
-                        headers = self._with_403_fallback(headers)
-                        await asyncio.sleep(1.0 + random.uniform(0.5, 1.0))
-                        continue
+                    if resp.status_code in (403, 520):
+                        if attempt < 2:
+                            headers = self._with_403_fallback(headers)
+                            await asyncio.sleep(1.0 + random.uniform(0.5, 1.0))
+                            continue
+                        try:
+                            browser_html = await self._get_with_web_js(
+                                url,
+                                request_headers=headers,
+                                fallback_http=False,
+                            )
+                        except RuntimeError as exc:
+                            if "anti-bot/captcha" in str(exc):
+                                raise
+                            browser_html = None
+                            logger.warning(
+                                "Browser fallback failed for %s: %s",
+                                url,
+                                exc,
+                            )
+                        except Exception as exc:
+                            browser_html = None
+                            logger.warning(
+                                "Browser fallback failed for %s: %s",
+                                url,
+                                exc,
+                            )
+                        if browser_html:
+                            return browser_html
+                        # The WAF blocked plain HTTP *and* the browser could not
+                        # clear the challenge.  Surface a clear hint instead of a
+                        # bare httpx 403/520 that hides the real cause.
+                        raise RuntimeError(
+                            "Site returned an anti-bot/captcha page (网站要求验证码/人机验证，"
+                            "请在浏览器中访问该网站通过验证后，把 Cookie 导入书源再同步): "
+                            + url
+                        )
                     if resp.status_code in (429, 500, 502, 503, 504):
                         retry_after = resp.headers.get("Retry-After", "")
                         wait = (
@@ -3334,6 +3628,30 @@ class YueduPlugin:
                             headers = self._with_403_fallback(headers)
                             await asyncio.sleep(1.0 + random.uniform(0.5, 1.5))
                             continue
+                        try:
+                            browser_html = await self._get_with_web_js(
+                                url,
+                                request_headers=headers,
+                                fallback_http=False,
+                            )
+                        except RuntimeError as exc:
+                            if "anti-bot/captcha" in str(exc):
+                                raise
+                            browser_html = None
+                            logger.warning(
+                                "Browser fallback failed for %s: %s",
+                                url,
+                                exc,
+                            )
+                        except Exception as exc:
+                            browser_html = None
+                            logger.warning(
+                                "Browser fallback failed for %s: %s",
+                                url,
+                                exc,
+                            )
+                        if browser_html:
+                            return browser_html
                         raise RuntimeError(
                             "Site returned an anti-bot/captcha page (网站要求验证码/人机验证，"
                             "请在浏览器中访问该网站通过验证后，把 Cookie 导入书源再同步): "
@@ -3397,6 +3715,14 @@ class YueduPlugin:
                     "Configured proxy %s unreachable (%s); retrying direct",
                     proxy_url,
                     exc,
+                )
+            except httpx.HTTPStatusError as exc:
+                if proxy is None:
+                    raise
+                last_error = exc
+                logger.warning(
+                    "Configured proxy returned HTTP %s; retrying direct",
+                    exc.response.status_code if exc.response is not None else "error",
                 )
 
         if last_error is not None:

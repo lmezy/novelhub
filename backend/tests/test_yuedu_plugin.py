@@ -267,6 +267,16 @@ def test_build_headers_uses_http_user_agent():
     assert plugin._build_headers()["User-Agent"] == "CustomAgent/1.0"
 
 
+def test_build_headers_merges_source_and_session_cookies():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "header": '{"Cookie":"isSimplified=1"}',
+    })
+    plugin.set_cookie("session=abc")
+
+    assert plugin._build_headers()["Cookie"] == "isSimplified=1; session=abc"
+
+
 def test_403_fallback_uses_desktop_ua_and_referer():
     plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
     fallback = plugin._with_403_fallback({
@@ -882,6 +892,74 @@ async def test_get_falls_back_to_direct_when_proxy_unreachable():
     assert html == "<html>ok</html>"
     assert proxy_calls[0] == "http://127.0.0.1:1"
     assert proxy_calls[-1] is None
+
+
+@pytest.mark.asyncio
+async def test_get_uses_browser_fallback_for_http_block_response():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "concurrentRate": "0",
+    })
+    request = httpx.Request("GET", "https://example.com/page")
+    blocked_response = httpx.Response(403, request=request)
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        async def get(self, url, headers=None):
+            return blocked_response
+
+    async def fake_browser(url, web_js="", **kwargs):
+        captured.update(url=url, web_js=web_js, options=kwargs)
+        return "<html><body>browser page</body></html>"
+
+    with (
+        patch.object(plugin, "_get_http_client", AsyncMock(return_value=FakeClient())),
+        patch.object(plugin, "_get_with_web_js", fake_browser),
+        patch("asyncio.sleep", AsyncMock()),
+        patch(
+            "app.services.proxy_config.get_proxy_config",
+            return_value=ProxyConfig(enabled=False),
+        ),
+    ):
+        html = await plugin._get("https://example.com/page")
+
+    assert html == "<html><body>browser page</body></html>"
+    assert captured["url"] == "https://example.com/page"
+    assert captured["options"]["fallback_http"] is False
+
+
+@pytest.mark.asyncio
+async def test_post_uses_browser_fallback_for_http_block_response():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "concurrentRate": "3",
+    })
+    request = httpx.Request("POST", "https://example.com/search")
+    blocked_response = httpx.Response(403, request=request)
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        async def post(self, url, headers=None, data=None, json=None, content=None):
+            return blocked_response
+
+    async def fake_browser(url, web_js="", **kwargs):
+        captured.update(url=url, web_js=web_js, options=kwargs)
+        return "<html><body>browser page</body></html>"
+
+    with (
+        patch.object(plugin, "_get_http_client", AsyncMock(return_value=FakeClient())),
+        patch.object(plugin, "_get_with_web_js", fake_browser),
+        patch("asyncio.sleep", AsyncMock()),
+        patch(
+            "app.services.proxy_config.get_proxy_config",
+            return_value=ProxyConfig(enabled=False),
+        ),
+    ):
+        html = await plugin._post("https://example.com/search", body="q=x")
+
+    assert html == "<html><body>browser page</body></html>"
+    assert captured["url"] == "https://example.com/search"
+    assert captured["options"]["fallback_http"] is False
 
 
 SEARCH_SOURCE = {
@@ -1822,6 +1900,99 @@ GOEDGE_CAPTCHA_HTML = """
 
 def test_is_blocked_page_detects_goedge_waf_captcha():
     assert YueduPlugin._is_blocked_page(GOEDGE_CAPTCHA_HTML) is True
+
+
+def test_is_challenge_page_detects_cloudflare():
+    html = (
+        "<html><head><title>Just a moment...</title></head>"
+        "<body><div class=\"cf-chl\">Checking your browser</div></body></html>"
+    )
+    assert YueduPlugin._is_challenge_page(html) is True
+    # A clean rendered page must not be treated as a pending challenge.
+    assert YueduPlugin._is_challenge_page(
+        "<html><head><title>某小说</title></head><body>正文内容</body></html>"
+    ) is False
+
+
+def test_is_blocked_page_detects_cloudflare_challenge():
+    html = (
+        "<html><head><title>Attention Required! | Cloudflare</title>"
+        "<script src=\"/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page\"></script>"
+        "</head><body>Attention Required! | Cloudflare</body></html>"
+    )
+    assert YueduPlugin._is_blocked_page(html) is True
+
+
+@pytest.mark.asyncio
+async def test_wait_for_challenge_waits_until_content_ready():
+    plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
+
+    contents = [
+        "<html><head><title>Just a moment...</title></head><body>cf-chl</body></html>",
+        "<html><body><div>real content</div></body></html>",
+    ]
+    page = SimpleNamespace(
+        content=AsyncMock(side_effect=contents),
+        wait_for_timeout=AsyncMock(),
+        reload=AsyncMock(),
+    )
+    context = SimpleNamespace(cookies=AsyncMock(return_value=[]))
+
+    html = await plugin._wait_for_challenge(context, page, "https://example.com/x", timeout=30)
+
+    assert html == "<html><body><div>real content</div></body></html>"
+    assert page.wait_for_timeout.await_count == 1
+    page.reload.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_wait_for_challenge_captures_session_cookies():
+    plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
+    captured: dict[str, object] = {}
+
+    def fake_capture(cookies):
+        captured["cookies"] = cookies
+
+    page = SimpleNamespace(
+        content=AsyncMock(return_value="<html><body>ok</body></html>"),
+        wait_for_timeout=AsyncMock(),
+        reload=AsyncMock(),
+    )
+    context = SimpleNamespace(
+        cookies=AsyncMock(return_value=[{"name": "cf_clearance", "value": "abc"}])
+    )
+
+    with patch.object(plugin, "_capture_playwright_cookies", side_effect=fake_capture):
+        html = await plugin._wait_for_challenge(
+            context, page, "https://example.com/x", timeout=30
+        )
+
+    assert html == "<html><body>ok</body></html>"
+    assert captured["cookies"] == [{"name": "cf_clearance", "value": "abc"}]
+
+
+@pytest.mark.asyncio
+async def test_fetch_explore_webview_uses_browser():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://yaoluku.example.com",
+        "exploreUrl": "最新::/sort/{{page}}/,{\"webView\":true}",
+    })
+    captured: dict[str, object] = {}
+    items = [{"bookUrl": "https://yaoluku.example.com/book/1", "name": "书"}]
+
+    async def fake_browser(url, web_js="", **kwargs):
+        captured.update(url=url, web_js=web_js, kwargs=kwargs)
+        return "<html><body><li>book</li></body></html>"
+
+    with (
+        patch.object(plugin, "_explore_items_from_html", return_value=items),
+        patch.object(plugin, "_get_with_web_js", fake_browser),
+    ):
+        result = await plugin.fetch_explore(page=1)
+
+    assert captured["url"] == "https://yaoluku.example.com/sort/1/"
+    assert captured["web_js"] == ""
+    assert [i["bookUrl"] for i in result] == ["https://yaoluku.example.com/book/1"]
 
 
 def test_is_blocked_page_detects_generic_identity_verification():
