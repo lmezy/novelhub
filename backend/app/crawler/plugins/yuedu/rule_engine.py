@@ -1234,10 +1234,16 @@ class YueduRuleEngine:
         encoded_placeholders = {
             "%7B%7Bpage%7D%7D": "{{page}}",
             "%7b%7bpage%7d%7d": "{{page}}",
+            "%257B%257Bpage%257D%257D": "{{page}}",
+            "%257b%257bpage%257d%257d": "{{page}}",
             "%7B%7BsearchPage%7D%7D": "{{searchPage}}",
             "%7b%7bsearchpage%7d%7d": "{{searchPage}}",
+            "%257B%257BsearchPage%257D%257D": "{{searchPage}}",
+            "%257b%257bsearchpage%257d%257d": "{{searchPage}}",
             "%7B%7BsearchKey%7D%7D": "{{searchKey}}",
             "%7b%7bsearchkey%7d%7d": "{{searchKey}}",
+            "%257B%257BsearchKey%257D%257D": "{{searchKey}}",
+            "%257b%257bsearchkey%257d%257d": "{{searchKey}}",
         }
         for encoded, placeholder in encoded_placeholders.items():
             result = result.replace(encoded, placeholder)

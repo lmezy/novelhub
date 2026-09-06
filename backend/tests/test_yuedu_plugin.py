@@ -107,6 +107,9 @@ def test_substitute_url_encoded_legado_placeholders():
         key="三体",
         page="3",
     ) == "https://example.com/search?q=三体&p=3"
+    assert engine._substitute(
+        "https://example.com/sort/%257B%257Bpage%257D%257D/", page="4"
+    ) == "https://example.com/sort/4/"
 
 
 def test_substitute_inner_rules_keeps_rules_without_templates():
