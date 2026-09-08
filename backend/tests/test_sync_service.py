@@ -35,6 +35,12 @@ def test_normalize_title_for_match():
     assert SyncService._normalize_title_for_match(" 剑来 ") == "剑来"
 
 
+def test_safe_title_clamps_to_column_limit():
+    remote = SimpleNamespace(title="x" * 500, source_book_id="src-id")
+    title = SyncService._safe_title(remote)
+    assert len(title) == 255
+
+
 def test_upstream_blocked_includes_http_status_errors():
     assert SyncService._is_upstream_blocked(
         SimpleNamespace(response=SimpleNamespace(status_code=403))

@@ -413,30 +413,41 @@ class YueduPlugin:
         if not self.engine:
             raise RuntimeError("YueduPlugin not configured")
 
+        # A source may append a Legado ``,{...}`` option suffix to the book URL
+        # (e.g. 要撸小说 appends `,{"webView":true}` to every book link).  That
+        # suffix must NOT become the book's identity: it corrupts baseUrl, makes
+        # source_book_id/url comparisons fail, and flows into the DB.  Keep it
+        # only for the page fetch (so `_get` can honor webView/JS), and use the
+        # clean URL for every identity/base operation below.
+        fetch_url = url
+        identity_url, url_options = self._split_options_suffix(url)
+        if not identity_url:
+            identity_url = url
+
         # Rules may refer to Legado's page-scoped ``baseUrl``.
-        self.engine.set_page_url(url)
+        self.engine.set_page_url(identity_url)
 
         # Use webJs-enabled fetch if the source has webJs configured
         web_js = self.engine.get_web_js()
         if web_js:
-            html = await self._get_with_web_js(url, web_js)
+            html = await self._get_with_web_js(fetch_url, web_js)
         else:
-            html = await self._get(url)
+            html = await self._get(fetch_url)
         info = self.engine.parse_book_info(html)
 
         # Run preUpdateJs before parsing TOC
-        toc_data = {"bookUrl": url, "baseUrl": self.base_url}
+        toc_data = {"bookUrl": identity_url, "baseUrl": self.base_url}
         self.engine.run_pre_update_js(toc_data)
 
         toc_url = str(info.get("tocUrl") or "").strip()
         if not toc_url:
-            toc_url = self._find_toc_url(html, url)
+            toc_url = self._find_toc_url(html, identity_url)
         if toc_url and not toc_url.startswith(("http://", "https://")):
-            toc_url = self._make_absolute(toc_url, url)
+            toc_url = self._make_absolute(toc_url, identity_url)
         if not toc_url:
-            toc_url = url
+            toc_url = identity_url
 
-        if toc_url.rstrip("/") == url.rstrip("/"):
+        if toc_url.rstrip("/") == identity_url.rstrip("/"):
             toc_html = html
         else:
             toc_html = await self._get(toc_url)
@@ -447,8 +458,8 @@ class YueduPlugin:
         self.engine.set_book({
             "name": str(info.get("name") or "").strip(),
             "author": str(info.get("author") or "").strip(),
-            "url": url,
-            "bookUrl": url,
+            "url": identity_url,
+            "bookUrl": identity_url,
             "baseUrl": self.base_url,
         })
         toc = self._resolve_toc_entries(
@@ -566,17 +577,17 @@ class YueduPlugin:
                     title = f"[VIP] {title}"
                 continue
             if ch_url and not ch_url.startswith("http"):
-                ch_url = self._make_absolute(ch_url, url)
+                ch_url = self._make_absolute(ch_url, identity_url)
             if urlparse(ch_url).scheme not in ("http", "https"):
                 continue
             title = str(title or "").strip() or f"Chapter {chapter_num + 1}"
             # Forum sources frequently model a post as a one-chapter book and
             # intentionally return the same URL from ruleToc. Keep it as a
             # fallback rather than discarding it as a book-detail URL.
-            if ch_url.rstrip("/") == url.rstrip("/"):
+            if ch_url.rstrip("/") == identity_url.rstrip("/"):
                 self_chapter_title = self_chapter_title or title
                 continue
-            if not self._is_chapter_url(ch_url, url):
+            if not self._is_chapter_url(ch_url, identity_url):
                 continue
             if (
                 title in ("目录", "简介", "上一章", "下一章", "返回目录", "首页", "开始阅读")
@@ -616,15 +627,15 @@ class YueduPlugin:
                 url=url,
                 chapter_number=1,
             )]
-        chapters = self._dedupe_chapters(chapters, url)
+        chapters = self._dedupe_chapters(chapters, identity_url)
         chapters = self._attach_next_urls(chapters)
 
-        cover_url = self._pick_cover_url(info.get("coverUrl"), url)
+        cover_url = self._pick_cover_url(info.get("coverUrl"), identity_url)
         description = info.get("intro", "")
         status = info.get("status", "")
 
         return RemoteBook(
-            source_book_id=self._book_id_from_url(url),
+            source_book_id=self._book_id_from_url(identity_url),
             title=book_title,
             author=author,
             description=description if description else None,
@@ -1854,6 +1865,7 @@ class YueduPlugin:
         When the source defines `bookUrlPattern`, discovery uses it strictly
         for the same host so category/chapter links are not mistaken for books.
         """
+        url = self._strip_url_options_suffix(url)
         pattern = self.config.get("bookUrlPattern", "")
         if pattern and pattern.strip():
             try:
@@ -1927,6 +1939,8 @@ class YueduPlugin:
 
     def _is_chapter_url(self, url: str, book_url: str) -> bool:
         """Filter out book-page, category, navigation, and ad links from a TOC."""
+        url = self._strip_url_options_suffix(url)
+        book_url = self._strip_url_options_suffix(book_url)
         abs_url = self._make_absolute(url, book_url or self.base_url)
         abs_book = self._make_absolute(book_url, self.base_url)
         if abs_url.rstrip("/") == abs_book.rstrip("/"):
@@ -2682,6 +2696,24 @@ class YueduPlugin:
         if not options:
             return url, None
         return options.get("url", url), options
+
+    @staticmethod
+    def _strip_url_options_suffix(url: str) -> str:
+        """Return the bare URL with any trailing ``,{...}`` Legado options dropped.
+
+        Used in identity/classification helpers so a suffixed book URL is
+        never treated as a distinct (and invalid) book key.
+        """
+        if not url:
+            return url
+        match = re.search(r"\s*,\s*(\{.*)$", url, re.DOTALL)
+        if not match:
+            return url
+        try:
+            json.loads(match.group(1))
+        except (ValueError, TypeError):
+            return url
+        return url[: match.start()].strip()
 
     async def update_book(self, url: str) -> RemoteBook | None:
         """Re-fetch a book to check for new chapters."""
@@ -4094,7 +4126,7 @@ class YueduPlugin:
         normalized URL so build_book_url() can reconstruct it directly
         without depending on the bookUrlPattern.
         """
-        return url.rstrip("/") or url
+        return YueduPlugin._strip_url_options_suffix(url).rstrip("/") or url
 
     @staticmethod
     def _make_absolute(href: str, base: str) -> str:

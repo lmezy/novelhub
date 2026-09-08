@@ -212,6 +212,11 @@ async def search_remote_books(
     candidates = set()
     for item in items:
         url = str(item.get("bookUrl") or item.get("url") or "").strip()
+        # Some sources append a Legado ``,{...}`` option suffix (webView/POST)
+        # to book links.  Strip it so it matches the clean source_book_id that
+        # the plugin now persists for the library-lookup below.
+        from app.crawler.plugins.yuedu import YueduPlugin
+        url = YueduPlugin._strip_url_options_suffix(url)
         last = url.rstrip("/").split("/")[-1] if "/" in url else url
         if url:
             candidates.add(url)

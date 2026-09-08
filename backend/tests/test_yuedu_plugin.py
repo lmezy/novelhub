@@ -228,6 +228,23 @@ def test_js_chapter_list_rule_can_build_chapters_from_book_variable():
     }]
 
 
+def test_book_id_from_url_strips_options_suffix():
+    assert YueduPlugin._book_id_from_url(
+        'https://www.yaoluku.com/book/57076/,{"webView":true}'
+    ) == "https://www.yaoluku.com/book/57076"
+
+
+def test_is_book_url_ignores_options_suffix():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.yaoluku.com",
+        "bookUrlPattern": r"https?://www\.yaoluku\.com/book/\d+",
+    })
+    assert plugin._is_book_url(
+        'https://www.yaoluku.com/book/57076/,{"webView":true}',
+        require_pattern=True,
+    )
+
+
 @pytest.mark.asyncio
 async def test_fetch_book_cleans_alice_metadata_and_extracts_cover():
     plugin = YueduPlugin({

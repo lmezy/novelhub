@@ -130,12 +130,26 @@ class SyncService:
         text = str(value).strip() if value else ""
         return text or fallback
 
-    def _safe_title(self, remote_book) -> str:
-        return self._safe_text(remote_book.title, remote_book.source_book_id or "Unknown")
+    @staticmethod
+    def _safe_title(remote_book) -> str:
+        return SyncService._clamp(
+            SyncService._safe_text(
+                remote_book.title,
+                remote_book.source_book_id or "Unknown",
+            ),
+            255,
+        )
 
     @staticmethod
     def _safe_author(name: str | None) -> str:
-        return SyncService._safe_text(name, "Unknown")
+        return SyncService._clamp(SyncService._safe_text(name, "Unknown"), 100)
+
+    @staticmethod
+    def _clamp(value: str, maxlen: int) -> str:
+        """Clamp to a DB column limit so a malformed over-long parsed value
+        cannot raise StringDataRightTruncationError."""
+        text = str(value or "")
+        return text if len(text) <= maxlen else text[:maxlen]
 
     @staticmethod
     async def _fetch_chapter_with_retry(
@@ -944,7 +958,10 @@ class SyncService:
             book.title = self._safe_title(remote_book)
             book.author_id = author_id
             book.description = remote_book.description
-            book.status = remote_book.status
+            book.status = self._clamp(
+                str(remote_book.status or ""),
+                32,
+            ) or None
             book.is_r18 = is_r18
             book.owner_id = owner_id
             await self.db.flush()
@@ -954,10 +971,16 @@ class SyncService:
             id=str(uuid4()),
             source_id=source_id,
             author_id=author_id,
-            source_book_id=remote_book.source_book_id,
+            source_book_id=self._clamp(
+                str(remote_book.source_book_id or ""),
+                255,
+            ),
             title=self._safe_title(remote_book),
             description=remote_book.description,
-            status=remote_book.status,
+            status=self._clamp(
+                str(remote_book.status or ""),
+                32,
+            ) or None,
             is_r18=is_r18,
             owner_id=owner_id,
         )

@@ -344,3 +344,43 @@ python -m pytest backend/tests/test_yuedu_plugin.py backend/tests/test_sync_serv
 新增测试：`backend/tests/test_cookie_health.py`（3 项：valid / invalid / timeout），
 `test_cookie_health.py + test_sync_service.py + test_yuedu_plugin.py + test_sync_settings.py`
 共 157 passed。
+
+### 第三轮：新镜像部署后同步仍报错（2026-09-08 深夜）
+
+用户重建镜像后同步，最新任务报 `同步连续失败超过 10 本，已中止任务`（新增的中止逻辑生效），
+被中止的是 `yuedu_b38b98d309e3`（要撸小说 `yaoluku.com`）。进一步看日志，定位到两处根因：
+
+1. **书源把 `,{"webView":true}` 追加在书 URL 上**（`ruleSearch/ruleExplore.bookUrl` 是
+   `...@js:result + ',{"webView":true}'`）。之前 `fetch_book` 把这个带后缀的 URL 当成
+   **书标识**用：`set_page_url`/`source_book_id`/章节 URL 匹配/相对地址 base 全被污染，
+   导致解析出 `chapters=0`（`Book page returned no usable metadata/chapters`）。
+   同时解析器把整页 SEO 文本当成 `title`，超 255 字符，触发
+   `StringDataRightTruncationError: value too long for type character varying(255)`。
+2. 这类 R18 站点对服务器无 Cookie 的请求返回反爬/挑战页，所以逐个书同步持续失败；
+   现在由新增的“连续 10 本失败中止”兜底，不再无限打源站。
+
+#### 本轮修复
+
+- `backend/app/crawler/plugins/yuedu/__init__.py`：
+  - `fetch_book` 先拆掉 `,{...}` 后缀：**fetch 用原 URL（保留 webView/JS 渲染），
+    标识/基址用干净 URL**（set_page_url、tocUrl、章节 URL 匹配、source_book_id、
+    bookUrlPattern/章节归属判断都改为干净 URL）。
+  - 新增静态 `_strip_url_options_suffix()`，并接入 `_book_id_from_url` / `_is_book_url`
+    / `_is_chapter_url`，让带后缀的 URL 不再被当成独立/无效的书籍标识。
+- `backend/app/services/sync.py`：`_safe_title` 截断到 255、`_safe_author` 到 100；
+  `_get_or_create_book` 里 `source_book_id`(255)、`status`(32) 也截断，杜绝 DB 截断崩溃。
+- `backend/app/api/routes/sources.py`：`search_remote_books` 在比对已入库书籍时
+  `_strip_url_options_suffix`，避免带后缀的 bookUrl 匹配不到已同步的书。
+
+#### 测试
+
+- `test_yuedu_plugin.py` 新增 `_book_id_from_url` 去后缀、`_is_book_url` 忽略后缀。
+- `test_sync_service.py` 新增 `_safe_title` 截断到 255。
+- 汇总：8 个相关测试文件 → **199 passed**；`compileall` 通过。
+
+#### 仍需用户处理
+
+- 5 个书源被验证码/反爬拦截，须导入浏览器 Cookie；否则会被“连续失败中止”尽早停止。
+- 修/关不可达代理 `http://192.168.1.17:27890`。
+- 重建并重启 `backend`/`scheduler`/`crawler`（前端也需重启），让 `fetch_book` 去后缀、
+  标题截断、cookie 超时等改动生效。本次未在线上执行部署。
