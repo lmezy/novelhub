@@ -61,3 +61,67 @@ async def test_update_source_404_when_missing():
         )
 
     assert exc_info.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_update_source_changes_scope_owner_in_place():
+    source = SimpleNamespace(
+        id="user:u1:yuedu:hash",
+        name="My Source",
+        url="https://example.com",
+        plugin_name="yuedu",
+        enabled=True,
+        is_r18=False,
+        config={},
+        owner_id="u1",
+        show_contributor=True,
+    )
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=source)
+    db.execute = AsyncMock()
+    db.scalars = AsyncMock(
+        return_value=SimpleNamespace(
+            unique=lambda: SimpleNamespace(all=lambda: [])
+        )
+    )
+    db.commit = AsyncMock()
+    db.refresh = AsyncMock()
+
+    with patch("app.api.routes.sources.search_service") as search_mock:
+        result = await update_source(
+            "user:u1:yuedu:hash",
+            SourceUpdate(scope="global"),
+            SimpleNamespace(id="u1", role="admin"),
+            db,
+        )
+
+    assert result is source
+    assert source.owner_id is None
+    assert source.show_contributor is True
+
+
+@pytest.mark.asyncio
+async def test_update_source_nonadmin_cannot_make_global():
+    source = SimpleNamespace(
+        id="user:u1:yuedu:hash",
+        name="My Source",
+        url="https://example.com",
+        plugin_name="yuedu",
+        enabled=True,
+        is_r18=False,
+        config={},
+        owner_id="u1",
+        show_contributor=True,
+    )
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=source)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await update_source(
+            "user:u1:yuedu:hash",
+            SourceUpdate(scope="global"),
+            SimpleNamespace(id="u1", role="user"),
+            db,
+        )
+
+    assert exc_info.value.status_code == 403

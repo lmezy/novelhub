@@ -106,6 +106,25 @@ async def update_source(
 
     old_is_r18 = source.is_r18
     data = payload.model_dump(exclude_unset=True)
+    # `scope` maps to ownership, not a source column. Apply it explicitly so
+    # a scope change during edit updates owner_id in place instead of the
+    # frontend falling back to a colliding POST ("Source already exists").
+    if "scope" in data:
+        scope = data.pop("scope") or "personal"
+        if scope == "global":
+            if user.role not in ("admin", "super_admin"):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Only admins can make a source global",
+                )
+            source.owner_id = None
+        else:
+            source.owner_id = user.id
+        source.show_contributor = (
+            getattr(source, "show_contributor", True)
+            if scope == "global"
+            else True
+        )
     for key, value in data.items():
         if value is None and key in ("enabled", "is_r18", "name", "plugin_name"):
             continue

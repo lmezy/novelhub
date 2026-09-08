@@ -6,6 +6,7 @@ resync_all_books    -- resync every book already in the library
 """
 
 import asyncio
+import os
 from uuid import uuid4
 from datetime import datetime, timedelta, timezone
 
@@ -15,6 +16,20 @@ from loguru import logger
 
 def _naive_utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _auto_sync_max_pages() -> int:
+    """Bounded catalog pages each source crawls per automatic sync.
+
+    ``max_pages<=0`` in the crawl runner means "whole site", which turns a
+    scheduled refresh into an unbounded full-site crawl.  Auto sync should
+    stay bounded: it refreshes a few discovery pages per source, not the
+    entire catalogue.  Operators can override with AUTO_SYNC_MAX_PAGES.
+    """
+    try:
+        return max(1, int(os.getenv("AUTO_SYNC_MAX_PAGES", "3")))
+    except (TypeError, ValueError):
+        return 3
 
 
 @app.task(name="tasks.daily_sync_all")
@@ -70,14 +85,21 @@ async def _auto_sync_check_async() -> dict:
     async with SessionLocal() as db:
         auto_settings = await get_auto_sync_settings(db)
         if not auto_settings["enabled"]:
+            logger.info("Auto sync is disabled; no tasks created")
             return {"enabled": False}
 
         now = datetime.now(timezone(timedelta(hours=8)))
         if now.strftime("%H:%M") != auto_settings["time"]:
+            logger.debug(
+                "Auto sync enabled but not due (now={} time={})",
+                now.strftime("%H:%M"),
+                auto_settings["time"],
+            )
             return {"enabled": True, "due": False}
 
         today = now.strftime("%Y-%m-%d")
         if await get_auto_sync_last_run(db) == today:
+            logger.info("Auto sync already ran today at {}", today)
             return {"enabled": True, "due": True, "already_run": True}
 
         rows = await db.scalars(
@@ -86,21 +108,28 @@ async def _auto_sync_check_async() -> dict:
                 Source.owner_id.is_(None),
             )
         )
-        source_ids = list(rows.all())
-        for source_id in source_ids:
+        sources = list(rows.all())
+        max_pages = _auto_sync_max_pages()
+        for source in sources:
             db.add(CrawlTask(
                 id=str(uuid4()),
-                source=source_id,
+                source=source.id,
                 mode="discover_all",
-                max_pages=0,
+                max_pages=max_pages,
                 status="pending",
             ))
         await set_auto_sync_last_run(db, today)
+        logger.info(
+            "Auto sync created {} discover task(s), max_pages={}",
+            len(sources),
+            max_pages,
+        )
         return {
             "enabled": True,
             "due": True,
-            "sources": len(source_ids),
-            "tasks_created": len(source_ids),
+            "sources": len(sources),
+            "tasks_created": len(sources),
+            "max_pages": max_pages,
         }
 
 

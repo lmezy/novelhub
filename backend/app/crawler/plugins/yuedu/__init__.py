@@ -378,7 +378,7 @@ class YueduPlugin:
             client = self.__class__._clients.get(proxy)
             if client is None:
                 client = httpx.AsyncClient(
-                    timeout=httpx.Timeout(60.0, connect=15.0, write=15.0),
+                    timeout=httpx.Timeout(60.0, connect=5.0, write=15.0),
                     follow_redirects=True,
                     proxy=proxy,
                     trust_env=False,
@@ -442,6 +442,15 @@ class YueduPlugin:
             toc_html = await self._get(toc_url)
 
         self.engine.set_page_url(toc_url)
+        # Legado exposes the parsed book as the ``book`` JS variable; TOC
+        # rules such as SiS's single-entry list reference ``book.name``.
+        self.engine.set_book({
+            "name": str(info.get("name") or "").strip(),
+            "author": str(info.get("author") or "").strip(),
+            "url": url,
+            "bookUrl": url,
+            "baseUrl": self.base_url,
+        })
         toc = self._resolve_toc_entries(
             self.engine.parse_toc(toc_html),
             toc_url,
@@ -3833,6 +3842,11 @@ class YueduPlugin:
 
         if not url.startswith(("http://", "https://")):
             return None
+        # A source may append a Legado ``,{...}`` URL-options suffix to the
+        # cover URL too. Strip it before requesting so it is not sent as part
+        # of the path (which turns into a 404 for otherwise valid images).
+        clean_url, _ = self._split_options_suffix(url)
+        url = clean_url or url
         await self._sleep_rate_limit()
         headers = self._build_headers({
             "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
@@ -3952,6 +3966,8 @@ class YueduPlugin:
 
         if not url.startswith(("http://", "https://")):
             return None
+        clean_url, _ = self._split_options_suffix(url)
+        url = clean_url or url
         await self._sleep_rate_limit()
         headers = self._build_headers({
             "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",

@@ -45,6 +45,22 @@ async def test_set_auto_sync_settings_rejects_bad_time():
 
 
 @pytest.mark.asyncio
+async def test_disable_auto_sync_cancels_stale_auto_tasks():
+    db = AsyncMock()
+    db.scalar = AsyncMock(return_value=None)
+    db.add = MagicMock()
+    db.execute = AsyncMock()
+    db.commit = AsyncMock()
+
+    result = await set_auto_sync_settings(db, False, "06:30")
+
+    assert result == {"enabled": False, "time": "06:30"}
+    # 3 setting writes + 1 task cancellation update
+    assert db.commit.await_count == 4
+    assert db.execute.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_auto_sync_settings_route():
     db = AsyncMock()
     db.scalar = AsyncMock(return_value=None)

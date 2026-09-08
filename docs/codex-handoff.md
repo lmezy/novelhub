@@ -181,3 +181,166 @@ python -m pytest backend/tests/test_yuedu_plugin.py backend/tests/test_sync_serv
 开始代码任务前还需要使用 glob 检查实际存在的 compose 文件、Dockerfile、Alembic 最新迁移、环境变量示例、部署脚本和测试配置文件。
 
 若准备远程部署，还必须额外读取远程容器当前镜像、挂载、环境变量和服务状态，并在用户明确确认后执行。
+
+---
+
+## 10. 2026-09-08 会话：三项用户问题的处理与结论
+
+### 背景
+
+用户在 master 主机（nas.19961113.xyz，SSH config 中 `master`）部署了 novelhub
+容器，并要求只改本地代码。本次尝试用 `master` SSH 登录读取线上日志，但
+`id_ed25519` 公钥被服务器拒绝（`Permission denied (publickey,password)`），
+无法读取线上 crawl_task / crawl_log 的真实报错；yckceo.com 及其镜像站从当前
+网络也连不通，无法取回 5 个书源的原始 config。因此第 1 项只能做“代码级加固”，
+未能做真实站点点位回归。
+
+### 第 2 项：后台自动同步
+
+根因确认：
+
+- `scheduler/app/celery_app.py` 的 beat 始终每 1 分钟投递 `tasks.auto_sync_check`。
+- `scheduler/app/tasks.py::_auto_sync_check_async` 在启用状态下会为所有
+  `enabled=True` 且 `owner_id` 为空的全局书源创建 `discover_all` 任务，且此前
+  `max_pages=0`，而 `run_crawl_task_async` / `discover_and_sync_all` 中
+  `max_pages<=0` 表示“整个站点不限量抓取”。
+- 于是“后台自动同步”实际是无限量全站爬取，且任务即使关闭开关后仍滞留在队列中继续跑。
+
+修复：
+
+- `scheduler/app/tasks.py`：`_auto_sync_check_async` 改为有界 `max_pages`
+  （默认 3，可用环境变量 `AUTO_SYNC_MAX_PAGES` 覆盖），并增加
+  关闭/未到时间/已运行/已创建任务数 的日志。
+- `backend/app/services/settings.py`：`set_auto_sync_settings(enabled=False)` 时，
+  把 `user_id IS NULL AND mode='discover_all'` 的 pending/running 任务置为
+  `cancelled`，让“关闭自动同步”真正停止后台爬取（人工任务带 user_id，不受影响）。
+
+### 第 3 项：编辑书源保存报“源已存在”
+
+根因：`frontend/src/pages/AdminPage.vue` 的 `createSource` 在“编辑已有书源且
+改变了 global/personal 作用域”时改走 `POST /sources`，而 `create_source` 对已存在
+的 id 直接抛 409 `Source already exists`（因为在原 id 上新建重复行）。
+
+修复：
+
+- `frontend/src/pages/AdminPage.vue`：编辑已有书源一律走 `PUT /sources/{id}`，
+  不再用 POST 制造重复 id。
+- `backend/app/schemas/source.py`：`SourceUpdate` 增加 `scope` 字段。
+- `backend/app/api/routes/sources.py`：`update_source` 处理 `scope`，就地把
+  `owner_id` 改成 `None`（global）或 `user.id`（personal）；非管理员改 global 返回 403。
+
+### 第 1 项：SiS文學網 简体 / 御宅屋 / 第一版主·言璃版 / 要撸小说 / 風月文學網 h528 同步报错
+
+这些书源都依赖 `<js>`/`@js:` 规则（`js_runtime.py` 中已点名的类型）。本次可
+确认并修复的代码级缺口：
+
+- `fetch_cover` 与 `fetch_content_image` 之前不拆分 Legado `,{...}` 后缀，
+  会把 `,{"webView":true}` 当作路径发送导致封面/图片 404；已补上 `_split_options_suffix`。
+- `rule_engine._try_eval_js` 中重复的 `if pattern_result is not None` 死代码已删除。
+
+仍未能确认的部分（需真实书源 config + 站点响应才能定位）：
+
+- 这些书源规则里用到的特定 Legado/Android JS API 是否被 Node shim 完整模拟。
+- 站点当前是否返回验证码 / WAF / 需登录内容（按约束不绕过验证码、WAF 与登录限制）。
+- 需在本地或线上拿到这 5 个书源的 `source.config` 后做真实点位回归。
+
+### 验证
+
+- `python -m pytest tests/test_yuedu_plugin.py tests/test_source_management.py tests/test_rule_engine_legado.py tests/test_crawl_queue.py tests/test_yuedu_import.py -q` → 149 passed
+- `python -m pytest tests/test_sync_service.py -q` → 37 passed
+- `python -m pytest tests/test_sync_settings.py -q` → 5 passed
+- `python -m compileall -q` 修改文件 → 通过
+
+说明：运行测试会在仓库里更新若干 `__pycache__/*.pyc`（本仓库未忽略它们），
+属字节码缓存副作用；提交时请忽略或勿将新增 `.pyc` 纳入版本库。
+
+### 补充：用密码登入 master 实际定位（2026-09-08）
+
+用户提供了服务器密码并允许访问远程容器。用 paramiko 连接
+`nas.19961113.xyz:10022`（用户 894654222）确认：
+
+1. **自动同步并没有开启**：`app_settings.auto_sync_enabled=false`。因此
+   `auto-sync-check` 每分钟投递但立即返回，不会创建任务；“后台一直在访问”
+   并不是定时自动同步造成的。
+2. **失败任务确实是终止的**：`crawl_tasks` 里 67 个 `failed`、13 个 `cancelled`、
+   14 个 `completed`、3 个 `completed_with_errors`、1 个 `paused`，当前没有
+   `pending`/`running`。这些失败任务的报错几乎全是
+   `Site returned an anti-bot/captcha page ... https://b.sis.la/`、
+   `https://www.cool18.com/bbs4/...`、`https://www.yaoluku.com/...`、
+   `https://yswhub.cc/...` 等。
+   => 这 5 个书源本身被 WAF/验证码拦截，按约束不绕过；需要用户在浏览器过验证后
+   导入 Cookie 才能同步。
+3. **代理配置坏了**：`/app/storage/proxy_config.json` 为
+   `{"enabled":true,"https_proxy":"http://192.168.1.17:27890",...}`，但该
+   Clash 代理只在用户电脑的 127.0.0.1 监听、NAS 容器访问不到，日志反复出现
+   `Configured proxy ... unreachable`。这会导致每个请求先等代理超时再退回直连，
+   是“看起来一直在访问/很慢”的主要原因之一。
+4. **5 个书源配置已读取**：
+   - `user:...:yuedu_acc2f030aa61`  → SiS文學網 简体 → `https://b.sis.la`
+   - `yuedu_123bca8ecb6a` → 御宅屋 → `https://yswhub.cc`
+   - `yuedu_9878e5489aec` → 第一版主·言璃版 → `https://www.banzhu44444444.net/##`
+   - `yuedu_b38b98d309e3` → 要撸小说 → `https://www.yaoluku.com`
+   - `yuedu_2ca378a79b50` → 風月文學網 h528 → `http://www.h528.com`
+
+#### 本次（第二轮）代码修复
+
+- `backend/app/services/sync.py`：`discover_and_sync_all` 增加**连续失败中止**，
+  默认 `SYNC_MAX_CONSECUTIVE_FAILURES=10`（可用环境变量覆盖），连续失败过多时
+  抛错中止任务，避免全站不限量同步时对已持续报错的站点继续狂刷。人工“全站不限量”
+  行为保持不变。
+- `backend/app/crawler/plugins/yuedu/rule_engine.py`：
+  - `_eval_list_rule` 现在支持 `<js>`/`@js:` 返回**数组**的 chapterList/bookList
+    规则（此前被当作 CSS 选择器，SiS 这类单帖书源会拿到 0 章）。
+  - `_build_js_context` 注入 Legado 的 `book` 变量（`book.name`/`book.author`），
+    并新增 `set_book()`；`fetch_book` 在解析目录前调用。
+- `backend/app/crawler/plugins/yuedu/__init__.py`：`_get_http_client` 连接超时由
+  15s 降到 5s，代理不可达时更快退回直连。
+
+#### 仍未解决 / 需要用户操作
+
+- 5 个书源被 WAF/验证码拦截：必须导入浏览器 Cookie 后重试（代码已给出明确提示）。
+- 修复或关闭不可达代理：`http://192.168.1.17:27890`（在 Clash 里开启“允许局域网”，
+  或把 NovelHub 设置里的代理改为 NAS 可达地址，或直接关闭）。
+- 重建并重启 `backend`/`scheduler`/`crawler`（含 nodejs）与 `frontend` 才能生效；
+  本次未在线上执行部署。
+
+#### 测试
+
+- `test_yuedu_plugin.py` → 111 passed（新增 `book` 变量 + JS chapterList 数组规则测试）
+- `test_sync_service.py` → 38 passed（新增连续失败中止测试）
+- 汇总：`test_yuedu_plugin / test_rule_engine_legado / test_sync_service /
+  test_crawl_queue / test_source_management / test_sync_settings / test_yuedu_import` → 193 passed
+
+### 补充：定位“后台持续访问书源网站”的真凶（2026-09-08 第二轮）
+
+用户反馈即使关闭了自动同步、任务也已失败，后台仍持续访问源站。进一步查线上日志：
+
+- `auto_sync_check` 因为 `auto_sync_enabled=false` 确实空跑，Redis 队列为空，
+  不是它的锅。
+- 真正元凶是 **`tasks.check_cookie_health`（2 点定时）**：
+  `CookieHealthService.check_all_cookies()` 会串行校验每个 Cookie，逐个调用
+  `plugin.fetch_bookshelf()` 去抓书源的书架页。由于代理 `http://192.168.1.17:27890`
+  不可达（每次请求先等 15s 代理超时再直连）且每个校验尝试多个书架路径 + Playwright，
+  **一个 Cookie 要耗 ~48 分钟**。10 个 Cookie 的任务总共运行了
+  `29138s ≈ 8 小时`，期间持续访问 b.sis.la/cool18/yaoluku 等源站 —— 这就是用户看到的
+  “持续访问书源网站”。
+- 其中 3 个 Cookie 因源站验证码/反爬被判 invalid，且无凭据可刷新，最终 `failed`。
+
+#### 本轮修复
+
+- `backend/app/services/cookie_health.py`：`check_all_cookies` 为每个 Cookie 加
+  `asyncio.wait_for` 超时（默认 `COOKIE_CHECK_ITEM_TIMEOUT=60s`，可用环境变量覆盖），
+  超时则 `rollback` 并记为 `failed` 项，避免单个被反爬的 Cookie 拖住任务数十分钟、
+  导致 2 点任务跑数小时持续打源站。
+- `backend/app/crawler/plugins/yuedu/__init__.py`：代理连接超时 15s→5s（上一轮）。
+
+#### 用户必须做（否则仍会慢/持续访问）
+
+- **修复或关闭代理** `http://192.168.1.17:27890`（Clash 开“允许局域网”，或改成 NAS
+  可达地址，或直接在 NovelHub 设置里关闭）。这一步是根因。
+- 重建并重启 `backend`/`scheduler`/`crawler`（nodejs）。
+- 5 个被验证码拦截的书源需导入浏览器 Cookie 后才可同步。
+
+新增测试：`backend/tests/test_cookie_health.py`（3 项：valid / invalid / timeout），
+`test_cookie_health.py + test_sync_service.py + test_yuedu_plugin.py + test_sync_settings.py`
+共 157 passed。

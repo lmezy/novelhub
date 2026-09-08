@@ -1489,6 +1489,11 @@ class SyncService:
         chapters_created = 0
         chapters_skipped = 0
         chapters_failed = 0
+        consecutive_failures = 0
+        max_consecutive_failures = max(
+            1,
+            int(getattr(settings, "SYNC_MAX_CONSECUTIVE_FAILURES", 10)),
+        )
         pages_checked = 0
         start_page = max(1, int(start_page or 1))
         max_pages = max_pages or 0
@@ -1549,6 +1554,7 @@ class SyncService:
             async def _record_outcome(sb, outcome) -> None:
                 nonlocal books_synced, books_failed, books_filtered
                 nonlocal chapters_created, chapters_skipped, chapters_failed
+                nonlocal consecutive_failures
                 if isinstance(outcome, SyncPaused):
                     raise outcome
                 if isinstance(outcome, BaseException):
@@ -1556,6 +1562,13 @@ class SyncService:
                         raise outcome
                     await self.db.rollback()
                     books_failed += 1
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        raise ValueError(
+                            "同步连续失败超过 {} 本，已中止任务以避免持续请求被"
+                            "反爬的站点。请检查书源规则、Cookie 或站点验证状态后"
+                            "再同步。".format(max_consecutive_failures)
+                        )
                     logger.warning(
                         "Failed to sync book {} ({}): {}",
                         sb.title,
@@ -1596,6 +1609,7 @@ class SyncService:
                         "failed_chapters": outcome.get("failed_chapters", []),
                     })
                     books_synced += 1
+                    consecutive_failures = 0
                     chapters_created += outcome.get("created_chapters", 0)
                     chapters_skipped += outcome.get("skipped_chapters", 0)
                     chapters_failed += len(outcome.get("failed_chapters", []))

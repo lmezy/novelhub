@@ -269,12 +269,21 @@ class YueduRuleEngine:
             "bookUrl": book_url,
             "sourceUrl": self.base_url,
             "url": self._variables.get("url", book_url),
+            "book": self._variables.get("book", {}),
         }
         if self._chapter_context:
             context["chapter"] = self._chapter_context
         if extra_context:
             context.update(extra_context)
         return context
+
+    def set_book(self, book: dict[str, Any] | None) -> None:
+        """Expose the parsed book object as the Legado ``book`` JS variable.
+
+        TOC/content rules commonly reference ``book.name`` / ``book.author``
+        (e.g. the SiS source builds a single-entry TOC with ``book.name``).
+        """
+        self._variables["book"] = book or {}
 
     # ---- Public API ----
     def build_search_url(self, keyword: str, page: int = 1) -> str:
@@ -478,6 +487,22 @@ class YueduRuleEngine:
         elif rule.startswith("+"):
             rule = rule[1:]
 
+        # Legado lets chapterList/bookList be an `<js>`/`@js:` expression that
+        # returns an ARRAY of objects (e.g. SiS builds a single-entry TOC with
+        # `[{name: book.name || "正文", url: baseUrl}]`).  Evaluate it here;
+        # otherwise such sources yield zero chapters and only the generic
+        # scanner (which may mis-parse single-post sites) gets a chance.
+        js_code = self._js_code_from_rule(rule)
+        if js_code is not None:
+            try:
+                js_result = self._try_eval_js(js_code, raw)
+            except Exception:
+                js_result = None
+            if isinstance(js_result, list):
+                return list(reversed(js_result)) if reverse else js_result
+            if isinstance(js_result, dict):
+                return [js_result]
+
         parsed = self._try_parse_json(raw)
         if parsed is not None:
             self._is_json_context = True
@@ -491,6 +516,17 @@ class YueduRuleEngine:
 
         self._is_json_context = False
         return self._get_elements(raw, rule)
+
+    def _js_code_from_rule(self, rule: str) -> str | None:
+        """Extract the JavaScript body from a rule that is a JS expression."""
+        text = (rule or "").strip()
+        if text.startswith("@js:"):
+            return text[4:].strip()
+        if text.startswith("<js>") and text.rstrip().endswith("</js>"):
+            return text[4:-5].strip()
+        if text.startswith("<js"):
+            return text[4:].strip()
+        return None
 
     def _get_elements(self, raw: Any, rule: str) -> list[Tag]:
         """Port of Legado AnalyzeByJSoup getElements with @ chains and indexes."""
@@ -1071,8 +1107,6 @@ class YueduRuleEngine:
         pattern_result = None
         if is_simple:
             pattern_result = try_eval_js_pattern(code, raw)
-        if pattern_result is not None:
-            return pattern_result
         if pattern_result is not None:
             return pattern_result
 

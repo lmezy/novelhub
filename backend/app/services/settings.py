@@ -86,6 +86,26 @@ async def set_auto_sync_settings(
     )
     await _set_setting(db, AUTO_SYNC_TIME_KEY, time)
     await _set_setting(db, AUTO_SYNC_LAST_RUN_KEY, "")
+    # Disabling auto-sync must also stop the tasks it already queued, or the
+    # background crawl keeps running and a user cannot tell it is "off".
+    # Auto-sync tasks were created without a user_id, unlike manual tasks.
+    if not enabled:
+        try:
+            from sqlalchemy import update
+            from app.models import CrawlTask
+
+            await db.execute(
+                update(CrawlTask)
+                .where(
+                    CrawlTask.user_id.is_(None),
+                    CrawlTask.mode == "discover_all",
+                    CrawlTask.status.in_(["pending", "running"]),
+                )
+                .values(status="cancelled")
+            )
+            await db.commit()
+        except Exception:
+            pass
     return {"enabled": enabled, "time": time}
 
 

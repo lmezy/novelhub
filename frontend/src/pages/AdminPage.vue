@@ -211,18 +211,12 @@ async function createSource() {
       config,
     }
     if (sourceEditingId.value) {
-      const current = sources.value.find((s: Source) => s.id === sourceEditingId.value)
-      const isGlobal = current && !current.owner_id
-      const wantGlobal = sourceForm.value.scope === "global"
-      if ((wantGlobal && !isGlobal) || (!wantGlobal && isGlobal)) {
-        await api.post("/sources", {
-          ...body,
-          id: current?.id || sourceForm.value.id,
-          scope: sourceForm.value.scope,
-        })
-      } else {
-        await api.put("/sources/" + sourceEditingId.value, body)
-      }
+      // Editing an existing source must use update semantics. POST-ing the
+      // same id that is already in the table is what produced the confusing
+      // "Source already exists" (409) when a user simply changed scope.
+      // The backend PUT now accepts `scope` and reassigns ownership in place,
+      // so a scope change never creates a colliding duplicate row.
+      await api.put("/sources/" + sourceEditingId.value, body)
     } else {
       await api.post("/sources", body)
     }

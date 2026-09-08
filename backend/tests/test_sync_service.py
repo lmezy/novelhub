@@ -1278,6 +1278,42 @@ async def test_discover_and_sync_all_unlimited_continues_until_empty():
 
 
 @pytest.mark.asyncio
+async def test_discover_and_sync_all_aborts_after_too_many_consecutive_failures():
+    db = _mock_db()
+    db.get.return_value = _source()
+    db.rollback = AsyncMock()
+
+    plugin = AsyncMock()
+    plugin.set_cookie = MagicMock()
+    plugin.discover_books.return_value = [
+        RemoteShelfBook(
+            source_book_id=f"{i}.html",
+            title=f"Book {i}",
+            author="Author",
+            url=f"https://example.com/{i}.html",
+        )
+        for i in range(3)
+    ]
+
+    fake_settings = SimpleNamespace(
+        SYNC_BOOK_CONCURRENCY=1,
+        SYNC_MAX_CONSECUTIVE_FAILURES=3,
+        SYNC_BOOK_CONTINUOUS=False,
+    )
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.settings", fake_settings),
+        patch.object(
+            SyncService,
+            "sync_book",
+            AsyncMock(side_effect=ValueError("boom")),
+        ),
+    ):
+        with pytest.raises(ValueError, match="连续失败超过"):
+            await SyncService(db).discover_and_sync_all("src1", max_pages=1)
+
+
+@pytest.mark.asyncio
 async def test_discover_and_sync_all_page_batch_requeues():
     db = _mock_db()
     db.get.return_value = _source()

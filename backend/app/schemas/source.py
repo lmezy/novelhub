@@ -19,6 +19,7 @@ class SourceUpdate(BaseModel):
     enabled: bool | None = None
     is_r18: bool | None = None
     config: dict | None = None
+    scope: str | None = None
 
 
 class SourceOut(BaseModel):

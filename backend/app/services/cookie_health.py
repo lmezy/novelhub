@@ -4,6 +4,7 @@ Periodically validates stored cookies and attempts automatic renewal
 via auto_login when credentials are available.
 """
 
+import asyncio
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -15,6 +16,7 @@ from app.crawler.registry import get_plugin
 from app.models import Cookie
 from app.models.source_credential import SourceCredential
 from app.services.cookie_crypto import safe_decrypt_cookie, encrypt_cookie
+from app.core.config import settings
 
 
 class CookieHealthService:
@@ -31,27 +33,59 @@ class CookieHealthService:
             cookies = await db.scalars(select(Cookie))
             cookie_list = list(cookies)
             results["checked"] = len(cookie_list)
-            for cookie in cookie_list:
+
+            # A captcha/anti-bot source can make each validation take minutes
+            # (proxy connect timeouts + bookshelf probing + Playwright).  Bound
+            # per-item work so the 2am task cannot hammer a blocked source for
+            # hours, which is what the user observes as "持续访问书源网站".
+            item_timeout = max(
+                1,
+                int(getattr(settings, "COOKIE_CHECK_ITEM_TIMEOUT", 60)),
+            )
+
+            async def _check_one(cookie) -> dict:
                 detail = {"source": cookie.source, "cookie_id": cookie.id}
                 if cookie.expired_at and cookie.expired_at < datetime.now(timezone.utc):
                     detail["reason"] = "expired"
-                    results["expired"] += 1
                     refresh_result = await CookieHealthService._try_refresh(db, cookie)
                     detail.update(refresh_result)
-                    key = "refreshed" if refresh_result.get("success") else "failed"
-                    results[key] += 1
+                    detail["_outcome"] = (
+                        "refreshed" if refresh_result.get("success") else "failed"
+                    )
                 else:
                     valid = await CookieHealthService._validate_cookie(cookie)
                     if valid:
-                        results["valid"] += 1
                         detail["status"] = "valid"
+                        detail["_outcome"] = "valid"
                     else:
-                        results["expired"] += 1
                         detail["reason"] = "invalid"
                         refresh_result = await CookieHealthService._try_refresh(db, cookie)
                         detail.update(refresh_result)
-                        key = "refreshed" if refresh_result.get("success") else "failed"
-                        results[key] += 1
+                        detail["_outcome"] = (
+                            "refreshed" if refresh_result.get("success") else "failed"
+                        )
+                return detail
+
+            for cookie in cookie_list:
+                try:
+                    detail = await asyncio.wait_for(_check_one(cookie), timeout=item_timeout)
+                except asyncio.TimeoutError:
+                    await db.rollback()
+                    results["failed"] += 1
+                    results["details"].append({
+                        "source": cookie.source,
+                        "cookie_id": cookie.id,
+                        "reason": "timeout",
+                        "status": False,
+                        "error": f"cookie validation timed out after {item_timeout}s",
+                    })
+                    continue
+                outcome = detail.pop("_outcome", "failed")
+                # valid / refreshed / failed each increment their own bucket;
+                # an expired-or-invalid cookie also counts toward "expired".
+                results[outcome] += 1
+                if detail.get("reason") in ("expired", "invalid"):
+                    results["expired"] += 1
                 results["details"].append(detail)
         logger.info(
             "Cookie health: {} checked, {} valid, {} expired, {} refreshed, {} failed",

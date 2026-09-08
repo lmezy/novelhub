@@ -204,6 +204,30 @@ def test_legacy_regex_rule_extracts_author():
     assert plugin.engine._eval_rule_str(html, r"作者：(.*?)\s") == "lisianthus"
 
 
+def test_js_chapter_list_rule_can_build_chapters_from_book_variable():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "ruleToc": {
+            "chapterList": "@js:[{\"name\": book.name || \"正文\", \"url\": baseUrl}]",
+            "chapterName": "name",
+            "chapterUrl": "url",
+        },
+    })
+    plugin.engine.set_book({
+        "name": "My Book",
+        "author": "Me",
+        "url": "https://example.com/book/1",
+    })
+    plugin.engine.set_page_url("https://example.com/book/1")
+
+    toc = plugin.engine.parse_toc("<html><body>irrelevant</body></html>")
+
+    assert toc == [{
+        "chapterName": "My Book",
+        "chapterUrl": "https://example.com/book/1",
+    }]
+
+
 @pytest.mark.asyncio
 async def test_fetch_book_cleans_alice_metadata_and_extracts_cover():
     plugin = YueduPlugin({
@@ -238,6 +262,43 @@ async def test_fetch_book_cleans_alice_metadata_and_extracts_cover():
     assert "lisianthus" not in book.tags
     assert "紫影玉茗最新章节" not in book.tags
     assert "重口" in book.tags
+
+
+@pytest.mark.asyncio
+async def test_fetch_cover_strips_url_options_suffix():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "concurrentRate": "0",
+    })
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        async def get(self, url, headers=None):
+            captured["url"] = url
+            request = httpx.Request("GET", url)
+            return httpx.Response(
+                200,
+                request=request,
+                content=b"x" * 256,
+                headers={"content-type": "image/jpeg"},
+            )
+
+    with (
+        patch.object(plugin, "_get_http_client", AsyncMock(return_value=FakeClient())),
+        patch.object(plugin, "_capture_cookie_jar"),
+        patch("asyncio.sleep", AsyncMock()),
+        patch(
+            "app.services.proxy_config.get_proxy_config",
+            return_value=ProxyConfig(enabled=False),
+        ),
+    ):
+        result = await plugin.fetch_cover(
+            'https://example.com/cover/1.jpg,{"webView":true}'
+        )
+
+    assert captured["url"] == "https://example.com/cover/1.jpg"
+    assert result is not None
+    assert result[1] == "image/jpeg"
 
 
 def test_build_book_url_uses_configured_detail_prefix():
