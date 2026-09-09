@@ -245,6 +245,94 @@ def test_is_book_url_ignores_options_suffix():
     )
 
 
+def test_book_url_pattern_does_not_match_chapter_url():
+    r"""A loose ``bookUrlPattern`` like ``book/\d+`` must not classify a
+    chapter URL under ``/book/{id}/{chapter}.html`` as another book page.
+    Otherwise ``_is_chapter_url`` rejects every chapter and the book syncs
+    with zero chapters (要撸小说 / yaoluku.com)."""
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.yaoluku.com",
+        "bookUrlPattern": r"https?://www\.yaoluku\.com/book/\d+",
+    })
+    book_url = "https://www.yaoluku.com/book/35979/"
+    chapter_url = "https://www.yaoluku.com/book/35979/399068.html"
+    assert plugin._is_book_url(book_url, require_pattern=True) is True
+    assert plugin._is_book_url(chapter_url, require_pattern=True) is False
+    assert plugin._is_chapter_url(chapter_url, book_url) is True
+
+
+def test_css_attribute_selector_not_parsed_as_legado_index():
+    """A rule like ``a[href*='next']@href`` must use the CSS attribute
+    selector, not be mis-parsed as a Legado index (which would select every
+    child element and make ``nextContentUrl`` fetch nav/javascript links)."""
+    eng = YueduRuleEngine({
+        "bookSourceUrl": "https://example.com",
+        "ruleContent": {
+            "content": "",
+            "nextContentUrl": "a[href*='next']@href",
+        },
+    })
+    html = (
+        "<html><body>"
+        "<a href='/book/1/next'>下一章</a>"
+        "<a href='/book/1/2.html'>第2章</a>"
+        "<a href=\"javascript:alert('x')\">noop</a>"
+        "</body></html>"
+    )
+    book_url = "https://example.com/book/1/"
+    eng.set_page_url(book_url)
+    nexts = eng.get_next_content_urls(html, book_url)
+    assert "https://example.com/book/1/next" in nexts
+    assert "https://example.com/book/1/2.html" not in nexts
+    assert not any("javascript" in u for u in nexts)
+
+
+def test_css_attribute_selector_extracts_meta_and_attr():
+    """CSS attribute selectors for metadata (og:novel:book_name, author links)
+    must extract the target field instead of returning all children."""
+    eng = YueduRuleEngine({"bookSourceUrl": "https://example.com"})
+    html = (
+        "<html><head>"
+        "<meta property='og:novel:book_name' content='书名'>"
+        "<meta property='og:novel:author' content='作者名'>"
+        "</head><body>"
+        "<div class='li_bottom'><a href='/author/1/'>作者名</a></div>"
+        "</body></html>"
+    )
+    name = eng._eval_field(html, "meta[property='og:novel:book_name']@content")
+    assert name == "书名"
+    author = eng._eval_field(html, "div.li_bottom a[href^='/author/']@text")
+    assert author == "作者名"
+
+
+def test_js_content_rule_supports_src_and_base64_decode():
+    """要撸小说 ruleContent uses ``String(src)`` + ``java.base64Decode`` to
+    decode a base64-encoded chapter body; both must be supported by the shim."""
+    import base64 as _b64
+    import shutil
+
+    if shutil.which("node") is None:
+        pytest.skip("node.js not available")
+
+    story = "这是正文内容，用于测试 base64 解码。结尾。"
+    encoded = _b64.b64encode(story.encode("utf-8")).decode("ascii")
+    html = (
+        '<html><body><div id="box" encoded="%s"></div></body></html>' % encoded
+    )
+    rule = (
+        "@js:\n"
+        "var m = String(src).match(/encoded\\s*=\\s*\"([^\"]+)\"/);\n"
+        "if (m) { String(java.base64Decode(m[1])); } else { \"\"; }\n"
+    )
+    eng = YueduRuleEngine({
+        "bookSourceUrl": "https://example.com",
+        "ruleContent": {"content": rule},
+    })
+    eng.set_page_url("https://example.com/book/1/")
+    out = eng.parse_content(html)
+    assert story in out
+
+
 @pytest.mark.asyncio
 async def test_fetch_book_cleans_alice_metadata_and_extracts_cover():
     plugin = YueduPlugin({
@@ -1072,6 +1160,58 @@ async def test_get_dispatches_webview_suffix_to_browser():
     assert html == "<html><body>ok</body></html>"
     # The suffix must not be part of the requested URL.
     assert captured["url"] == "https://yaoluku.example.com/book/123/"
+
+
+@pytest.mark.asyncio
+async def test_get_forces_browser_when_url_requests_webview():
+    """A ``,{"webView":true}`` suffix must never fall back to plain HTTP."""
+    plugin = YueduPlugin({"bookSourceUrl": "https://yaoluku.example.com"})
+    captured: dict[str, object] = {}
+
+    async def fake_browser(url, web_js="", **kwargs):
+        captured.update(
+            url=url,
+            web_js=web_js,
+            fallback_http=kwargs.get("fallback_http"),
+        )
+        return "<html><body>ok</body></html>"
+
+    with patch.object(plugin, "_get_with_web_js", fake_browser):
+        html = await plugin._get(
+            "https://yaoluku.example.com/book/123/,{\"webView\":true}"
+        )
+
+    assert html == "<html><body>ok</body></html>"
+    assert captured["url"] == "https://yaoluku.example.com/book/123/"
+    # webView means the site only serves the page to a browser; a HTTP fallback
+    # would just re-request a challenge page and hide the real cause.
+    assert captured["fallback_http"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_with_web_js_forces_browser_for_webview(monkeypatch):
+    """webView URLs must use the browser and never silently fall back to HTTP."""
+    plugin = YueduPlugin({"bookSourceUrl": "https://yaoluku.example.com"})
+
+    async def fake_get(url, **kwargs):
+        raise AssertionError("webView URL must not fall back to plain HTTP")
+
+    plugin._get = fake_get  # type: ignore[assignment]
+
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "playwright" or name == "playwright.async_api":
+            raise ImportError("playwright not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    with pytest.raises(RuntimeError, match="Playwright is not installed"):
+        await plugin._get_with_web_js(
+            "https://yaoluku.example.com/book/123/,{\"webView\":true}"
+        )
 
 
 SEARCH_SOURCE = {

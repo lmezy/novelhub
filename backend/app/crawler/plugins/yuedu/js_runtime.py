@@ -308,6 +308,7 @@ class JsRuntime:
                     f'(function(){{'
                     f'{context_js}'
                     f'var result={input_json};'
+                    f'var src=result;'
                     f'if(globalThis.__nhSetContent){{globalThis.__nhSetContent(result);}}'
                     f'var __codex_src__={src_json};'
                     f'var __codex_out__;'
@@ -647,6 +648,21 @@ var java = {{
     }},
     getLoginInfoMap: function() {{
         return java.getLoginInfo();
+    }},
+    // Base64 helpers used by many R18/forum sources whose chapter body is
+    // base64-encoded in the raw HTML (e.g. 要撸小说 ruleContent decodes an
+    // ``encoded="..."`` blob with ``java.base64Decode``).
+    base64Decode: function(s) {{
+        try {{ return Buffer.from(String(s), 'base64').toString('utf-8'); }} catch(e) {{ return ""; }}
+    }},
+    base64Encode: function(s) {{
+        try {{ return Buffer.from(String(s), 'utf-8').toString('base64'); }} catch(e) {{ return ""; }}
+    }},
+    // Some sources build their request header with ``java.getWebViewUA()``
+    // (Legado returns the WebView UA).  Provide a plausible Android WebView UA
+    // so the source config can be evaluated without a real AppEnvironment.
+    getWebViewUA: function() {{
+        return "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
     }},
     put: function(key, value) {{
         _cache[key] = String(value);

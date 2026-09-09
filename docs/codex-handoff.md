@@ -384,3 +384,159 @@ python -m pytest backend/tests/test_yuedu_plugin.py backend/tests/test_sync_serv
 - 修/关不可达代理 `http://192.168.1.17:27890`。
 - 重建并重启 `backend`/`scheduler`/`crawler`（前端也需重启），让 `fetch_book` 去后缀、
   标题截断、cookie 超时等改动生效。本次未在线上执行部署。
+
+---
+
+## 11. 2026-09-09 会话：要撸小说（yaoluku.com）同步报错复诊
+
+### 背景
+
+用户反馈 crawler 同步“要撸小说”（`yuedu_b38b98d309e3`，`https://www.yaoluku.com`）
+时出现大量报错。本会话在 VPN 打开后对真实站点做了回归：`yaoluku.com` 对纯 HTTP 请求
+返回 **403 的 JS 挑战页**（`<script> window.location.href ="/..."</script>`，约 132 字节），
+书页与章节页都如此；但 Playwright 真实浏览器能渲染出完整书页/正文。于是定位到真正
+导致“整本失败/章节为空”的代码缺陷，并做了修复。
+
+### 已确认根因（本次修复的核心）
+
+要撸小说书源把 `,{"webView":true}` 追加到书 URL 上，但正文/章节 URL 是
+`https://www.yaoluku.com/book/{bookId}/{chapterId}.html`。其 `bookUrlPattern` 形如
+`https?://www\.yaoluku\.com/book/\d+`。
+
+`_is_book_url` 以 **非锚定** 的 `re.search` 匹配 `bookUrlPattern`，因此章节 URL
+`/book/35979/399068.html` 也命中 `book/\d+` 前缀，被判为“书详情页”。于是
+`_is_chapter_url` 里 `if self._is_book_url(abs_url, require_pattern=True): return False`
+把每个章节都当成书页丢弃 → `fetch_book` 得到 **0 章** → 同步报“无可用章节/整本失败”。
+
+本地回归：用该书源配置对 `https://www.yaoluku.com/book/35979/` 执行 `fetch_book`，
+修复前 `num chapters: 0`，修复后 `num chapters: 51`（含第52章），章节 URL 正常
+（`/book/35979/353043.html` … `/book/35979/399068.html`）。
+
+### 确认的现状（无需改动）
+
+- 工作区干净，HEAD=`2e4ba07 update_backend`（develop 分支）。仓库已包含上一轮
+  `,{"webView":true}` 后缀剥离、`_safe_title/_safe_author` 截断、anti-bot 页面识别、
+  连续失败中止等改动。
+- `fetch_book` / `_is_book_url` / `_book_id_from_url` / `discover_books` / `search_books`
+  都已正确保留并剥离 `,{...}` 后缀，身份/基址/章节 URL 匹配不会再被污染。
+- `crawler`/`backend` 镜像均预装 Playwright + Chromium，webView URL 会走浏览器渲染。
+- VPN 后可通过本地系统代理 `127.0.0.1:7897` 访问 `yaoluku.com`，能对真实站点做回归；
+  `yckceo.com` 仍被该代理出口阻断（SSL EOF / 403），故 5 个书源的原始 config 仍需从
+  服务器数据库获取。随后用户提供 SSH 密码，已用 paramiko 登入 `master`
+  （`nas.19961113.xyz:10022`，用户 `894654222`）并读取了
+  `yuedu_b38b98d309e3` 的真实 `source.config` 与 `crawl_tasks`。
+
+### 本次改动
+
+`backend/app/crawler/plugins/yuedu/__init__.py`：
+
+- **`_is_book_url`（核心修复）**：`bookUrlPattern` 匹配改为“路径终结”校验——`re.search`
+  命中后，要求匹配之后只剩空的路径（允许尾部 `/`、query、fragment），不再允许章节 URL
+  因命中 `book/\d+` 前缀而被当成书页。这使 `_is_chapter_url` 能正确放行
+  `/book/{bookId}/{chapterId}.html`。
+- `_get`：当 URL 带 `,{"webView":true}` 后缀时，强制以 `fallback_http=False` 调用
+  `_get_with_web_js`（浏览器必须使用）。仅 `webJs`（无 `webView`）的规则仍保留
+  HTTP 回退，因为 Legado 还能在纯 HTTP 响应上求值 webJs。
+- `_get_with_web_js`：拆出 URL 选项后，若 `web_view=true`，无论调用方传什么，都把
+  `fallback_http` 关掉，避免浏览器命中 anti-bot 挑战时“静默回退到纯 HTTP”，从而
+  把真正的“需要 Cookie/JS 渲染”原因掩盖成“无可用元数据/正文”，并重复轰炸反爬站点。
+
+`backend/tests/test_yuedu_plugin.py` 新增 2 项：
+
+- `test_book_url_pattern_does_not_match_chapter_url`：验证 `book/\d+` 不再把
+  `/book/{id}/{chapter}.html` 当书页，且 `_is_chapter_url` 放行章节。
+- `test_get_forces_browser_when_url_requests_webview`：`_get` 对 webView URL 以
+  `fallback_http=False` 派发给浏览器。
+- `test_get_with_web_js_forces_browser_for_webview`：`_get_with_web_js` 对 webView URL
+  即使调用方传 `fallback_http=True` 也被强制关闭，Playwright 不可用时抛
+  `Playwright is not installed` 而不是回退 HTTP。
+
+### 验证
+
+- `test_yuedu_plugin.py` → **116 passed**（较上轮 113 增加 3 项）。
+- `test_sync_service.py` + `test_rule_engine_legado.py` + `test_yuedu_import.py`
+  + `test_source_management.py` → **71 passed**。
+- `compileall` 通过。
+- 真实站点回归：`fetch_book("https://www.yaoluku.com/book/35979/,{\"webView\":true}")`
+  修复前 0 章 → 修复后 **51 章**；章节页纯 HTTP 稳定返回 403 JS 挑战，浏览器可渲染。
+
+### 仍未定位 / 需用户配合
+
+- “大量报错”最可能的根因（书名命中章节也被当书页 → 全书 0 章）已确认并修复；仍需
+  从服务器数据库读取 `yuedu_b38b98d309e3` 的真实 `source.config` 才能确认该书源的
+  `bookUrlPattern` 与 `ruleContent` 是否与预期一致（尤其正文选择器是否提取到正文而非页眉）。
+- 章节页对纯 HTTP 稳定 403，依赖浏览器渲染；若线上仍偶发失败，多为反爬限流或不可达代理。
+- 代理 **必须修改**：线上 `http://192.168.1.17:27890` 不可达，会导致每个请求先等
+  5s 代理超时再直连。可关闭或改为 NAS 可达地址（如本地 `127.0.0.1:7897` 仅本机可达）。
+- 若要读取线上 crawl_log / 书源 config 做最终确认，需**提供服务器 SSH 密码**（或用
+  可用密钥替换 `master` 的 `id_ed25519`）。
+- 需修/关不可达代理 `http://192.168.1.17:27890`，否则每个请求先等 5s 代理超时再直连。
+
+---
+
+## 12. 2026-09-09 补：连上服务器后的完整定位（要撸小说 4 处根因）
+
+拿到 SSH 密码后已读取真实 `source.config` 并做真实站点点位回归，共定位并修复
+**4 处代码缺陷**。真实 `source.config` 要点：
+
+- `bookUrlPattern: https://www\.yaoluku\.com/book/\d+`
+- `ruleContent.content`: `@js:` 用 `String(src).match(/encoded\s*=\s*"([^"]+)"/)` +
+  `java.base64Decode(m[1])` 解码 base64 正文
+- `header`: `@js: JSON.stringify({"User-Agent": java.getWebViewUA()})`
+- 所有书/搜索/分类 URL 都带 `,{"webView":true}`
+
+### 4 处根因与修复
+
+1. **`_is_book_url` 非锚定匹配**（`yuedu/__init__.py`）：章节 URL
+   `/book/35979/399068.html` 命中 `book/\d+` 前缀被判为书页，`_is_chapter_url`
+   丢弃所有章节 → `fetch_book` 0 章。改为“路径终结”校验。
+2. **`_parse_legado_index` 把 CSS 属性选择器当索引**（`rule_engine.py`）：
+   任何以 `]` 结尾的规则（`a[href*='next']`、`meta[property='og:...']`、
+   `a[href^='/author/']`）都被误判为 Legado 索引 → `nextContentUrl` 返回全站链接
+   （含 `javascript:`→ 章节抓取崩溃）、元数据/书名被全页文本污染。改为“非纯数字/范围
+   索引一律走 CSS”。
+3. **规则正文解码缺 API**（`js_runtime.py`）：`java` shim 缺
+   `base64Decode`/`base64Encode`/`getWebViewUA`；且 JS 只注入 `result` 未注入 Legado
+   约定的 `src` → 正文规则抛错、正文为空。已补齐。
+4. **下一页 URL 过滤**（`yuedu/__init__.py`）：`fetch_chapter_content` 未过滤非 http(s)
+   下一页，遇 `javascript:alert('敬请期待')` 抛 `Unsupported URL` 使整章失败。已只保留
+   `http/https`。
+
+另确认：`yaoluku.com` 对纯 HTTP 稳定返回 403 的 JS 挑战页（约 132 字节），书页/章节页/
+分类页都如此；Playwright 真实浏览器可渲染，`_is_blocked_page` 不会误判真实书页。
+
+### 真实站点回归（本地走代理 127.0.0.1:7897）
+
+- `fetch_book("https://www.yaoluku.com/book/35979/,{\"webView\":true}")`：
+  修复前 0 章 → 修复后 **51 章**，`title=鬼父：母女花丧失`、`author=二极管写手`。
+- `fetch_chapter_content(第一章)`：返回 **3446 字**正文（base64 解码成功）。
+
+### 线上数据库确认（本次 SSH 读到）
+
+- 《要撸小说》最近任务全部 `failed`：09-06 `403 Forbidden for .../sort/1/`、
+  `anti-bot/captcha ... /book/21428/`、`/book/56673/,{"webView":true}`；
+  09-08/09-09 `同步连续失败超过 10 本，已中止任务...`。
+- `app_settings.auto_sync_enabled=false`。
+- **`/app/storage/proxy_config.json` 仍是坏代理**
+  `{"enabled": true, "https_proxy": "http://192.168.1.17:27890", ...}`，
+  `192.168.1.17` 是用户电脑、NAS 不可达 → 每请求先等 5s 代理超时再回退直连，诱发超时/反爬。
+- 线上镜像仍是部署时构建的旧代码，**不含**本次 4 处修复，故仍“连续失败中止”。
+
+### 测试
+
+- `test_yuedu_plugin.py` + `test_rule_engine_legado.py` + `test_sync_service.py`
+  + `test_yuedu_import.py` + `test_source_management.py` → **190 passed**。
+- 新增 6 项：`test_book_url_pattern_does_not_match_chapter_url`、
+  `test_css_attribute_selector_not_parsed_as_legado_index`、
+  `test_css_attribute_selector_extracts_meta_and_attr`、
+  `test_js_content_rule_supports_src_and_base64_decode`、
+  `test_get_forces_browser_when_url_requests_webview`、
+  `test_get_with_web_js_forces_browser_for_webview`。
+
+### 需要用户操作
+
+- **先改代理**：关闭 `/app/storage/proxy_config.json` 或改成 NAS 可达地址（本地
+  `127.0.0.1:7897` 仅用户电脑可达，NAS 用不了）。
+- **重建并重启** `backend`/`crawler`（含 nodejs）与 `scheduler`，让 4 处修复上线。
+- 若线上 IP 仍被反爬，可导入浏览器 Cookie；但本次修复后 webView 浏览器渲染已可稳定取到
+  书页与章节正文。

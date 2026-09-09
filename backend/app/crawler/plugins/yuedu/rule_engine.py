@@ -587,8 +587,18 @@ class YueduRuleEngine:
         if rule.endswith("]"):
             start = rule.rfind("[")
             if start != -1:
-                before = rule[:start].rstrip()
                 inner = rule[start + 1:-1].strip()
+                # Rules ending in `]` are not always Legado indexes.  A CSS
+                # attribute selector such as ``a[href*='next']``,
+                # ``meta[property='og:title']`` or ``a[href^='/author/']``
+                # also ends in ``]``.  Legado indexes are numeric only
+                # (``[0]``, ``[1:3]``, ``[0,!1]``, ``[1,2,3]``); if the bracket
+                # body contains letters/operators it is a CSS selector, so hand
+                # the whole rule to the CSS engine instead of mis-parsing it as
+                # an index (which would select every child element).
+                if not re.fullmatch(r"[\d\s,:!-]*", inner or ""):
+                    return rule, " ", []
+                before = rule[:start].rstrip()
                 split = "!"
                 if inner.startswith("!"):
                     inner = inner[1:]

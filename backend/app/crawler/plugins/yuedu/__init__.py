@@ -1390,7 +1390,10 @@ class YueduPlugin:
         pending_content_urls = [
             url
             for url in chapter_engine.get_next_content_urls(html, chapter.url)
-            if url not in seen_content_urls
+            if (
+                url not in seen_content_urls
+                and url.startswith(("http://", "https://"))
+            )
         ]
         seen_content_urls.update(pending_content_urls)
         pages_fetched = 0
@@ -1429,7 +1432,10 @@ class YueduPlugin:
                 pending_content_urls.extend(
                     url
                     for url in chapter_engine.get_next_content_urls(next_html, next_url)
-                    if url not in seen_content_urls
+                    if (
+                        url not in seen_content_urls
+                        and url.startswith(("http://", "https://"))
+                    )
                 )
             seen_content_urls.update(pending_content_urls)
 
@@ -1869,10 +1875,29 @@ class YueduPlugin:
         pattern = self.config.get("bookUrlPattern", "")
         if pattern and pattern.strip():
             try:
-                if any(
-                    re.search(pattern, candidate)
-                    for candidate in self._url_host_aliases(url)
-                ):
+                # ``bookUrlPattern`` must only match a *book detail* URL, not a
+                # URL that merely *starts with* the book page.  A loose, not
+                # anchored pattern such as ``book/\d+`` also matches a chapter
+                # URL (``/book/35979/399068.html``); that would make
+                # ``_is_chapter_url`` reject every chapter and yield zero books'
+                # worth of chapter content for sites like 要撸小说.  Require the
+                # match to reach the end of the path (an optional trailing "/"
+                # or query/fragment is allowed).
+                matched = False
+                for candidate in self._url_host_aliases(url):
+                    m = re.search(pattern, candidate)
+                    if m is None:
+                        continue
+                    remainder = candidate[m.end() :]
+                    remainder = (
+                        remainder.split("?", 1)[0]
+                        .split("#", 1)[0]
+                        .rstrip("/")
+                    )
+                    if remainder == "":
+                        matched = True
+                        break
+                if matched:
                     return True
             except re.error:
                 pass
@@ -2781,6 +2806,12 @@ class YueduPlugin:
         web_js = str(web_js or "").strip()
         clean_url, url_options = self._split_options_suffix(url)
         if url_options:
+            # ``webView:true`` means the site only serves the page to a real
+            # browser (e.g. 要撸小说 / forum sources).  A plain-HTTP fallback
+            # would just re-request a challenge page, so force it off here
+            # regardless of what the caller passed.
+            if url_options.get("web_view"):
+                fallback_http = False
             if url_options.get("web_js") and not web_js:
                 web_js = str(url_options.get("web_js"))
             if url_options.get("headers"):
@@ -3674,6 +3705,15 @@ class YueduPlugin:
                     clean_url,
                     str(url_options.get("web_js") or ""),
                     request_headers=url_options.get("headers") or None,
+                    # A ``,{"webView":true}`` suffix means the site *requires* a
+                    # browser (e.g. 要撸小说 / forum sources).  Do NOT silently
+                    # fall back to plain HTTP when the browser hits an anti-bot
+                    # challenge: that only re-requests a page that will never
+                    # render over HTTP and turns the real "needs cookie / JS"
+                    # cause into a confusing "no usable metadata" error.  Keep
+                    # the HTTP fallback for webJs-only rules, which Legado can
+                    # still evaluate against the plain-HTTP response.
+                    fallback_http=not bool(url_options.get("web_view")),
                 )
             if str(url_options.get("method", "GET")).upper() == "POST":
                 return await self._post(
