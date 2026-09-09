@@ -197,6 +197,11 @@ class JsRuntime:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                # Large JS results (e.g. a base64-decoded chapter body) exceed
+                # the 64KiB default StreamReader line limit and raise
+                # ``asyncio.LimitOverrunError`` ("chunk exceed the limit"),
+                # which made long chapters fail to fetch.
+                limit=16 * 1024 * 1024,
             )
             # Wait for ready signal
             try:
@@ -517,6 +522,7 @@ class JsRuntime:
                 tmp_path,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=16 * 1024 * 1024,
             )
             try:
                 stdout, stderr = await asyncio.wait_for(

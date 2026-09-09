@@ -186,6 +186,23 @@ class SyncService:
         return status in {403, 408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524}
 
     @staticmethod
+    def _is_transient_book_fetch(exc: BaseException) -> bool:
+        """Whether a failed book fetch is a transient error worth retrying
+        (Cloudflare 5xx / upstream error, browser load timeout, or a dropped
+        connection) rather than a deterministic rule/Cookie problem."""
+        message = str(exc).lower()
+        transient_markers = (
+            "5xx", "browser request failed", "timeout", "timed out",
+            "connection", "connect error", "unknown error", "error code 5",
+            "upstream server returned", "empty content",
+        )
+        if any(marker in message for marker in transient_markers):
+            return True
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        return status in {408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524}
+
+    @staticmethod
     def _chapter_concurrency(config: dict | None) -> int:
         """Pick chapter fetch concurrency, mirroring Legado's thread model."""
         default = min(
@@ -512,7 +529,23 @@ class SyncService:
         )
         if cookie_record:
             plugin.set_cookie(safe_decrypt_cookie(cookie_record.cookie_data))
-        remote_book = await plugin.fetch_book(url)
+        # A single transient Cloudflare 5xx / browser timeout on the book page
+        # should not fail the whole book.  Retry a few times with backoff for
+        # transient upstream errors before giving up.
+        remote_book = None
+        last_book_exc: Exception | None = None
+        for book_attempt in range(3):
+            try:
+                remote_book = await plugin.fetch_book(url)
+                break
+            except Exception as exc:
+                last_book_exc = exc
+                if not self._is_transient_book_fetch(exc):
+                    raise
+                if book_attempt < 2:
+                    await asyncio.sleep(2.0 + book_attempt * 2.0)
+        if remote_book is None:
+            raise last_book_exc  # type: ignore[misc]
         if (
             not remote_book.chapters
             or str(remote_book.title or "").strip() in ("", "Unknown")

@@ -540,3 +540,49 @@ python -m pytest backend/tests/test_yuedu_plugin.py backend/tests/test_sync_serv
 - **重建并重启** `backend`/`crawler`（含 nodejs）与 `scheduler`，让 4 处修复上线。
 - 若线上 IP 仍被反爬，可导入浏览器 Cookie；但本次修复后 webView 浏览器渲染已可稳定取到
   书页与章节正文。
+
+---
+
+## 13. 2026-09-09 再补：同步“21 本发现、20 本同步、9 成功 / 11 失败”的剩余根因
+
+用户反馈修复后仍“发现 21 本、同步 20 本、成功 9 本、失败 11 本”。读 crawler 容器日志
+（`docker logs novelhub-crawler`）确认剩余失败是**瞬态上游错误**，非规则缺陷：
+
+- `Book page returned no usable metadata/chapters ... (title='Web server is returning an
+  unknown error\nError code 520', chapters=0)` —— Cloudflare **520**。
+- `Playwright webJs fetch failed for ... Page.goto: Timeout 20000ms exceeded` →
+  `Browser request failed: ...` —— 浏览器 20s 超时。
+- `JsRuntime eval error: Separator is not found, and chunk exceed the limit` —— Node 子进程
+  `readline()` 默认 64KiB 上限，长章节（base64 解码结果）超限。
+- 大量 `JsRuntime` 报错 + 偶发成功，说明站点/代理对服务器 IP 间歇性反爬/超时。
+
+### 本轮新增修复
+
+- `js_runtime.py`：`create_subprocess_exec` 两处加 `limit=16*1024*1024`，修掉
+  “chunk exceed the limit”；长章节不再因 64KiB 上限失败。
+- `yuedu/__init__.py`：新增 `_looks_like_upstream_error()`，识别 Cloudflare/5xx 错误页，
+  在 `fetch_book` 里把它当作“瞬态 5xx”抛清晰错误，而不是解析成 0 章书籍；Playwright
+  `page.goto` 超时 20s→45s。
+- `services/sync.py`：`sync_book` 对 `fetch_book` 增加**瞬态错误重试**（最多 3 次，退避
+  2s/4s），`_is_transient_book_fetch()` 识别 5xx/timeout/connection/empty-content。
+
+### 新增测试
+
+- `test_js_runtime_handles_large_result`（长内容不再超限）
+- `test_looks_like_upstream_error`（520 页识别）
+- `test_transient_book_fetch_classification`（瞬态分类）
+
+### 验证
+
+- `test_yuedu_plugin + test_rule_engine_legado + test_sync_service + test_yuedu_import
+  + test_source_management` → **193 passed**。
+
+### 仍需用户处理（这才是“11 失败”的根因）
+
+- **先改/关代理**：`/app/storage/proxy_config.json` 仍为
+  `{"enabled": true, "https_proxy": "http://192.168.1.17:27890", ...}`。`192.168.1.17`
+  是用户电脑、NAS 不可达 → 每请求先等 5s 代理超时再回退直连，正好诱发 Cloudflare 520、
+  Playwright 超时与间歇反爬。本地 `127.0.0.1:7897` 只有用户电脑可达。
+- **重建并重启** `backend`/`crawler`(含 nodejs)/`scheduler`，让“4 处修复 + 本章 3 处韧性
+  修复”上线。
+- 若服务器 IP 仍被 yaoluku 反爬，才需导入浏览器 Cookie。

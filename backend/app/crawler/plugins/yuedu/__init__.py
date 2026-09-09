@@ -433,6 +433,11 @@ class YueduPlugin:
             html = await self._get_with_web_js(fetch_url, web_js)
         else:
             html = await self._get(fetch_url)
+        if self._looks_like_upstream_error(html):
+            raise RuntimeError(
+                "Upstream server returned a transient 5xx error page "
+                f"(Cloudflare/520 etc.): {fetch_url}"
+            )
         info = self.engine.parse_book_info(html)
 
         # Run preUpdateJs before parsing TOC
@@ -2895,7 +2900,7 @@ class YueduPlugin:
 
                     # WAF-protected sites often keep analytics sockets open forever;
                     # waiting for networkidle turns a usable page into a timeout.
-                    await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
                     # Cloudflare / WAF challenge pages ("Just a moment…") return
                     # before the JS challenge has solved itself.  Wait for the
                     # real page (and the resolved session cookies) before running
@@ -3588,6 +3593,27 @@ class YueduPlugin:
         for marker in WEAK_BLOCK_MARKERS:
             if marker in lowered:
                 return any(confirm in lowered for confirm in confirmations)
+        return False
+
+    @staticmethod
+    def _looks_like_upstream_error(html: str) -> bool:
+        """Detect a Cloudflare / origin 5xx error page (e.g. "Error code 520 /
+        Web server is returning an unknown error").  These are transient upstream
+        failures — treating them as a book with 0 chapters produced misleading
+        "no usable metadata" errors and wasted the whole sync on a transient blip,
+        so callers should surface this as a retryable error instead.
+        """
+        if not html:
+            return False
+        lowered = html.lower()
+        if "web server is returning an unknown error" in lowered:
+            return True
+        if "error code 5" in lowered:
+            return True
+        if ("cloudflare" in lowered and "error" in lowered) or "cf-error" in lowered:
+            return True
+        if re.search(r"\b(?:error|could not be found)\b[^<]{0,40}\b5\d{2}\b", lowered):
+            return True
         return False
 
     @classmethod

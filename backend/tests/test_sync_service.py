@@ -49,6 +49,18 @@ def test_upstream_blocked_includes_http_status_errors():
     assert not SyncService._is_upstream_blocked(RuntimeError("解析失败"))
 
 
+def test_transient_book_fetch_classification():
+    assert SyncService._is_transient_book_fetch(
+        RuntimeError("Upstream server returned a transient 5xx error page")
+    ) is True
+    assert SyncService._is_transient_book_fetch(
+        RuntimeError("Browser request failed: https://example.com/book/1")
+    ) is True
+    assert SyncService._is_transient_book_fetch(
+        ValueError("Book page returned no usable metadata/chapters")
+    ) is False
+
+
 def test_clean_sync_tags_drops_title_and_author_fragments():
     tags = {
         "官路之谁与争锋(卷帘西风666)",

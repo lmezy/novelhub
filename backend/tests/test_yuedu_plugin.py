@@ -334,6 +334,38 @@ def test_js_content_rule_supports_src_and_base64_decode():
 
 
 @pytest.mark.asyncio
+async def test_js_runtime_handles_large_result():
+    """Long chapter bodies must not trip the Node subprocess 64KiB readline
+    limit (``asyncio.LimitOverrunError`` / "chunk exceed the limit")."""
+    import shutil
+
+    if shutil.which("node") is None:
+        pytest.skip("node.js not available")
+
+    story = ("很长很长的正文。" * 4000)  # ~ 72 KiB of text
+    rule = "@js: String(src)"
+    eng = YueduRuleEngine({
+        "bookSourceUrl": "https://example.com",
+        "ruleContent": {"content": rule},
+    })
+    eng.set_page_url("https://example.com/book/1/")
+    out = eng.parse_content(story)
+    assert len(out) >= len(story) - 10
+
+
+def test_looks_like_upstream_error():
+    assert YueduPlugin._looks_like_upstream_error(
+        "<html><body>Web server is returning an unknown error Error code 520</body></html>"
+    ) is True
+    assert YueduPlugin._looks_like_upstream_error(
+        "<html><title>Error 520</title><body>cf-ray: abc</body></html>"
+    ) is True
+    assert YueduPlugin._looks_like_upstream_error(
+        "<html><body><h1>鬼父：母女花丧失</h1><div>正文</div></body></html>"
+    ) is False
+
+
+@pytest.mark.asyncio
 async def test_fetch_book_cleans_alice_metadata_and_extracts_cover():
     plugin = YueduPlugin({
         "bookSourceUrl": "https://www.alicesw.com",
