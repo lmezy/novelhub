@@ -132,6 +132,7 @@ async def update_auto_sync(
             db,
             payload.enabled,
             payload.time,
+            payload.interval_hours,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -6,10 +6,13 @@ import pytest
 from app.core.database import get_db
 from app.main import app
 from app.services.settings import (
+    auto_sync_is_due,
     get_auto_sync_settings,
+    parse_auto_sync_last_run,
     set_auto_sync_settings,
 )
 from app.services.auth import require_admin
+from datetime import datetime
 
 
 @pytest.mark.asyncio
@@ -19,7 +22,7 @@ async def test_auto_sync_settings_defaults():
 
     result = await get_auto_sync_settings(db)
 
-    assert result == {"enabled": False, "time": "03:00"}
+    assert result == {"enabled": False, "time": "03:00", "interval_hours": 0}
 
 
 @pytest.mark.asyncio
@@ -31,9 +34,33 @@ async def test_set_auto_sync_settings_saves():
 
     result = await set_auto_sync_settings(db, True, "06:30")
 
-    assert result == {"enabled": True, "time": "06:30"}
-    assert db.add.call_count == 3
-    assert db.commit.await_count == 3
+    assert result == {"enabled": True, "time": "06:30", "interval_hours": 0}
+    assert db.add.call_count == 4
+    assert db.commit.await_count == 4
+
+
+@pytest.mark.asyncio
+async def test_set_auto_sync_settings_saves_interval_hours():
+    db = AsyncMock()
+    db.scalar = AsyncMock(return_value=None)
+    db.add = MagicMock()
+    db.commit = AsyncMock()
+
+    result = await set_auto_sync_settings(db, True, "06:30", interval_hours=6)
+
+    assert result == {"enabled": True, "time": "06:30", "interval_hours": 6}
+    stored = {call.args[0].key: call.args[0].value for call in db.add.call_args_list}
+    assert stored["auto_sync_interval_hours"] == "6"
+
+
+@pytest.mark.asyncio
+async def test_set_auto_sync_settings_rejects_bad_interval():
+    db = AsyncMock()
+
+    with pytest.raises(ValueError):
+        await set_auto_sync_settings(db, True, "06:30", interval_hours=-1)
+    with pytest.raises(ValueError):
+        await set_auto_sync_settings(db, True, "06:30", interval_hours=1000)
 
 
 @pytest.mark.asyncio
@@ -54,9 +81,9 @@ async def test_disable_auto_sync_cancels_stale_auto_tasks():
 
     result = await set_auto_sync_settings(db, False, "06:30")
 
-    assert result == {"enabled": False, "time": "06:30"}
-    # 3 setting writes + 1 task cancellation update
-    assert db.commit.await_count == 4
+    assert result == {"enabled": False, "time": "06:30", "interval_hours": 0}
+    # 4 setting writes + 1 task cancellation update
+    assert db.commit.await_count == 5
     assert db.execute.await_count == 1
 
 
@@ -84,6 +111,88 @@ async def test_auto_sync_settings_route():
         app.dependency_overrides.clear()
 
     assert get_resp.status_code == 200
-    assert get_resp.json() == {"enabled": False, "time": "03:00"}
+    assert get_resp.json() == {
+        "enabled": False,
+        "time": "03:00",
+        "interval_hours": 0,
+    }
     assert put_resp.status_code == 200
-    assert put_resp.json() == {"enabled": True, "time": "06:30"}
+    assert put_resp.json() == {
+        "enabled": True,
+        "time": "06:30",
+        "interval_hours": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_auto_sync_settings_route_accepts_interval_hours():
+    db = AsyncMock()
+    db.scalar = AsyncMock(return_value=None)
+    db.add = MagicMock()
+    db.commit = AsyncMock()
+
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[require_admin] = lambda: None
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            put_resp = await client.put(
+                "/api/admin/settings/auto-sync",
+                json={"enabled": True, "time": "06:30", "interval_hours": 12},
+            )
+            bad_resp = await client.put(
+                "/api/admin/settings/auto-sync",
+                json={"enabled": True, "time": "06:30", "interval_hours": 999},
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert put_resp.status_code == 200
+    assert put_resp.json()["interval_hours"] == 12
+    assert bad_resp.status_code == 422
+
+
+def test_parse_auto_sync_last_run_supports_date_and_timestamp():
+    assert parse_auto_sync_last_run("") is None
+    assert parse_auto_sync_last_run("2026-09-10") == datetime(2026, 9, 10, 0, 0)
+    assert parse_auto_sync_last_run("2026-09-10T08:30:00") == datetime(
+        2026, 9, 10, 8, 30
+    )
+    assert parse_auto_sync_last_run("not-a-date") is None
+
+
+def test_auto_sync_is_due_daily_mode_catches_up_after_missed_minute():
+    settings_dict = {"enabled": True, "time": "03:00", "interval_hours": 0}
+
+    # Before the configured time nothing runs.
+    assert auto_sync_is_due(
+        settings_dict, "", datetime(2026, 9, 10, 2, 59)
+    ) is False
+    # The exact minute is not required: a check later in the day still runs.
+    assert auto_sync_is_due(
+        settings_dict, "", datetime(2026, 9, 10, 10, 17)
+    ) is True
+    # Already ran today (legacy date-only marker) -> not due again.
+    assert auto_sync_is_due(
+        settings_dict, "2026-09-10", datetime(2026, 9, 10, 23, 0)
+    ) is False
+    # Yesterday's run -> due again.
+    assert auto_sync_is_due(
+        settings_dict, "2026-09-09", datetime(2026, 9, 10, 10, 0)
+    ) is True
+
+
+def test_auto_sync_is_due_interval_mode():
+    settings_dict = {"enabled": True, "time": "03:00", "interval_hours": 6}
+    now = datetime(2026, 9, 10, 12, 0)
+
+    assert auto_sync_is_due(settings_dict, "", now) is True
+    assert auto_sync_is_due(
+        settings_dict, "2026-09-10T08:30:00", now
+    ) is False
+    assert auto_sync_is_due(
+        settings_dict, "2026-09-10T05:30:00", now
+    ) is True
+    assert auto_sync_is_due(
+        {**settings_dict, "enabled": False}, "", now
+    ) is False

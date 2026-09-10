@@ -1093,6 +1093,111 @@ async def test_get_falls_back_to_direct_when_proxy_unreachable():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stale_error",
+    [httpx.ReadTimeout("read timed out"), httpx.ReadError("connection reset")],
+)
+async def test_get_resets_pooled_client_after_transport_error_and_succeeds(
+    stale_error,
+):
+    """A stale pooled socket must not burn three 60s read timeouts.
+
+    要撸小说 could only be reached through the Clash/mihomo proxy, and every
+    time that proxy restarted the worker's pooled connection hung until the
+    read timeout.  The request now drops the client and retries on a fresh
+    connection instead of failing.
+    """
+    YueduPlugin._clients.clear()
+    YueduPlugin._transport_bad_until.clear()
+    YueduPlugin._transport_preferred.clear()
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://stale-proxy.example.com",
+        "concurrentRate": "0",
+    })
+
+    calls = {"n": 0}
+    reset_calls: list[str | None] = []
+
+    class FakeResponse:
+        status_code = 200
+        headers = {}
+        text = "<html>ok</html>"
+        content = b"<html>ok</html>"
+
+        def raise_for_status(self):
+            return None
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def get(self, url, headers=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise stale_error
+            return FakeResponse()
+
+        async def aclose(self):
+            return None
+
+    async def fake_reset(proxy):
+        reset_calls.append(proxy)
+
+    try:
+        with (
+            patch.object(
+                plugin,
+                "_get_http_client",
+                AsyncMock(return_value=FakeClient()),
+            ),
+            patch.object(plugin, "_reset_http_client", side_effect=fake_reset),
+            patch("asyncio.sleep", AsyncMock()),
+            patch(
+                "app.services.proxy_config.get_proxy_config",
+                return_value=ProxyConfig(
+                    enabled=True,
+                    https_proxy="http://127.0.0.1:27890",
+                    http_proxy="http://127.0.0.1:27890",
+                ),
+            ),
+        ):
+            html = await plugin._get("https://stale-proxy.example.com/page")
+    finally:
+        YueduPlugin._clients.clear()
+        YueduPlugin._transport_bad_until.clear()
+        YueduPlugin._transport_preferred.clear()
+
+    assert html == "<html>ok</html>"
+    assert calls["n"] == 2
+    assert reset_calls == ["http://127.0.0.1:27890"]
+
+
+def test_ordered_transports_prefers_last_success_and_demotes_failures():
+    YueduPlugin._transport_bad_until.clear()
+    YueduPlugin._transport_preferred.clear()
+    plugin = YueduPlugin({"bookSourceUrl": "https://order.example.com"})
+    proxy = "http://127.0.0.1:27890"
+
+    try:
+        assert plugin._ordered_transports(proxy)[0] == proxy
+
+        plugin._mark_transport_success(None)
+        assert plugin._ordered_transports(proxy)[0] is None
+
+        plugin._mark_transport_success(proxy)
+        assert plugin._ordered_transports(proxy)[0] == proxy
+
+        # A proxy that just hung is tried after direct, but is still retried
+        # (some sources are only reachable through the proxy).
+        plugin._mark_transport_failure(proxy)
+        assert plugin._ordered_transports(proxy)[0] is None
+        assert proxy in plugin._ordered_transports(proxy)
+    finally:
+        YueduPlugin._transport_bad_until.clear()
+        YueduPlugin._transport_preferred.clear()
+
+
+@pytest.mark.asyncio
 async def test_get_uses_browser_fallback_for_http_block_response():
     plugin = YueduPlugin({
         "bookSourceUrl": "https://example.com",

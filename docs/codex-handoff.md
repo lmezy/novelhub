@@ -586,3 +586,111 @@ python -m pytest backend/tests/test_yuedu_plugin.py backend/tests/test_sync_serv
 - **重建并重启** `backend`/`crawler`(含 nodejs)/`scheduler`，让“4 处修复 + 本章 3 处韧性
   修复”上线。
 - 若服务器 IP 仍被 yaoluku 反爬，才需导入浏览器 Cookie。
+
+---
+
+## 14. 2026-09-10 会话：要撸小说同步报错 + 同步频率慢（真实线上定位）
+
+用户提供 SSH（`master` / nas.19961113.xyz:10022），并说明已把 NovelHub 代理指向 NAS 上的
+metacube(xd)（mihomo，混合端口 27890）。本次连上服务器只读排查，定位到两个问题的真实根因。
+
+### 线上事实（09-10 20:00 前后）
+
+- 容器 `novelhub-crawler` 采用 **host 网络**，`/app/storage/proxy_config.json` 为
+  `{"enabled": true, "https_proxy": "http://127.0.0.1:27890", ...}`，代理端口在宿主机可用
+  （容器内 curl 经代理访问 yaoluku 返回 403 挑战页 = 站点特有的 JS 跳转页，正常）。
+- 《要撸小说》（`yuedu_b38b98d309e3`）有一个 `discover_all`、`max_pages=0`（不限量）的任务
+  `d5890e75-…` 从 09-09 16:51 一直 `running`，到现在仍停在 `next_page=1`；
+  `progress.current_book=画壁…`、`current_chapters_total=58`、`current_chapters_failed=38`、
+  `current_chapters_created=0`。
+- crawler 日志显示**每章固定耗时约 10 分 18 秒**：每章打印 3 行
+  `Configured proxy http://127.0.0.1:27890 unreachable (); retrying direct`，
+  行间精确相隔约 207s，最后一行之后约 21s 抛出**空字符串错误**（`sync_book` 日志里
+  报错信息为空）。
+- 逐项计时（容器内）：`[http] len=19837 secs=5.5`、`[chapter] len=2145 secs=1.0`，
+  即**新进程下该章完全正常**；失败只发生在长期运行的 worker 进程里。
+- `docker exec` 统计容器内进程：**1293 个进程，其中 1287 个是僵尸（Z）**，
+  全部是 `chrome` / `chrome_crashpad`，父进程为容器 PID 1（`crawler/app/main.py`）。
+- 数据库 `app_settings`：`auto_sync_enabled=false`、`auto_sync_time=03:00`、
+  `auto_sync_last_run` 为空 —— **自动同步其实从未开启**。
+- 宿主机上 `metacubexd` 日志反复出现 `starting bundled mihomo on boot…`（mihomo 会重启），
+  这正是池化连接失效的来源。
+
+### 根因
+
+1. **代理长连接失效后不自愈（问题 1 的核心）**
+   mihomo 重启后，worker 里 `httpx.AsyncClient` 连接池中的 keep-alive 连接变成半开状态，
+   httpx 复用该连接会一直挂到 **60s 读超时**；`_get` 对该代理重试 3 次（≈186s），
+   再回退直连（yaoluku 直连是 `ConnectTimeout`，3×5s+退避 ≈21s），合计
+   **≈207s/请求**；外层每章又重试 3 次 → **≈10 分钟/章且必然失败**。
+   空错误信息正是 `httpx.ReadTimeout` / `ConnectTimeout` 这类异常的 `str()`。
+2. **直连 fallback 无意义**：yaoluku 直连不可达（ConnectTimeout），但每次仍要先等 5s×3。
+3. **僵尸进程泄漏**：Playwright 每次请求都新起 Chromium，Node 驱动退出后浏览器进程被
+   挂到 PID 1，而 PID 1 从不 `waitpid`，一天累积 1287 个僵尸。
+4. **同步频率问题**：自动同步默认关闭；即使开启也只支持“每天某个 HH:MM”，
+   且 due 判断是 `now.strftime("%H:%M") == 设定值` 的**分钟精确匹配**——
+   beat 若在那一分钟繁忙/容器重启/队列暂停，**整天就被静默跳过**。
+5. **手动“全站同步”默认 `max_pages=0`（不限量）**：在这种站点上任务几乎不可能结束，
+   一个任务可以独占队列好几天。
+
+### 本次改动
+
+`backend/app/crawler/plugins/yuedu/__init__.py`
+
+- 新增 `_http_timeout()`：读超时 60s → **25s**（connect 5s / write 15s / pool 10s），
+  可用 `YUEDU_HTTP_READ_TIMEOUT` 等环境变量覆盖；`_get_http_client` 增加
+  `httpx.Limits(max_connections=32, max_keepalive_connections=8, keepalive_expiry=5)`。
+- 新增 `_reset_http_client(proxy)`：请求遇到 `httpx.TransportError`
+  （ReadTimeout/PoolTimeout/ReadError/ConnectError…）时**关闭并丢弃池化客户端**，
+  重试时重新建连（原来会复用在同一个坏连接上）。
+- 新增 `_ordered_transports(proxy_url)`：按“最近成功过的通道优先 + 失败通道冷却
+  （`YUEDU_TRANSPORT_COOLDOWN_SECONDS`，默认 60s）”排序代理/直连，
+  但两条路径都会尝试（yaoluku 只能走代理，不能把代理禁用）。
+- 代理失败日志改为
+  `Configured proxy … request failed (ReadTimeout: …); retrying direct`，
+  **不再出现“空错误信息”**；封面/正文图片两条代理循环同样接入上述逻辑。
+
+`scheduler/app/tasks.py` + `backend/app/services/settings.py`
+
+- 自动同步新增**按间隔**模式：`auto_sync_interval_hours`（0=每天固定时间，1~168=每隔 N 小时）。
+- due 判断抽到 `app.services.settings.auto_sync_is_due()`：间隔模式按“上次运行时间 + N 小时”；
+  每天模式改为**补跑语义**（当天未跑且已过设定时间即视为到点），分钟精确匹配导致的漏跑不再发生。
+- `auto_sync_last_run` 改存完整 ISO 时间戳（兼容旧的 `YYYY-MM-DD`）。
+- 创建任务前先查同书源是否已有 `pending/running/paused` 的自动任务，避免任务堆叠占满队列。
+
+`backend/app/schemas/admin.py` + `backend/app/api/routes/admin.py`
+
+- `AutoSyncSettingsUpdate.interval_hours`（0~168，None 表示保留原值）并透传给 service。
+
+`crawler/app/main.py`
+
+- 新增守护线程 `orphan-reaper`：每 15s 用 `os.waitid(..., WNOWAIT)` 窥视已退出子进程，
+  `waitpid` 回收**非本进程管理的**僵尸（Chromium/crashpad），修掉 1287 僵尸泄漏。
+
+`frontend/src/pages/SyncPage.vue` + `frontend/src/stores/i18n.ts`
+
+- 自动同步新增“调度方式”选择：每天固定时间 / 每隔 1·2·3·4·6·8·12·24 小时。
+- 手动“全站同步”新增**最大页数**输入（默认 20，0=不限），避免单任务无限期占用队列。
+
+### 验证
+
+- 单元测试：`test_yuedu_plugin / test_rule_engine_legado / test_sync_service / test_crawl_queue
+  / test_source_management / test_sync_settings / test_yuedu_import / test_auto_sync_schedule
+  / test_cookie_health` → **221 passed**。
+- 真实站点回归（把改动后的 `yuedu/__init__.py` 影子挂载到 crawler 容器的 `/tmp`，
+  不动线上代码，走容器内 127.0.0.1:27890 代理）：
+  `[plain http] len=19837 secs=5.5`、`[chapter] len=2145 secs=1.0`、
+  模拟坏连接 `[stale-socket recovery] len=23954 secs=11.4 client_replaced=True`。
+- 前端 `pnpm run build`（Vite）通过，构建产物已清理。
+- 新增测试：`test_get_resets_pooled_client_after_transport_error_and_succeeds`（ReadTimeout /
+  ReadError 两种坏连接都会换客户端重试）、`test_ordered_transports_prefers_last_success_and_demotes_failures`、
+  `test_auto_sync_schedule.py`（4 项：到期建任务、跳过在跑书源、间隔未到不建任务、关闭时空跑）、
+  以及 `test_sync_settings.py` 的间隔/补跑用例。
+
+### 仍需用户处理
+
+1. **重建并重启** `backend`/`crawler`(含 nodejs)/`scheduler`/`frontend` 才能生效。
+2. 在“同步”页 **开启自动同步**（线上目前 `auto_sync_enabled=false`，等于从没自动同步过），
+   建议选“每隔 6/12 小时”。
+3. 之前 `max_pages=0` 的僵尸任务建议取消后重新发起（新任务默认 20 页封顶）。
+4. 代理配置保持 `http://127.0.0.1:27890` 即可（crawler 是 host 网络，容器内 127.0.0.1 就是 NAS 本机）。

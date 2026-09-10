@@ -17,9 +17,11 @@ const loadingTasks = ref(false)
 const pageError = ref("")
 const autoSyncEnabled = ref(false)
 const autoSyncTime = ref("03:00")
+const autoSyncIntervalHours = ref(0)
 const autoSyncSaving = ref(false)
 const autoSyncSaved = ref(false)
 const autoSyncError = ref("")
+const syncMaxPages = ref(20)
 const bookshelfSyncing = ref(false)
 const bookshelfResults = ref<any[]>([])
 
@@ -114,6 +116,7 @@ async function loadAutoSyncSettings() {
     const res = await api.get<any>("/admin/settings/auto-sync")
     autoSyncEnabled.value = res.enabled
     autoSyncTime.value = res.time || "03:00"
+    autoSyncIntervalHours.value = Number(res.interval_hours || 0)
   } catch {
     // Settings are admin-only; ignore for non-admin visitors.
   }
@@ -127,9 +130,11 @@ async function saveAutoSyncSettings() {
     const res = await api.put<any>("/admin/settings/auto-sync", {
       enabled: autoSyncEnabled.value,
       time: autoSyncTime.value,
+      interval_hours: Number(autoSyncIntervalHours.value || 0),
     })
     autoSyncEnabled.value = res.enabled
     autoSyncTime.value = res.time
+    autoSyncIntervalHours.value = Number(res.interval_hours || 0)
     autoSyncSaved.value = true
   } catch (e) {
     autoSyncError.value = e instanceof Error ? e.message : i18n.t('sync_auto_save_failed')
@@ -151,7 +156,7 @@ async function startCrawl() {
       if (!syncableSources.value.some((s: any) => s.id === id)) continue
       const task = await api.post<any>("/crawl/tasks", {
         source: id,
-        max_pages: 0,
+        max_pages: Math.max(0, Math.floor(Number(syncMaxPages.value) || 0)),
       })
       created.push(task)
     }
@@ -289,7 +294,16 @@ onMounted(async () => {
           <p v-if="syncableSources.length === 0" class="col-span-full text-sm text-muted dark:text-gray-400 py-4 text-center">{{ i18n.t('sync_no_sources') }}</p>
         </div>
 
-        <div class="flex flex-wrap items-center gap-3">
+        <div class="flex flex-wrap items-center gap-3 mb-1">
+          <label class="inline-flex items-center gap-2 text-sm">
+            <span class="text-muted dark:text-gray-400">{{ i18n.t('sync_max_pages') }}</span>
+            <input
+              type="number"
+              min="0"
+              v-model.number="syncMaxPages"
+              class="w-24 px-2 py-1.5 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
+            />
+          </label>
           <button @click="startCrawl" :disabled="starting" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">
             {{ starting ? i18n.t('sync_starting') : i18n.t('sync_import_books') }}
           </button>
@@ -297,6 +311,7 @@ onMounted(async () => {
             {{ bookshelfSyncing ? i18n.t('sync_starting') : i18n.t('sync_import_bookshelf') }}
           </button>
         </div>
+        <p class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('sync_max_pages_hint') }}</p>
         <div v-if="bookshelfResults.length" class="mt-3 space-y-1 text-xs">
           <p
             v-for="r in bookshelfResults"
@@ -313,6 +328,18 @@ onMounted(async () => {
               {{ i18n.t('sync_auto_enable') }}
             </label>
             <label class="inline-flex items-center gap-2 text-sm">
+              <span class="text-muted dark:text-gray-400">{{ i18n.t('sync_auto_mode') }}</span>
+              <select
+                v-model.number="autoSyncIntervalHours"
+                class="px-2 py-1.5 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
+              >
+                <option :value="0">{{ i18n.t('sync_auto_mode_daily') }}</option>
+                <option v-for="hours in [1, 2, 3, 4, 6, 8, 12, 24]" :key="hours" :value="hours">
+                  {{ i18n.t('sync_auto_every_hours', { n: hours }) }}
+                </option>
+              </select>
+            </label>
+            <label v-if="autoSyncIntervalHours === 0" class="inline-flex items-center gap-2 text-sm">
               <span class="text-muted dark:text-gray-400">{{ i18n.t('sync_auto_time') }}</span>
               <input
                 type="time"

@@ -76,6 +76,7 @@ async def _auto_sync_check_async() -> dict:
     from app.core.database import SessionLocal
     from app.models import CrawlTask, Source
     from app.services.settings import (
+        auto_sync_is_due,
         get_auto_sync_last_run,
         get_auto_sync_settings,
         set_auto_sync_last_run,
@@ -88,19 +89,20 @@ async def _auto_sync_check_async() -> dict:
             logger.info("Auto sync is disabled; no tasks created")
             return {"enabled": False}
 
-        now = datetime.now(timezone(timedelta(hours=8)))
-        if now.strftime("%H:%M") != auto_settings["time"]:
+        now = datetime.now(timezone(timedelta(hours=8))).replace(tzinfo=None)
+        last_run = await get_auto_sync_last_run(db)
+        # Due check lives in app.services.settings so the daily mode can catch
+        # up after a missed minute and the interval mode can run every N hours
+        # instead of once per day.
+        if not auto_sync_is_due(auto_settings, last_run, now):
             logger.debug(
-                "Auto sync enabled but not due (now={} time={})",
-                now.strftime("%H:%M"),
+                "Auto sync enabled but not due (now={} time={} interval_hours={} last_run={})",
+                now.strftime("%Y-%m-%d %H:%M"),
                 auto_settings["time"],
+                auto_settings.get("interval_hours", 0),
+                last_run,
             )
             return {"enabled": True, "due": False}
-
-        today = now.strftime("%Y-%m-%d")
-        if await get_auto_sync_last_run(db) == today:
-            logger.info("Auto sync already ran today at {}", today)
-            return {"enabled": True, "due": True, "already_run": True}
 
         rows = await db.scalars(
             select(Source).where(
@@ -109,8 +111,25 @@ async def _auto_sync_check_async() -> dict:
             )
         )
         sources = list(rows.all())
+        # Never stack a second automatic task on top of one that is still
+        # queued or running: a slow source used to accumulate pending tasks
+        # and monopolise the crawl queue.
+        active_sources = set(await db.scalars(
+            select(CrawlTask.source).where(
+                CrawlTask.user_id.is_(None),
+                CrawlTask.mode == "discover_all",
+                CrawlTask.status.in_(["pending", "running", "paused"]),
+            )
+        ))
         max_pages = _auto_sync_max_pages()
+        created = 0
         for source in sources:
+            if source.id in active_sources:
+                logger.info(
+                    "Auto sync skipped {}: a task is already queued or running",
+                    source.id,
+                )
+                continue
             db.add(CrawlTask(
                 id=str(uuid4()),
                 source=source.id,
@@ -118,9 +137,11 @@ async def _auto_sync_check_async() -> dict:
                 max_pages=max_pages,
                 status="pending",
             ))
-        await set_auto_sync_last_run(db, today)
+            created += 1
+        await set_auto_sync_last_run(db, now.isoformat(timespec="seconds"))
         logger.info(
-            "Auto sync created {} discover task(s), max_pages={}",
+            "Auto sync created {} discover task(s) ({} source(s) known), max_pages={}",
+            created,
             len(sources),
             max_pages,
         )
@@ -128,7 +149,7 @@ async def _auto_sync_check_async() -> dict:
             "enabled": True,
             "due": True,
             "sources": len(sources),
-            "tasks_created": len(sources),
+            "tasks_created": created,
             "max_pages": max_pages,
         }
 

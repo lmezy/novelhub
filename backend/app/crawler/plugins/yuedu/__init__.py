@@ -15,6 +15,7 @@ import base64
 import codecs
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -322,6 +323,11 @@ class YueduPlugin:
 
     name = "yuedu"
     _clients: dict[str | None, httpx.AsyncClient] = {}
+    # Transport health, keyed by "<source base url>::proxy|direct".  A proxy
+    # (or a direct connection) that just hung or refused is remembered so the
+    # next request does not pay for the dead path first.
+    _transport_bad_until: dict[str, float] = {}
+    _transport_preferred: dict[str, str] = {}
     _rate_locks: dict[str, asyncio.Lock] = {}
     _rate_state: dict[str, dict[str, float | int]] = {}
     # DoH (DNS over HTTPS) cache for bypassing polluted system DNS.
@@ -372,22 +378,115 @@ class YueduPlugin:
                 normalized[field] = {}
         return normalized
 
+    @staticmethod
+    def _env_float(name: str, default: float) -> float:
+        try:
+            value = float(os.getenv(name, "") or default)
+        except (TypeError, ValueError):
+            return default
+        return value if value > 0 else default
+
+    def _http_timeout(self) -> httpx.Timeout:
+        """Request timeouts tuned so a hung socket/proxy fails fast.
+
+        A stale pooled connection (the Clash/mihomo proxy restarts, the
+        upstream node drops the socket) previously hung for the full 60s read
+        timeout, three times per request and three times per chapter -- about
+        ten minutes for every chapter of 《要撸小说》 while nothing ever got
+        saved.  A shorter read timeout plus a client reset on timeout turns
+        that into "one slow request, then success".
+        """
+        return httpx.Timeout(
+            self._env_float("YUEDU_HTTP_READ_TIMEOUT", 25.0),
+            connect=self._env_float("YUEDU_HTTP_CONNECT_TIMEOUT", 5.0),
+            write=self._env_float("YUEDU_HTTP_WRITE_TIMEOUT", 15.0),
+            pool=self._env_float("YUEDU_HTTP_POOL_TIMEOUT", 10.0),
+        )
+
     async def _get_http_client(self, proxy: str | None) -> httpx.AsyncClient:
         """Reuse one AsyncClient per proxy so TLS/connections are pooled."""
         async with self._client_lock:
             client = self.__class__._clients.get(proxy)
             if client is None:
                 client = httpx.AsyncClient(
-                    timeout=httpx.Timeout(60.0, connect=5.0, write=15.0),
+                    timeout=self._http_timeout(),
                     follow_redirects=True,
                     proxy=proxy,
                     trust_env=False,
+                    limits=httpx.Limits(
+                        max_connections=32,
+                        max_keepalive_connections=8,
+                        # The proxy restarts often enough that half-open
+                        # connections are common; do not keep idle sockets.
+                        keepalive_expiry=5.0,
+                    ),
                     # Proxy (Clash) TLS interception uses a local CA cert;
                     # browsers accept it interactively but httpx cannot.
                     verify=False,
                 )
                 self.__class__._clients[proxy] = client
             return client
+
+    async def _reset_http_client(self, proxy: str | None) -> None:
+        """Drop the pooled client for ``proxy`` so the retry reconnects.
+
+        httpx happily reuses a pooled socket that the peer already dropped
+        (proxies that restarted, upstream nodes that vanished), and only
+        reports it after the read timeout.  Closing and forgetting the client
+        forces the retry onto a brand new connection.
+        """
+        async with self._client_lock:
+            client = self.__class__._clients.pop(proxy, None)
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+    def _transport_key(self, proxy: str | None) -> str:
+        return f"{self.base_url or 'default'}::{'proxy' if proxy else 'direct'}"
+
+    def _transport_in_cooldown(self, proxy: str | None) -> bool:
+        until = self.__class__._transport_bad_until.get(
+            self._transport_key(proxy),
+            0.0,
+        )
+        return time.monotonic() < until
+
+    def _mark_transport_failure(self, proxy: str | None) -> None:
+        cooldown = self._env_float("YUEDU_TRANSPORT_COOLDOWN_SECONDS", 60.0)
+        self.__class__._transport_bad_until[self._transport_key(proxy)] = (
+            time.monotonic() + cooldown
+        )
+
+    def _mark_transport_success(self, proxy: str | None) -> None:
+        key = self._transport_key(proxy)
+        self.__class__._transport_bad_until.pop(key, None)
+        self.__class__._transport_preferred[self.base_url or "default"] = key
+
+    def _ordered_transports(self, proxy_url: str | None) -> list[str | None]:
+        """Order the proxy/direct attempts, best candidate first.
+
+        Some sources are only reachable through the proxy (直连 returns
+        ConnectTimeout), while the proxy itself restarts now and then, so both
+        paths stay available -- ordering merely avoids paying the known-bad
+        path on every single request.
+        """
+        candidates: list[str | None] = []
+        if proxy_url:
+            candidates.append(proxy_url)
+        candidates.append(None)
+        preferred = self.__class__._transport_preferred.get(
+            self.base_url or "default"
+        )
+
+        def _rank(transport: str | None) -> tuple[int, int]:
+            return (
+                0 if self._transport_in_cooldown(transport) else 1,
+                1 if self._transport_key(transport) == preferred else 0,
+            )
+
+        return sorted(candidates, key=_rank, reverse=True)
 
     def build_book_url(self, book_id: str) -> str:
         """Reconstruct a book detail URL from a stored source book id."""
@@ -3541,23 +3640,22 @@ class YueduPlugin:
                 raise last_error
             raise RuntimeError(f"Request failed after retries: {url}")
 
-        proxies: list[str | None] = [None]
-        if proxy_url:
-            proxies.insert(0, proxy_url)
-
         last_error: httpx.HTTPError | None = None
-        for proxy in proxies:
+        for proxy in self._ordered_transports(proxy_url):
             try:
-                return await _request(proxy)
+                html = await _request(proxy)
             except httpx.RequestError as exc:
                 last_error = exc
+                self._mark_transport_failure(proxy)
                 if proxy is None:
                     raise
                 logger.warning(
-                    "Configured proxy %s unreachable (%s); retrying direct",
+                    "Configured proxy %s request failed (%s%s); retrying direct",
                     proxy_url,
-                    exc,
+                    type(exc).__name__,
+                    f": {exc}" if str(exc) else "",
                 )
+                continue
             except httpx.HTTPStatusError as exc:
                 if proxy is None:
                     raise
@@ -3566,6 +3664,9 @@ class YueduPlugin:
                     "Configured proxy returned HTTP %s; retrying direct",
                     exc.response.status_code if exc.response is not None else "error",
                 )
+                continue
+            self._mark_transport_success(proxy)
+            return html
 
         if last_error is not None:
             raise last_error
@@ -3891,10 +3992,17 @@ class YueduPlugin:
                                     rewritten[0],
                                 )
                                 continue
+                    # A dropped/stale socket must not be reused by the retry.
+                    await self._reset_http_client(proxy)
                     last_error = exc
                     if attempt < 2:
                         await asyncio.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
                 except httpx.HTTPError as exc:
+                    if isinstance(exc, httpx.TransportError):
+                        # The pooled connection hung (proxy restarted, upstream
+                        # node vanished). Drop it so the retry dials fresh
+                        # instead of burning another read timeout.
+                        await self._reset_http_client(proxy)
                     last_error = exc
                     if attempt < 2:
                         await asyncio.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
@@ -3903,23 +4011,22 @@ class YueduPlugin:
                 raise last_error
             raise RuntimeError(f"Request failed after retries: {url}")
 
-        proxies: list[str | None] = [None]
-        if proxy_url:
-            proxies.insert(0, proxy_url)
-
         last_error: httpx.HTTPError | None = None
-        for proxy in proxies:
+        for proxy in self._ordered_transports(proxy_url):
             try:
-                return await _request(proxy)
+                html = await _request(proxy)
             except httpx.RequestError as exc:
                 last_error = exc
+                self._mark_transport_failure(proxy)
                 if proxy is None:
                     raise
                 logger.warning(
-                    "Configured proxy %s unreachable (%s); retrying direct",
+                    "Configured proxy %s request failed (%s%s); retrying direct",
                     proxy_url,
-                    exc,
+                    type(exc).__name__,
+                    f": {exc}" if str(exc) else "",
                 )
+                continue
             except httpx.HTTPStatusError as exc:
                 if proxy is None:
                     raise
@@ -3928,6 +4035,9 @@ class YueduPlugin:
                     "Configured proxy returned HTTP %s; retrying direct",
                     exc.response.status_code if exc.response is not None else "error",
                 )
+                continue
+            self._mark_transport_success(proxy)
+            return html
 
         if last_error is not None:
             raise last_error
@@ -3993,12 +4103,8 @@ class YueduPlugin:
                 raise last_error
             raise RuntimeError(f"Request failed after retries: {url}")
 
-        proxies: list[str | None] = [None]
-        if proxy_url:
-            proxies.insert(0, proxy_url)
-
         last_error: Exception | None = None
-        for proxy in proxies:
+        for proxy in self._ordered_transports(proxy_url):
             try:
                 data, content_type = await _request(proxy)
                 if not data or len(data) < 128:
@@ -4011,12 +4117,17 @@ class YueduPlugin:
                 return data, content_type
             except httpx.RequestError as exc:
                 last_error = exc
+                self._mark_transport_failure(proxy)
+                if isinstance(exc, httpx.TransportError):
+                    await self._reset_http_client(proxy)
                 if proxy is None:
                     break
                 logger.warning(
-                    "Configured proxy %s unreachable for cover (%s); retrying direct",
+                    "Configured proxy %s request failed for cover (%s%s); "
+                    "retrying direct",
                     proxy_url,
-                    exc,
+                    type(exc).__name__,
+                    f": {exc}" if str(exc) else "",
                 )
             except Exception as exc:
                 last_error = exc
@@ -4113,12 +4224,8 @@ class YueduPlugin:
                 raise last_error
             raise RuntimeError(f"Request failed after retries: {url}")
 
-        proxies: list[str | None] = [None]
-        if proxy_url:
-            proxies.insert(0, proxy_url)
-
         last_error: Exception | None = None
-        for proxy in proxies:
+        for proxy in self._ordered_transports(proxy_url):
             try:
                 data, content_type = await _request(proxy)
                 if not data or len(data) < 128:
@@ -4130,12 +4237,17 @@ class YueduPlugin:
                 return data, content_type
             except httpx.RequestError as exc:
                 last_error = exc
+                self._mark_transport_failure(proxy)
+                if isinstance(exc, httpx.TransportError):
+                    await self._reset_http_client(proxy)
                 if proxy is None:
                     break
                 logger.warning(
-                    "Configured proxy %s unreachable for content image (%s); retrying direct",
+                    "Configured proxy %s request failed for content image (%s%s); "
+                    "retrying direct",
                     proxy_url,
-                    exc,
+                    type(exc).__name__,
+                    f": {exc}" if str(exc) else "",
                 )
             except Exception as exc:
                 last_error = exc

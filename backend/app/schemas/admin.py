@@ -61,10 +61,21 @@ class RegistrationApprovalUpdate(BaseModel):
 class AutoSyncSettingsUpdate(BaseModel):
     enabled: bool
     time: str = "03:00"
+    # 0 = "every day at `time`"; >0 = "every N hours".
+    interval_hours: int | None = None
 
     @field_validator("time")
     @classmethod
     def _validate_time(cls, value: str) -> str:
         if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", value):
             raise ValueError("time must be in HH:MM format")
+        return value
+
+    @field_validator("interval_hours")
+    @classmethod
+    def _validate_interval(cls, value: int | None) -> int | None:
+        if value is None:
+            return None
+        if value < 0 or value > 168:
+            raise ValueError("interval_hours must be between 0 and 168")
         return value
