@@ -383,7 +383,7 @@ async def test_sync_book_loads_existing_tags_without_lazy_load():
         assert result["created_chapters"] == 1
         service._save_tags.assert_awaited_once_with(
             "book-1",
-            ["all-ages", "old", "remote"],
+            ["all-ages", "remote"],
         )
 
 
@@ -469,8 +469,124 @@ async def test_sync_book_does_not_rewrite_other_source_tags():
         assert result["created_chapters"] == 1
         service._save_tags.assert_awaited_once_with(
             "book-1",
-            ["all-ages", "old", "remote"],
+            ["all-ages", "remote"],
         )
+
+
+def _book_sync_fixture(remote_tags: list[str]):
+    """Shared setup for the tag-merge tests below."""
+    db = _mock_db()
+    db.get.return_value = _source()
+    db.scalar.return_value = None
+    db.rollback = AsyncMock()
+    db.commit = AsyncMock()
+    db.flush = AsyncMock()
+    db.add = MagicMock()
+
+    remote_book = RemoteBook(
+        source_book_id="https://example.com/book/1",
+        title="Book",
+        author="Author",
+        description=None,
+        status=None,
+        chapters=[
+            RemoteChapter(
+                source_chapter_id="1",
+                title="Chapter 1",
+                url="https://example.com/book/1.html",
+                chapter_number=1,
+            ),
+        ],
+        tags=list(remote_tags),
+    )
+    plugin = AsyncMock()
+    plugin.fetch_book.return_value = remote_book
+    book = Book(
+        id="book-1",
+        source_id="src1",
+        source_book_id="https://example.com/book/1",
+        title="Book",
+    )
+    service = SyncService(db)
+    service.storage = MagicMock()
+    service.storage.write_metadata = MagicMock()
+    return db, plugin, book, service
+
+
+@pytest.mark.asyncio
+async def test_sync_book_replaces_stale_source_tags():
+    """Re-syncing drops tags left behind by an earlier, buggy extraction.
+
+    要撸小说 books previously ended up with the site's whole category menu
+    (书库/完本/武侠/…) as tags.  The next sync must replace them with what the
+    source actually reports instead of unioning forever.
+    """
+    db, plugin, book, service = _book_sync_fixture(["玄幻奇幻"])
+    stored = ["玄幻奇幻", "玄幻", "都市", "武侠", "书库", "完本", "1" * 19]
+    save_tags = AsyncMock()
+
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.emit"),
+        patch("app.services.sync.search_service"),
+        patch("app.services.auto_categorize.AutoCategorizationService"),
+        patch.object(
+            service,
+            "_get_or_create_author",
+            AsyncMock(return_value=MagicMock(id="author-1")),
+        ),
+        patch.object(
+            service,
+            "_get_or_create_book",
+            AsyncMock(return_value=(book, True)),
+        ),
+        patch.object(service, "_find_same_title_books", AsyncMock(return_value=[])),
+        patch.object(service, "_book_tag_names", AsyncMock(return_value=stored)),
+        patch.object(service, "_save_tags", save_tags),
+    ):
+        await service.sync_book("src1", "https://example.com/book/1")
+
+    save_tags.assert_awaited_once_with(
+        "book-1",
+        ["all-ages", "玄幻奇幻"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_sync_book_keeps_stored_tags_when_source_has_none():
+    """A parse that yields nothing must not wipe the book's existing tags."""
+    db, plugin, book, service = _book_sync_fixture([])
+    save_tags = AsyncMock()
+
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.emit"),
+        patch("app.services.sync.search_service"),
+        patch("app.services.auto_categorize.AutoCategorizationService"),
+        patch.object(
+            service,
+            "_get_or_create_author",
+            AsyncMock(return_value=MagicMock(id="author-1")),
+        ),
+        patch.object(
+            service,
+            "_get_or_create_book",
+            AsyncMock(return_value=(book, True)),
+        ),
+        patch.object(service, "_find_same_title_books", AsyncMock(return_value=[])),
+        patch.object(
+            service,
+            "_book_tag_names",
+            AsyncMock(return_value=["玄幻奇幻", "r18"]),
+        ),
+        patch.object(service, "_save_tags", save_tags),
+    ):
+        await service.sync_book("src1", "https://example.com/book/1")
+
+    save_tags.assert_awaited_once_with(
+        "book-1",
+        ["all-ages", "玄幻奇幻"],
+    )
 
 
 @pytest.mark.asyncio

@@ -2501,3 +2501,209 @@ async def test_fetch_explore_reports_js_explore_url_without_kinds():
     })
     with pytest.raises(RuntimeError, match="Legado"):
         await plugin.fetch_explore(page=1)
+
+
+def test_inside_navigation_detects_site_menu_blocks():
+    soup = BeautifulSoup(
+        '<nav class="container"><a href="/sort/1/1/">玄幻</a></nav>'
+        '<div class="navigation"><a href="/sort/2/1/">武侠</a></div>'
+        '<div class="book-tags"><a href="/tag/x/">修真</a></div>'
+        '<div class="book-info"><a href="/author/1/">作者</a></div>',
+        "lxml",
+    )
+
+    assert YueduPlugin._inside_navigation(soup.select_one("nav a")) is True
+    assert YueduPlugin._inside_navigation(soup.select_one(".navigation a")) is True
+    assert YueduPlugin._inside_navigation(soup.select_one(".book-tags a")) is False
+    assert YueduPlugin._inside_navigation(soup.select_one(".book-info a")) is False
+
+
+def test_clean_tags_drops_numeric_ids_and_status_words():
+    plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
+
+    tags = plugin._clean_tags(
+        ["1013798727695077372", "1234", "连载", "完本", "玄幻奇幻"],
+        "画壁",
+        "念湫",
+    )
+
+    assert tags == ["玄幻奇幻"]
+
+
+def test_clean_listing_kind_drops_ranking_titles():
+    assert YueduPlugin._clean_listing_kind("周排行") == ""
+    assert YueduPlugin._clean_listing_kind("新作榜") == ""
+    assert YueduPlugin._clean_listing_kind("最近更新") == ""
+    assert YueduPlugin._clean_listing_kind("全部小说") == ""
+    assert YueduPlugin._clean_listing_kind("都市") == "都市"
+    assert YueduPlugin._clean_listing_kind("乱伦") == "乱伦"
+
+
+@pytest.mark.asyncio
+async def test_discover_books_ignores_ranking_titles_as_tags():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.banshanren.com",
+        "bookUrlPattern": r"https://www\.banshanren\.com/book/\d+\.html",
+        "concurrentRate": "0",
+    })
+    items = [{
+        "name": "Book",
+        "author": "Author",
+        "bookUrl": "https://www.banshanren.com/book/123.html",
+        "exploreKind": "周排行",
+        "kind": "奇幻玄幻",
+    }]
+
+    with patch.object(plugin, "fetch_explore", AsyncMock(return_value=items)):
+        books = await plugin.discover_books()
+
+    assert len(books) == 1
+    assert books[0].tags == ["奇幻玄幻"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_book_rule_category_wins_over_nav_menu_tags():
+    """要撸小说 的书籍标签曾变成站点导航（书库/武侠/都市…）。
+
+    The generic scraper used to append the ``<nav>`` category menu on top of
+    the rule's real category (``ruleBookInfo.kind``).
+    """
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.yaoluku.com",
+        "concurrentRate": "0",
+        "ruleBookInfo": {
+            "kind": "meta[property='og:novel:category']@content",
+        },
+        "ruleToc": {
+            "chapterList": "ul#chapters li",
+            "chapterName": "a@text",
+            "chapterUrl": "a@href",
+        },
+    })
+    html = """<html><head>
+      <meta property="og:novel:category" content="玄幻奇幻">
+      <meta name="keywords" content="画壁,念湫,玄幻奇幻,连载">
+    </head><body>
+      <nav class="container">
+        <a href="/sort/">书库</a>
+        <a href="/sort/1/1/">玄幻</a>
+        <a href="/sort/2/1/">武侠</a>
+        <a href="/sort/3/1/">都市</a>
+      </nav>
+      <div class="navigation"><a href="/sort/4/1/">科幻</a></div>
+      <h1>画壁</h1>
+      <div class="author">念湫</div>
+      <ul id="chapters">
+        <li><a href="/book/56443/1.html">第1章</a></li>
+        <li><a href="/book/56443/2.html">第2章</a></li>
+      </ul>
+    </body></html>"""
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        book = await plugin.fetch_book("https://www.yaoluku.com/book/56443/")
+
+    assert book.tags == ["玄幻奇幻"]
+    assert len(book.chapters) == 2
+
+
+@pytest.mark.asyncio
+async def test_fetch_book_falls_back_to_generic_tags_without_kind_rule():
+    """Sources without a kind rule still get keyword metadata as tags."""
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "concurrentRate": "0",
+        "ruleToc": {
+            "chapterList": "ul#chapters li",
+            "chapterName": "a@text",
+            "chapterUrl": "a@href",
+        },
+    })
+    html = """<html><head>
+      <meta name="keywords" content="画壁,念湫,玄幻奇幻">
+    </head><body>
+      <nav class="container"><a href="/sort/1/1/">玄幻</a></nav>
+      <h1>画壁</h1>
+      <div class="author">念湫</div>
+      <ul id="chapters">
+        <li><a href="/book/56443/1.html">第1章</a></li>
+      </ul>
+    </body></html>"""
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        book = await plugin.fetch_book("https://example.com/book/56443/")
+
+    assert "玄幻奇幻" in book.tags
+    assert "玄幻" not in book.tags
+
+
+@pytest.mark.asyncio
+async def test_fetch_book_noisy_kind_rule_still_uses_generic_tags():
+    """A kind rule that only returns noise must not blank out the tags.
+
+    禁忌书屋 declares ``ruleBookInfo.kind = 论坛帖子`` (a constant forum
+    label); the book still gets the page's real keywords/tags.
+    """
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.cool18.com/bbs4",
+        "bookSourceName": "禁忌书屋",
+        "concurrentRate": "0",
+        "ruleBookInfo": {"kind": "论坛帖子"},
+        "ruleToc": {
+            "chapterList": "ul#chapters li",
+            "chapterName": "a@text",
+            "chapterUrl": "a@href",
+        },
+    })
+    html = """<html><head>
+      <meta name="keywords" content="标题,作者,都市,调教">
+    </head><body>
+      <h1>标题</h1>
+      <div class="author">作者</div>
+      <div class="tags"><a href="/tag/1/">制服</a></div>
+      <ul id="chapters">
+        <li><a href="/bbs4/thread-1.html">第1章</a></li>
+      </ul>
+    </body></html>"""
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        book = await plugin.fetch_book("https://www.cool18.com/bbs4/thread-1.html")
+
+    assert "论坛帖子" not in book.tags
+    assert {"都市", "调教", "制服"} <= set(book.tags)
+
+
+@pytest.mark.asyncio
+async def test_fetch_book_does_not_use_single_char_author_as_tag():
+    """A one-character pen name is not a tag.
+
+    ``要撸小说`` exposes ``求生游戏…`` by author "竹"; the short name is
+    rejected as the author but still appears in the page's keyword list.
+    """
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.yaoluku.com",
+        "concurrentRate": "0",
+        "ruleBookInfo": {
+            "name": "meta[property='og:novel:book_name']@content",
+            "author": "meta[property='og:novel:author']@content",
+            "kind": "meta[property='og:novel:category']@content",
+        },
+        "ruleToc": {
+            "chapterList": "ul#chapters li",
+            "chapterName": "a@text",
+            "chapterUrl": "a@href",
+        },
+    })
+    html = """<html><head>
+      <meta property="og:novel:book_name" content="求生游戏">
+      <meta property="og:novel:author" content="竹">
+      <meta property="og:novel:category" content="精品其他">
+      <meta name="keywords" content="求生游戏,竹,精品其他,连载">
+    </head><body>
+      <h1>求生游戏</h1>
+      <ul id="chapters"><li><a href="/book/1/1.html">第1章</a></li></ul>
+    </body></html>"""
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        book = await plugin.fetch_book("https://www.yaoluku.com/book/56508/")
+
+    assert book.tags == ["精品其他"]

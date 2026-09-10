@@ -694,3 +694,73 @@ metacube(xd)（mihomo，混合端口 27890）。本次连上服务器只读排�
    建议选“每隔 6/12 小时”。
 3. 之前 `max_pages=0` 的僵尸任务建议取消后重新发起（新任务默认 20 页封顶）。
 4. 代理配置保持 `http://127.0.0.1:27890` 即可（crawler 是 host 网络，容器内 127.0.0.1 就是 NAS 本机）。
+
+---
+
+## 15. 2026-09-10 补充：同步出来的书籍标签不正确
+
+用户反馈“同步书籍的时候，标签好像获取的有问题”。读线上数据 + 真实页面回归后定位到
+标签解析把**站点导航菜单**当成了书籍标签。
+
+### 线上现象（真实数据）
+
+- 《要撸小说》18 本书的标签是站点整条分类菜单：
+  `玄幻,都市,武侠,科幻,穿越,耽美,游戏,精品,午夜,书库,完本,连载,最新,…`；
+  某本书里甚至混进了一个 19 位数字 ID。
+- 真实页面回归（容器内走代理）显示：书源规则**本来就是对的**
+  （`ruleBookInfo.kind = meta[property='og:novel:category']@content` → `玄幻奇幻`），
+  但通用解析器又追加了一批标签：
+  - `meta[name=keywords]` → 正常（`玄幻奇幻, 连载`）；
+  - `a[href*="/sort/"]` 等链接扫描 → **站点 `<nav class="container">` 里的整条菜单**
+    （书库/完本/玄幻/武侠/都市/科幻/穿越/耽美/游戏/精品/午夜），
+    而这段菜单在**每一页**都有，于是每本书都拿到同一串标签。
+- 另外还发现两类噪音：排行榜名称被当成标签（搬山人 `周排行/新作榜`），
+  以及单字笔名（《求生游戏…》作者“竹”）因 `_looks_like_invalid_author` 判定无效而残留在标签里。
+
+### 本次改动
+
+`backend/app/crawler/plugins/yuedu/__init__.py`
+
+- 新增 `_inside_navigation()`：判断元素是否处于站点框架
+  （`nav`/`header`/`footer`，以及 class/id 语义以 nav/menu/header/footer/breadcrumb/
+  toolbar/topbar/sidebar 开头的块）。通用解析器收集标签时（`.tags a`、`[class*=tag] a`、
+  `[class*=category] a`、以及按 `/tag/` `/category/` `/sort/` 等 href 的兜底扫描）
+  **跳过导航块内的链接**。这是本次修复的核心。
+- `_clean_tags()`：
+  - 新增 `extra_noise` 参数，用页面原始作者名做**精确**过滤（单字笔名不再变成标签）；
+  - 丢弃纯数字标签（≥4 位，站点内部 ID）；
+  - 噪音词补充：连载/连载中/完结/已完结/完本/全本/免费小说/在线阅读/全文免费阅读/手机阅读。
+- 新增 `_clean_listing_kind()`：发现书籍时的列表页名称若带“排行/榜单/榜/最新/最近更新/
+  全部/首页/书库/完本/完结/推荐/入库”（例如“周排行”“新作榜”），不再作为标签写入。
+- **保留** 规则 kind 与页面关键词/标签的合并（爱丽丝书屋的 `kind` 只给大类“系统”，
+  真正的标签“剧情/反差/调教/制服/道具/性转”来自页面），所以没有改成“规则优先”。
+
+`backend/app/services/sync.py`
+
+- 同步时**重新推导标签**：书源的标签以本次抓取结果为准（`remote_book.tags` +
+  discovery tags），不再与库里旧标签做并集。这样历史上被写进去的导航菜单标签会在
+  下一次同步时自动消失，而不是永久残留。仅当本次抓取**一个标签都没有**时才回退保留
+  库里的标签，避免偶发解析失败把标签清空。手动标签在 `book_custom_tags`，不受影响。
+
+### 验证
+
+- 后端全量测试：**374 passed**。
+- 新增测试：`test_inside_navigation_detects_site_menu_blocks`、
+  `test_clean_tags_drops_numeric_ids_and_status_words`、
+  `test_clean_listing_kind_drops_ranking_titles`、
+  `test_discover_books_ignores_ranking_titles_as_tags`、
+  `test_fetch_book_rule_category_wins_over_nav_menu_tags`、
+  `test_fetch_book_noisy_kind_rule_still_uses_generic_tags`、
+  `test_fetch_book_does_not_use_single_char_author_as_tag`、
+  `test_sync_book_replaces_stale_source_tags`、
+  `test_sync_book_keeps_stored_tags_when_source_has_none`。
+- 真实站点回归（容器内影子加载改动后的插件，不动线上代码）：
+  - `https://www.yaoluku.com/book/56443/` → 标签 `['玄幻奇幻']`（修复前 13 个导航标签）
+  - `https://www.yaoluku.com/book/56508/` → 标签 `['精品其他']`（作者“竹”不再变成标签）
+  - `https://www.alicesw.com/novel/48948.html` → `['系统','剧情','反差','调教','制服','道具','性转']`（真实标签保留）
+
+### 用户需要做的
+
+1. 重建并重启 `crawler`/`backend`（`scheduler`/`frontend` 本次无改动）。
+2. 对已有书籍重新同步一次即可清掉旧标签（同步会以书源结果覆盖标签）；未重新同步的书
+   仍保留旧标签。

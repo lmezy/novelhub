@@ -626,6 +626,7 @@ class YueduPlugin:
         generic = self._parse_book_generic(html, url)
         if not str(info.get("name") or "").strip():
             info["name"] = generic["title"]
+        raw_rule_author = str(info.get("author") or "").strip()
         rule_author = self._clean_author(str(info.get("author") or "").strip())
         generic_author = self._clean_author(str(generic.get("author") or "").strip())
         labelled_author = self._clean_author(
@@ -645,9 +646,14 @@ class YueduPlugin:
             info["coverUrl"] = self._pick_cover_url(generic.get("cover"), url)
         generic_tags = generic.get("tags") or []
         raw_kind = info.get("kind") or ""
-        kind_tags = self._split_kind_text(raw_kind)
         book_title = self._clean_book_title(str(info.get("name") or "").strip()) or "Unknown"
         author = self._clean_author(str(info.get("author") or "").strip()) or "Unknown"
+        # The rule-defined ``ruleBookInfo.kind`` (the source's own category)
+        # and the page's own keywords/tag list are both kept: sources such as
+        # 爱丽丝书屋 declare only the broad category in ``kind`` while the page
+        # carries the real tags.  What must never be scraped is the site's
+        # navigation menu -- see ``_inside_navigation``.
+        kind_tags = self._split_kind_text(raw_kind)
         tags = list(dict.fromkeys([
             *kind_tags,
             *generic_tags,
@@ -657,7 +663,12 @@ class YueduPlugin:
                 generic.get("description"),
             ),
         ]))
-        tags = self._clean_tags(tags, book_title, author)
+        tags = self._clean_tags(
+            tags,
+            book_title,
+            author,
+            extra_noise=[raw_rule_author],
+        )
         info["kind"] = ",".join(tags)
         info["name"] = book_title
         info["author"] = author
@@ -908,6 +919,54 @@ class YueduPlugin:
                 seen_kept.add(id(chapter))
         return final
 
+    _NAV_CONTAINER_KEYWORDS = (
+        "nav",
+        "menu",
+        "header",
+        "footer",
+        "breadcrumb",
+        "crumb",
+        "toolbar",
+        "topbar",
+        "sidebar",
+    )
+
+    @classmethod
+    def _inside_navigation(cls, element: Any) -> bool:
+        """Whether an element sits inside the site chrome (menu/header/footer).
+
+        Book pages repeat the site's category menu (书库/完本/玄幻/都市/…), so
+        links from those blocks must never be scraped as book tags.
+        """
+        node = element
+        depth = 0
+        while node is not None and depth < 10:
+            name = getattr(node, "name", None)
+            if name in ("nav", "header", "footer"):
+                return True
+            if name in ("body", "html") or name is None:
+                return False
+            tokens: list[str] = []
+            classes = node.get("class") if hasattr(node, "get") else None
+            if classes:
+                tokens.extend(str(value) for value in classes)
+            ident = ""
+            if hasattr(node, "get"):
+                ident = str(node.get("id") or "")
+            if ident:
+                tokens.append(ident)
+            for token in tokens:
+                parts = re.split(r"[^a-z0-9]+", token.lower())
+                if any(
+                    part.startswith(cls._NAV_CONTAINER_KEYWORDS)
+                    for part in parts
+                    if part
+                ):
+                    return True
+            node = node.parent
+            depth += 1
+        return False
+
     def _parse_book_generic(
         self,
         html: str,
@@ -1013,11 +1072,17 @@ class YueduPlugin:
             if marker
         }
 
-        def _add_tag(value: str) -> None:
+        def _add_tag(value: str, element: Any = None) -> None:
             value = value.strip().strip("#").strip()
             if not value or len(value) > 20 or value.lower() in (
                 "tags", "tag", "标签", "分类", "类别", "类型", "最新章节",
             ):
+                return
+            # A category link inside the site chrome (nav/header/footer/menu)
+            # is navigation, not a tag for this book.  要撸小说 repeats its whole
+            # 书库/完本/玄幻/都市/… menu on every book page, which used to turn
+            # every book's tags into the site's navigation list.
+            if element is not None and self._inside_navigation(element):
                 return
             normalized = re.sub(r"[^\w\u3400-\u9fff]+", "", value).lower()
             if normalized in normalized_site_markers:
@@ -1043,7 +1108,7 @@ class YueduPlugin:
             "[class*='category'] a",
         ):
             for link in soup.select(selector):
-                _add_tag(link.get_text(" ", strip=True))
+                _add_tag(link.get_text(" ", strip=True), link)
 
         # Legado forum sources commonly expose tags as plain text rather than
         # links, for example: `标签：#奇幻 #后宫 #异世界`.
@@ -1069,7 +1134,7 @@ class YueduPlugin:
                     "/category/", "/categories/", "/fenlei/", "/sort/",
                 )
             ):
-                _add_tag(link.get_text(" ", strip=True))
+                _add_tag(link.get_text(" ", strip=True), link)
 
         chapter_links: list[Tag] = []
         for selector in GENERIC_CHAPTER_SELECTORS:
@@ -1334,11 +1399,30 @@ class YueduPlugin:
             cleaned.append(part)
         return cleaned
 
+    # Listing titles that describe a ranking/sort view rather than a genre.
+    _LISTING_ONLY_KIND_RE = re.compile(
+        r"(?:排行|榜单|榜|最新|最近更新|全部|首页|书库|完本|完结|推荐|入库)",
+    )
+
+    @classmethod
+    def _clean_listing_kind(cls, title: Any) -> str:
+        """Drop explore/ranking titles that are not real book categories.
+
+        A book discovered through "周排行" is not tagged 周排行.
+        """
+        text = str(title or "").strip()
+        if not text:
+            return ""
+        if cls._LISTING_ONLY_KIND_RE.search(text):
+            return ""
+        return text
+
     def _clean_tags(
         self,
         tags: list[str],
         title: str = "",
         author: str = "",
+        extra_noise: list[str] | None = None,
     ) -> list[str]:
         """Drop title/author/site noise that generic parsers add as tags."""
         def _normalize(value: str) -> str:
@@ -1360,7 +1444,19 @@ class YueduPlugin:
             "最新章节", "最新章节列表", "全文阅读", "免费阅读", "阅读更多",
             "书友正在看", "大家都在看", "上一章", "下一章", "目录",
             "返回目录", "首页", "开始阅读", "小说", "本站",
+            # Serialisation status / site chrome that some pages expose next to
+            # the real category.
+            "连载", "连载中", "完结", "已完结", "完本", "全本",
+            "免费小说", "在线阅读", "全文免费阅读", "手机阅读",
         }
+        # Values that must never be tags even though they cannot be used as the
+        # book's author (a one-character pen name such as "竹", for example, is
+        # rejected by _looks_like_invalid_author but still shows up in the
+        # page's keyword list).
+        for value in extra_noise or []:
+            value = str(value or "").strip().lower()
+            if value:
+                noise.add(value)
         title_noise = {"最新章节", "全文", "全文阅读", "免费阅读", "小说", "最新更新"}
         result: list[str] = []
         for tag in tags:
@@ -1369,6 +1465,9 @@ class YueduPlugin:
                 continue
             normalized = _normalize(tag)
             if not normalized:
+                continue
+            # Internal ids sometimes leak in as "tags" (e.g. a 19 digit book id).
+            if normalized.isdigit() and len(normalized) >= 4:
                 continue
             if title_norm:
                 if normalized == title_norm:
@@ -2649,7 +2748,9 @@ class YueduPlugin:
                 latest_chapter_title=item.get("latestChapterTitle"),
                 tags=self._clean_tags(
                     self._split_kind_text(item.get("kind"))
-                    + self._split_kind_text(item.get("exploreKind")),
+                    + self._split_kind_text(
+                        self._clean_listing_kind(item.get("exploreKind"))
+                    ),
                     str(item.get("name") or item.get("title") or ""),
                     str(item.get("author") or ""),
                 ),

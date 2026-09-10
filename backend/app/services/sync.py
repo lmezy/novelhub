@@ -609,24 +609,38 @@ class SyncService:
         )
         remote_cover_url = await self._persist_cover(book, plugin, remote_book)
 
-        # Keep tags scoped to this source. Same-title books from other sources
-        # may legitimately have different tags, so syncing one source must not
-        # rewrite their stored tags.
+        # Tags are re-derived on every sync: the source is the authority, so a
+        # tag added by an earlier (buggy) extraction disappears on the next
+        # sync instead of accumulating forever.  Only fall back to the stored
+        # tags when the source produced nothing usable, so a transient parse
+        # failure cannot wipe a book's tags.  Manual tags live in
+        # ``book_custom_tags`` and are untouched by this.
         classification_tag = "r18" if is_r18 else "all-ages"
-        source_tags: set[str] = set()
-        for tag in await self._book_tag_names(book.id):
-            tag = tag.strip().lower()
-            if tag and tag not in ("all-ages", "r18"):
-                source_tags.add(tag)
+        derived_tags: set[str] = set()
         for tag in remote_book.tags:
             tag = str(tag).strip().lower()
             if tag:
-                source_tags.add(tag)
+                derived_tags.add(tag)
         for tag in discovery_tags or []:
             tag = str(tag).strip().lower()
             if tag:
-                source_tags.add(tag)
-        source_tags = self._clean_sync_tags(source_tags, book_title, author_name)
+                derived_tags.add(tag)
+        source_tags = self._clean_sync_tags(
+            derived_tags,
+            book_title,
+            author_name,
+        )
+        if not source_tags:
+            stored_tags = {
+                str(tag).strip().lower()
+                for tag in await self._book_tag_names(book.id)
+                if tag and str(tag).strip().lower() not in ("all-ages", "r18")
+            }
+            source_tags = self._clean_sync_tags(
+                stored_tags,
+                book_title,
+                author_name,
+            )
         await self._save_tags(
             book.id,
             sorted([*source_tags, classification_tag]),
