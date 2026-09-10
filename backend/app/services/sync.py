@@ -166,11 +166,26 @@ class SyncService:
                 last_error = exc
                 if SyncService._is_upstream_blocked(exc):
                     raise
+                if SyncService._is_permanent_chapter_error(exc):
+                    raise
                 if attempt < attempts - 1:
                     await asyncio.sleep((2 ** attempt) + 0.5)
         if last_error is not None:
             raise last_error
         raise RuntimeError("Chapter fetch failed")
+
+    @staticmethod
+    def _is_permanent_chapter_error(exc: BaseException) -> bool:
+        """Whether retrying cannot possibly help.
+
+        A chapter the source deleted keeps answering with the same notice
+        page, so retrying only adds three requests per chapter.
+        """
+        message = str(exc)
+        return any(
+            marker in message
+            for marker in ("已被删除或禁用", "已被删除", "已下架", "不存在")
+        )
 
     @staticmethod
     def _is_upstream_blocked(exc: BaseException) -> bool:

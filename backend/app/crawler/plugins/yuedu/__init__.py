@@ -340,6 +340,25 @@ CONTEXTUAL_BLOCK_HINTS = (
     "challenge",
 )
 
+# Notice pages for content that no longer exists.  Sites answer with a tiny
+# page (often only a JS alert) instead of a 404, which otherwise surfaces as
+# the unhelpful "Chapter returned empty content".
+REMOVED_PAGE_MARKERS = (
+    "小说被禁用或已删除",
+    "作品被禁用或已删除",
+    "小说已删除",
+    "作品已删除",
+    "书籍已删除",
+    "该作品已被删除",
+    "内容已被删除",
+    "小说不存在",
+    "作品不存在",
+    "书籍不存在",
+    "该作品已下架",
+    "作品已下架",
+    "小说已下架",
+)
+
 
 def has_contextual_block_marker(text: str) -> bool:
     """Whether an ambiguous block phrase appears in a blocking context."""
@@ -597,6 +616,11 @@ class YueduPlugin:
             raise RuntimeError(
                 "Upstream server returned a transient 5xx error page "
                 f"(Cloudflare/520 etc.): {fetch_url}"
+            )
+        if self._looks_like_removed_page(html):
+            raise RuntimeError(
+                "该书在源站已被删除或禁用（站点提示：小说被禁用或已删除）: "
+                f"{fetch_url}"
             )
         info = self.engine.parse_book_info(html)
 
@@ -1642,6 +1666,16 @@ class YueduPlugin:
             html = await self._get_with_web_js(chapter.url, web_js)
         else:
             html = await self._get(chapter.url)
+        if self._looks_like_removed_page(html):
+            raise RuntimeError(
+                "章节在源站已被删除或禁用（站点提示：小说被禁用或已删除）: "
+                + chapter.url
+            )
+        if self._looks_like_upstream_error(html):
+            raise RuntimeError(
+                "Upstream server returned a transient 5xx error page "
+                f"(Cloudflare/520 etc.): {chapter.url}"
+            )
         chapter_engine.set_chapter_context({
             "title": str(getattr(chapter, "title", "") or ""),
             "url": chapter.url,
@@ -4014,6 +4048,19 @@ class YueduPlugin:
         if re.search(r"\b(?:error|could not be found)\b[^<]{0,40}\b5\d{2}\b", lowered):
             return True
         return False
+
+    @staticmethod
+    def _looks_like_removed_page(html: str) -> bool:
+        """Detect a "this novel/chapter no longer exists" notice page.
+
+        爱丽丝书屋 answers with a 1KB page whose only text lives in JS
+        (``let msg = "小说被禁用或已删除！"``) and redirects home, so the sync
+        used to report the unhelpful "Chapter returned empty content".
+        """
+        if not html:
+            return False
+        lowered = html.lower()
+        return any(marker in lowered for marker in REMOVED_PAGE_MARKERS)
 
     @classmethod
     def _is_challenge_page(cls, html: str) -> bool:

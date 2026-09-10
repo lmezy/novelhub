@@ -1971,6 +1971,57 @@ def test_is_blocked_page_ignores_context_free_alert_text():
     ) is True
 
 
+REMOVED_NOTICE_HTML = (
+    '<html><head><title>提示信息</title></head><body><script>'
+    'let msg = "小说被禁用或已删除！";'
+    '</script></body></html>'
+)
+
+CLOUDFLARE_520_HTML = (
+    '<html><head><title>yaoluku.com | 520: Web server is returning an '
+    'unknown error</title></head><body><div id="cf-error-details"></div>'
+    '</body></html>'
+)
+
+
+def test_looks_like_removed_page_detects_deleted_notice():
+    assert YueduPlugin._looks_like_removed_page(REMOVED_NOTICE_HTML) is True
+    assert YueduPlugin._looks_like_removed_page("<html><body>正文</body></html>") is False
+
+
+@pytest.mark.asyncio
+async def test_fetch_book_reports_removed_book():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.alicesw.com",
+        "concurrentRate": "0",
+    })
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=REMOVED_NOTICE_HTML)):
+        with pytest.raises(RuntimeError, match="已被删除或禁用"):
+            await plugin.fetch_book("https://www.alicesw.com/novel/54334.html")
+
+
+@pytest.mark.asyncio
+async def test_fetch_chapter_content_reports_reason_instead_of_empty():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "concurrentRate": "0",
+    })
+    chapter = SimpleNamespace(
+        url="https://www.alicesw.com/book/54334/9649c1e6e30a0.html",
+        title="t",
+        next_url=None,
+    )
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=REMOVED_NOTICE_HTML)):
+        with pytest.raises(RuntimeError, match="已被删除或禁用"):
+            await plugin.fetch_chapter_content(chapter)
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=CLOUDFLARE_520_HTML)):
+        with pytest.raises(RuntimeError, match="5xx"):
+            await plugin.fetch_chapter_content(chapter)
+
+
 def test_content_is_blocked_rejects_captcha_text():
     text = "系统检测到您访问异常\n输入验证码后可继续访问\n输入验证码"
     assert YueduPlugin._content_is_blocked(text) is True

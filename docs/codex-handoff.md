@@ -903,3 +903,60 @@ metacube(xd)（mihomo，混合端口 27890）。本次连上服务器只读排�
 2. 第一版主 / SiS / 御宅屋：浏览器过 Cloudflare 后导入 Cookie（**出口 IP 与浏览器一致**），
    或换能过 Cloudflare 的代理节点。
 3. 瞬时网络失败现在会自动重试 2 次（间隔 60s/120s），不需要手动重发。
+
+---
+
+## 18. 2026-09-11 补充：章节同步失败的真实原因（"Chapter returned empty content"）
+
+用户反馈“后台同步章节是失败的”。线上统计（00:34–00:55）：爱丽丝书屋当前书 250 章中
+31 章失败、要撸小说当前书 98 章中 5 章失败，失败信息全是
+`Chapter returned empty content: <url>`。逐条复现后确认是**两个不同的真实原因**，
+而错误信息把所有情况都写成了“空内容”。
+
+### 1) 爱丽丝书屋 54334：**源站已删除该书**（不是代码问题）
+
+- 失败章节全部属于 `https://www.alicesw.com/book/54334/...`。
+- 请求 `https://www.alicesw.com/novel/54334.html` 稳定返回 1046 字节提示页，
+  页面 JS 明确写着：`let msg = "小说被禁用或已删除！";`（3 秒后跳回首页）。
+- 章节 URL 则被重定向到首页（61766 字节）或 1209 字节残页 → 规则取不到正文
+  → `Chapter returned empty content`。
+- 对照组：同书源 `https://www.alicesw.com/novel/48948.html` 正常返回 34106 字节书页，
+  说明站点与代理都正常。
+
+### 2) 要撸小说 54350：**Cloudflare 520 错误页**（瞬态）
+
+- 章节页返回 7071 字节，标题 `yaoluku.com | 520: Web server is returning an unknown
+  error`，`_looks_like_upstream_error()` 判定为 True，但**章节路径此前没有做这个判断**
+  （只有 `fetch_book` 有），于是也变成“空内容”。
+
+### 本轮修复
+
+`backend/app/crawler/plugins/yuedu/__init__.py`
+
+- 新增 `REMOVED_PAGE_MARKERS` + `_looks_like_removed_page()`：识别
+  “小说被禁用或已删除 / 作品已删除 / 已下架 / 不存在”等提示页（包含只写在 JS 里的提示）。
+- `fetch_book()`：命中删除提示页时抛
+  `该书在源站已被删除或禁用（站点提示：小说被禁用或已删除）: <url>`。
+- `fetch_chapter_content()`：先判断删除提示页与 5xx 错误页，分别抛
+  `章节在源站已被删除或禁用…` / `Upstream server returned a transient 5xx error page
+  (Cloudflare/520 etc.)…`，不再统一报成 “empty content”。
+
+`backend/app/services/sync.py`
+
+- 新增 `_is_permanent_chapter_error()`：章节/书籍已被删除这类**永久失败不再重试 3 次**
+  （原来每章会白白重发 3 次请求）；520 等瞬态错误仍按原逻辑重试。
+
+### 验证
+
+- 后端全量测试：**393 passed**（新增删除提示页识别、书页/章节明确报错、
+  永久失败不重试 vs 520 可重试用例）。
+- 真实站点回归（容器内影子加载改动文件）：
+  - `fetch_book("https://www.alicesw.com/novel/54334.html")`
+    → `该书在源站已被删除或禁用（站点提示：小说被禁用或已删除）`
+  - yaoluku 520 章节 → `Upstream server returned a transient 5xx error page (Cloudflare/520 etc.)`
+
+### 说明
+
+- 54334 这类“源站已删除”的书**无法通过重试修好**，重新同步只会得到一条明确的失败原因；
+  如需彻底清理，可在管理端删除该书或后续增加“失效书籍自动标记”。
+- 要撸小说的 520 属于站点瞬态错误，重试即可；命中 5xx 的章节现在会带明确原因。

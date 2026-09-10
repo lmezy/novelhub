@@ -61,6 +61,22 @@ def test_transient_book_fetch_classification():
     ) is False
 
 
+def test_permanent_chapter_error_detection():
+    assert SyncService._is_permanent_chapter_error(
+        RuntimeError("章节在源站已被删除或禁用（站点提示：小说被禁用或已删除）: http://x")
+    ) is True
+    assert SyncService._is_permanent_chapter_error(
+        RuntimeError("该书在源站已被删除或禁用: http://x")
+    ) is True
+    # Transient upstream errors must still be retried.
+    assert SyncService._is_permanent_chapter_error(
+        RuntimeError("Upstream server returned a transient 5xx error page (Cloudflare/520 etc.)")
+    ) is False
+    assert SyncService._is_permanent_chapter_error(
+        RuntimeError("Chapter returned empty content: http://x")
+    ) is False
+
+
 def test_clean_sync_tags_drops_title_and_author_fragments():
     tags = {
         "官路之谁与争锋(卷帘西风666)",
