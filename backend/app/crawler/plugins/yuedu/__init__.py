@@ -263,8 +263,6 @@ TOC_NOISE_TITLES = {
 STRONG_BLOCK_MARKERS = (
     "输入验证码后可继续访问",
     "验证码后可继续访问",
-    "请完成验证",
-    "安全验证",
     "人机验证",
     "滑动验证",
     "limit_box",
@@ -275,12 +273,10 @@ STRONG_BLOCK_MARKERS = (
     "操作过于频繁",
     "访问频率过高",
     "请求频率过高",
-    "请稍后再试",
     # GoEdge WAF captcha gate (used by boluomao.com etc.)
     "goedge_waf",
     "goedge-waf",
     "请输入上面的验证码",
-    "身份验证",
     # Generic WAF / challenge gates
     "waf_captcha",
     "captcha-gate",
@@ -316,6 +312,51 @@ WEAK_BLOCK_MARKERS = (
     "请求频繁",
     "限流",
 )
+
+# Phrases that also occur in ordinary site chrome -- 禁忌书屋's report button
+# ships `alert('举报失败，请稍后再试')`, which used to flag every thread page as
+# a captcha gate.  They only count when a verification/rate-limit word sits
+# next to them.
+CONTEXTUAL_BLOCK_MARKERS = (
+    "请稍后再试",
+    "请稍后重试",
+    "请完成验证",
+    "安全验证",
+    "身份验证",
+)
+CONTEXTUAL_BLOCK_HINTS = (
+    "验证码",
+    "人机",
+    "频繁",
+    "限流",
+    "访问异常",
+    "访问被拒绝",
+    "自动程序",
+    "安全服务",
+    "拦截",
+    "限制访问",
+    "已被限制",
+    "captcha",
+    "challenge",
+)
+
+
+def has_contextual_block_marker(text: str) -> bool:
+    """Whether an ambiguous block phrase appears in a blocking context."""
+    lowered = str(text or "").lower()
+    if not lowered:
+        return False
+    for marker in CONTEXTUAL_BLOCK_MARKERS:
+        start = 0
+        while True:
+            index = lowered.find(marker, start)
+            if index == -1:
+                break
+            window = lowered[max(0, index - 90): index + len(marker) + 90]
+            if any(hint in window for hint in CONTEXTUAL_BLOCK_HINTS):
+                return True
+            start = index + len(marker)
+    return False
 
 
 class YueduPlugin:
@@ -1706,8 +1747,8 @@ class YueduPlugin:
             )
         return content
 
-    @staticmethod
-    def _content_is_blocked(text: str) -> bool:
+    @classmethod
+    def _content_is_blocked(cls, text: str) -> bool:
         """Reject extracted chapter text that is really an anti-bot page."""
         if not text:
             return False
@@ -1715,7 +1756,6 @@ class YueduPlugin:
         strong = (
             "输入验证码后可继续访问",
             "请完成验证",
-            "安全验证",
             "人机验证",
             "滑动验证",
             "验证码后可继续访问",
@@ -1723,9 +1763,10 @@ class YueduPlugin:
             "访问过于频繁",
             "请求过于频繁",
             "操作过于频繁",
-            "请稍后再试",
         )
         if any(marker in lowered for marker in strong):
+            return True
+        if has_contextual_block_marker(lowered):
             return True
         if "访问异常" in lowered:
             return any(confirm in lowered for confirm in (
@@ -2492,6 +2533,7 @@ class YueduPlugin:
             results = []
             blocked_errors: list[str] = []
             unavailable_errors: list[str] = []
+            transport_errors: list[str] = []
             for kind in kinds:
                 kind_url = str(kind.get("url", "")).strip()
                 if not kind_url:
@@ -2511,22 +2553,35 @@ class YueduPlugin:
                     ))
                 except Exception as exc:
                     message = str(exc)
+                    described = (
+                        f"{type(exc).__name__}: {message}"
+                        if message
+                        else type(exc).__name__
+                    )
                     if (
                         "anti-bot" in message.lower()
                         or "captcha" in message.lower()
                         or "验证码" in message
                         or "身份验证" in message
                     ):
-                        blocked_errors.append(message)
+                        blocked_errors.append(described)
                     response = getattr(exc, "response", None)
                     status_code = getattr(response, "status_code", None)
                     if status_code is not None or any(
                         marker in message.lower()
                         for marker in ("403", "404", "408", "429", "500", "502", "503", "504", "520")
                     ):
-                        unavailable_errors.append(message)
+                        unavailable_errors.append(described)
+                    elif not any(
+                        marker in message.lower()
+                        for marker in ("anti-bot", "captcha", "验证码", "身份验证")
+                    ):
+                        # Timeouts / dropped connections / empty httpx errors.
+                        transport_errors.append(described)
                     logger.warning(
-                        f"Explore kind failed: {kind.get('title', kind_url)} ({exc})"
+                        "Explore kind failed: %s (%s)",
+                        kind.get("title", kind_url),
+                        described,
                     )
             if not results and blocked_errors:
                 # Every discover category was gated by an anti-bot / captcha
@@ -2536,6 +2591,14 @@ class YueduPlugin:
             if not results and unavailable_errors:
                 raise RuntimeError(
                     "书源目录暂时不可访问：" + unavailable_errors[0]
+                )
+            if not results and transport_errors:
+                # A short network/proxy outage used to surface as the
+                # misleading "书源未返回可同步的书籍"; say what actually
+                # happened so the task can be retried meaningfully.
+                raise RuntimeError(
+                    "书源目录暂时无法访问（网络/代理错误，请稍后重试）："
+                    + transport_errors[0]
                 )
             return results
 
@@ -3919,6 +3982,8 @@ class YueduPlugin:
             return False
         lowered = html.lower()
         if any(marker in lowered for marker in STRONG_BLOCK_MARKERS):
+            return True
+        if has_contextual_block_marker(lowered):
             return True
         confirmations = (
             "验证码", "继续访问", "稍后再试", "后再试", "频繁", "限流",

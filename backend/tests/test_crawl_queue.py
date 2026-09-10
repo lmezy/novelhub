@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.exc import MissingGreenlet
@@ -236,6 +237,87 @@ async def test_run_crawl_task_async_marks_paused_when_checkpoint_raises():
 
     assert result == {"status": "paused", "task_id": "task-1"}
     assert task.status == "paused"
+
+
+def _session_for(db):
+    session = AsyncMock()
+    session.__aenter__ = AsyncMock(return_value=db)
+    session.__aexit__ = AsyncMock(return_value=False)
+    return session
+
+
+def test_is_transient_task_error_classification():
+    from app.services.crawl_runner import _is_transient_task_error
+
+    assert _is_transient_task_error(httpx.ConnectTimeout("")) is True
+    assert _is_transient_task_error(httpx.ReadError("connection reset")) is True
+    assert _is_transient_task_error(
+        RuntimeError("书源目录暂时无法访问（网络/代理错误，请稍后重试）：ConnectTimeout")
+    ) is True
+    # WAF / rule problems must not be retried in a loop.
+    assert _is_transient_task_error(
+        RuntimeError("Site returned an anti-bot/captcha page: https://x/")
+    ) is False
+    assert _is_transient_task_error(
+        RuntimeError("该书源的发现规则是 Legado JS 脚本（<js>/@js:），当前环境无法执行")
+    ) is False
+    assert _is_transient_task_error(
+        RuntimeError("书源未返回可同步的书籍，请检查书源规则、Cookie 或站点验证状态。")
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_run_crawl_task_async_retries_transient_network_failure():
+    """A short proxy/network outage must not mark the whole task failed."""
+    task = _task()
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=task)
+    db.commit = AsyncMock()
+    db.refresh = AsyncMock()
+
+    class FakeSyncService:
+        def __init__(self, db):
+            self.db = db
+
+        async def discover_and_sync_all(self, *args, **kwargs):
+            raise httpx.ConnectTimeout("")
+
+    with (
+        patch("app.services.crawl_runner.SessionLocal", return_value=_session_for(db)),
+        patch("app.services.sync.SyncService", FakeSyncService),
+    ):
+        result = await run_crawl_task_async("task-1")
+
+    assert result["status"] == "retrying"
+    assert task.status == "pending"
+    assert task.resume_at is not None
+    assert task.progress["auto_retries"] == 1
+    assert "重试" in task.error
+
+
+@pytest.mark.asyncio
+async def test_run_crawl_task_async_does_not_retry_captcha_failure():
+    task = _task()
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=task)
+    db.commit = AsyncMock()
+    db.refresh = AsyncMock()
+
+    class FakeSyncService:
+        def __init__(self, db):
+            self.db = db
+
+        async def discover_and_sync_all(self, *args, **kwargs):
+            raise RuntimeError("Site returned an anti-bot/captcha page: https://x/")
+
+    with (
+        patch("app.services.crawl_runner.SessionLocal", return_value=_session_for(db)),
+        patch("app.services.sync.SyncService", FakeSyncService),
+    ):
+        with pytest.raises(RuntimeError, match="anti-bot"):
+            await run_crawl_task_async("task-1")
+
+    assert task.status == "failed"
 
 
 @pytest.mark.asyncio

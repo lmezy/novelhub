@@ -6,6 +6,7 @@ a specific source to the front without waiting for every earlier task.
 """
 
 import asyncio
+import os
 from datetime import datetime, timedelta, timezone
 
 from loguru import logger
@@ -18,6 +19,84 @@ from app.models import CrawlTask
 
 def _naive_utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+# Failures that are worth retrying on their own: the proxy/upstream was
+# momentarily unreachable, not the source rules or a captcha gate.  A short
+# outage used to mark the whole task failed (and the UI then showed a
+# misleading "书源未返回可同步的书籍").
+_TRANSIENT_TASK_MARKERS = (
+    "timeout",
+    "timed out",
+    "connecttimeout",
+    "readtimeout",
+    "pooltimeout",
+    "connecterror",
+    "readerror",
+    "writeerror",
+    "remoteprotocolerror",
+    "proxyerror",
+    "connection reset",
+    "connection closed",
+    "connection refused",
+    "connection aborted",
+    "temporarily unavailable",
+    "temporary failure",
+    "network is unreachable",
+    "name or service not known",
+    "getaddrinfo failed",
+    "upstream server returned",
+    "server returned a transient",
+    "error code 5",
+    "empty content",
+    "网络",
+    "暂时无法访问",
+)
+
+# These need a Cookie / a different exit node, so retrying immediately only
+# hammers the site.
+_NON_TRANSIENT_TASK_MARKERS = (
+    "anti-bot",
+    "captcha",
+    "验证码",
+    "人机验证",
+    "身份验证",
+    "反爬",
+    "cookie",
+    "legado js",
+    "书源规则",
+)
+
+
+def _is_transient_task_error(exc: BaseException) -> bool:
+    """Whether a failed crawl task should be retried automatically."""
+    name = type(exc).__name__.lower()
+    message = str(exc).lower()
+    if any(marker in message for marker in _NON_TRANSIENT_TASK_MARKERS):
+        return False
+    if any(marker in message for marker in _TRANSIENT_TASK_MARKERS):
+        return True
+    # httpx.RequestError and asyncio.TimeoutError often stringify to "".
+    return name in {
+        "connecttimeout",
+        "readtimeout",
+        "writetimeout",
+        "pooltimeout",
+        "connecterror",
+        "readerror",
+        "writeerror",
+        "proxyerror",
+        "remoteprotocolerror",
+        "timeouterror",
+    }
+
+
+def _task_retry_delay_seconds(retries: int) -> int:
+    try:
+        base = int(os.getenv("SYNC_TASK_RETRY_BASE_SECONDS", "60"))
+    except (TypeError, ValueError):
+        base = 60
+    return max(5, base) * (2 ** max(0, retries))
 
 
 async def _next_pending_task_ids(limit: int = 1) -> list[str]:
@@ -212,6 +291,39 @@ async def run_crawl_task_async(task_id: str) -> dict:
             await db.commit()
             raise
         except Exception as exc:
+            retries = int((task_obj.progress or {}).get("auto_retries") or 0)
+            try:
+                max_retries = int(os.getenv("SYNC_TASK_MAX_AUTO_RETRIES", "2"))
+            except (TypeError, ValueError):
+                max_retries = 2
+            if _is_transient_task_error(exc) and retries < max(0, max_retries):
+                delay = _task_retry_delay_seconds(retries)
+                task_obj.status = "pending"
+                task_obj.finished_at = None
+                task_obj.resume_at = _naive_utcnow() + timedelta(seconds=delay)
+                task_obj.progress = {
+                    **(task_obj.progress or {}),
+                    "auto_retries": retries + 1,
+                }
+                task_obj.error = (
+                    f"网络/代理暂时不可用（{type(exc).__name__}: {exc}），"
+                    f"{delay} 秒后自动重试（第 {retries + 1}/{max_retries} 次）"
+                )
+                await db.commit()
+                logger.warning(
+                    "Crawl task {} hit a transient error, retrying in {}s "
+                    "({}/{}): {}",
+                    task_id,
+                    delay,
+                    retries + 1,
+                    max_retries,
+                    exc,
+                )
+                return {
+                    "status": "retrying",
+                    "task_id": task_id,
+                    "retry_in_seconds": delay,
+                }
             task_obj.status = "failed"
             task_obj.error = str(exc)
             task_obj.finished_at = _naive_utcnow()

@@ -1950,6 +1950,27 @@ def test_is_blocked_page_normal_chapter_page_not_flagged():
     assert YueduPlugin._is_blocked_page(html) is False
 
 
+def test_is_blocked_page_ignores_context_free_alert_text():
+    """禁忌书屋 thread pages embed `alert('举报失败，请稍后再试')`.
+
+    The phrase is ordinary chrome there, so it must not flag the page (or the
+    extracted chapter text) as a captcha gate.
+    """
+    html = (
+        '<html><head><title>【云雨箱庭？大胆去干！】（34） 作者：Xiaodie Zhuang</title></head>'
+        '<body><script>$.post(url, {cb: function(res){ '
+        "alert('举报失败，请稍后再试'); }});</script>"
+        '<div id="content-section">正文……</div></body></html>'
+    )
+
+    assert YueduPlugin._is_blocked_page(html) is False
+    assert YueduPlugin._content_is_blocked("举报失败，请稍后再试") is False
+    # A real rate-limit notice next to the same phrase is still detected.
+    assert YueduPlugin._is_blocked_page(
+        '<html><title>提示</title><script>let m = "访问异常，请稍后再试";</script></html>'
+    ) is True
+
+
 def test_content_is_blocked_rejects_captcha_text():
     text = "系统检测到您访问异常\n输入验证码后可继续访问\n输入验证码"
     assert YueduPlugin._content_is_blocked(text) is True
@@ -2899,3 +2920,19 @@ async def test_get_does_not_fall_back_to_direct_on_definitive_404():
         YueduPlugin._transport_preferred.clear()
 
     assert seen_proxies == ["http://127.0.0.1:27890"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_explore_reports_transport_failure_not_empty_catalog():
+    """A proxy/network outage must not look like "no books found"."""
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.yaoluku.com",
+        "exploreUrl": "最新::/sort/{{page}}/",
+    })
+
+    async def fake_get(url):
+        raise httpx.ConnectTimeout("")
+
+    with patch.object(plugin, "_get", fake_get):
+        with pytest.raises(RuntimeError, match="网络/代理错误"):
+            await plugin.fetch_explore(page=1)
