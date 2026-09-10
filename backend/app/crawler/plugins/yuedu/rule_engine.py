@@ -28,6 +28,34 @@ from app.crawler.plugins.yuedu.js_runtime import (
 
 logger = logging.getLogger(__name__)
 
+# Legado source authors write attribute selectors without quotes because
+# jsoup tolerates it (``a[href*=/post/][href$=.html]``).  soupsieve/BeautifulSoup
+# raises "Malformed attribute selector" on those, and the rule engine only had
+# a silent fallback, so such sources discovered zero books with no explanation.
+_UNQUOTED_ATTR_VALUE_RE = re.compile(
+    r"\[\s*([A-Za-z_][-\w:]*)\s*(\^=|\$=|\*=|~=|\|=|=)\s*([^\]\"'=][^\]]*?)\s*\]"
+)
+
+
+def normalize_css_selector(selector: str) -> str:
+    """Quote unquoted attribute values so soupsieve accepts the selector."""
+    text = str(selector or "")
+    if "[" not in text:
+        return text
+
+    def _quote(match: re.Match) -> str:
+        attr, op, value = match.group(1), match.group(2), match.group(3).strip()
+        if not value or value[0] in "'\"":
+            return match.group(0)
+        if "'" in value:
+            value = '"' + value.replace('"', '\\"') + '"'
+        else:
+            value = "'" + value + "'"
+        return f"[{attr}{op}{value}]"
+
+    return _UNQUOTED_ATTR_VALUE_RE.sub(_quote, text)
+
+
 class _RuleAnalyzer:
     """Port of Legado's RuleAnalyzer -- splits combined rules while respecting
     balanced brackets, quotes, and nested structures."""
@@ -564,7 +592,7 @@ class YueduRuleEngine:
             rule = rule[2:]
             selected: list[Tag] = []
             for el in elements:
-                selected.extend(el.select(rule))
+                selected.extend(el.select(normalize_css_selector(rule)))
             return selected
 
         before, split, indexes = self._parse_legado_index(rule)
@@ -661,7 +689,7 @@ class YueduRuleEngine:
                     if node.parent is not None and value in str(node)
                 ]
         try:
-            return el.select(before)
+            return el.select(normalize_css_selector(before))
         except Exception:
             # Legacy text rules such as `作者：@text` use a plain label as the
             # selector. Jsoup/Legado treat that as a text search, so fall back
@@ -1037,7 +1065,7 @@ class YueduRuleEngine:
                     texts.append((el.text or "").strip())
             return "\n".join(t for t in texts if t) if texts else None
         except Exception:
-            results = soup.select(rule)
+            results = soup.select(normalize_css_selector(rule))
             return "\n".join(r.get_text("\n", strip=True) for r in results) if results else None
 
     def _apply_replace_regex(self, text: str, rule: Any) -> str:

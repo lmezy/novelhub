@@ -764,3 +764,74 @@ metacube(xd)（mihomo，混合端口 27890）。本次连上服务器只读排�
 1. 重建并重启 `crawler`/`backend`（`scheduler`/`frontend` 本次无改动）。
 2. 对已有书籍重新同步一次即可清掉旧标签（同步会以书源结果覆盖标签）；未重新同步的书
    仍保留旧标签。
+
+---
+
+## 16. 2026-09-10 补充：多书源同步“不同程度的报错”
+
+用户重建容器（21:07）后同步多个书源，出现不同错误。线上镜像已包含第 14/15 节全部改动
+（md5 与本地 HEAD 一致）。逐个定位结果如下。
+
+### 1) 風月文學網 h528：`书源未返回可同步的书籍`（已修复，两处代码缺陷）
+
+真实复现：分类页 `html len=40101`，`ruleExplore.bookList = a[href*=/post/][href$=.html]`：
+
+- **Legado 风格未加引号的属性选择器**。jsoup 允许 `a[href*=/post/]`，soupsieve 抛
+  `Malformed attribute selector`；`_legado_before_elements` 的 `except Exception` 兜底成
+  “按文本找元素”，于是静默返回 0 个元素 → 0 本书。
+  修复：`rule_engine.py` 新增 `normalize_css_selector()`，在所有 CSS 执行点自动补引号
+  （`a[href*=/post/]` → `a[href*='/post/']`），已有引号 / 非属性选择器不动。
+- **`_is_book_url` 兜底启发式不认 `/post/<id>.html`**。即使解析出 55 个条目，
+  `_explore_items_from_html` 的 `_is_book_url(require_pattern=True)` 也会把它们全部丢弃。
+  修复：兜底路径段新增 `post/thread/topic/article/story`（仍要求“前缀后只剩一段”，
+  `/post/category/xxx` 依旧判为非书页）。
+- 连带修复：`_is_chapter_url` 对“无 bookUrlPattern 的站点”改用 `_same_book_shape()`
+  判断（同 host、同目录、同后缀即视为同系列的章节），否则 h528 的书页与章节都是
+  `/post/<id>.html`，章节会被当成“别的书”全部丢掉（本次中间版本就复现了这个回归）。
+
+真实回归：h528 分类页 → **55 本/页**；`/post/29145.html` → `title='疑愛6'`、1 章、正文 7424 字。
+
+### 2) SiS文學網 b.sis.la / 御宅屋 yswhub.cc：Cloudflare 安全验证（非误判，需用户处理）
+
+抓取原始 HTML 确认页面就是 Cloudflare 挑战页：
+`<h2>正在进行安全验证</h2>` + `/cdn-cgi/challenge-platform/...` + `<meta http-equiv="refresh" content="360">`，
+命中 `安全验证` / `challenge-platform` 标记。无头 Chromium 未能自动通过，属站点侧防护。
+需要：导入浏览器 Cookie（且代理出口 IP 与浏览器一致）或更换代理节点；代码不绕过验证码。
+
+### 3) 爱丽丝书屋：同步中连续 5 章“反爬/空白页”（已做并发与限速加固）
+
+真实回归显示单章正常（HTTP 34742 字节、浏览器 40208 字节、正文 5817 字），
+说明是**并发下的瞬时失败**：webJs/webView 路径此前 **既不限速、也不限制并发浏览器数**，
+同步时 3 本书 × 9 章会同时拉起几十个 Chromium（NAS 上表现为空白页/挑战页）。
+修复：
+- `_browser_semaphore()`：按事件循环限制并发 Chromium 实例（默认 3，
+  `YUEDU_PLAYWRIGHT_CONCURRENCY` 可调）。
+- webJs 路径补上 `_sleep_rate_limit()`（遵循书源 concurrentRate / CRAWL_DELAY_MS）。
+- 浏览器瞬时失败（空白页、导航超时等）**重试一次**；anti-bot 页面不重试，直接给提示。
+- 浏览器失败时保留原始错误：`Browser request failed: <url> (RuntimeError: Site returned an
+  empty browser page ...)`，不再吞成一句无信息的 `Browser request failed`。
+- 修掉 `_wait_for_challenge` 里 `frame.query_selector(...)` 未 `await`（Playwright async API）
+  的真实 bug：此前 Turnstile 复选框点击从未生效，并持续刷 `RuntimeWarning`。
+
+### 4) 其他
+
+- 代理返回**明确的 404/410 等**时不再回退直连：此前会白等 3×5s 连接超时
+  （实测 26s → 现在 5s 直接抛错）；403/408/429/5xx 仍保留直连回退。
+- h528 标题 `h2@text` 命中了侧栏标题，得到 `疑愛6\n分站\n分類\n最新文章`；
+  `_clean_book_title` 现在会对多行结果取第一条非站点框架文本，并归一化空白。
+
+### 验证
+
+- 后端全量测试：**384 passed**（新增 CSS 归一化、post 书页/章节判定、多行标题、
+  浏览器并发信号量、浏览器重试/不重试、404 不回退等用例）。
+- 真实站点回归（容器内影子加载改动文件，不动线上代码）：
+  - h528：`discover=55`、`title='疑愛6'`、`chapters=1`、正文 7424 字
+  - 爱丽丝书屋：`title='慾望女皇'`、`chapters=6`、`tags=['系统','剧情','反差','调教','制服','道具','性转']`、正文 5817 字
+  - 错误 URL 现在 5.1s 内失败（此前 26s）
+
+### 用户需要做的
+
+1. 重建并重启 `crawler`（`rule_engine.py` + `__init__.py` 在 crawler/backend 内生效）。
+2. SiS / 御宅屋：在浏览器通过 Cloudflare 验证后导入 Cookie（出口 IP 需与代理一致），
+   或更换一个能过 Cloudflare 的代理节点。
+3. h528 重新发起同步即可正常入库。

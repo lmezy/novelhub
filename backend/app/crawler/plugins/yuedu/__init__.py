@@ -446,6 +446,26 @@ class YueduPlugin:
     def _transport_key(self, proxy: str | None) -> str:
         return f"{self.base_url or 'default'}::{'proxy' if proxy else 'direct'}"
 
+    # Chromium is launched per webJs/webView fetch.  Sync runs several books
+    # and chapters at once, so without a cap a NAS-sized host ends up with
+    # dozens of browsers, which shows up as "empty browser page" failures and
+    # a steadily growing pile of chrome/crashpad processes.
+    _browser_semaphores: dict[int, asyncio.Semaphore] = {}
+
+    @classmethod
+    def _browser_semaphore(cls) -> asyncio.Semaphore:
+        """Per-event-loop semaphore limiting concurrent Chromium instances."""
+        key = id(asyncio.get_running_loop())
+        semaphore = cls._browser_semaphores.get(key)
+        if semaphore is None:
+            try:
+                limit = int(os.getenv("YUEDU_PLAYWRIGHT_CONCURRENCY", "3") or 3)
+            except (TypeError, ValueError):
+                limit = 3
+            semaphore = asyncio.Semaphore(max(1, limit))
+            cls._browser_semaphores[key] = semaphore
+        return semaphore
+
     def _transport_in_cooldown(self, proxy: str | None) -> bool:
         until = self.__class__._transport_bad_until.get(
             self._transport_key(proxy),
@@ -1231,6 +1251,25 @@ class YueduPlugin:
             title,
             flags=re.IGNORECASE,
         ).strip()
+        # A rule like ``h2@text`` can match several elements, so the value may
+        # be a newline-joined list (風月文學網 h528 returns the post title
+        # followed by the sidebar headings 分站/分類/最新文章).  Keep the first
+        # line that is not site chrome.
+        if "\n" in title:
+            chrome = {
+                "分站", "分類", "分类", "最新", "最新文章", "最新章節",
+                "最新章节", "首页", "首頁", "主页", "主頁", "目錄", "目录",
+                "章節列表", "章节列表", "作者", "狀態", "状态", "字數", "字数",
+                "簡介", "简介", "分页", "分頁",
+            }
+            candidates = [
+                line.strip()
+                for line in title.splitlines()
+                if line.strip() and line.strip() not in chrome
+            ]
+            if candidates:
+                title = candidates[0]
+        title = re.sub(r"\s+", " ", title).strip()
         return title
 
     @staticmethod
@@ -2068,6 +2107,30 @@ class YueduPlugin:
             path = path[:-5]
         return path == nav or path.startswith(nav + "/")
 
+    @staticmethod
+    def _same_book_shape(url: str, book_url: str) -> bool:
+        """Whether ``url`` is a sibling of ``book_url`` (same dir/extension).
+
+        Forum-style sources keep a book and its chapters in one flat directory
+        (h528: ``/post/29144.html`` and ``/post/29145.html``), so pattern-free
+        chapter detection needs the book URL as context to tell a chapter from
+        another book's detail page.
+        """
+        candidate = urlparse(url)
+        book = urlparse(book_url)
+        if candidate.netloc.lower() != book.netloc.lower():
+            return False
+        candidate_dir = candidate.path.rsplit("/", 1)[0]
+        book_dir = book.path.rsplit("/", 1)[0]
+        if candidate_dir != book_dir:
+            return False
+
+        def _extension(path: str) -> str:
+            name = path.rsplit("/", 1)[-1]
+            return name.rsplit(".", 1)[1].lower() if "." in name else ""
+
+        return _extension(candidate.path) == _extension(book.path)
+
     def _is_book_url(self, url: str, require_pattern: bool = False) -> bool:
         """Check whether a URL points to a book detail page.
 
@@ -2127,7 +2190,12 @@ class YueduPlugin:
         ):
             return True
         segments = [seg for seg in path.split("/") if seg]
-        for prefix in ("novel", "book", "read", "detail", "xiaoshuo"):
+        # ``post``/``thread``/``topic`` cover forum-style sources whose book
+        # page is a single post (風月文學網 h528 uses ``/post/29145.html``).
+        for prefix in (
+            "novel", "book", "read", "detail", "xiaoshuo",
+            "post", "thread", "topic", "article", "story",
+        ):
             if prefix not in segments:
                 continue
             tail = segments[segments.index(prefix) + 1:]
@@ -2183,7 +2251,15 @@ class YueduPlugin:
 
         # A book detail page is not a chapter, even if it sits under /book/.
         if self._is_book_url(abs_url, require_pattern=True):
-            return False
+            if self.config.get("bookUrlPattern", "").strip():
+                # The source told us exactly what a book URL looks like.
+                return False
+            # Without a pattern the heuristic cannot tell a book page from a
+            # post that is a chapter of the same series: on 風月文學網 h528 both
+            # the book and its chapters are ``/post/<id>.html``.  A sibling URL
+            # (same directory, same extension) is a chapter.
+            if not self._same_book_shape(abs_url, abs_book):
+                return False
 
         same_host = (
             parsed.netloc.lower() == urlparse(self.base_url).netloc.lower()
@@ -3036,134 +3112,53 @@ class YueduPlugin:
                 raise RuntimeError(f"Playwright is not installed: {url}")
             return await self._get(url)
 
-        try:
-            async with async_playwright() as pw:
-                launch_kwargs: dict[str, Any] = {
-                    "headless": True,
-                    "args": [
-                        "--no-sandbox",
-                        "--disable-setuid-sandbox",
-                        "--disable-blink-features=AutomationControlled",
-                    ],
-                }
-                try:
-                    from app.services.proxy_config import get_playwright_proxy
-                    proxy = get_playwright_proxy()
-                    if proxy:
-                        launch_kwargs["proxy"] = proxy
-                except Exception:
-                    pass
-                # Prefer the full Chromium build (new headless) over the
-                # lightweight headless shell: Cloudflare/WAF fingerprint checks
-                # pass far more often against a full browser.  If it is not
-                # available, fall back to Playwright's default launch.
-                try:
-                    browser = await pw.chromium.launch(
-                        **launch_kwargs,
-                        channel="chromium",
-                    )
-                except Exception:
-                    browser = await pw.chromium.launch(**launch_kwargs)
-                try:
-                    headers = dict(request_headers or self._build_headers())
-                    user_agent = headers.pop("User-Agent", None)
-                    # Cookie is installed through the browser cookie jar below.
-                    cookie_header = self._merge_cookie_strings(
-                        headers.pop("Cookie", ""),
-                        self._cookie,
-                    )
-                    headers.pop("Connection", None)
-                    context = await browser.new_context(
-                        viewport={"width": 1280, "height": 720},
-                        locale="zh-CN",
-                        **({"user_agent": user_agent} if user_agent else {}),
-                        extra_http_headers=headers,
-                    )
-                    # Mask common automation fingerprints so challenge pages
-                    # do not immediately classify the browser as a headless bot.
-                    try:
-                        await context.add_init_script(
-                            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-                            "window.chrome=window.chrome||{runtime:{}};"
-                            "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});"
-                            "Object.defineProperty(navigator,'languages',{get:()=>['zh-CN','zh','en']});"
-                        )
-                    except Exception:
-                        pass
-                    page = await context.new_page()
+        # The source's own rate limit applies to the browser path too; it used
+        # to bypass it, which hammered WAF-protected sites with parallel
+        # browsers and produced captcha pages mid-sync.
+        async with self._browser_semaphore():
+            await self._sleep_rate_limit()
 
-                    # Apply cookies if set
-                    if cookie_header:
-                        await context.add_cookies(
-                            self._parse_cookies_for_playwright(cookie_header)
-                        )
-
-                    # WAF-protected sites often keep analytics sockets open forever;
-                    # waiting for networkidle turns a usable page into a timeout.
-                    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                    # Cloudflare / WAF challenge pages ("Just a moment…") return
-                    # before the JS challenge has solved itself.  Wait for the
-                    # real page (and the resolved session cookies) before running
-                    # any webJs or parsing the content.
-                    rendered = await self._wait_for_challenge(
-                        context,
-                        page,
+        # A single transient browser failure (empty page, navigation timeout)
+        # is common right after the proxy reconnects, so retry once when the
+        # caller requires a real browser.
+        attempts = 1 if fallback_http else 2
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                async with self._browser_semaphore():
+                    html = await self._fetch_with_playwright(
+                        async_playwright,
                         url,
-                        timeout=25.0,
+                        web_js,
+                        request_headers,
                     )
-                    if not rendered:
-                        raise RuntimeError(
-                            "Site returned an empty browser page (网站返回了空白页): "
-                            + url
-                        )
-                    if self._is_blocked_page(rendered):
-                        # Even after waiting the challenge never cleared; surface
-                        # a clear hint instead of parsing the WAF gate as content.
-                        raise RuntimeError(
-                            "Site returned an anti-bot/captcha page (网站要求验证码/人机验证，"
-                            "请在浏览器中访问该网站通过验证后，把 Cookie 导入书源再同步): "
-                            + url
-                        )
-                    self._capture_playwright_cookies(await context.cookies())
-
-                    # Legado webJs may mutate the DOM or return the rendered
-                    # HTML directly. Preserve both forms instead of discarding
-                    # the script result.
-                    if web_js:
-                        try:
-                            html = await page.evaluate(
-                                f"(function(){{ var result=document.documentElement.outerHTML; "
-                                f"var value=(function(){{ {web_js} }})(); "
-                                f"return (typeof value === 'string' && value.trim()) "
-                                f"? value : document.documentElement.outerHTML; }})()"
-                            )
-                        except Exception as e:
-                            logger.warning(f"webJs execution error: {e}")
-                            html = rendered
-                    else:
-                        html = rendered
-
-                    if self._is_blocked_page(html):
-                        raise RuntimeError(
-                            "Site returned an anti-bot/captcha page (网站要求验证码/人机验证，"
-                            "请在浏览器中访问该网站通过验证后，把 Cookie 导入书源再同步): "
-                            + url
-                        )
-
-                    await context.close()
-                    return html
-                finally:
-                    await browser.close()
-        except Exception as e:
-            logger.warning(
-                f"Playwright webJs fetch failed for {url}: {e}; falling back to HTTP"
-            )
-            if not fallback_http and "anti-bot/captcha" in str(e):
-                raise
+                return html
+            except Exception as exc:
+                last_error = exc
+                message = str(exc)
+                if "anti-bot/captcha" in message or "is not installed" in message:
+                    logger.warning(
+                        "Playwright webJs fetch failed for %s: %s%s",
+                        url,
+                        exc,
+                        "; falling back to HTTP" if fallback_http else "",
+                    )
+                    break
+                logger.warning(
+                    "Playwright webJs fetch failed for %s: %s (%s/%s)%s",
+                    url,
+                    exc,
+                    attempt + 1,
+                    attempts,
+                    "; falling back to HTTP" if fallback_http else "",
+                )
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(1.0 + random.uniform(0.5, 1.0))
 
         # Fallback: try evaluating webJs on plain HTTP response
         if not fallback_http:
-            raise RuntimeError(f"Browser request failed: {url}")
+            detail = f" ({type(last_error).__name__}: {last_error})" if last_error else ""
+            raise RuntimeError(f"Browser request failed: {url}{detail}") from last_error
 
         html = await self._get(url)
         if self.engine:
@@ -3171,6 +3166,132 @@ class YueduPlugin:
             if result and result != html:
                 return result
         return html
+
+    async def _fetch_with_playwright(
+        self,
+        async_playwright: Any,
+        url: str,
+        web_js: str,
+        request_headers: dict[str, str] | None,
+    ) -> str:
+        """Render ``url`` in Chromium and return the (webJs-processed) HTML."""
+        async with async_playwright() as pw:
+            launch_kwargs: dict[str, Any] = {
+                "headless": True,
+                "args": [
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            }
+            try:
+                from app.services.proxy_config import get_playwright_proxy
+                proxy = get_playwright_proxy()
+                if proxy:
+                    launch_kwargs["proxy"] = proxy
+            except Exception:
+                pass
+            # Prefer the full Chromium build (new headless) over the
+            # lightweight headless shell: Cloudflare/WAF fingerprint checks
+            # pass far more often against a full browser.  If it is not
+            # available, fall back to Playwright's default launch.
+            try:
+                browser = await pw.chromium.launch(
+                    **launch_kwargs,
+                    channel="chromium",
+                )
+            except Exception:
+                browser = await pw.chromium.launch(**launch_kwargs)
+            try:
+                headers = dict(request_headers or self._build_headers())
+                user_agent = headers.pop("User-Agent", None)
+                # Cookie is installed through the browser cookie jar below.
+                cookie_header = self._merge_cookie_strings(
+                    headers.pop("Cookie", ""),
+                    self._cookie,
+                )
+                headers.pop("Connection", None)
+                context = await browser.new_context(
+                    viewport={"width": 1280, "height": 720},
+                    locale="zh-CN",
+                    **({"user_agent": user_agent} if user_agent else {}),
+                    extra_http_headers=headers,
+                )
+                # Mask common automation fingerprints so challenge pages
+                # do not immediately classify the browser as a headless bot.
+                try:
+                    await context.add_init_script(
+                        "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                        "window.chrome=window.chrome||{runtime:{}};"
+                        "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});"
+                        "Object.defineProperty(navigator,'languages',{get:()=>['zh-CN','zh','en']});"
+                    )
+                except Exception:
+                    pass
+                page = await context.new_page()
+
+                # Apply cookies if set
+                if cookie_header:
+                    await context.add_cookies(
+                        self._parse_cookies_for_playwright(cookie_header)
+                    )
+
+                # WAF-protected sites often keep analytics sockets open forever;
+                # waiting for networkidle turns a usable page into a timeout.
+                await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                # Cloudflare / WAF challenge pages ("Just a moment…") return
+                # before the JS challenge has solved itself.  Wait for the
+                # real page (and the resolved session cookies) before running
+                # any webJs or parsing the content.
+                rendered = await self._wait_for_challenge(
+                    context,
+                    page,
+                    url,
+                    timeout=25.0,
+                )
+                if not rendered:
+                    raise RuntimeError(
+                        "Site returned an empty browser page (网站返回了空白页): "
+                        + url
+                    )
+                if self._is_blocked_page(rendered):
+                    # Even after waiting the challenge never cleared; surface
+                    # a clear hint instead of parsing the WAF gate as content.
+                    raise RuntimeError(
+                        "Site returned an anti-bot/captcha page (网站要求验证码/人机验证，"
+                        "请在浏览器中访问该网站通过验证后，把 Cookie 导入书源再同步): "
+                        + url
+                    )
+                self._capture_playwright_cookies(await context.cookies())
+
+                # Legado webJs may mutate the DOM or return the rendered
+                # HTML directly. Preserve both forms instead of discarding
+                # the script result.
+                if web_js:
+                    try:
+                        html = await page.evaluate(
+                            f"(function(){{ var result=document.documentElement.outerHTML; "
+                            f"var value=(function(){{ {web_js} }})(); "
+                            f"return (typeof value === 'string' && value.trim()) "
+                            f"? value : document.documentElement.outerHTML; }})()"
+                        )
+                    except Exception as e:
+                        logger.warning(f"webJs execution error: {e}")
+                        html = rendered
+                else:
+                    html = rendered
+
+                if self._is_blocked_page(html):
+                    raise RuntimeError(
+                        "Site returned an anti-bot/captcha page (网站要求验证码/人机验证，"
+                        "请在浏览器中访问该网站通过验证后，把 Cookie 导入书源再同步): "
+                        + url
+                    )
+
+                await context.close()
+                return html
+            finally:
+                await browser.close()
 
     def _parse_cookies_for_playwright(
         self,
@@ -3758,12 +3879,23 @@ class YueduPlugin:
                 )
                 continue
             except httpx.HTTPStatusError as exc:
-                if proxy is None:
-                    raise
                 last_error = exc
+                status = (
+                    exc.response.status_code
+                    if exc.response is not None
+                    else None
+                )
+                # Only retry the other transport for statuses that may be
+                # specific to this exit node / IP.  A 404 from the proxy is a
+                # definitive answer; falling back to direct just burned the
+                # 3x connect timeout before failing anyway.
+                if proxy is None or status not in (
+                    403, 408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524,
+                ):
+                    raise
                 logger.warning(
                     "Configured proxy returned HTTP %s; retrying direct",
-                    exc.response.status_code if exc.response is not None else "error",
+                    status if status is not None else "error",
                 )
                 continue
             self._mark_transport_success(proxy)
@@ -3897,7 +4029,9 @@ class YueduPlugin:
             if "turnstile" in (last_html or "").lower():
                 for frame in page.frames:
                     try:
-                        checkbox = frame.query_selector("input[type=checkbox]")
+                        checkbox = await frame.query_selector(
+                            "input[type=checkbox]"
+                        )
                         if checkbox:
                             await checkbox.click(timeout=3000)
                             break
@@ -4129,12 +4263,19 @@ class YueduPlugin:
                 )
                 continue
             except httpx.HTTPStatusError as exc:
-                if proxy is None:
-                    raise
                 last_error = exc
+                status = (
+                    exc.response.status_code
+                    if exc.response is not None
+                    else None
+                )
+                if proxy is None or status not in (
+                    403, 408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524,
+                ):
+                    raise
                 logger.warning(
                     "Configured proxy returned HTTP %s; retrying direct",
-                    exc.response.status_code if exc.response is not None else "error",
+                    status if status is not None else "error",
                 )
                 continue
             self._mark_transport_success(proxy)

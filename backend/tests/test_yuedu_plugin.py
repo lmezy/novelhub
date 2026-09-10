@@ -2707,3 +2707,195 @@ async def test_fetch_book_does_not_use_single_char_author_as_tag():
         book = await plugin.fetch_book("https://www.yaoluku.com/book/56508/")
 
     assert book.tags == ["精品其他"]
+
+
+def test_is_book_url_accepts_forum_post_urls():
+    """風月文學網 h528 book pages are ``/post/29145.html``.
+
+    The fallback heuristic only knew novel/book/read/detail/xiaoshuo, so its
+    whole catalogue was filtered out during discovery.
+    """
+    plugin = YueduPlugin({"bookSourceUrl": "http://www.h528.com"})
+
+    assert plugin._is_book_url("http://www.h528.com/post/29145.html") is True
+    assert plugin._is_book_url("http://www.h528.com/thread/29145.html") is True
+    assert plugin._is_book_url(
+        "http://www.h528.com/post/category/%e4%ba%ba%e5%a6%bb%e7%86%9f%e5%a5%b3"
+    ) is False
+    assert plugin._is_book_url("http://www.h528.com/") is False
+
+
+def test_is_chapter_url_accepts_sibling_posts_without_pattern():
+    """h528 keeps the book and its chapters in the same flat directory."""
+    plugin = YueduPlugin({"bookSourceUrl": "http://www.h528.com"})
+
+    assert plugin._is_chapter_url(
+        "http://www.h528.com/post/29144.html",
+        "http://www.h528.com/post/29145.html",
+    ) is True
+    assert plugin._is_chapter_url(
+        "http://www.h528.com/post/category/abc",
+        "http://www.h528.com/post/29145.html",
+    ) is False
+
+
+def test_is_chapter_url_rejects_other_book_when_pattern_is_set():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.yaoluku.com",
+        "bookUrlPattern": r"https://www\.yaoluku\.com/book/\d+",
+    })
+
+    assert plugin._is_chapter_url(
+        "https://www.yaoluku.com/book/35979/399068.html",
+        "https://www.yaoluku.com/book/35979/",
+    ) is True
+    # Another book's detail page must never be treated as a chapter.
+    assert plugin._is_chapter_url(
+        "https://www.yaoluku.com/book/56508/",
+        "https://www.yaoluku.com/book/56443/",
+    ) is False
+
+
+def test_clean_book_title_keeps_first_line_of_multi_match_rule():
+    plugin = YueduPlugin({"bookSourceUrl": "http://www.h528.com"})
+
+    assert plugin._clean_book_title("疑愛6\n分站\n分類\n最新文章") == "疑愛6"
+    # A single-line title is only whitespace-normalised.
+    assert plugin._clean_book_title("  画壁【女出轨】  ") == "画壁【女出轨】"
+
+
+@pytest.mark.asyncio
+async def test_browser_semaphore_limits_concurrent_chromium(monkeypatch):
+    monkeypatch.setenv("YUEDU_PLAYWRIGHT_CONCURRENCY", "2")
+    YueduPlugin._browser_semaphores.clear()
+    try:
+        semaphore = YueduPlugin._browser_semaphore()
+        assert YueduPlugin._browser_semaphore() is semaphore
+
+        await semaphore.acquire()
+        await semaphore.acquire()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(semaphore.acquire(), timeout=0.05)
+        semaphore.release()
+        await asyncio.wait_for(semaphore.acquire(), timeout=0.5)
+    finally:
+        YueduPlugin._browser_semaphores.clear()
+
+
+@pytest.mark.asyncio
+async def test_web_js_browser_path_retries_transient_failure():
+    YueduPlugin._browser_semaphores.clear()
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "concurrentRate": "0",
+    })
+    calls = {"n": 0}
+
+    async def fake_fetch(async_playwright, url, web_js, request_headers):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError(
+                "Site returned an empty browser page (网站返回了空白页): " + url
+            )
+        return "<html>ok</html>"
+
+    try:
+        with (
+            patch.object(plugin, "_fetch_with_playwright", side_effect=fake_fetch),
+            patch("asyncio.sleep", AsyncMock()),
+        ):
+            html = await plugin._get_with_web_js(
+                "https://example.com/page",
+                "",
+                fallback_http=False,
+            )
+    finally:
+        YueduPlugin._browser_semaphores.clear()
+
+    assert html == "<html>ok</html>"
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_web_js_captcha_is_not_retried_and_keeps_detail():
+    YueduPlugin._browser_semaphores.clear()
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "concurrentRate": "0",
+    })
+    calls = {"n": 0}
+
+    async def fake_fetch(async_playwright, url, web_js, request_headers):
+        calls["n"] += 1
+        raise RuntimeError(
+            "Site returned an anti-bot/captcha page (网站要求验证码/人机验证): " + url
+        )
+
+    try:
+        with (
+            patch.object(plugin, "_fetch_with_playwright", side_effect=fake_fetch),
+            patch("asyncio.sleep", AsyncMock()),
+        ):
+            with pytest.raises(RuntimeError, match="anti-bot/captcha"):
+                await plugin._get_with_web_js(
+                    "https://example.com/page",
+                    "",
+                    fallback_http=False,
+                )
+    finally:
+        YueduPlugin._browser_semaphores.clear()
+
+    # A captcha page will not clear by retrying immediately.
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_get_does_not_fall_back_to_direct_on_definitive_404():
+    """A 404 from the proxy is final; retrying direct only wasted 26s."""
+    YueduPlugin._clients.clear()
+    YueduPlugin._transport_bad_until.clear()
+    YueduPlugin._transport_preferred.clear()
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "concurrentRate": "0",
+    })
+    seen_proxies: list[str | None] = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            seen_proxies.append(kwargs.get("proxy"))
+
+        async def get(self, url, headers=None):
+            request = httpx.Request("GET", url)
+            response = httpx.Response(404, request=request)
+            raise httpx.HTTPStatusError(
+                "404 Not Found",
+                request=request,
+                response=response,
+            )
+
+        async def aclose(self):
+            return None
+
+    try:
+        with (
+            patch("httpx.AsyncClient", FakeClient),
+            patch("asyncio.sleep", AsyncMock()),
+            patch(
+                "app.services.proxy_config.get_proxy_config",
+                return_value=ProxyConfig(
+                    enabled=True,
+                    https_proxy="http://127.0.0.1:27890",
+                    http_proxy="http://127.0.0.1:27890",
+                ),
+            ),
+            pytest.raises(httpx.HTTPStatusError),
+        ):
+            await plugin._get("https://example.com/book/missing.html")
+    finally:
+        YueduPlugin._clients.clear()
+        YueduPlugin._transport_bad_until.clear()
+        YueduPlugin._transport_preferred.clear()
+
+    assert seen_proxies == ["http://127.0.0.1:27890"]

@@ -1,5 +1,8 @@
 from app.crawler.plugins.yuedu.js_runtime import try_eval_js_pattern
-from app.crawler.plugins.yuedu.rule_engine import YueduRuleEngine
+from app.crawler.plugins.yuedu.rule_engine import (
+    YueduRuleEngine,
+    normalize_css_selector,
+)
 
 
 def _engine():
@@ -36,6 +39,45 @@ def test_legado_chain_selector_scopes_children():
     items = engine._get_elements(HTML, ".site-scroll__list@.col-12")
     assert len(items) == 2
     assert items[0].h5.get_text() == "Book A"
+
+
+def test_normalize_css_selector_quotes_unquoted_attribute_values():
+    # 風月文學網 h528 writes `a[href*=/post/][href$=.html]`; soupsieve rejects
+    # the unquoted value, which silently produced zero books before.
+    assert normalize_css_selector("a[href*=/post/]") == "a[href*='/post/']"
+    assert normalize_css_selector("a[href$=.html]") == "a[href$='.html']"
+    assert normalize_css_selector("div[class~=a b]") == "div[class~='a b']"
+    # Already-quoted values and non-attribute selectors stay untouched.
+    assert normalize_css_selector("a[href*='/post/']") == "a[href*='/post/']"
+    assert normalize_css_selector('a[href*="/post/"]') == 'a[href*="/post/"]'
+    assert normalize_css_selector("ul#list > li.item a") == "ul#list > li.item a"
+    assert normalize_css_selector("li[0]") == "li[0]"
+
+
+def test_explore_list_rule_with_unquoted_attribute_selector():
+    engine = YueduRuleEngine({
+        "bookSourceUrl": "http://www.h528.com",
+        "ruleExplore": {
+            "bookList": "a[href*=/post/][href$=.html]",
+            "name": "text",
+            "bookUrl": "href",
+        },
+    })
+    html = """
+    <html><body>
+      <a href="/post/123.html">人妻小说 A</a>
+      <a href="/post/456.html">家庭亂倫 B</a>
+      <a href="/tag/x.html">标签</a>
+    </body></html>
+    """
+
+    items = engine.parse_explore_results(html)
+
+    assert [item["name"] for item in items] == ["人妻小说 A", "家庭亂倫 B"]
+    assert [item["bookUrl"] for item in items] == [
+        "/post/123.html",
+        "/post/456.html",
+    ]
 
 
 def test_legado_pseudo_selectors_and_attr_chain():
