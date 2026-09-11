@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 import json
+import re
 import time
 from bs4 import BeautifulSoup
 
@@ -2987,3 +2988,165 @@ async def test_fetch_explore_reports_transport_failure_not_empty_catalog():
     with patch.object(plugin, "_get", fake_get):
         with pytest.raises(RuntimeError, match="网络/代理错误"):
             await plugin.fetch_explore(page=1)
+
+
+# ---- Catalog pagination for explore URLs without a {{page}} placeholder ----
+
+
+def test_detect_page_template_from_page_two_link():
+    html = """
+    <html><body>
+      <a href="/post/category/cat/page/2">下一页</a>
+      <a href="/post/category/other/page/2">别的分类</a>
+    </body></html>
+    """
+    template = YueduPlugin._detect_page_template(
+        "https://example.com/post/category/cat",
+        html,
+    )
+    assert template == "https://example.com/post/category/cat/page/{page}"
+
+
+def test_detect_page_template_ignores_links_to_other_categories():
+    html = """
+    <html><body>
+      <a href="/post/category/other/page/2">别的分类</a>
+      <a href="/post/123.html">一本书</a>
+    </body></html>
+    """
+    assert (
+        YueduPlugin._detect_page_template(
+            "https://example.com/post/category/cat",
+            html,
+        )
+        is None
+    )
+
+
+def test_detect_page_template_supports_query_pagination():
+    html = """
+    <html><body><a href="/list?page=2&amp;type=hot">下一页</a></body></html>
+    """
+    template = YueduPlugin._detect_page_template(
+        "https://example.com/list?type=hot",
+        html,
+    )
+    assert template == "https://example.com/list?page={page}&type=hot"
+
+
+@pytest.mark.asyncio
+async def test_fetch_explore_pages_catalogs_without_page_placeholder():
+    """h528-style sources list a plain category URL and page via ``/page/N``.
+
+    Regression: every page resolved to the same URL, so discovery returned the
+    same books, stopped after page 1 and reported the source as fully
+    synchronized ("only 360 books, then complete").
+    """
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "exploreUrl": "分类::https://example.com/novel/category/cat",
+        "ruleExplore": {},
+        "concurrentRate": "0",
+    })
+
+    def page_html(number: int) -> str:
+        return f"""
+        <html><body>
+          <a href="/novel/{number}001.html">第{number}页第一本</a>
+          <a href="/novel/{number}002.html">第{number}页第二本</a>
+          <a href="/novel/category/cat/page/{number + 1}">下一页</a>
+        </body></html>
+        """
+
+    seen_urls: list[str] = []
+
+    async def fake_get(url):
+        seen_urls.append(url)
+        if url.endswith("/page/1"):
+            return "<html><body></body></html>"
+        match = re.search(r"/page/(\d+)$", url)
+        return page_html(int(match.group(1)) if match else 1)
+
+    with patch.object(plugin, "_get", fake_get):
+        first = await plugin.discover_books(page=1)
+        second = await plugin.discover_books(page=2)
+        third = await plugin.discover_books(page=3)
+
+    assert [b.url for b in first] == [
+        "https://example.com/novel/1001.html",
+        "https://example.com/novel/1002.html",
+    ]
+    assert [b.url for b in second] == [
+        "https://example.com/novel/2001.html",
+        "https://example.com/novel/2002.html",
+    ]
+    assert [b.url for b in third] == [
+        "https://example.com/novel/3001.html",
+        "https://example.com/novel/3002.html",
+    ]
+    assert "https://example.com/novel/category/cat/page/2" in seen_urls
+
+
+@pytest.mark.asyncio
+async def test_fetch_explore_stops_when_pagination_page_is_missing():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "exploreUrl": "分类::https://example.com/novel/category/cat",
+        "ruleExplore": {},
+        "concurrentRate": "0",
+    })
+
+    request = httpx.Request("GET", "https://example.com/novel/category/cat/page/2")
+    not_found = httpx.HTTPStatusError(
+        "404", request=request, response=httpx.Response(404, request=request)
+    )
+
+    async def fake_get(url):
+        if url.endswith("/page/2"):
+            raise not_found
+        return """
+        <html><body>
+          <a href="/novel/1001.html">第一本</a>
+          <a href="/novel/category/cat/page/2">下一页</a>
+        </body></html>
+        """
+
+    with patch.object(plugin, "_get", fake_get):
+        await plugin.discover_books(page=1)
+        # No new page template is learned for a missing page, and the probe
+        # must not raise: the catalog is simply finished.
+        books = await plugin.discover_books(page=2)
+
+    assert books == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_explore_probes_pagination_when_task_resumes_mid_catalog():
+    """A task resumed at page > 1 has not seen page 1, so it must probe."""
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "exploreUrl": "分类::https://example.com/novel/category/cat",
+        "ruleExplore": {},
+        "concurrentRate": "0",
+    })
+
+    async def fake_get(url):
+        if url.endswith("?page=2"):
+            return """
+            <html><body>
+              <a href="/novel/2001.html">第二页第一本</a>
+            </body></html>
+            """
+        request = httpx.Request("GET", url)
+        raise httpx.HTTPStatusError(
+            "404", request=request, response=httpx.Response(404, request=request)
+        )
+
+    with patch.object(plugin, "_get", fake_get):
+        books = await plugin.discover_books(page=2)
+
+    assert [b.url for b in books] == ["https://example.com/novel/2001.html"]
+    assert (
+        plugin._explore_page_templates["https://example.com/novel/category/cat"]
+        == "https://example.com/novel/category/cat?page={page}"
+    )

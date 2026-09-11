@@ -370,3 +370,77 @@ async def test_worker_loop_picks_up_new_task_while_another_is_running():
                 pass
 
     assert started_tasks == {"task-a", "task-b"}
+
+
+@pytest.mark.asyncio
+async def test_run_crawl_task_async_survives_expired_orm_state_on_failure():
+    """A failed task must never stay ``running`` behind a MissingGreenlet.
+
+    SyncService rolls the worker session back when a book fails, which expires
+    every ORM instance.  The old error handler then read ``task_obj.progress``
+    in non-async code, raised ``MissingGreenlet`` and left the row ``running``
+    with no explanation (seen online as "Crawl task ... stopped: greenlet_spawn
+    has not been called").
+    """
+    task = _task()
+    task.progress = {"next_page": 1, "books_failed": 9}
+    state = {"expired": False}
+
+    # Make every ORM attribute read raise, exactly like an expired instance.
+    class Guarded:
+        def __init__(self, inner):
+            self.__dict__["_inner"] = inner
+
+        def __getattr__(self, name):
+            if name == "progress" and state["expired"]:
+                raise MissingGreenlet(
+                    "greenlet_spawn has not been called; can't call await_only() here"
+                )
+            return getattr(self.__dict__["_inner"], name)
+
+        def __setattr__(self, name, value):
+            setattr(self.__dict__["_inner"], name, value)
+
+    guarded = Guarded(task)
+
+    class FakeSyncService:
+        def __init__(self, db):
+            self.db = db
+
+        async def discover_and_sync_all(self, *args, **kwargs):
+            # A failed book sync rolls the session back, which expires every
+            # ORM instance the worker still holds.
+            state["expired"] = True
+            raise RuntimeError("同步连续失败超过 10 本，已中止任务。")
+
+    async def fake_commit():
+        if state["expired"]:
+            raise MissingGreenlet("expired session")
+
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=guarded)
+    db.commit = AsyncMock(side_effect=fake_commit)
+    db.rollback = AsyncMock()
+    db.refresh = AsyncMock()
+    written: dict = {}
+
+    async def fake_write(task_id, values):
+        written.update(values)
+        return True
+
+    with (
+        patch("app.services.crawl_runner.SessionLocal", return_value=_session_for(db)),
+        patch("app.services.sync.SyncService", FakeSyncService),
+        patch("app.services.crawl_runner._write_task_row", fake_write),
+    ):
+        with pytest.raises(RuntimeError, match="连续失败"):
+            await run_crawl_task_async("task-1")
+
+    # The task is persisted as failed through the fallback session instead of
+    # silently staying "running".
+    assert written["status"] == "failed"
+    assert "连续失败" in written["error"]
+    assert written["finished_at"] is not None
+    # The progress snapshot came from memory, never from the expired ORM state.
+    assert written["progress"]["next_page"] == 1
+    assert task.progress == {"next_page": 1, "books_failed": 9}

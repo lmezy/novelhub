@@ -1575,6 +1575,7 @@ class SyncService:
         chapters_skipped = 0
         chapters_failed = 0
         consecutive_failures = 0
+        consecutive_transient_failures = 0
         max_consecutive_failures = max(
             1,
             int(getattr(settings, "SYNC_MAX_CONSECUTIVE_FAILURES", 10)),
@@ -1639,7 +1640,7 @@ class SyncService:
             async def _record_outcome(sb, outcome) -> None:
                 nonlocal books_synced, books_failed, books_filtered
                 nonlocal chapters_created, chapters_skipped, chapters_failed
-                nonlocal consecutive_failures
+                nonlocal consecutive_failures, consecutive_transient_failures
                 if isinstance(outcome, SyncPaused):
                     raise outcome
                 if isinstance(outcome, BaseException):
@@ -1647,13 +1648,30 @@ class SyncService:
                         raise outcome
                     await self.db.rollback()
                     books_failed += 1
-                    consecutive_failures += 1
-                    if consecutive_failures >= max_consecutive_failures:
-                        raise ValueError(
-                            "同步连续失败超过 {} 本，已中止任务以避免持续请求被"
-                            "反爬的站点。请检查书源规则、Cookie 或站点验证状态后"
-                            "再同步。".format(max_consecutive_failures)
-                        )
+                    if self._is_transient_book_fetch(outcome):
+                        # Cloudflare 5xx / browser timeouts are a site or proxy
+                        # hiccup, not an anti-crawl gate.  Aborting the task here
+                        # used to hide the real cause behind a generic
+                        # "consecutive failures" error; abort with a transient
+                        # message instead so the task is retried later.
+                        consecutive_failures = 0
+                        consecutive_transient_failures += 1
+                        if consecutive_transient_failures >= max_consecutive_failures:
+                            raise RuntimeError(
+                                "上游/代理暂时不可用（网络错误，例如 Cloudflare "
+                                f"520/5xx），已连续 {consecutive_transient_failures} "
+                                "本同步失败；任务会在稍后自动重试，请检查代理节点或"
+                                "稍后再试。"
+                            )
+                    else:
+                        consecutive_transient_failures = 0
+                        consecutive_failures += 1
+                        if consecutive_failures >= max_consecutive_failures:
+                            raise ValueError(
+                                "同步连续失败超过 {} 本，已中止任务以避免持续请求被"
+                                "反爬的站点。请检查书源规则、Cookie 或站点验证状态后"
+                                "再同步。".format(max_consecutive_failures)
+                            )
                     logger.warning(
                         "Failed to sync book {} ({}): {}",
                         sb.title,
@@ -1695,6 +1713,7 @@ class SyncService:
                     })
                     books_synced += 1
                     consecutive_failures = 0
+                    consecutive_transient_failures = 0
                     chapters_created += outcome.get("created_chapters", 0)
                     chapters_skipped += outcome.get("skipped_chapters", 0)
                     chapters_failed += len(outcome.get("failed_chapters", []))

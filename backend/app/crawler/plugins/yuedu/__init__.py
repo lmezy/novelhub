@@ -19,8 +19,17 @@ import os
 import random
 import re
 import time
+from html import unescape as html_unescape
 from typing import Any
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import (
+    parse_qsl,
+    urlencode,
+    urljoin,
+    urlparse,
+    urlsplit,
+    urlunsplit,
+    urlunparse,
+)
 
 import httpx
 from bs4 import BeautifulSoup, Tag
@@ -410,6 +419,14 @@ class YueduPlugin:
         self.base_url: str = self.config.get("bookSourceUrl", "")
         self._cookie: str = ""
         self._client_lock = asyncio.Lock()
+        # Pagination templates learned from a catalog page.  Sources such as
+        # 風月文學網 h528 list categories without a ``{{page}}`` placeholder,
+        # so Legado/NovelHub have to page through ``.../page/2`` themselves.
+        # ``{base_url: template}`` where the template contains ``{page}``.
+        self._explore_page_templates: dict[str, str] = {}
+        # ``{kind_url: page-1 URL}`` memo so a ``<js>`` rule is not evaluated
+        # twice per page.
+        self._explore_kind_bases: dict[str, str] = {}
 
     @property
     def display_name(self) -> str:
@@ -2580,8 +2597,10 @@ class YueduPlugin:
                 if not resolved:
                     continue
                 try:
-                    results.extend(await self._fetch_explore_url(
-                        resolved,
+                    results.extend(await self._fetch_kind_items(
+                        kind_url=kind_url,
+                        resolved=resolved,
+                        page=page,
                         explore_kind=kind.get("title", ""),
                         options=options,
                     ))
@@ -2688,6 +2707,202 @@ class YueduPlugin:
         resolved, _options = self._resolve_kind(kind_url, page)
         return resolved
 
+    # ---- Catalog pagination for URLs without a ``{{page}}`` placeholder ----
+    #
+    # Legado sources frequently configure a plain category URL and expect the
+    # client to walk the site's own paging links (風月文學網 h528:
+    # ``/post/category/<cat>`` -> ``/post/category/<cat>/page/2``).  Without
+    # this the resolver returned the *same* URL for every page, so discovery
+    # saw page 2 as a page of duplicates, stopped and reported the source as
+    # fully synchronized after a single page ("only 360 books, then complete").
+    _PAGE_PATH_RES = (
+        re.compile(r"^(?P<prefix>.*?)(?P<sep>/page/)(?P<num>\d+)(?P<suffix>/?)$"),
+        re.compile(
+            r"^(?P<prefix>.*?)(?P<sep>/(?:index|list)_)(?P<num>\d+)"
+            r"(?P<suffix>\.html?)$"
+        ),
+    )
+
+    def _explore_page_base(self, kind_url: str) -> str:
+        """Page-1 URL of an explore kind, used as the pagination cache key."""
+        key = str(kind_url or "")
+        if key in self._explore_kind_bases:
+            return self._explore_kind_bases[key]
+        try:
+            resolved, _options = self._resolve_kind(kind_url, 1)
+        except Exception:
+            resolved = ""
+        base = (resolved or "").rstrip("/")
+        # Resolving a ``<js>`` explore rule twice per page is wasteful; the
+        # page-1 URL of a kind never changes within one plugin instance.
+        self._explore_kind_bases[key] = base
+        return base
+
+    @classmethod
+    def _detect_page_template(cls, base_url: str, html: str) -> str | None:
+        """Infer a pagination URL template from the links of a catalog page.
+
+        Only a real "page 2" link that stays under the current catalog URL is
+        accepted, so a nav link to another category can never be mistaken for
+        the pagination pattern.
+        """
+        base = (base_url or "").rstrip("/")
+        if not base or not html:
+            return None
+        base_parts = urlsplit(base_url)
+        base_path = base_parts.path.rstrip("/")
+        links: set[str] = set()
+        for href in re.findall(r'href\s*=\s*["\']([^"\']+)["\']', html, re.I):
+            href = html_unescape(href.strip())
+            if not href or href.startswith(("javascript:", "#", "mailto:")):
+                continue
+            links.add(urljoin(base_url, href))
+        for link in sorted(links):
+            parts = urlsplit(link)
+            if (parts.scheme, parts.netloc) != (
+                base_parts.scheme,
+                base_parts.netloc,
+            ):
+                continue
+            # Query pagination (``?page=2``); the path stays the same.
+            if parts.query and parts.path.rstrip("/") == base_path:
+                params = parse_qsl(parts.query, keep_blank_values=True)
+                for index, (key, value) in enumerate(params):
+                    if key.lower() in ("page", "paged") and value == "2":
+                        rewritten = list(params)
+                        rewritten[index] = (key, "{page}")
+                        return urlunsplit((
+                            parts.scheme,
+                            parts.netloc,
+                            parts.path,
+                            urlencode(rewritten, safe="{page}"),
+                            "",
+                        ))
+                continue
+            # Path pagination (``/page/2``, ``/index_2.html``).
+            for pattern in cls._PAGE_PATH_RES:
+                match = pattern.match(parts.path)
+                if not match or match.group("num") != "2":
+                    continue
+                if match.group("prefix").rstrip("/") != base_path:
+                    continue
+                template_path = (
+                    match.group("prefix")
+                    + match.group("sep")
+                    + "{page}"
+                    + match.group("suffix")
+                )
+                return urlunsplit((
+                    parts.scheme,
+                    parts.netloc,
+                    template_path,
+                    "",
+                    "",
+                ))
+        return None
+
+    def _remember_page_template(self, page_url: str, html: str) -> None:
+        """Cache the pagination template discovered on a catalog page."""
+        base = (page_url or "").rstrip("/")
+        if not base or base in self._explore_page_templates:
+            return
+        try:
+            template = self._detect_page_template(base, html)
+        except Exception:  # pragma: no cover - never fail a fetch over this
+            template = None
+        if template:
+            self._explore_page_templates[base] = template
+
+    def _page_url_from_template(self, template: str, page: int) -> str:
+        return template.replace("{page}", str(page))
+
+    @staticmethod
+    def _page_candidates(base_url: str, page: int) -> list[str]:
+        """Common catalog pagination shapes, tried when nothing was learned."""
+        base = base_url.rstrip("/")
+        return [
+            f"{base}/page/{page}",
+            f"{base}/page/{page}/",
+            f"{base}?page={page}",
+            f"{base}&page={page}",
+            f"{base}/index_{page}.html",
+            f"{base}/list_{page}.html",
+        ]
+
+    @staticmethod
+    def _is_missing_page_error(exc: BaseException) -> bool:
+        """Whether an exception means "that page does not exist"."""
+        response = getattr(exc, "response", None)
+        return getattr(response, "status_code", None) in (404, 410)
+
+    async def _fetch_kind_items(
+        self,
+        kind_url: str,
+        resolved: str,
+        page: int,
+        explore_kind: str,
+        options: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        """Fetch one catalog page, paging URLs that lack a page placeholder."""
+        base = self._explore_page_base(kind_url)
+        if page <= 1 or not base or resolved.rstrip("/") != base:
+            # Either the first page, or the source rule already paginates
+            # itself (``{{page}}`` / JS template), so use it verbatim.
+            return await self._fetch_explore_url(
+                resolved,
+                explore_kind=explore_kind,
+                options=options,
+                learn_page_template=(page <= 1),
+            )
+
+        template = self._explore_page_templates.get(base)
+        if template:
+            candidate = self._page_url_from_template(template, page)
+            try:
+                return await self._fetch_explore_url(
+                    candidate,
+                    explore_kind=explore_kind,
+                    options=self._options_for_url(options, candidate),
+                )
+            except Exception as exc:
+                if self._is_missing_page_error(exc):
+                    # Past the last page: the catalog is exhausted.
+                    return []
+                raise
+
+        # No template learned yet (e.g. a task resumed straight at page > 1):
+        # probe the common paging shapes until one returns books.
+        last_error: Exception | None = None
+        for candidate in self._page_candidates(base, page):
+            try:
+                items = await self._fetch_explore_url(
+                    candidate,
+                    explore_kind=explore_kind,
+                    options=self._options_for_url(options, candidate),
+                )
+            except Exception as exc:
+                if not self._is_missing_page_error(exc):
+                    last_error = last_error or exc
+                continue
+            if items:
+                self._explore_page_templates[base] = re.sub(
+                    r"\d+/?$", "{page}", candidate
+                )
+                return items
+        if last_error is not None:
+            raise last_error
+        return []
+
+    @staticmethod
+    def _options_for_url(
+        options: dict[str, Any] | None,
+        candidate: str,
+    ) -> dict[str, Any] | None:
+        """Keep Legado URL options in sync with a rewritten catalog URL."""
+        if options is None:
+            return None
+        return {**options, "url": candidate}
+
     def _resolve_kind(
         self,
         kind_url: str,
@@ -2785,6 +3000,7 @@ class YueduPlugin:
         explore_url: str,
         explore_kind: str = "",
         options: dict[str, Any] | None = None,
+        learn_page_template: bool = False,
     ) -> list[dict[str, Any]]:
         if options is None:
             options = self._parse_url_options(explore_url)
@@ -2808,6 +3024,8 @@ class YueduPlugin:
                 html = await self._get(request_url, charset=options["charset"])
             else:
                 html = await self._get(request_url)
+        if learn_page_template:
+            self._remember_page_template(request_url, html)
         items = self._explore_items_from_html(html, request_url)
         if not explore_kind:
             return items

@@ -1464,6 +1464,52 @@ async def test_discover_and_sync_all_aborts_after_too_many_consecutive_failures(
 
 
 @pytest.mark.asyncio
+async def test_discover_and_sync_all_transient_failures_stay_retryable():
+    """A burst of Cloudflare 5xx pages is a site hiccup, not a captcha gate.
+
+    Counting them as "consecutive failures" aborted a healthy run with a
+    misleading anti-crawl message; the task now ends with a transient error so
+    the crawl task retries it later instead.
+    """
+    db = _mock_db()
+    db.get.return_value = _source()
+    db.rollback = AsyncMock()
+
+    plugin = AsyncMock()
+    plugin.set_cookie = MagicMock()
+    plugin.discover_books.return_value = [
+        RemoteShelfBook(
+            source_book_id=f"{i}.html",
+            title=f"Book {i}",
+            author="Author",
+            url=f"https://example.com/{i}.html",
+        )
+        for i in range(4)
+    ]
+
+    fake_settings = SimpleNamespace(
+        SYNC_BOOK_CONCURRENCY=1,
+        SYNC_MAX_CONSECUTIVE_FAILURES=3,
+        SYNC_BOOK_CONTINUOUS=False,
+    )
+    upstream_error = RuntimeError(
+        "Upstream server returned a transient 5xx error page "
+        "(Cloudflare/520 etc.): https://example.com/1.html"
+    )
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.settings", fake_settings),
+        patch.object(
+            SyncService,
+            "sync_book",
+            AsyncMock(side_effect=upstream_error),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="网络错误"):
+            await SyncService(db).discover_and_sync_all("src1", max_pages=1)
+
+
+@pytest.mark.asyncio
 async def test_discover_and_sync_all_page_batch_requeues():
     db = _mock_db()
     db.get.return_value = _source()

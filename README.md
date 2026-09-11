@@ -113,6 +113,7 @@ Cookie 粘贴整段浏览器 Cookie 即可（形如 `key1=value1; key2=value2`�
 
 更多说明：
 
+- [文档索引](docs/README.md)
 - [全站同步](docs/full-site-sync.md)
 - [书源搜索](docs/source-search.md)
 

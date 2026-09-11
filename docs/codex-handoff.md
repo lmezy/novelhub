@@ -960,3 +960,118 @@ metacube(xd)（mihomo，混合端口 27890）。本次连上服务器只读排�
 - 54334 这类“源站已删除”的书**无法通过重试修好**，重新同步只会得到一条明确的失败原因；
   如需彻底清理，可在管理端删除该书或后续增加“失效书籍自动标记”。
 - 要撸小说的 520 属于站点瞬态错误，重试即可；命中 5xx 的章节现在会带明确原因。
+
+---
+
+## 19. 2026-09-11 补充：全站同步报 MissingGreenlet + 風月文學網只同步 360 本
+
+用户反馈两件事：①“crawler 同步书籍时报错”；②“風月文學網只同步了 360 本书就显示完成”。
+本轮先在线上（NAS 上的 novelhub 容器）定位，再改本地代码。
+
+### 线上事实（09-11 的一批全站同步任务）
+
+`crawl_tasks` 里成功/失败情况：
+
+| 任务 | 书源 | 结果 |
+|---|---|---|
+| `d6bc3716` | 風月文學網 h528 | completed，`books_found=360`、`pages_checked=2` |
+| `bce548e2` | 要撸小说 | **status 一直停在 running**，日志最后一行是 `Crawl task … stopped: greenlet_spawn has not been called …` |
+| `be670609` | 禁忌书屋 cool18 | failed（真 Cloudflare 验证页，需 Cookie） |
+| `e54e4650` | 爱丽丝书屋 | failed（连续 5 章被判为反爬，当时是瞬态） |
+
+### 根因 1：错误处理里读了“已过期”的 ORM 对象 → MissingGreenlet，任务卡死在 running
+
+`SyncService.discover_and_sync_all()` 里，一本书同步失败后会执行
+`await self.db.rollback()`；SQLAlchemy 的 `rollback()` 会把当前 session 里
+**所有 ORM 实例标记为 expired**（`expire_on_commit=False` 只影响 commit，不影响
+rollback）。
+
+紧接着 `run_crawl_task_async()` 的 `except Exception` 分支第一行是老代码
+
+```python
+retries = int((task_obj.progress or {}).get("auto_retries") or 0)
+```
+
+这是一次**同步的属性读取**：对象已 expired，SQLAlchemy 需要发一条 SELECT 去补数据，
+而这里不在 `await` 的 greenlet 上下文里 → 抛
+`MissingGreenlet: greenlet_spawn has not been called`。于是：
+
+1. 真正的业务错误（要撸小说那批书连续 10 本被 Cloudflare 520）被这个 greenlet 错误顶掉；
+2. 错误处理里的 `await db.commit()` 也因为 session 处于损坏状态而失败，结果
+   `crawl_tasks.status` **永远停在 running**，前端只能看到一条看不懂的 greenlet 报错。
+
+（这也解释了为什么 DB 里 `books_failed` 停在 9：第 10/11/12 次失败还没写进度就抛异常了。）
+
+**修复**（`backend/app/services/crawl_runner.py`）：
+
+- 异常分支**不再读任何 ORM 属性**，改用内存快照 `progress_state`（`auto_retries` 等）；
+- 新增 `_apply_task_state()` / `_write_task_row()`：先把字段写到 ORM 对象并 commit，
+  **commit 失败时用一条独立的短生命周期 session 直接 UPDATE 该行**，保证任务一定能落到
+  `failed` / `completed` / `paused` / `cancelled`，不会再卡在 `running`；
+- `_describe_error()`：异常 `str()` 为空时（httpx 常见）用类名兜底，错误信息不再为空。
+
+### 根因 2：目录类书源没有 `{{page}}` 占位符时不会翻页 → 只同步第一页
+
+`風月文學網 h528` 的 `exploreUrl` 是 13 个**写死的分类 URL**（例如
+`http://www.h528.com/post/category/人妻熟女`），没有 `{{page}}`。
+`_resolve_kind()` 对没有占位符的 URL 做 `{{page}}` 替换后结果不变，于是
+**第 2、3、4… 页请求的还是同一个 URL**：`discover_and_sync_all()` 拿到的是同一批书，
+去重后 `new_books` 为空就判定“目录到底了”，任务显示完成。
+
+线上复核（容器内影子加载新代码）：
+
+```
+page 1: books=715 unique=360 new=360 total_seen=360
+page 2: books=715 unique=415 new=360 total_seen=720   # 修复前 new=0
+page 3: books=715 unique=415 new=360 total_seen=1080
+page 4: books=715 unique=415 new=360 total_seen=1440
+```
+
+站点真实分页是 `/{分类}/page/2`（该分类最多 92 页）。
+
+**修复**（`backend/app/crawler/plugins/yuedu/__init__.py`）：
+
+- 新增“目录自动翻页”：抓第 1 页时从 HTML 里**学习**分页模板
+  （`_remember_page_template()` / `_detect_page_template()`），只接受
+  “同一 URL 下的第 2 页链接”，支持 `/page/2`、`/index_2.html`、`?page=2`/`?paged=2`
+  三类形态；之后 `page>1` 用学到的模板翻页；
+- 从任务中途恢复（`start_page>1`，还没学过模板）时按常见分页形态探测；
+- 页面 404/410 视为“目录到底”，返回空列表让任务正常结束，不会报错；
+- 规则本来就有 `{{page}}`/JS 模板的书源完全不受影响（`resolved != 第1页URL` 时直接用规则结果）；
+- 只学一次、按分类缓存，额外开销可忽略。
+
+### 根因 3（顺带修）：瞬态 5xx 不该按“连续失败”中止整个任务
+
+`_record_outcome()` 原来把每一本失败的书都算进 `consecutive_failures`，达到
+`SYNC_MAX_CONSECUTIVE_FAILURES`（默认 10）就用“同步连续失败超过 N 本，已中止任务以避免
+持续请求被反爬的站点”报错。要撸小说那一批 520 全是**站点/代理瞬态错误**，却被当成了反爬。
+
+**修复**（`backend/app/services/sync.py`）：瞬态错误（Cloudflare 5xx、浏览器超时、连接
+中断等，`_is_transient_book_fetch()`）单独计数，达到阈值时抛
+“上游/代理暂时不可用（网络错误…）”这一**可被任务级自动重试识别**的错误（
+`_TRANSIENT_TASK_MARKERS` 命中“网络”），由 worker 在 60s/120s 后自动重试；
+只有**非瞬态**连续失败才会触发原来的反爬中止逻辑。成功一本即清零两种计数。
+
+### 验证
+
+- 后端全量测试：**401 passed**（新增 8 个用例：3 个分页模板识别、翻页、目录到底不报错、
+  断点续跑时的分页探测、1 个任务级 greenlet 容错、1 个瞬态失败不计入反爬中止）
+- 真实站点影子回归（容器内加载改动文件，不动线上代码）：
+  - 風月文學網 h528：page1/2/3/4 → 360 / 360 / 360 / 360 本新书，模板识别为
+    `…/post/category/<cat>/page/{page}`（首页 `最新` 识别为 `http://www.h528.com/page/{page}`）
+  - 要撸小说：page1=93 本、page2=88 本（`{{page}}` 书源仍走原规则，未受影响）
+  - 87书屋：新旧代码都是 0 本（站点侧问题，非本次回归）
+- 线上章节页复核：爱丽丝书屋失败章节现在直接返回 200/23KB 正常页面，
+  当时的“反爬”是瞬态；要撸小说书页/章节页现在也正常（520 已恢复）
+
+### 用户需要做的
+
+1. 重建并重启 `crawler`（可选 `backend`）：
+   `docker compose -f docker-compose.yaml build crawler && docker compose -f docker-compose.yaml up -d crawler backend`
+2. 重启会自动把卡在 `running` 的旧任务（要撸小说 `bce548e2`）改回 `pending` 继续跑，
+   不需要手动删任务。
+3. 重新发起 風月文學網 h528 的全站同步：现在会逐页翻目录。
+   **注意 h528 是短篇站，一篇文章=一本书**，每页约 360 本，全站量级很大，
+   建议用“暂停/取消”控制节奏；任务可断点续跑，已入库的书不会重复下载。
+4. 第一版主 / SiS / 御宅屋 仍是真 Cloudflare 挑战，需要在浏览器过验证后导入 Cookie；
+   菠萝猫需过 GoEdge 验证码后导入 Cookie。
