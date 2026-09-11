@@ -4,7 +4,12 @@ WORKDIR /app
 
 # Node.js powers the YueDu JS rule runtime (org.jsoup shim) and curl is used
 # by that shim's synchronous java.ajax/post/get helpers.
-RUN export DEBIAN_FRONTEND=noninteractive \
+# Use a China mirror for Debian packages so builds don't stall on deb.debian.org
+RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' \
+        /etc/apt/sources.list \
+        /etc/apt/sources.list.d/debian.sources \
+    2>/dev/null || true \
+    && export DEBIAN_FRONTEND=noninteractive \
     && apt-get update && apt-get install -y --no-install-recommends \
     curl nodejs \
     && rm -rf /var/lib/apt/lists/*
