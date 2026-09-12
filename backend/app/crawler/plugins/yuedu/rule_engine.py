@@ -36,6 +36,21 @@ _UNQUOTED_ATTR_VALUE_RE = re.compile(
     r"\[\s*([A-Za-z_][-\w:]*)\s*(\^=|\$=|\*=|~=|\|=|=)\s*([^\]\"'=][^\]]*?)\s*\]"
 )
 
+# Legado hands the rule engine the book/chapter object that the current
+# request already carries; ``{{book.name}}`` / ``{{chapter.title}}`` read it.
+_CONTEXT_OBJECT_NAMES = ("book", "chapter")
+
+
+class RuleUnbalancedError(ValueError):
+    """A rule's ``[]`` / ``()`` group is not balanced.
+
+    Legado's ``RuleAnalyzer.splitRule`` throws ``"...后未平衡"`` in this case.
+    This port ignored the failed balance scan and re-split from the same
+    position, which recurred until Python raised ``RecursionError`` (or spun
+    forever in the tail scanner).  Callers that cannot use the rule should
+    catch this instead of losing the whole book.
+    """
+
 
 def normalize_css_selector(selector: str) -> str:
     """Quote unquoted attribute values so soupsieve accepts the selector."""
@@ -107,11 +122,10 @@ class _RuleAnalyzer:
         if st != -1 and st < end:
             self._pos = st
             next_ch = "]" if q[st] == "[" else ")"
-            self._chomp_balanced(q[st], next_ch)
-            if self._pos > end:
-                self._start = self._pos
-                self._split_head(separators)
-                return
+            if not self._chomp_balanced(q[st], next_ch):
+                # Legado aborts the split here.  Re-splitting from the same
+                # position would recurse until the stack overflows.
+                raise RuleUnbalancedError(f"{q[:st]}后未平衡")
             self._start = self._pos
             self._split_head(separators)
             return
@@ -140,7 +154,8 @@ class _RuleAnalyzer:
             if st != -1 and st < end:
                 self._pos = st
                 next_ch = "]" if q[st] == "[" else ")"
-                self._chomp_balanced(q[st], next_ch)
+                if not self._chomp_balanced(q[st], next_ch):
+                    raise RuleUnbalancedError(f"{q[:st]}后未平衡")
                 if self._pos > end:
                     self._start = self._pos
                     self._split_tail(separators)
@@ -1055,8 +1070,21 @@ class YueduRuleEngine:
             return None
         analyzer = _RuleAnalyzer(rule)
         separators = ("&&", "||", "%%") if "##" in rule else self.SEPARATORS
-        rules = analyzer.split_rule(*separators)
-        elem_type = analyzer.elements_type
+        try:
+            rules = analyzer.split_rule(*separators)
+            elem_type = analyzer.elements_type
+        except RuleUnbalancedError:
+            # A rule whose ``[]``/``()`` group never closes cannot be split
+            # the way Legado would (it throws there).  Keep the field usable
+            # by evaluating the whole text as a single selector instead of
+            # failing the book: nothing matches, so the caller falls back to
+            # its own heuristics.
+            logger.debug(
+                "Unbalanced yuedu rule, evaluating as a single fragment: {}",
+                rule[:160],
+            )
+            rules = [rule]
+            elem_type = ""
         results: list[list[str]] = []
         for rl in rules:
             rl = rl.strip()
@@ -1174,8 +1202,18 @@ class YueduRuleEngine:
             return None
         analyzer = _RuleAnalyzer(rule, code_balance=True)
         separators = ("&&", "||", "%%") if "##" in rule else self.SEPARATORS
-        rules = analyzer.split_rule(*separators)
-        elem_type = analyzer.elements_type
+        try:
+            rules = analyzer.split_rule(*separators)
+            elem_type = analyzer.elements_type
+        except RuleUnbalancedError:
+            # Same fallback as ``_eval_css``: an unbalanced rule must not take
+            # the whole book down with it.
+            logger.debug(
+                "Unbalanced yuedu JSON rule, treating as one fragment: {}",
+                rule[:160],
+            )
+            rules = [rule]
+            elem_type = ""
         results: list[str] = []
         for rl in rules:
             rl = rl.strip()
@@ -1431,14 +1469,81 @@ class YueduRuleEngine:
             if inner.startswith("@") or inner.startswith("$.") or inner.startswith("//"):
                 result = self._eval_field(raw, inner)
                 return str(result) if result is not None else ""
-            if inner in self._variables:
-                return self._variables[inner]
-            js_result = self._try_eval_js(inner, raw)
+            variable = self._lookup_variable(inner)
+            if variable is not None:
+                return variable
+            js_result = self._try_eval_js_value(inner, raw)
             if js_result is not None:
                 return str(js_result)
             return ""
         analyzer = _RuleAnalyzer(rule)
         return analyzer.inner_rule("{{", "}}", _resolve_template)
+
+    def _lookup_variable(self, path: str) -> str | None:
+        """Resolve ``book.name`` / ``chapter.title`` style template references.
+
+        Legado's inner rules read the *known* book/chapter object, never the
+        page that is being parsed.  ``None`` means "not a variable reference",
+        which lets the caller try JS; a resolved-but-empty path returns ``""``
+        so the field stays empty instead of falling back to the whole page.
+        """
+        name, _, rest = path.partition(".")
+        if name in self._variables:
+            current: Any = self._variables[name]
+        elif name == "chapter" and self._chapter_context is not None:
+            current = self._chapter_context
+        elif rest and name in _CONTEXT_OBJECT_NAMES:
+            # ``book.name`` before any book is known (``fetch_book`` only has
+            # the URL at that point): stay empty.
+            return ""
+        else:
+            return None
+        if not rest:
+            return None if isinstance(current, (dict, list)) else str(current)
+        for part in rest.split("."):
+            if isinstance(current, dict):
+                current = current.get(part)
+            else:
+                current = getattr(current, part, None)
+            if current is None:
+                return ""
+        return "" if current is None else str(current)
+
+    def _try_eval_js_value(self, js_code: str, raw: Any) -> Any:
+        """Evaluate JS for a ``{{...}}`` template, never echoing the input.
+
+        ``_try_eval_js`` returns its input as a last resort, which is right at
+        the end of a rule chain but wrong inside a template: ``{{book.name}}``
+        without a book context resolved to the whole HTML page, and that page
+        was then evaluated as a CSS selector (in 绅士漫画's case, until the
+        stack overflowed and the book failed to sync).
+        """
+        code = js_code.strip()
+        if not code:
+            return None
+        try:
+            expression = json.loads(code)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            expression = None
+        if isinstance(expression, str):
+            return expression
+        pattern_result = try_eval_js_pattern(code, raw)
+        if pattern_result is not None:
+            return pattern_result
+        try:
+            runtime = self._get_js_runtime()
+            result = runtime.eval_js_sync(
+                code,
+                raw,
+                context=self._build_js_context(),
+            )
+        except Exception:
+            return None
+        # The runtime returns its input when the expression evaluates to
+        # ``undefined`` (correct for a rule chain, wrong for a template).
+        if isinstance(raw, str) and result == raw:
+            return None
+        return result
 
     def get_variable(self, key: str) -> str:
         return self._variables.get(key, "")

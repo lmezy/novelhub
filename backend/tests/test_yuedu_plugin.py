@@ -575,6 +575,46 @@ async def test_fetch_book_source_book_id_uses_full_normalized_url():
 
 
 @pytest.mark.asyncio
+async def test_fetch_book_with_book_name_template_falls_back_to_page_title():
+    """绅士漫画 (wn09.shop) writes ``ruleBookInfo.name`` as ``{{book.name}}``.
+
+    NovelHub opens the page by URL only, so the template used to resolve to
+    the whole HTML document; the page then went through the CSS rule splitter
+    and books whose markup contains ``|`` plus an unbalanced ``[`` failed with
+    ``maximum recursion depth exceeded``.  The name must stay empty so the
+    page title is used instead.
+    """
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.wn09.shop/",
+        "ruleBookInfo": {"name": "{{book.name}}"},
+        "ruleToc": {
+            "chapterList": "//div[@class='gallary_wrap tb']/ul/li",
+            "chapterName": "//li/text()",
+            "chapterUrl": "//li//a/@href",
+        },
+        "concurrentRate": "0",
+    })
+    html = """
+    <html><head><title>アモラルアイランド【1-5】 - 紳士漫畫</title></head><body>
+      <p>標籤：(未閉合 | 未閉合 [</p>
+      <div class="gallary_wrap tb"><ul>
+        <li class="tb"> 全话阅读 <a href="/photos-view-id-1.html">看图</a></li>
+      </ul></div>
+    </body></html>
+    """
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        book = await plugin.fetch_book(
+            "https://www.wn09.shop/photos-index-aid-342704.html"
+        )
+
+    assert book.title.startswith("アモラルアイランド")
+    assert [chapter.url for chapter in book.chapters] == [
+        "https://www.wn09.shop/photos-view-id-1.html"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_fetch_book_uses_generic_fallback():
     plugin = YueduPlugin({
         "bookSourceUrl": "https://example.com",

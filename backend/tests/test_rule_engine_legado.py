@@ -1,6 +1,10 @@
+import pytest
+
 from app.crawler.plugins.yuedu.js_runtime import try_eval_js_pattern
 from app.crawler.plugins.yuedu.rule_engine import (
+    RuleUnbalancedError,
     YueduRuleEngine,
+    _RuleAnalyzer,
     normalize_css_selector,
 )
 
@@ -278,3 +282,66 @@ def test_list_rule_with_trailing_js_step_keeps_the_elements():
     # this selects the second ``li`` -- the same element Legado would use.
     assert entries[0]["chapterUrl"] == "/photos-view-id-2.html"
     assert entries[0]["chapterName"] == "全话阅读"
+
+
+def test_unbalanced_rule_raises_instead_of_recursing():
+    """A rule with an unclosed ``[``/``(`` must fail fast, as Legado does."""
+    with pytest.raises(RuleUnbalancedError):
+        _RuleAnalyzer("a[href=foo|bar").split_rule("|")
+
+
+def test_unbalanced_tail_rule_raises_instead_of_looping():
+    """The tail scanner must not spin forever on the same unbalanced bracket."""
+    with pytest.raises(RuleUnbalancedError):
+        _RuleAnalyzer("a|b[c|d").split_rule("|")
+
+
+def test_eval_css_tolerates_unbalanced_rule():
+    engine = _engine()
+    # Must not recurse/hang; the caller falls back to its own heuristics.
+    assert engine._eval_css(HTML, "a[href=foo|bar") is None
+
+
+def test_book_name_template_without_book_context_is_empty():
+    """``{{book.name}}`` must never resolve to the page being parsed.
+
+    The old fallback returned the raw HTML, which ``_eval_css`` then treated
+    as a selector: 绅士漫画 (wn09.shop) books failed with ``maximum recursion
+    depth exceeded``.
+    """
+    engine = _engine()
+    raw = "<html><body><p>正文|未闭合[</p></body></html>"
+
+    assert engine._substitute_inner_rules("{{book.name}}", raw) == ""
+
+    engine.set_book({"name": "书名"})
+    assert engine._substitute_inner_rules("{{book.name}}", raw) == "书名"
+
+
+def test_inner_rule_still_resolves_js_context_names():
+    """``{{sourceUrl}}``/``{{chapter.title}}`` keep working."""
+    engine = YueduRuleEngine({"bookSourceUrl": "https://example.com"})
+    raw = "<html><body><p>x</p></body></html>"
+
+    assert engine._substitute_inner_rules("{{sourceUrl}}", raw) == "https://example.com"
+
+    engine.set_chapter_context({"title": "第一章"})
+    assert engine._substitute_inner_rules("{{chapter.title}}", raw) == "第一章"
+
+
+def test_book_info_name_template_does_not_evaluate_the_page_as_css():
+    engine = YueduRuleEngine(
+        {
+            "bookSourceUrl": "https://www.wn09.shop/",
+            "ruleBookInfo": {"name": "{{book.name}}"},
+        }
+    )
+    html = (
+        "<html><head><title>页面标题</title></head>"
+        "<body><p>正文|未闭合[</p></body></html>"
+    )
+
+    info = engine.parse_book_info(html)
+
+    # Empty name lets ``fetch_book`` fall back to the page title.
+    assert not info.get("name")

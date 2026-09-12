@@ -40,6 +40,9 @@
 - 站点要求验证码 / 人机验证 / Cloudflare → [cookie-guide.md](cookie-guide.md)
 - 章节报 `Chapter returned empty content` → [full-site-sync.md](full-site-sync.md)
   “章节报 Chapter returned empty content”
+- 同一书源只有个别书失败、报 `maximum recursion depth exceeded` →
+  [full-site-sync.md](full-site-sync.md)
+  “同一书源大部分书正常，个别书报…”
 - 想连服务器看真实任务与日志 → [codex-handoff.md](codex-handoff.md) 第 1、5 节
 
 ## 文档维护约定

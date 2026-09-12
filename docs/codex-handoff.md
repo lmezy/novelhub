@@ -43,7 +43,7 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 
 ## 2. 当前状态（2026-09-12）
 
-- 后端全量测试 **421 passed**：`cd backend && python -m pytest -q`
+- 后端全量测试 **428 passed**：`cd backend && python -m pytest -q`
 - Source Engine 闭环已完成并可用：导入书源 → 搜索 → 目录 → 正文 → Storage/DB/搜索 →
   网页阅读。当前工作重心是**同步稳定性与线上排错**，不是新增架构能力。
 - 并发模型：**一个书源一个 worker**（`SYNC_WORKER_CONCURRENCY=0` 默认不限），书源之间
@@ -81,6 +81,7 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 | Cookie 书源同步 0 本书（绅士漫画/wn09.shop） | ①`header` 的 `@js:` 规则没执行，声明 UA 被丢→站点返回手机版页面 ②`bookList` 的 XPath 风格规则解析出 0 元素 ③`discover_books` 又用 `/novel/123` 路径启发式把规则命中的书全部过滤 | 见第 8 节 |
 | 全站同步里第 4 个书源排队几小时 | 全局只有 `SYNC_WORKER_CONCURRENCY`(3) 个槽位 | 见第 8 节 |
 | 目录只出 1 章、章节是 `/cdn-cgi/l/email-protection` | `chapterList` 是“元素规则 + `@js:` 脚本”，引擎只认整条 JS，回退后被通用链接扫描捡到邮箱保护链接 | 见第 8 节 |
+| 同一书源大部分书正常、个别书报 `maximum recursion depth exceeded` | `ruleBookInfo.name` 是 `{{book.name}}`，无 book 上下文时模板回退成整页 HTML，被当成 CSS 规则切分；解析器遇到不闭合括号时原地递归 | 见第 9 节 |
 
 ---
 
@@ -121,7 +122,7 @@ stdin 送进 `docker exec -i novelhub-crawler python -`，脚本里 `sys.path.in
 ## 6. 修改与验证约定
 
 1. 动手前先 `git status --short`，理解并保留用户已有改动。
-2. 提交前运行 `cd backend && python -m pytest -q`（当前 406 passed）；
+2. 提交前运行 `cd backend && python -m pytest -q`（当前 428 passed）；
    改前端再跑 `cd frontend && npm run build`。
 3. 修复尽量落在“为什么失败”的那一层，并补一个能复现的测试。
 4. 文档只写长期有用的结论：本文件（索引 + 追加小节）和
@@ -236,3 +237,34 @@ Cookie 其实都正常，用户看到的是一条指向错误方向的报错，�
   否则 CPU 会先到瓶颈（`YUEDU_PLAYWRIGHT_CONCURRENCY` 也要按内存调整）。
 - `tests/` 与 `app/**/__pycache__` 里的 `.pyc` 会被本地测试改写（仓库一直在跟踪它们），
   提交时一并带上即可。
+
+## 9. 2026-09-12：Cookie 书源里个别书报 maximum recursion depth exceeded
+
+**现象**：绅士漫画（wn09.shop，已导入 Chrome Cookie）全站同步能发现、入库书籍，但同一书源
+里少数书（`photos-index-aid-342704`、`-337834`、`-359759`）失败，日志/任务是
+`Failed to sync book …: maximum recursion depth exceeded`，其余书都正常。
+
+**根因**（线上影子回归复现）：
+
+1. 这些书的 `ruleBookInfo.name` 是 `{{book.name}}`。NovelHub 打开书页时只拿到 URL，
+   `book` 上下文为空，`_try_eval_js` 走到兜底「JS 求不出值就把输入原样返回」——输入正是
+   整页 HTML，于是模板被替换成整页 HTML。
+2. `_eval_field` 把这段 HTML 当规则交给 `_eval_css`：分析器在页面里的 `|` 处切分，若 `|`
+   之前存在未闭合的 `[`/`(`，`_chomp_balanced` 返回 False 后位置不前进（Legado 在这里直接
+   `throw Error("…后未平衡")`），旧实现却用同一位置继续递归（尾段扫描里则是死循环）。
+   只有「`|` 前有不闭合括号」的页面触发，所以同源只有个别书失败。
+
+**改动**：
+
+| 文件 | 改动 |
+|---|---|
+| `backend/app/crawler/plugins/yuedu/rule_engine.py` | 新增 `RuleUnbalancedError`；`_split_head`/`_split_tail` 按 Legado 语义在括号不平衡时抛错，不再递归/死循环；`_eval_css`/`_eval_json` 捕获后按单片段求值（字段为空，而不是整本书失败） |
+| 同上 | `_substitute_inner_rules` 用新的 `_lookup_variable` 解析 `{{book.name}}`/`{{chapter.title}}`（含 `set_chapter_context` 的对象），未知 book/chapter 返回空串；新增 `_try_eval_js_value`，模板求值不再回退成“原样返回输入”，运行时返回输入本身时也视为未解析 |
+| `backend/app/crawler/plugins/yuedu/__init__.py` | `fetch_book` 解析 `ruleBookInfo` 前先 `engine.set_book({})`，避免同一引擎里上一本书的 `book.name` 被下本书的模板读到 |
+| `backend/tests/test_rule_engine_legado.py`、`backend/tests/test_yuedu_plugin.py` | 新增 6 项回归：不平衡规则抛错而非递归/死循环、`_eval_css` 容错、无 book 上下文时 `{{book.name}}` 不再返回整页、`{{sourceUrl}}`/`{{chapter.title}}` 仍可解析、书页 `{{book.name}}` 回退到页面标题 |
+
+**验证**：`cd backend && python -m pytest -q` → **428 passed**。线上影子回归（改动后的
+`rule_engine.py`/`__init__.py` 放进容器 `/tmp/shadow` 后跑真实站点）：
+上述 3 本原本失败的书全部成功（书名取自页面标题、1 章、章节正文 ~107 字符）；
+同一内核下御宅屋 `yswhub.cc/read/91164.html`（Cookie + Cloudflare）36 章、要撸小说
+`yaoluku.com/book/57213/`（webView）12 章正文正常，说明改动没有波及其它书源。

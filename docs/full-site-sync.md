@@ -172,6 +172,17 @@ Admin → 代理里填的是别的主机地址，容器访问不到。crawler/ba
 `/cdn-cgi/l/email-protection`（邮箱保护链接）当成唯一章节。现在会先取元素、再把这个脚本
 当作一步执行，脚本只做 `java.put` 时保留原元素。
 
+### 同一书源大部分书正常，个别书报 `maximum recursion depth exceeded`
+
+书源把 `ruleBookInfo.name` 写成 `{{book.name}}`（绅士漫画 wn09.shop 等）：NovelHub 打开书页
+时只知道 URL、拿不到 Legado 的 book 对象，旧版模板解析不出来就回退成“返回输入本身”，
+也就是把整页 HTML 当规则交给了 CSS 解析器；页面里一旦出现「`|` 之前有不闭合的 `[`/`(`」，
+解析器就会原地递归（`maximum recursion depth exceeded`）。所以同一书源里只有少数书失败，
+Cookie 与网络其实都正常。
+
+2026-09-12 修：模板不再把整页当规则，解析器也按 Legado 的语义在括号不平衡时报错并降级
+（该字段留空、调用方回退到页面标题）。重新同步这些书即可，不需要动 Cookie。
+
 ### 书源发现规则是 `<js>` / `@js:` 脚本，同步报无法执行
 
 例如 UAA 小说的 `exploreUrl` 是 `eval(String(Reload('https://…/xxx.js')))`，依赖完整

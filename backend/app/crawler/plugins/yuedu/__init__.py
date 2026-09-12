@@ -656,6 +656,12 @@ class YueduPlugin:
                 "该书在源站已被删除或禁用（站点提示：小说被禁用或已删除）: "
                 f"{fetch_url}"
             )
+        # ``ruleBookInfo`` often starts with ``{{book.name}}`` (绅士漫画 and
+        # others): Legado resolves it against the book object the opening
+        # request already carried.  NovelHub only knows the URL here, so clear
+        # any book left over from a previous fetch on this engine instead of
+        # letting ``{{book.name}}`` resolve to another book's title.
+        self.engine.set_book({})
         info = self.engine.parse_book_info(html)
 
         # Run preUpdateJs before parsing TOC
