@@ -64,6 +64,34 @@ def test_content_text_preserving_images_supports_lazy_src():
     assert "![懒加载](https://example.com/lazy.jpg)" in text
 
 
+def test_chapter_image_fallback_keeps_manga_images():
+    """A chapter page that is only images must not end up empty.
+
+    绅士漫画's ``ruleContent`` now yields nothing (its image-list JS is stale),
+    so the generic fallback has to keep the content images of the page.
+    """
+    plugin = YueduPlugin({"bookSourceUrl": "https://www.wn09.shop/"})
+    html = """
+    <html><body>
+      <div class="header"><img src="/static/logo.png" alt="站标"></div>
+      <div class="gallery">
+        <img id="picarea" src="//img5.wnimg2.cfd/data/3427/04/1-01.jpg?verify=1" alt="1">
+        <img id="picarea2" data-src="//img5.wnimg2.cfd/data/3427/04/1-02.jpg" alt="2">
+      </div>
+      <div class="footer"><img src="/static/qrcode.png"></div>
+    </body></html>
+    """
+
+    content = plugin._parse_chapter_content_generic(
+        html, "https://www.wn09.shop/photos-view-id-1.html"
+    )
+
+    assert content.splitlines() == [
+        "![1](https://img5.wnimg2.cfd/data/3427/04/1-01.jpg?verify=1)",
+        "![2](https://img5.wnimg2.cfd/data/3427/04/1-02.jpg)",
+    ]
+
+
 def test_parse_bookshelf_direct_anchor_fallback():
     plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
     html = """

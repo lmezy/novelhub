@@ -19,6 +19,36 @@ from app.services.sync import SyncPaused
 from app.core.config import settings
 
 
+@pytest.mark.asyncio
+async def test_recent_tasks_put_running_first_then_failed():
+    """The sync page shows what is running now, then what broke."""
+    from app.repositories.crawl_task import CrawlTaskRepository
+
+    captured: dict[str, object] = {}
+
+    class _EmptyResult:
+        def __iter__(self):
+            return iter(())
+
+    db = AsyncMock()
+
+    async def fake_scalars(query):
+        captured["query"] = query
+        return _EmptyResult()
+
+    db.scalars = fake_scalars
+
+    await CrawlTaskRepository(db).list_recent(limit=5)
+
+    compiled = captured["query"].compile()  # type: ignore[union-attr]
+    sql = str(compiled)
+    params = set(compiled.params.values())
+
+    assert {"running", "failed"} <= params
+    assert "CASE" in sql
+    assert sql.index("CASE") < sql.index("crawl_tasks.created_at DESC")
+
+
 def _task(**overrides):
     base = {
         "id": "task-1",

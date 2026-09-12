@@ -222,19 +222,24 @@ function __nhSimpleMatch(el, tokens) {
       if (classes.indexOf(cls) === -1) return false;
     } else if (t[0] === '[') {
       var inner = t.slice(1, -1).trim();
-      var am = inner.match(/^([\w-]+)(?:\s*(~|\^|\$|\*|)=?\s*["']?([^"']*)["']?)?$/);
+      // The operator list must include plain ``=``: without it ``[class=x]``
+      // degraded to "has a class attribute" and matched any element, so
+      // XPath translated selectors (``//div[@class='info']``) picked the
+      // wrong node.
+      var am = inner.match(/^([\w:.-]+)(?:\s*(~=|\^=|\$=|\*=|\|=|=)\s*(.*?))?$/);
       if (!am) return false;
       var name = am[1].toLowerCase();
       var op = am[2] || '';
-      var val = am[3] !== undefined ? am[3] : '';
+      var val = am[3] !== undefined ? am[3].replace(/^["']|["']$/g, '') : '';
       var attrVal = el.attrs[name];
       if (attrVal === undefined) return false;
       if (!op) return true;
       if (op === '=') return attrVal === val;
-      if (op === '~') return (' ' + attrVal + ' ').indexOf(' ' + val + ' ') >= 0;
-      if (op === '^') return attrVal.indexOf(val) === 0;
-      if (op === '$') return attrVal.length >= val.length && attrVal.slice(attrVal.length - val.length) === val;
-      if (op === '*') return attrVal.indexOf(val) >= 0;
+      if (op === '~=') return (' ' + attrVal + ' ').indexOf(' ' + val + ' ') >= 0;
+      if (op === '|=') return attrVal === val || attrVal.indexOf(val + '-') === 0;
+      if (op === '^=') return attrVal.indexOf(val) === 0;
+      if (op === '$=') return attrVal.length >= val.length && attrVal.slice(attrVal.length - val.length) === val;
+      if (op === '*=') return attrVal.indexOf(val) >= 0;
       return false;
     } else if (t[0] === ':') {
       var pm = t.match(/^:([a-zA-Z-]+)(?:\(([^)]*)\))?$/);
@@ -263,6 +268,17 @@ function __nhSimpleMatch(el, tokens) {
           ok = Number.isInteger(k) && k >= 0;
         }
         if (!ok) return false;
+      } else if (pname === 'nth-of-type') {
+        // Used by the XPath translator: ``li[2]`` -> ``li:nth-of-type(2)``.
+        var specT = parg.trim();
+        if (!/^\d+$/.test(specT)) return false;
+        var idxT = 1;
+        var prevT = el.previousElementSibling();
+        while (prevT) {
+          if (prevT.tag === el.tag) idxT++;
+          prevT = prevT.previousElementSibling();
+        }
+        if (idxT !== parseInt(specT, 10)) return false;
       } else if (pname === 'contains') {
         var needle = parg.trim().replace(/^["']|["']$/g, '');
         if (el.text().indexOf(needle) === -1) return false;
@@ -833,28 +849,169 @@ function __nhSetContent(value) {
   return value;
 }
 
+// Split a rule on '@' step separators, ignoring '@' inside [...], (...) and
+// quotes.  Legado's RuleAnalyzer does the same; a naive split tore
+// ``//div[@class='x']/text()`` apart and made ``java.getString`` return ''.
+function __nhSplitSteps(rule) {
+  var text = String(rule == null ? '' : rule);
+  var parts = [];
+  var buf = '';
+  var depth = 0;
+  var quote = '';
+  for (var i = 0; i < text.length; i++) {
+    var c = text[i];
+    if (quote) {
+      buf += c;
+      if (c === '\\' && i + 1 < text.length) { buf += text[++i]; continue; }
+      if (c === quote) quote = '';
+      continue;
+    }
+    if (c === '"' || c === "'") { quote = c; buf += c; continue; }
+    if (c === '[' || c === '(') depth++;
+    else if (c === ']' || c === ')') { if (depth > 0) depth--; }
+    else if (c === '@' && depth === 0) {
+      parts.push(buf);
+      buf = '';
+      continue;
+    }
+    buf += c;
+  }
+  parts.push(buf);
+  return parts.filter(function (p) { return String(p).trim() !== ''; });
+}
+
+// Translate the XPath subset book sources use (``//div[@class='x']/ul/li``)
+// into the CSS subset the shim implements.  Returns null when the rule uses
+// XPath features we cannot express in CSS.
+function __nhXPathStepToCss(step) {
+  var m = /^([A-Za-z][\w-]*|\*)?((?:\[[^\]]*\])*)$/.exec(String(step || '').trim());
+  if (!m) return null;
+  var css = m[1] || '*';
+  var preds = m[2] || '';
+  var re = /\[([^\]]*)\]/g;
+  var pm;
+  while ((pm = re.exec(preds))) {
+    var pred = pm[1].trim();
+    if (pred.charAt(0) === '@') {
+      var body = pred.slice(1).trim();
+      if (!/^[\w:.-]+(\s*(?:[!^$*~|]?=)\s*\S.*)?$/.test(body)) return null;
+      css += '[' + body + ']';
+      continue;
+    }
+    if (/^\d+$/.test(pred)) {
+      css += ':nth-of-type(' + pred + ')';
+      continue;
+    }
+    return null;
+  }
+  return css;
+}
+
+function __nhXPathToCss(rule) {
+  var text = String(rule || '').trim().replace(/^@xpath:/i, '').trim();
+  if (!text) return null;
+  if (text.charAt(0) !== '/' && text.indexOf('./') !== 0) return null;
+  text = text.replace(/^\.?\/\/?/, '');
+  if (!text) return null;
+  var steps = [];
+  var buf = '';
+  var combinator = ' ';
+  var i = 0;
+  while (i < text.length) {
+    var c = text[i];
+    if (c === '[') {
+      var end = text.indexOf(']', i);
+      if (end === -1) return null;
+      buf += text.slice(i, end + 1);
+      i = end + 1;
+      continue;
+    }
+    if (c === '/') {
+      var e = i;
+      while (e < text.length && text[e] === '/') e++;
+      if (!buf.trim()) return null;
+      steps.push([combinator, buf.trim()]);
+      buf = '';
+      combinator = (e - i > 1) ? ' ' : ' > ';
+      i = e;
+      continue;
+    }
+    buf += c;
+    i++;
+  }
+  if (buf.trim()) steps.push([combinator, buf.trim()]);
+  if (!steps.length) return null;
+  var css = '';
+  for (var s = 0; s < steps.length; s++) {
+    var converted = __nhXPathStepToCss(steps[s][1]);
+    if (converted === null) return null;
+    css += (s === 0 ? '' : steps[s][0]) + converted;
+  }
+  return css;
+}
+
 function __nhGetString(rule) {
-  var parts = String(rule || '').split('@').filter(function (p) { return p.trim(); });
+  var text = String(rule == null ? '' : rule).trim();
+  if (!text) return '';
+  // Legado's ``##regex##replacement`` transform.
+  var transform = null;
+  var tIdx = text.indexOf('##');
+  if (tIdx > 0) {
+    var tParts = text.slice(tIdx + 2).split('##');
+    if (tParts.length >= 2) {
+      transform = [tParts[0], tParts[1]];
+      text = text.slice(0, tIdx);
+    }
+  }
+  var parts = __nhSplitSteps(text);
   if (!parts.length) return '';
+  var selector = parts.shift().trim();
+  // ``//div/span/text()``: keep the trailing accessor as a step.
+  var tail = selector.match(/^(.*?)\/(text\(\)|html\(\)|outerHtml|ownText|all)$/);
+  if (tail && tail[1]) {
+    selector = tail[1].trim();
+    parts.unshift(tail[2] === 'text()' ? 'text' : (tail[2] === 'html()' ? 'html' : tail[2]));
+  }
+  if (selector.charAt(0) === '/' || selector.indexOf('./') === 0) {
+    var css = __nhXPathToCss(selector);
+    if (css === null) return '';
+    selector = css;
+  }
   var current = new __nhDocument(__nhContent);
-  var first = parts.shift().trim();
-  current = current.select(first).first();
+  current = current.select(selector).first();
   if (!current) return '';
+  var value = null;
   for (var i = 0; i < parts.length; i++) {
     var part = parts[i].trim();
-    if (part === 'text') return current.text();
-    if (part === 'html') return current.html();
-    if (part === 'outerHtml') return current.outerHtml();
-    if (part === 'ownText') return current.ownText();
-    if (part.indexOf('attr.') === 0) return current.attr(part.slice(5));
+    if (part === 'text') { value = current.text(); break; }
+    if (part === 'html') { value = current.html(); break; }
+    if (part === 'outerHtml' || part === 'all') { value = current.outerHtml(); break; }
+    if (part === 'ownText') { value = current.ownText(); break; }
+    if (part.indexOf('attr.') === 0) { value = current.attr(part.slice(5)); break; }
     var tag = part.match(/^tag\.([^\.]+)(?:\.(\d+))?$/);
     if (tag) {
       var children = current.select(tag[1]);
       current = children.get(tag[2] ? parseInt(tag[2], 10) : 0);
       if (!current) return '';
+      continue;
+    }
+    // ``@href`` / ``@title`` come through as a bare attribute name.
+    var attrName = part.replace(/^@/, '');
+    if (/^[\w:.-]+$/.test(attrName) && current.attr(attrName) !== '') {
+      value = current.attr(attrName);
+      break;
     }
   }
-  return current.text();
+  if (value === null) value = current.text();
+  value = value == null ? '' : String(value);
+  if (transform) {
+    try {
+      value = value.replace(new RegExp(transform[0], 'g'), transform[1]);
+    } catch (e) {
+      /* keep the untransformed value */
+    }
+  }
+  return value;
 }
 
 var java = {
@@ -888,7 +1045,16 @@ var java = {
   getString: function (rule) { return __nhGetString(rule); },
   // ---- legacy variable store (kept for compatibility) ----
   put: function (k, v) { __nhCache[String(k)] = { value: v, expires: 0 }; return v; },
-  get: function (url, headers) { return java.httpGet(url, headers); },
+  // Legado has two overloads: ``java.get(key)`` reads what ``java.put`` stored,
+  // ``java.get(url, headers)`` performs an HTTP GET.  Treating the one-argument
+  // form as HTTP made ``JSON.parse(java.get('imgInfoList') || '[]')`` (绅士漫画's
+  // ruleContent) parse an empty response body and throw.
+  get: function (key, headers) {
+    var isUrl = arguments.length >= 2 || /^(https?:)?\/\//.test(String(key));
+    if (isUrl) return java.httpGet(key, headers);
+    var stored = __nhCacheGet(String(key));
+    return stored === undefined || stored === null ? '' : stored;
+  },
   httpGet: function (url, headers) {
     return new __nhResponse(url, __nhCurlRaw(url, 'GET', null, headers), 200, {});
   },
@@ -897,6 +1063,11 @@ var java = {
   getCookies: function () { return __nhCookieJar.slice(); },
   getLoginInfo: function () { return null; },
   getLoginInfoMap: function () { return null; },
+  // Legado returns the WebView UA; sources build their ``header`` rule with it
+  // (要撸小说), so a missing function broke the whole header evaluation.
+  getWebViewUA: function () {
+    return "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
+  },
   startBrowserAwait: function (url, msg) {
     throw new Error('startBrowserAwait: 页面需要浏览器验证/输入验证码，无法自动处理: ' + msg);
   },

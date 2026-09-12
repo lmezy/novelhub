@@ -43,7 +43,7 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 
 ## 2. 当前状态（2026-09-12）
 
-- 后端全量测试 **428 passed**：`cd backend && python -m pytest -q`
+- 后端全量测试 **434 passed**：`cd backend && python -m pytest -q`
 - Source Engine 闭环已完成并可用：导入书源 → 搜索 → 目录 → 正文 → Storage/DB/搜索 →
   网页阅读。当前工作重心是**同步稳定性与线上排错**，不是新增架构能力。
 - 并发模型：**一个书源一个 worker**（`SYNC_WORKER_CONCURRENCY=0` 默认不限），书源之间
@@ -82,6 +82,9 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 | 全站同步里第 4 个书源排队几小时 | 全局只有 `SYNC_WORKER_CONCURRENCY`(3) 个槽位 | 见第 8 节 |
 | 目录只出 1 章、章节是 `/cdn-cgi/l/email-protection` | `chapterList` 是“元素规则 + `@js:` 脚本”，引擎只认整条 JS，回退后被通用链接扫描捡到邮箱保护链接 | 见第 8 节 |
 | 同一书源大部分书正常、个别书报 `maximum recursion depth exceeded` | `ruleBookInfo.name` 是 `{{book.name}}`，无 book 上下文时模板回退成整页 HTML，被当成 CSS 规则切分；解析器遇到不闭合括号时原地递归 | 见第 9 节 |
+| 日志一直刷 `JsRuntime JS error: Cannot read properties of null (reading '0')` | jsoup shim 的 `java.getString` 只认 CSS，书源的 XPath 规则返回空串；且 shim 把“上一步结果”当成 `java.getString` 的求值内容（Legado 用的是当前列表项/页面） | 见第 10 节 |
+| 日志出现 `java.getWebViewUA is not a function` / `Unexpected end of JSON input` | shim 缺 `getWebViewUA()`；`java.get(key)` 被当成 HTTP 请求（Legado 单参数是 `java.put` 的变量存储） | 见第 10 节 |
+| 漫画书章节报 `Chapter returned empty content` | 章节规则失效后通用解析只找文字容器，图片型章节没有兜底 | 见第 10 节 |
 
 ---
 
@@ -122,7 +125,7 @@ stdin 送进 `docker exec -i novelhub-crawler python -`，脚本里 `sys.path.in
 ## 6. 修改与验证约定
 
 1. 动手前先 `git status --short`，理解并保留用户已有改动。
-2. 提交前运行 `cd backend && python -m pytest -q`（当前 428 passed）；
+2. 提交前运行 `cd backend && python -m pytest -q`（当前 434 passed）；
    改前端再跑 `cd frontend && npm run build`。
 3. 修复尽量落在“为什么失败”的那一层，并补一个能复现的测试。
 4. 文档只写长期有用的结论：本文件（索引 + 追加小节）和
@@ -263,8 +266,56 @@ Cookie 其实都正常，用户看到的是一条指向错误方向的报错，�
 | `backend/app/crawler/plugins/yuedu/__init__.py` | `fetch_book` 解析 `ruleBookInfo` 前先 `engine.set_book({})`，避免同一引擎里上一本书的 `book.name` 被下本书的模板读到 |
 | `backend/tests/test_rule_engine_legado.py`、`backend/tests/test_yuedu_plugin.py` | 新增 6 项回归：不平衡规则抛错而非递归/死循环、`_eval_css` 容错、无 book 上下文时 `{{book.name}}` 不再返回整页、`{{sourceUrl}}`/`{{chapter.title}}` 仍可解析、书页 `{{book.name}}` 回退到页面标题 |
 
-**验证**：`cd backend && python -m pytest -q` → **428 passed**。线上影子回归（改动后的
+**验证**：`cd backend && python -m pytest -q` → **428 passed**（后续第 10 节又加了用例）。线上影子回归（改动后的
 `rule_engine.py`/`__init__.py` 放进容器 `/tmp/shadow` 后跑真实站点）：
 上述 3 本原本失败的书全部成功（书名取自页面标题、1 章、章节正文 ~107 字符）；
 同一内核下御宅屋 `yswhub.cc/read/91164.html`（Cookie + Cloudflare）36 章、要撸小说
 `yaoluku.com/book/57213/`（webView）12 章正文正常，说明改动没有波及其它书源。
+
+## 10. 2026-09-12：部署后日志仍刷 JsRuntime JS error（jsoup shim 能力缺口）
+
+**现象**：第 9 节修复部署后再同步，日志里仍然刷
+`JsRuntime JS error: Cannot read properties of null (reading '0')`（20 分钟内 399 条，
+每条对应一个列表项），另有零星的 `java.getWebViewUA is not a function` 和
+`Unexpected end of JSON input`；绅士漫画的章节正文只有 107 字符（其实是一条图片 URL）。
+任务本身是成功的（`books_failed: 0`），但这些报错说明字段被静默丢掉了。
+
+**根因**（都是 `yuedu/jsoup_shim.js` 与 Legado 的语义缺口，线上逐条复现）：
+
+1. **`java.getString` 只认 CSS**：书源的规则写 XPath（绅士漫画 `ruleExplore.kind` 里
+   `java.getString("//li/div[@class='info']/div[@class='info_col']/text()")`），shim 用
+   CSS 选择器去匹配，必然返回空串，接着 `pages.split('，')[0].match(...)[0]` 就抛
+   “Cannot read properties of null”。顺带丢了“49P/137P”这类页数标签。
+2. **求值内容不对**：Legado 的 `java.getString` 是对当前解析内容（列表项元素/页面）求值，
+   而我们把它设成了规则链上一步的中间值，即使支持 XPath 也找不到节点。
+3. **CSS 属性选择器漏了 `=`**：`[class='info']` 退化成“只要有 class 属性就算命中”，
+   翻译出来的 XPath 选择器会选错节点（这也是第 1 条能“看似选到东西”的原因）。
+4. **`java.get(key)` 被实现成 HTTP**：Legado 单参数是 `java.put` 的变量存储，
+   双参数才是 HTTP。绅士漫画的 `ruleContent` 用它取 `imgInfoList`，于是
+   `JSON.parse('')` → `Unexpected end of JSON input`，图片列表永远为空。
+5. **缺 `java.getWebViewUA()`**：要撸小说的 `header` 规则会调用它。
+6. 第 4 条修好之后，绅士漫画的章节规则会“正常地”返回空（书源自己的
+   `wnimg1.ru` 前缀已过期），于是章节报 `Chapter returned empty content`——
+   通用正文兜底只找文字容器，图片型章节没有出口。
+
+**改动**：
+
+| 文件 | 改动 |
+|---|---|
+| `backend/app/crawler/plugins/yuedu/jsoup_shim.js` | `java.getString` 支持 XPath 子集（`//tag[@attr='v']/child/text()`、`@attr`、`[n]`→`:nth-of-type`），`@` 步骤按括号/引号配对切分，支持 `##regex##replacement`；补 `nth-of-type` 与 `getWebViewUA()`；修属性选择器 `=`（含 `~=`/`\|=`/`^=`/`$=`/`*=`）；`java.get(key)` 读变量存储、`java.get(url, headers)` 仍走 HTTP |
+| `backend/app/crawler/plugins/yuedu/js_runtime.py` | `_eval_js_impl`/`eval_js_sync`/`eval_js` 新增 `content` 参数：JS 里的 `src` 与 `__nhSetContent`（即 `java.getString` 的根）指向当前解析内容，而不是上一步结果 |
+| `backend/app/crawler/plugins/yuedu/rule_engine.py` | 新增 `_js_content`，在 `_extract_list`（每个 item）/`_extract_book_info`/`_extract_content`/`_eval_list_rule` 里设置并透传给 JS 运行时 |
+| `backend/app/crawler/plugins/yuedu/__init__.py` | `_parse_chapter_content_generic(html, base_url)` 增加图片兜底：没有文字容器时把内容图（排除 logo/验证码/导航图标）输出成 markdown 图片，阅读器可直接渲染 |
+| `backend/tests/test_rule_engine_legado.py`、`backend/tests/test_yuedu_plugin.py` | 新增 5 项回归：`java.getString` 的 XPath 取文本/属性、`java.get`/`java.put` 变量存储、`getWebViewUA`、绅士漫画 kind 规则产出 `49P`、图片型章节不再为空 |
+
+**验证**：`cd backend && python -m pytest -q` → **434 passed**；前端 `vite build` 通过。
+线上影子回归（改动文件放容器 `/tmp/shadow`）：
+
+- 绅士漫画 `discover_books(page=1)` → **399 本，JS 报错 0 条**，标签出现 `137P/229P/152P`；
+- 第 9 节那 3 本原本失败的书：章节正文由“一条 URL/空”变成 178 字符的 markdown 图片；
+- 御宅屋（Cookie + Cloudflare）36 章、要撸小说（webView，`header` 用 `java.getWebViewUA()`）
+  12 章正文都正常，说明 shim 改动没有波及其它书源。
+
+**顺带的需求（同步页排序）**：最近任务改为“正在执行 → 失败 → 其余（按时间倒序）”。
+排序在后端仓库层 `CrawlTaskRepository.list_recent` 用 `CASE` 完成（保证 limit 内先取到在跑/失败
+的任务），前端 `SyncPage.vue` 再用同一个 rank 兜一次，避免任务状态原地变化后仍留在旧位置。

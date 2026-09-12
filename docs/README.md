@@ -43,6 +43,10 @@
 - 同一书源只有个别书失败、报 `maximum recursion depth exceeded` →
   [full-site-sync.md](full-site-sync.md)
   “同一书源大部分书正常，个别书报…”
+- 日志一直刷 `JsRuntime JS error: Cannot read properties of null (reading '0')` →
+  [full-site-sync.md](full-site-sync.md) “日志一直刷 JsRuntime JS error…”
+- 漫画书章节报 `Chapter returned empty content` → [full-site-sync.md](full-site-sync.md)
+  “漫画书章节报 Chapter returned empty content”
 - 想连服务器看真实任务与日志 → [codex-handoff.md](codex-handoff.md) 第 1、5 节
 
 ## 文档维护约定

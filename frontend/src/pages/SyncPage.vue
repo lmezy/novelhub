@@ -40,6 +40,18 @@ const activeProgress = computed(() => {
   return Math.min(100, Math.round((pages / max) * 100))
 })
 
+// Recent tasks: what is running now on top, failed tasks directly below it,
+// everything else keeps the newest-first order. Sorted again on the client so
+// a task that changes status in place (pause/cancel/finish) stays in place.
+const taskStatusRank: Record<string, number> = { running: 0, failed: 1 }
+const orderedTasks = computed(() =>
+  [...tasks.value].sort((a: any, b: any) => {
+    const rankDiff = (taskStatusRank[a.status] ?? 2) - (taskStatusRank[b.status] ?? 2)
+    if (rankDiff !== 0) return rankDiff
+    return new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime()
+  })
+)
+
 const terminal = ["completed", "failed", "cancelled", "completed_with_errors"]
 
 function sourceName(task: any) {
@@ -416,7 +428,7 @@ onMounted(async () => {
         <p v-else-if="tasks.length === 0" class="text-sm text-muted">{{ i18n.t('sync_no_tasks') }}</p>
         <div v-else class="divide-y divide-border">
           <div
-            v-for="task in tasks"
+            v-for="task in orderedTasks"
             :key="task.id"
             class="py-3 cursor-pointer hover:bg-accent/5 transition-colors"
             @click="selectTask(task)"

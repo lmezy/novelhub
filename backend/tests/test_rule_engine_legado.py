@@ -1,3 +1,5 @@
+import shutil
+
 import pytest
 
 from app.crawler.plugins.yuedu.js_runtime import try_eval_js_pattern
@@ -345,3 +347,113 @@ def test_book_info_name_template_does_not_evaluate_the_page_as_css():
 
     # Empty name lets ``fetch_book`` fall back to the page title.
     assert not info.get("name")
+
+
+WN09_LIST_HTML = """
+<html><body>
+  <div class="gallary_wrap">
+    <ul>
+      <li>
+        <div class="pic_box"><div>封面</div><div>图片说明</div></div>
+        <div class="info">
+          <div class="title"><a href="/photos-index-aid-1.html">[あるぷ] アモラルアイランド</a></div>
+          <div class="info_col">2026-09-12, 49張圖片</div>
+        </div>
+      </li>
+      <li>
+        <div class="pic_box"><div>封面</div><div>图片说明</div></div>
+        <div class="info">
+          <div class="title"><a href="/photos-index-aid-2.html">[みな本] 訪問姦誘</a></div>
+          <div class="info_col">2026-09-11, 245張圖片</div>
+        </div>
+      </li>
+    </ul>
+  </div>
+</body></html>
+"""
+
+
+def _wn09_engine() -> YueduRuleEngine:
+    return YueduRuleEngine({
+        "bookSourceUrl": "https://www.wn09.shop/",
+        "ruleExplore": {
+            "bookList": "//div[@class='gallary_wrap']/ul/li",
+            "name": "//div[@class='info']/div[@class='title']/a//text()",
+            "bookUrl": "//div[@class='info']/div[@class='title']/a/@href",
+            # The source reads the card again from inside the JS step; the
+            # step's ``result`` is only a sub-string of the card.
+            "kind": (
+                "//div[@class='pic_box']/div[2]/text()@js:\n"
+                "result = Array.from(result)\n"
+                "var pages = java.getString(\n"
+                "  \"//li/div[@class='info']/div[@class='info_col']/text()\")\n"
+                "var imgNum = pages.split('，')[0].match(/\\d+(?=張圖片)/g)[0]\n"
+                "result.push(imgNum+'P')\n"
+                "result"
+            ),
+        },
+    })
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_java_get_string_supports_xpath_against_the_item_element():
+    """绅士漫画's ``kind`` rule reads the card with ``java.getString(XPath)``.
+
+    Two things used to break it: the shim only understood CSS, and the JS
+    content was the previous step's text instead of the list item, so the rule
+    threw ``Cannot read properties of null (reading '0')`` and the ``49P`` tag
+    was lost.
+    """
+    items = _wn09_engine().parse_explore_results(WN09_LIST_HTML)
+
+    # The source pushes the page count onto ``Array.from(result)``, so the
+    # value is a list (Legado produces the same shape); what matters is that
+    # the XPath lookup found the card text instead of throwing.
+    kinds = [str(item["kind"]) for item in items]
+    assert "49P" in kinds[0]
+    assert "245P" in kinds[1]
+    assert items[0]["name"] == "[あるぷ] アモラルアイランド"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_java_get_web_view_ua_is_available():
+    """要撸小说's ``header`` rule calls ``java.getWebViewUA()``."""
+    engine = _engine()
+
+    value = engine._try_eval_js("java.getWebViewUA()", "")
+
+    assert isinstance(value, str) and "Android" in value
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_java_get_reads_the_value_written_by_java_put():
+    """绅士漫画's ``ruleContent`` reads ``java.get('imgInfoList')``.
+
+    ``java.get(key)`` is Legado's variable store (``java.put``), not an HTTP
+    call; treating it as HTTP made ``JSON.parse`` see an empty body and throw
+    ``Unexpected end of JSON input`` instead of returning the image list.
+    """
+    engine = _engine()
+
+    value = engine._try_eval_js(
+        "java.put('images', JSON.stringify([{name: '001'}]));"
+        " JSON.parse(java.get('images'))[0].name",
+        "",
+    )
+
+    assert value == "001"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_java_get_string_supports_attribute_and_regex_transform():
+    engine = _engine()
+    engine._js_content = (
+        '<div class="box"><a href="/book/1.html">第一本</a></div>'
+    )
+
+    assert engine._try_eval_js(
+        'java.getString("//div[@class=\'box\']/a/@href")', ""
+    ) == "/book/1.html"
+    assert engine._try_eval_js(
+        'java.getString("//div[@class=\'box\']/a/text()##第一##第1")', ""
+    ) == "第1本"

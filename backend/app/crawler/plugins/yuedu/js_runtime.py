@@ -266,6 +266,7 @@ class JsRuntime:
         js_code: str,
         input_value: Any = None,
         context: dict[str, Any] | None = None,
+        content: Any = None,
     ) -> Any:
         """Evaluate a JavaScript expression/code against an input value.
 
@@ -273,6 +274,8 @@ class JsRuntime:
             js_code: JavaScript code to execute. Should use ``result`` as
                      the input variable and return the desired output.
             input_value: The value to pass as ``result`` to the JS code.
+            content: Legado's page content (``src`` / ``java.getString`` root).
+                     Defaults to ``input_value`` for single-step rules.
 
         Returns:
             The JS evaluation result, or None if execution failed.
@@ -309,12 +312,18 @@ class JsRuntime:
                         ctx_json + ");}"
                     )
                 src_json = json.dumps(user_code, ensure_ascii=False)
+                content_json = (
+                    json.dumps(content if isinstance(content, str) else str(content),
+                               ensure_ascii=False)
+                    if content is not None
+                    else "result"
+                )
                 snippet = (
                     f'(function(){{'
                     f'{context_js}'
                     f'var result={input_json};'
-                    f'var src=result;'
-                    f'if(globalThis.__nhSetContent){{globalThis.__nhSetContent(result);}}'
+                    f'var src={content_json};'
+                    f'if(globalThis.__nhSetContent){{globalThis.__nhSetContent(src);}}'
                     f'var __codex_src__={src_json};'
                     f'var __codex_out__;'
                     f'try{{__codex_out__=eval(__codex_src__);}}'
@@ -345,13 +354,14 @@ class JsRuntime:
         js_code: str,
         input_value: Any = None,
         context: dict[str, Any] | None = None,
+        content: Any = None,
     ) -> Any:
         """Blocking eval for sync callers (rule engine)."""
         if not self._ready and not self.start_sync():
             return None
         try:
             return self._run_sync(
-                lambda: self._eval_js_impl(js_code, input_value, context)
+                lambda: self._eval_js_impl(js_code, input_value, context, content)
             )
         except Exception:
             return None
@@ -361,10 +371,11 @@ class JsRuntime:
         js_code: str,
         input_value: Any = None,
         context: dict[str, Any] | None = None,
+        content: Any = None,
     ) -> Any:
         """Async alias of eval_js_sync() for await-based callers."""
         return await asyncio.to_thread(
-            self.eval_js_sync, js_code, input_value, context,
+            self.eval_js_sync, js_code, input_value, context, content,
         )
 
     async def _eval_bytes_impl(self, js_code: str, raw_bytes: bytes) -> bytes | None:

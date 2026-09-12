@@ -1729,7 +1729,7 @@ class YueduPlugin:
             "url": chapter.url,
             "tag": str(getattr(chapter, "tags", "") or ""),
         })
-        generic_content = self._parse_chapter_content_generic(html)
+        generic_content = self._parse_chapter_content_generic(html, chapter.url)
         if self._uses_android_js_rule("ruleContent", "content"):
             content = generic_content
         else:
@@ -1783,14 +1783,14 @@ class YueduPlugin:
                     break
                 chapter_engine.set_page_url(next_url)
                 if self._uses_android_js_rule("ruleContent", "content"):
-                    next_part = self._parse_chapter_content_generic(next_html)
+                    next_part = self._parse_chapter_content_generic(next_html, next_url)
                 else:
                     try:
                         next_part = chapter_engine.parse_content(next_html)
                     except Exception:
                         next_part = ""
                     if not next_part or self._looks_like_rule_diagnostic(next_part, next_html):
-                        next_part = self._parse_chapter_content_generic(next_html)
+                        next_part = self._parse_chapter_content_generic(next_html, next_url)
                 if next_part and next_part != next_html:
                     parts.append(next_part)
                 pages_fetched += 1
@@ -1813,7 +1813,7 @@ class YueduPlugin:
                 pass
 
         if not content:
-            content = self._parse_chapter_content_generic(html)
+            content = self._parse_chapter_content_generic(html, chapter.url)
         content = content.strip()
         if self._content_is_blocked(content):
             raise RuntimeError(
@@ -1887,8 +1887,24 @@ class YueduPlugin:
             "org.jsoup", "Packages.", "java.lang.", "ReferenceError:",
         ))
 
-    def _parse_chapter_content_generic(self, html: str) -> str:
-        """Extract readable text when the configured content rule misses."""
+    # Images that are clearly site chrome rather than chapter content.
+    _NOISE_IMAGE_RE = re.compile(
+        r"logo|avatar|icon|sprite|banner|advert|qrcode|blank|placeholder"
+        r"|loading|spacer|pixel|button",
+        re.IGNORECASE,
+    )
+    _IMAGE_FILE_RE = re.compile(
+        r"\.(?:jpe?g|png|webp|gif|bmp|avif)(?:[?#]|$)", re.IGNORECASE
+    )
+
+    def _parse_chapter_content_generic(self, html: str, base_url: str = "") -> str:
+        """Extract readable text when the configured content rule misses.
+
+        Manga / photo sources have chapter pages without any text container:
+        their content is one or more images.  Falling back to those images
+        (as markdown, which the reader renders) keeps such chapters readable
+        instead of ending in ``Chapter returned empty content``.
+        """
         soup = BeautifulSoup(html, "lxml")
         content_selectors = (
             "#content-section pre",
@@ -1932,7 +1948,46 @@ class YueduPlugin:
             )
             if text:
                 return text
+        images = self._chapter_images(soup, base_url)
+        if images:
+            return "\n".join(images)
         return ""
+
+    def _chapter_images(self, soup: BeautifulSoup, base_url: str = "") -> list[str]:
+        """Markdown image references for a chapter page that is only images."""
+        refs: list[str] = []
+        seen: set[str] = set()
+        for img in soup.find_all("img"):
+            src = (
+                img.get("data-src")
+                or img.get("data-original")
+                or img.get("data-lazy-src")
+                or img.get("src")
+                or ""
+            )
+            src = str(src).strip()
+            if not src or src.startswith("data:"):
+                continue
+            descriptor = " ".join([
+                src,
+                str(img.get("id") or ""),
+                " ".join(str(c) for c in (img.get("class") or [])),
+            ])
+            if self._NOISE_IMAGE_RE.search(descriptor):
+                continue
+            if not self._IMAGE_FILE_RE.search(src):
+                continue
+            if self._inside_navigation(img):
+                continue
+            url = urljoin(base_url, src) if base_url else src
+            if url.startswith("//"):
+                url = "https:" + url
+            if url in seen:
+                continue
+            seen.add(url)
+            alt = str(img.get("alt") or "").strip()
+            refs.append(f"![{alt}]({url})")
+        return refs
 
     @staticmethod
     def _content_text_preserving_images(content: str) -> str:

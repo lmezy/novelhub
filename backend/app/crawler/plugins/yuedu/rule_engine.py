@@ -289,6 +289,10 @@ class YueduRuleEngine:
         self.base_url: str = source_config.get("bookSourceUrl", "")
         self._variables: dict[str, str] = {}
         self._chapter_context: dict[str, Any] | None = None
+        # Legado's ``java.getString``/``src`` resolve against the content that
+        # is being parsed (a list item element, or the page), not against the
+        # previous rule step; see ``_extract_list``.
+        self._js_content: Any = None
         self._is_json_context: bool = False
         self._js_runtime: "JsRuntime | None" = None
 
@@ -451,6 +455,11 @@ class YueduRuleEngine:
         results: list[dict[str, Any]] = []
         for item in items:
             entry: dict[str, Any] = {}
+            # Legado evaluates ``java.getString(...)`` inside a field rule
+            # against the item element (its ``AnalyzeRule`` content), so
+            # sources such as 绅士漫画 read sibling nodes from the card while
+            # the step-visible ``result`` is just a sub-string of it.
+            self._js_content = item
             for field in field_names:
                 rule = rules.get(field, "")
                 if rule:
@@ -467,6 +476,7 @@ class YueduRuleEngine:
         return results
 
     def _extract_book_info(self, raw: str, rules: dict[str, Any]) -> dict[str, Any]:
+        self._js_content = raw
         init_rule = rules.get("init", "")
         if init_rule:
             narrowed = self._eval_field(raw, init_rule)
@@ -488,6 +498,7 @@ class YueduRuleEngine:
         return info
 
     def _extract_content(self, raw: str, rules: dict[str, Any]) -> str:
+        self._js_content = raw
         content_rule = rules.get("content", "")
         title_rule = rules.get("title", "")
         if title_rule:
@@ -523,6 +534,9 @@ class YueduRuleEngine:
         if not rule:
             return []
 
+        # ``chapterList``/``bookList`` JS steps read sibling nodes through
+        # ``java.getString``; Legado resolves those against this element.
+        self._js_content = raw
         reverse = False
         if rule.startswith("-"):
             reverse = True
@@ -1365,6 +1379,7 @@ class YueduRuleEngine:
                 code,
                 raw,
                 context=self._build_js_context(extra_context),
+                content=self._js_content,
             )
             if result is not None:
                 return result
@@ -1536,6 +1551,7 @@ class YueduRuleEngine:
                 code,
                 raw,
                 context=self._build_js_context(),
+                content=self._js_content,
             )
         except Exception:
             return None
