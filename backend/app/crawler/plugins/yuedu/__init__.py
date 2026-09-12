@@ -444,6 +444,11 @@ class YueduPlugin:
         # ``{kind_url: page-1 URL}`` memo so a ``<js>`` rule is not evaluated
         # twice per page.
         self._explore_kind_bases: dict[str, str] = {}
+        # Manga sources often collect ``imgInfoList`` while parsing the TOC.
+        # Keep the manifest on the plugin instance so later chapter fetches do
+        # not depend on the shared Node runtime's mutable global cache (several
+        # books may sync concurrently).
+        self._chapter_image_manifest: list[dict[str, str]] = []
 
     @property
     def display_name(self) -> str:
@@ -460,6 +465,7 @@ class YueduPlugin:
         self.config = self._normalize_source_config(config)
         self.engine = YueduRuleEngine(self.config)
         self.base_url = self.config.get("bookSourceUrl", "")
+        self._chapter_image_manifest = []
 
     @staticmethod
     def _normalize_source_config(
@@ -695,6 +701,10 @@ class YueduPlugin:
             self.engine.parse_toc(toc_html),
             toc_url,
         )
+        # Capture the image manifest produced by a TOC ``chapterList`` script
+        # before another concurrent book can overwrite the JS runtime's global
+        # variable store.
+        self._chapter_image_manifest = self._read_chapter_image_manifest()
         # Whether the source's own ``ruleToc`` produced the list.  A rule that
         # matched is authoritative about what a chapter URL looks like; the
         # URL-shape heuristic below is only for the generic scanner, which
@@ -892,6 +902,132 @@ class YueduPlugin:
             tags=tags,
             cover_url=cover_url or None,
         )
+
+    def _read_chapter_image_manifest(self) -> list[dict[str, str]]:
+        """Read ``imgInfoList`` captured by a manga source's TOC script.
+
+        The variable name comes from the source's own ``chapterList`` rule.
+        Reading it only for sources that explicitly use a manifest avoids
+        treating a stale global value from an unrelated source as real.
+        """
+        if self.engine is None:
+            return []
+        toc_rules = json.dumps(
+            self.config.get("ruleToc") or {},
+            ensure_ascii=False,
+        )
+        if "imgInfoList" not in toc_rules:
+            return []
+        value = self.engine._try_eval_js(
+            "String(java.get('imgInfoList'))",
+            "",
+        )
+        if isinstance(value, (dict, list)):
+            payload = value
+        elif isinstance(value, str) and value.strip():
+            try:
+                payload = json.loads(value)
+            except (TypeError, ValueError):
+                return []
+        else:
+            return []
+        if not isinstance(payload, list):
+            return []
+
+        manifest: list[dict[str, str]] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("imgName") or "").strip()
+            extension = str(item.get("imgExtension") or "").strip().lower()
+            if not name or not re.fullmatch(r"[a-z0-9]{1,8}", extension):
+                continue
+            manifest.append({"imgName": name, "imgExtension": extension})
+        return manifest
+
+    @staticmethod
+    def _gallery_next_url(html: str, current_url: str) -> str:
+        """Find the next page of an image gallery.
+
+        Manga/photo sites usually expose this as ``a.btnnext`` / ``rel=next``
+        or visible text such as ``下一张``.  Keep the same host and strip the
+        fragment so ``#pic_block`` does not look like a new page.
+        """
+        try:
+            soup = BeautifulSoup(html, "lxml")
+        except Exception:
+            return ""
+
+        current = current_url.split("#", 1)[0].rstrip("/")
+        current_host = urlparse(current_url).netloc.lower()
+        candidates: list[Tag] = list(
+            soup.select('a.btnnext[href], a[rel="next"][href], link[rel="next"][href]')
+        )
+        for anchor in soup.select("a[href]"):
+            text = anchor.get_text(" ", strip=True).lower()
+            descriptor = " ".join([
+                str(anchor.get("id") or ""),
+                " ".join(str(c) for c in (anchor.get("class") or [])),
+                text,
+            ]).lower()
+            if "prev" in descriptor or "上一" in descriptor:
+                continue
+            if "next" in descriptor or text in (
+                "下一张", "下一張", "下一页", "下一頁", "下页", "下頁",
+            ):
+                candidates.append(anchor)
+
+        seen: set[int] = set()
+        for anchor in candidates:
+            marker = id(anchor)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            href = str(anchor.get("href") or "").strip()
+            if not href or href.startswith(("javascript:", "#")):
+                continue
+            target = urljoin(current_url, href).split("#", 1)[0]
+            if not target.startswith(("http://", "https://")):
+                continue
+            if target.rstrip("/") == current:
+                continue
+            if current_host and urlparse(target).netloc.lower() != current_host:
+                continue
+            return target
+        return ""
+
+    @staticmethod
+    def _count_content_images(content: str) -> int:
+        return len(re.findall(
+            r"!\[[^\]]*\]\([^)]*\)|<img\b[^>]*\bsrc=",
+            str(content or ""),
+            re.IGNORECASE,
+        ))
+
+    @classmethod
+    def _is_bare_image_url(cls, content: str) -> bool:
+        """Whether content is one plain image URL rather than readable text."""
+        value = str(content or "").strip()
+        if not value or "\n" in value or not cls._IMAGE_FILE_RE.search(value):
+            return False
+        return bool(re.fullmatch(r"(?:https?:)?//\S+", value))
+
+    @staticmethod
+    def _dedupe_content_images(content: str) -> str:
+        """Drop duplicate image-only lines while preserving text and order."""
+        lines: list[str] = []
+        seen: set[str] = set()
+        image_line = re.compile(r"^!\[[^\]]*\]\(([^)]+)\)$")
+        for line in str(content or "").splitlines():
+            stripped = line.strip()
+            match = image_line.match(stripped)
+            if match:
+                key = match.group(1).split("#", 1)[0]
+                if key in seen:
+                    continue
+                seen.add(key)
+            lines.append(line)
+        return "\n".join(lines).strip()
 
     @staticmethod
     def _has_forum_content(html: str) -> bool:
@@ -1737,12 +1873,21 @@ class YueduPlugin:
                 content = chapter_engine.parse_content(html)
             except Exception:
                 content = ""
-            if not content or self._looks_like_rule_diagnostic(content, html):
+            if (
+                not content
+                or self._looks_like_rule_diagnostic(content, html)
+                or self._is_bare_image_url(content)
+            ):
                 content = generic_content
         parts = [content] if content else []
 
         # Follow nextContentUrl for multi-page chapters
-        max_pages = 20  # safety limit
+        gallery_limit = len(self._chapter_image_manifest)
+        max_pages = 20
+        if gallery_limit > 1:
+            # Manga/photo albums paginate one image per page; allow the number
+            # of pages the source's own manifest declares (with a hard cap).
+            max_pages = min(max(20, gallery_limit + 1), 512)
         seen_content_urls = {chapter.url}
         content_semaphore = asyncio.Semaphore(self._thread_count())
 
@@ -1760,9 +1905,21 @@ class YueduPlugin:
                 and url.startswith(("http://", "https://"))
             )
         ]
+        if (
+            gallery_limit > 1
+            and self._count_content_images(content) < gallery_limit
+        ):
+            gallery_next = self._gallery_next_url(html, chapter.url)
+            if gallery_next and gallery_next not in seen_content_urls:
+                pending_content_urls.append(gallery_next)
         seen_content_urls.update(pending_content_urls)
         pages_fetched = 0
         while pending_content_urls and pages_fetched < max_pages:
+            if (
+                gallery_limit > 1
+                and self._count_content_images("\n".join(parts)) >= gallery_limit
+            ):
+                break
             eligible = [
                 url
                 for url in pending_content_urls
@@ -1794,17 +1951,25 @@ class YueduPlugin:
                 if next_part and next_part != next_html:
                     parts.append(next_part)
                 pages_fetched += 1
-                pending_content_urls.extend(
+                next_candidates = [
                     url
                     for url in chapter_engine.get_next_content_urls(next_html, next_url)
                     if (
                         url not in seen_content_urls
                         and url.startswith(("http://", "https://"))
                     )
-                )
+                ]
+                if (
+                    gallery_limit > 1
+                    and self._count_content_images("\n".join(parts)) < gallery_limit
+                ):
+                    gallery_next = self._gallery_next_url(next_html, next_url)
+                    if gallery_next and gallery_next not in seen_content_urls:
+                        next_candidates.append(gallery_next)
+                pending_content_urls.extend(next_candidates)
             seen_content_urls.update(pending_content_urls)
 
-        content = "\n".join(parts)
+        content = self._dedupe_content_images("\n".join(parts))
 
         if content and ("<" in content or ">" in content):
             try:
@@ -1906,6 +2071,12 @@ class YueduPlugin:
         instead of ending in ``Chapter returned empty content``.
         """
         soup = BeautifulSoup(html, "lxml")
+        # Gallery pages often contain an ad image before the real page.  Prefer
+        # the site's own content-image containers so the ad never becomes the
+        # chapter and pagination can follow one primary image at a time.
+        primary_images = self._gallery_primary_images(soup, base_url)
+        if primary_images:
+            return "\n".join(primary_images)
         content_selectors = (
             "#content-section pre",
             "#content-section",
@@ -1955,9 +2126,39 @@ class YueduPlugin:
 
     def _chapter_images(self, soup: BeautifulSoup, base_url: str = "") -> list[str]:
         """Markdown image references for a chapter page that is only images."""
+        return self._image_refs_from_tags(soup.find_all("img"), base_url)
+
+    def _gallery_primary_images(
+        self,
+        soup: BeautifulSoup,
+        base_url: str = "",
+    ) -> list[str]:
+        """Image references from common manga/photo viewer containers."""
+        selectors = (
+            "#imgarea img",
+            ".gallery img",
+            "#photo_body img.photo",
+            ".photo_body img",
+            ".manga-images img",
+            ".comic-images img",
+            "img#picarea",
+            "img.photo",
+        )
+        for selector in selectors:
+            refs = self._image_refs_from_tags(soup.select(selector), base_url)
+            if refs:
+                return refs
+        return []
+
+    def _image_refs_from_tags(
+        self,
+        tags: Any,
+        base_url: str = "",
+    ) -> list[str]:
+        """Convert image tags into deduplicated markdown references."""
         refs: list[str] = []
         seen: set[str] = set()
-        for img in soup.find_all("img"):
+        for img in tags:
             src = (
                 img.get("data-src")
                 or img.get("data-original")

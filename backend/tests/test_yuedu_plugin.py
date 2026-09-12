@@ -92,6 +92,86 @@ def test_chapter_image_fallback_keeps_manga_images():
     ]
 
 
+def test_read_chapter_image_manifest_from_toc_script():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.wn09.shop/",
+        "ruleToc": {
+            "chapterList": "li@js:java.put('imgInfoList', '[]'); result;",
+        },
+    })
+    plugin.engine = SimpleNamespace(
+        _try_eval_js=lambda code, raw: (
+            '[{"imgName":"001","imgExtension":"jpg"},'
+            '{"imgName":"002","imgExtension":"JPG"}]'
+        ),
+    )
+
+    assert plugin._read_chapter_image_manifest() == [
+        {"imgName": "001", "imgExtension": "jpg"},
+        {"imgName": "002", "imgExtension": "jpg"},
+    ]
+
+
+def test_gallery_next_url_uses_next_link_not_previous():
+    html = """
+    <a class="btnprev" href="/photos-view-id-10.html#pic_block">上一張</a>
+    <a class="btnnext" href="/photos-view-id-12.html#pic_block">下一張</a>
+    """
+
+    assert YueduPlugin._gallery_next_url(
+        html,
+        "https://www.wn09.shop/photos-view-id-11.html#pic_block",
+    ) == "https://www.wn09.shop/photos-view-id-12.html"
+
+
+@pytest.mark.asyncio
+async def test_fetch_chapter_content_walks_gallery_pages_to_manifest_limit():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.wn09.shop/",
+        "concurrentRate": "0",
+        "ruleContent": {"content": "meta[name='missing']@content"},
+    })
+    plugin._chapter_image_manifest = [
+        {"imgName": "002", "imgExtension": "jpg"},
+        {"imgName": "003", "imgExtension": "jpg"},
+        {"imgName": "004", "imgExtension": "jpg"},
+    ]
+    pages = {
+        "https://reader.test/view/1": """
+          <div class="ad"><img src="https://cdn.test/ad.jpg"></div>
+          <span id="imgarea"><img id="picarea"
+            src="//img.test/data/1/002.jpg?verify=2"></span>
+          <a class="btnnext" href="/view/2">下一張</a>
+        """,
+        "https://reader.test/view/2": """
+          <span id="imgarea"><img id="picarea"
+            src="//img.test/data/1/003.jpg?verify=3"></span>
+          <a class="btnnext" href="/view/3">下一張</a>
+        """,
+        "https://reader.test/view/3": """
+          <span id="imgarea"><img id="picarea"
+            src="//img.test/data/1/004.jpg?verify=4"></span>
+          <a class="btnnext" href="/view/4">下一張</a>
+        """,
+    }
+    get = AsyncMock(side_effect=lambda url: pages[url])
+    chapter = SimpleNamespace(
+        title="全话阅读",
+        url="https://reader.test/view/1",
+        tags="",
+    )
+
+    with patch.object(plugin, "_get", get):
+        content = await plugin.fetch_chapter_content(chapter)
+
+    assert content.splitlines() == [
+        "![](https://img.test/data/1/002.jpg?verify=2)",
+        "![](https://img.test/data/1/003.jpg?verify=3)",
+        "![](https://img.test/data/1/004.jpg?verify=4)",
+    ]
+    assert get.await_count == 3
+
+
 def test_parse_bookshelf_direct_anchor_fallback():
     plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
     html = """

@@ -77,6 +77,21 @@ def test_permanent_chapter_error_detection():
     ) is False
 
 
+def test_transient_chapter_classification_excludes_empty_content():
+    assert SyncService._is_transient_chapter_error(
+        RuntimeError(
+            "Upstream server returned a transient 5xx error page "
+            "(Cloudflare/520 etc.)"
+        )
+    ) is True
+    assert SyncService._is_transient_chapter_error(
+        RuntimeError("Browser request failed: https://example.com/read/1")
+    ) is True
+    assert SyncService._is_transient_chapter_error(
+        RuntimeError("Chapter returned empty content: https://example.com/read/1")
+    ) is False
+
+
 def test_clean_sync_tags_drops_title_and_author_fragments():
     tags = {
         "官路之谁与争锋(卷帘西风666)",
@@ -991,6 +1006,33 @@ async def test_chapter_has_real_content_rejects_anti_bot_text():
         "#第二章\n\n这是一段足够长的真实正文内容，用于确认章节不会被误删。"
     )
     assert service._chapter_has_real_content(chapter) is True
+
+
+@pytest.mark.asyncio
+async def test_image_only_chapter_is_real_content_but_bare_url_is_not():
+    service = SyncService(AsyncMock())
+    service.storage = MagicMock()
+    chapter = Chapter(
+        id="c-manga",
+        book_id="book-1",
+        chapter_number=1,
+        source_chapter_id="https://example.com/photos-view-id-1.html",
+        title="全话阅读",
+        content_path="/x/000001.md",
+    )
+
+    service.storage.read_chapter.return_value = (
+        "#全话阅读\n\n"
+        "![](https://img.example/data/1/002.jpg?verify=2)\n"
+        "![](https://img.example/data/1/003.jpg?verify=3)"
+    )
+    assert service._chapter_has_real_content(chapter) is True
+
+    service.storage.read_chapter.return_value = (
+        "#全话阅读\n\n"
+        "https://img.example/data/1/002.jpg?verify=2"
+    )
+    assert service._chapter_has_real_content(chapter) is False
 
 
 

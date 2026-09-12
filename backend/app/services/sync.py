@@ -218,6 +218,30 @@ class SyncService:
         return status in {408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524}
 
     @staticmethod
+    def _is_transient_chapter_error(exc: BaseException) -> bool:
+        """Whether a chapter failed because the upstream/proxy was temporarily
+        unavailable.
+
+        Unlike an empty content rule, repeated 5xx/timeout failures are worth
+        stopping the current book early for: continuing only sends dozens of
+        doomed requests while the origin is down.
+        """
+        message = str(exc).lower()
+        return any(
+            marker in message
+            for marker in (
+                "5xx",
+                "upstream server returned",
+                "browser request failed",
+                "timeout",
+                "timed out",
+                "connection",
+                "connect error",
+                "network",
+            )
+        )
+
+    @staticmethod
     def _chapter_concurrency(config: dict | None) -> int:
         """Pick chapter fetch concurrency, mirroring Legado's thread model."""
         default = min(
@@ -794,6 +818,17 @@ class SyncService:
         # Make sure the book row really exists before chapter inserts begin.
         book_row_verified = await self._ensure_book_row(book_id, book_values)
         consecutive_blocked = 0
+        consecutive_transient = 0
+        max_consecutive_transient = max(
+            1,
+            int(
+                getattr(
+                    settings,
+                    "SYNC_MAX_CONSECUTIVE_CHAPTER_FAILURES",
+                    5,
+                )
+            ),
+        )
         try:
             while remaining > 0:
                 remote_chapter, content, error, chapter_db_id = await results_queue.get()
@@ -823,6 +858,10 @@ class SyncService:
                             ) from error
                         continue
                     consecutive_blocked = 0
+                    if self._is_transient_chapter_error(error):
+                        consecutive_transient += 1
+                    else:
+                        consecutive_transient = 0
                     failed_chapters.append({
                         "chapter_number": remote_chapter.chapter_number,
                         "title": remote_chapter.title,
@@ -836,6 +875,12 @@ class SyncService:
                         error,
                     )
                     await _report_progress(remote_chapter)
+                    if consecutive_transient >= max_consecutive_transient:
+                        raise RuntimeError(
+                            "上游/代理暂时不可用（网络错误，例如 Cloudflare "
+                            f"520/5xx），已连续 {consecutive_transient} 章失败；"
+                            "已停止同步这本书，请检查代理节点或等待源站恢复后重新同步。"
+                        ) from error
                     continue
 
                 try:
@@ -887,6 +932,7 @@ class SyncService:
                         chapter_id=chapter.id,
                         book_id=book_id,
                     )
+                    consecutive_transient = 0
                     created += 1
                 except SQLAlchemyError as exc:
                     await self.db.rollback()
@@ -1164,17 +1210,33 @@ class SyncService:
             return False
         if not isinstance(content, str):
             return False
+        has_image_refs = bool(
+            re.search(
+                r"!\[[^\]]*\]\([^)]*\)|<img\b[^>]*\bsrc=",
+                content,
+                re.IGNORECASE,
+            )
+        )
         body = re.sub(r"^#.*(?:\r?\n|$)", "", content, flags=re.M).strip()
         # Markdown image references and HTML wrappers are not chapter text.
         body = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", body)
         body = re.sub(r"<[^>]+>", " ", body)
         body = re.sub(r"\s+", " ", body).strip()
-        if len(body) < 20:
-            return False
         lowered = body.lower()
-        return not any(
+        if any(
             marker in lowered for marker in self.BLOCK_CONTENT_MARKERS
-        )
+        ):
+            return False
+        # A chapter stored as one bare image URL is the old broken manga
+        # fallback, not readable content.  Let a re-sync replace it with the
+        # image-page chain (markdown/HTML image references).
+        if body and re.fullmatch(r"(?:https?://\S+\s*)+", body):
+            return False
+        if len(body) < 20:
+            # Image-only manga chapters are valid even though stripping their
+            # image references leaves no text.
+            return has_image_refs
+        return True
 
     @staticmethod
     def _looks_like_junk_chapter(chapter: Chapter, remote_hosts: set[str]) -> bool:

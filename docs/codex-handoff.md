@@ -319,3 +319,38 @@ Cookie 其实都正常，用户看到的是一条指向错误方向的报错，�
 **顺带的需求（同步页排序）**：最近任务改为“正在执行 → 失败 → 其余（按时间倒序）”。
 排序在后端仓库层 `CrawlTaskRepository.list_recent` 用 `CASE` 完成（保证 limit 内先取到在跑/失败
 的任务），前端 `SyncPage.vue` 再用同一个 rank 兜一次，避免任务状态原地变化后仍留在旧位置。
+
+## 11. 2026-09-13：要撸小说连续 520；绅士漫画只保存一条图片 URL
+
+**现象**：
+
+1. 要撸小说（`yuedu_b38b98d309e3`）同步时，同一本书从某一章开始连续得到
+   `Upstream server returned a transient 5xx error page (Cloudflare/520 etc.)`；
+   任务仍继续请求该书后续几十章，crawler 日志被同一种错误刷满。
+2. 绅士漫画（`yuedu_f34d61039a65`）部分书（例如 `photos-index-aid-343500`）章节正文是
+   `#全话阅读` + 一条裸 `img5.wnimg2.cfd/.../002.jpg?verify=...`，阅读器只能显示文字。
+
+**根因**：
+
+1. 线上实测这些要撸章节/书籍的源站响应确为 Cloudflare `520`（HTTP 与浏览器路径都返回
+   Cloudflare 错误页）；这是源站/代理侧故障，不是 Cookie 或规则错误。原逻辑只把单章记为
+   failed，仍会继续请求整本书的每个章节。
+2. 绅士漫画书源目录阶段的 `chapterList` 能拿到 12 张图片的 `imgInfoList`，但正文 JS 的
+   图片域名正则仍写死旧域名 `wnimg1.ru`；当前站已改为 `wnimg2.cfd`，于是 JS 返回空。
+   通用兜底只抓当前页面的图片，且当前 CDN 的 `verify` 签名是逐 URL 生成的，不能拿
+   `imgInfoList` 直接拼完整图片地址。
+
+**改动**：
+
+| 文件 | 改动 |
+|---|---|
+| `backend/app/crawler/plugins/yuedu/__init__.py` | 在 `fetch_book` 后把 TOC 脚本产生的 `imgInfoList` 快照保存在插件实例上，避免并发同步时被 Node 全局变量覆盖 |
+| 同上 | 正文规则为空且存在图片清单时，沿 `a.btnnext`/`rel=next`/“下一张”链逐页提取 `#imgarea`、`.gallery`、`#picarea` 等正文主图；每页保留各自的 `verify` 查询串，达到清单数量即停止（硬上限 512 页） |
+| 同上 | 漫画页优先取正文图片容器，避免把页面顶部广告图当成章节；旧数据中的单条裸图片 URL 会被识别为规则失败并走上述图片链 |
+| `backend/app/services/sync.py` | 连续 5 章为 5xx/超时/连接类瞬态错误时提前终止当前书（本次任务跳过该书，后续同步再试），不再对已 520 的整本书逐章轰炸；阈值可用 `SYNC_MAX_CONSECUTIVE_CHAPTER_FAILURES` 调整 |
+| 同上 | `_chapter_has_real_content`：纯 Markdown/HTML 图片章节视为有效；只有一条裸图片 URL 的旧章节视为无效，重同步时自动回填 |
+| `backend/tests/test_yuedu_plugin.py`、`backend/tests/test_sync_service.py` | 新增图片清单、相册翻页、广告图过滤、图片章节健康判断、瞬态章节终止的回归测试 |
+
+**验证**：`cd backend && python -m pytest -q` → **439 passed**。
+线上影子回归（只放容器 `/tmp/shadow`，不动线上代码）：`photos-index-aid-343500` 的正文从 1 条
+裸 URL 变为 **12 张图片**，每张使用当前页面独立签名，广告图未混入。

@@ -58,6 +58,10 @@ class Settings(BaseSettings):
     SYNC_CHAPTER_CONCURRENCY:int=9
     SYNC_BOOK_CONCURRENCY:int=3
     SYNC_BOOK_CONTINUOUS:bool=False
+    # Stop a book early when the upstream keeps returning transient 5xx
+    # pages.  The task is retried later instead of hammering every chapter
+    # of a book while the origin is unavailable.
+    SYNC_MAX_CONSECUTIVE_CHAPTER_FAILURES:int=5
     SYNC_IGNORE_RATE_LIMIT:bool=False
     SYNC_THREAD_COUNT:int=9
     # How many book sources may sync at the same time.  0 (or less) means
