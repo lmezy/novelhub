@@ -1,211 +1,157 @@
 # 全站同步
 
-全站同步在后台通过 crawler 容器（Celery worker）执行：遍历书源的发现/分类分页，直到没有新书为止，然后逐本下载书籍、章节、元数据、标签和作者信息，并把结果摘要写入 `crawl_tasks.result`。
+全站同步在后台由 crawler 容器的队列 worker 执行：遍历书源的发现/分类分页直到没有新书，
+再逐本下载书籍、章节、元数据、标签和作者信息，结果摘要写入 `crawl_tasks.result`。
 
 ## 使用方式
 
 1. 先导入书源。
-2. 启动全站同步任务：
+2. 启动任务（也可以在「同步」页面点“导入书籍 / 全站同步”）：
 
 ```bash
 curl -X POST http://localhost:8088/api/crawl/tasks \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"source": "yuedu_xxx", "max_pages": 0}'
+  -d '{"source": "yuedu_xxx", "max_pages": 20}'
 ```
 
-`max_pages` 是“发现/分类页数”上限，不是书本数量；设为 `0` 表示不限制页数，任务会一直翻页直到书源没有下一页或没有新书为止。
+`max_pages` 是**发现/分类页数**上限，不是书本数量；`0` 表示不限页数。几十万本书的大站
+不建议做全站同步，`max_pages` 给小一点、或只同步书架更合理。
 
-可在创建任务时传入排除标签和排除分类。匹配发生在书页元数据解析完成后、创建数据库记录和下载章节之前：
+创建任务时可以排除标签和分类。匹配发生在书页元数据解析完成后、入库和下载章节之前，
+被过滤的书计入 `books_filtered`，不算失败：
 
 ```json
-{
-  "source": "source-id",
-  "max_pages": 0,
-  "exclude_tags": ["耽美", "BL"],
-  "exclude_categories": ["言情"]
-}
+{"source": "yuedu_xxx", "max_pages": 20, "exclude_tags": ["耽美"], "exclude_categories": ["言情"]}
 ```
 
-被过滤的书籍计入任务结果的 `books_filtered`，不计入失败数。管理页的“导入并同步”和“全站同步”表单也提供同样的排除输入框。
+3. 轮询任务状态：`curl http://localhost:8088/api/crawl/tasks/<task_id>`
+   （Admin 的「同步」页会自动轮询并显示进度）。
 
-3. 轮询任务状态：
+## 限速与并发
 
-```bash
-curl http://localhost:8088/api/crawl/tasks/<task_id>
-```
+- 请求间隔优先用书源 JSON 里的 `concurrentRate`，未配置时用 `CRAWL_DELAY_MS`（默认 1200ms），
+  另叠加 200–600ms 随机抖动；长任务每 `SYNC_RATE_COOLDOWN_EVERY`（默认 300）次请求暂停
+  `SYNC_RATE_COOLDOWN_SECONDS`（默认 10）秒。
+- 并发模型对齐 Legado：`SYNC_THREAD_COUNT`（默认 9，封顶 9）；单任务内书籍并发
+  `SYNC_BOOK_CONCURRENCY`（默认 3）、章节并发 `SYNC_CHAPTER_CONCURRENCY`（默认 9）；
+  `SYNC_WORKER_CONCURRENCY` 控制同时运行多少个书源任务。
+- 无头浏览器（webJs / webView 书源）受 `YUEDU_PLAYWRIGHT_CONCURRENCY`（默认 3）限制，
+  并且同样走书源限速，避免几十个 Chromium 同时打一个站点。
+- 429/5xx 自动退避重试；设置 `SYNC_IGNORE_RATE_LIMIT=true` 才会忽略书源自身的限速。
+- `SYNC_PAGE_BATCH_SIZE`（默认 0）> 0 时，任务每处理 N 页就保存 `next_page` 并重新排队，
+  间隔由 `SYNC_BATCH_INTERVAL_MS` 控制。
+- Admin 里配置的代理会写进共享 storage，backend / crawler 都能读到。
 
-Admin 的 `Sync` 页也提供“全站同步”按钮，启动后会自动轮询进度。
+## 任务进度与控制
 
-## 爬取限速
+`crawl_tasks.progress` 按页更新（`pages_checked / books_found / books_synced / books_failed`），
+任务可暂停、继续、取消、置顶（`/api/crawl/tasks/<id>/{pause,resume,cancel,move-front}`）。
+暂停发生在翻页/换书的边界，worker 立刻空出来去跑别的任务；恢复时从保存的页继续，
+已下载的章节按章节 URL 去重，不会重复下载。
 
-为避免被目标网站识别为爬虫，每次 HTTP 请求之间会加入安全延迟：
+任务失败但已经同步了一部分书时，累计数量保留在 `result` 里（自动重试不会把它们清零，
+也不会重复累加）。
 
-- 优先使用书源 JSON 里的 `concurrentRate`（毫秒）；
-- 未配置时使用环境变量 `CRAWL_DELAY_MS`，默认 `1200`；
-- 每次延迟额外叠加 200-600ms 随机抖动；
-- 长任务每处理 `SYNC_RATE_COOLDOWN_EVERY`（默认 300）次请求暂停
-  `SYNC_RATE_COOLDOWN_SECONDS`（默认 10）秒，避免长时间高频请求触发站点风控；
-- 遇到 429/5xx 会自动重试并退避；
-- crawler 队列 worker 可按 `SYNC_WORKER_CONCURRENCY` 并行跑多个爬取任务；单个任务内章节下载按 `SYNC_CHAPTER_CONCURRENCY` 并发，默认 `9`。
-- 并发模型对齐 Legado：`SYNC_THREAD_COUNT` 默认 `9`，最大封顶 `9`；目录分页和正文分页也按这个线程数并行抓取。
-- 全站同步默认按 `SYNC_BOOK_CONCURRENCY` 并发处理书籍，默认 `3`；单本书的章节下载按 `SYNC_CHAPTER_CONCURRENCY`（默认 `9`）控制，调大前请确认书站能承受请求量。
-- 书源里的 `concurrentRate` 默认仍会生效；如果明确愿意承担被限流/封禁的风险，可设置 `SYNC_IGNORE_RATE_LIMIT=true`，让章节并发直接使用 `SYNC_CHAPTER_CONCURRENCY`。
-- 多个书源任务可以通过 `SYNC_WORKER_CONCURRENCY` 并行执行，默认 `3`；手动全站同步、书源导入并同步、每天 `03:00` 的自动同步都会并行处理多个书源，每个任务使用独立数据库会话。
-- 设置 `SYNC_PAGE_BATCH_SIZE`（默认 `0`）后，全站任务每处理完 N 页就保存 `next_page` 并自动重新排队，间隔由 `SYNC_BATCH_INTERVAL_MS` 控制，避免单个任务长时间连续占用。
-- Admin 里配置的代理会写入共享 storage，backend 和 crawler worker 都能读取。
+## 自动更新
 
-几十上百万本书的站点不建议做全站同步。更合理的做法是同步书架/手动选择要看的书，或给全站任务设置较小的 `max_pages`；全站同步更适合几千本以内的小站。
+- Celery Beat 每天 `03:00` 跑 `daily_sync_all`：有 Cookie 的书源同步书架，没有 Cookie 的
+  书源对库内书籍检查新章节。它**不会**自动全站发现新书，发现新书要手动发起全站同步。
+  自动任务有 `AUTO_SYNC_MAX_PAGES`（默认 3）兜底，不会变成无限量爬取。
+- 再次同步同一本书按章节 URL 去重；失败章节下次会重试；已存在的章节不会被覆盖，
+  需要覆盖用阅读页的“重同步本章”或书详情页的“重新同步”。
+- cookie 健康检查（`check_cookie_health`）每项最多 `COOKIE_CHECK_ITEM_TIMEOUT`（默认 60s），
+  避免被反爬的站点把 2 点的任务拖成数小时。
 
-## 任务进度
+## 常见报错排查
 
-`crawl_tasks.progress` 会按页更新：
+### 同步/导入 0 本书，日志报 All connection attempts failed
 
-```json
-{"pages_checked": 12, "books_found": 480, "books_synced": 320, "books_failed": 2}
-```
+Admin → 代理里填的是别的主机地址，容器访问不到。crawler/backend 在 NAS 上用的是 host
+网络，`http://127.0.0.1:27890`（metacubexd / mihomo 混合端口）是对的；代理在别的机器上时
+要改成容器可达的地址或关闭代理。代理连不上时程序会自动尝试直连，但每次都会先白等一个
+连接超时。
 
-Admin 的“全站同步”卡片会显示进度条和已检查页数。
+### 任务报“书源未返回可同步的书籍”，但书源本身正常
+
+2026-09-12 起：如果该源库里**已有书**，目录整轮返回空会被当作网络/代理波动（提示里带
+“网络”字样），任务在 60s / 120s 后自动重试，不再把已同步的成果判成败；只有全新书源
+才会保留这条错误。重试仍失败时看日志里的 `Explore kind ... returned no books`，
+它带着具体分类 URL。
+
+### 只有首页返回 0 本书
+
+书源的发现规则（`ruleExplore` 的 `bookList`）和站点当前 HTML 不匹配。解析器会退回通用
+列表页解析，仍为 0 说明页面没有可识别的书籍链接：用浏览器确认页面结构，必要时换源。
+
+### 目录只同步了一页（几百本）就显示“完成”
+
+书源的 `exploreUrl` 是写死的分类 URL（没有 `{{page}}`），旧版每页请求同一地址，去重后
+判定到底。现在会从第 1 页的分页链接自动学习模板（`/page/2`、`/index_2.html`、`?page=2`、
+`?paged=2`），后续按模板翻页；页面 404/410 视为目录结束。规则自带 `{{page}}` 或 JS 模板
+的书源不受影响。
+
+> 風月文學網 h528 是“一篇文章=一本书”的短篇站，修好翻页后每页约 360 本，量级很大，
+> 建议先用较小的 `max_pages` 或随时暂停/取消；任务可断点续跑。
+
+### 任务卡在“运行中”不动，日志报 MissingGreenlet
+
+一本书同步失败后 `rollback()` 会让 session 里所有 ORM 实例过期，旧版错误处理又同步读取
+`task_obj.progress`，于是真正的错误被 greenlet 报错顶掉、任务永远停在 `running`。
+现在错误分支只读内存里的进度快照，写终态时会用独立 session 兜底；crawler 重启时也会把
+遗留的 `running` 任务改回 `pending` 自动续跑，不需要手动删任务。
+
+### 一批书同步失败后报“同步连续失败超过 N 本，已中止任务”
+
+这条只针对**非瞬态**失败（规则 / Cookie 类）。Cloudflare 520、浏览器超时、连接中断属瞬态：
+它们单独计数，达到阈值时抛“上游/代理暂时不可用（网络…）”，由 worker 在 60s/120s 后自动
+重试（`SYNC_TASK_MAX_AUTO_RETRIES`，默认 2）。成功一本即清零两种计数。
+
+### 章节报 Chapter returned empty content
+
+现在会区分三种真实原因：
+
+- `该书在源站已被删除或禁用` / `章节在源站已被删除或禁用`：站点提示页（爱丽丝书屋 54334
+  这类），重试无用，只能删书或等源站恢复；
+- `Upstream server returned a transient 5xx error page`：Cloudflare 520 等瞬态错误，会重试；
+- 其余才是真的取不到正文（选择器不匹配、需要 Cookie、正文全在图片里）。
+
+### 站点要求验证码 / 人机验证 / Cloudflare “Just a moment”
+
+这类页面在服务端无法绕过（代码也不会去绕）。处理办法：在浏览器里（出口 IP 与代理一致）
+打开站点通过验证，把 Cookie 导入「设置 → 书源 → Cookie / 账号」，再重新同步。
+已知情况：
+
+- 菠萝猫（boluomao.com）：GoEdge 图形验证码；
+- SiS文學網（b.sis.la）、御宅屋（yswhub.cc）、第一版主（banzhu…net）：Cloudflare 挑战页；
+- 搬山人小说网（banshanren.com）：连 Playwright 浏览器也会被挑战（2026-09-12 实测：
+  同一个任务里连续几十章被判拦截），同样需要 Cookie 或换一个能过验证的代理节点；
+- 禁忌书屋 cool18：页面里出现“请稍后再试”属正常文案，已不会被误判成拦截。
+
+### 书源发现规则是 `<js>` / `@js:` 脚本，同步报无法执行
+
+例如 UAA 小说的 `exploreUrl` 是 `eval(String(Reload('https://…/xxx.js')))`，依赖完整
+Legado Android 运行时（`source`、`cache`、`java.importScript`）和登录 token，
+NovelHub 的 Node shim 跑不了这类脚本：请在 Legado 里搜索后走书源搜索/手动链接同步，
+或在 yckceo 书源库换一个实现。
+
+### 爱丽丝书屋（alicesw.com）域名解析异常
+
+该域名曾被 DNS 污染（解析到 127.0.0.1）。插件会自动用 DoH（doh.pub → Cloudflare →
+Google）解析真实 IP，并以 `IP + Host 头` 直连，结果缓存 300 秒，无需改书源 URL。
+所有 DoH 端点都不通时，可在服务器 `/etc/hosts` 里写死真实 IP 作为双保险。
 
 ## 迁移
 
-本功能新增 `crawl_tasks.result` 字段：
-
-```bash
-cd backend
-alembic upgrade head
-```
-
-Docker 部署时 backend 容器启动会自动执行迁移。
+`crawl_tasks.result / progress / priority / resume_at` 等字段由 Alembic 管理
+（`cd backend && alembic upgrade head`；Docker 启动 backend 时自动执行）。
 
 ## 批量删除
 
 ```bash
 curl -X POST http://localhost:8088/api/books/batch-delete \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"ids": ["book-id-1", "book-id-2"]}'
 ```
 
-管理员的 Home 页面也支持勾选多本书后批量删除。
-
-## 常见问题
-
-### 同步/导入显示 0 本书，日志报 All connection attempts failed
-
-如果 Admin -> Proxy 启用了代理，但代理地址填的是宿主机 `127.0.0.1`，Docker 容器内无法访问该地址。请把代理改为容器可访问的地址（宿主机网关或 `host.docker.internal`），或关闭代理。NovelHub 现在会在代理连不上时自动尝试直连。
-
-### 批量删除报 relation "book_categories" does not exist
-
-这是旧数据库缺少分类表迁移导致的。运行 `docker compose restart backend` 或手动执行 `cd backend && alembic upgrade head` 即可补建 `categories` 与 `book_categories` 表。
-
-### 全站同步显示 0 本书但页面请求成功
-
-如果 YueDu 书源的 `ruleExplore` / `ruleSearch` 规则与网站当前 HTML 不匹配，旧版可能只返回没有 `bookUrl` 的空条目。现在会过滤空条目，并自动回退到通用列表页解析；相对链接也会按当前列表页拼接。重新部署 backend 后再发起一次全站同步即可。
-
-### 同步到分类、章节显示小说名、正文报 content missing
-
-旧版 YueDu 规则引擎没有完整处理书源里常见的 `|` 规则分隔符、字面量回退和 `replaceRegex` 数组，导致规则解析失败后把分类链接、书页链接当成书籍和章节。现在会按 `bookUrlPattern` 过滤发现结果，过滤与书页 URL 相同的目录链接，并支持单 `|` 规则与 `replaceRegex` 数组。章节接口也会对缺失正文返回明确的 404 或空正文，不再报 Pydantic 校验错误。已经同步错的分类书籍需要先删除，再重新同步。
-
-### 后端反复重启，日志报 StringDataRightTruncation
-
-`alembic_version.version_num` 列只有 32 字符，迁移 ID 不能超过该长度。当前分类迁移已改为 `0009_categories`，更新后端代码后重新启动 backend 即可。
-
-### 同步后只有几百本书，且有大量重复/空白章节
-
-常见原因是书源规则已经和站点页面脱节，通用兜底解析把站内导航、外链广告和
-“查看所有章节”按钮都当成了章节，同时章节页被站点反爬限流后返回空正文。
-
-新版已做以下处理：
-
-- 书籍页自动识别“查看所有章节 / 章节目录”链接，抓取完整目录页；
-- 章节链接按同站、正文路径和导航关键词过滤，外部广告链接不再入库；
-- 按 URL 和同目录下重复标题去重（例如 `/book/1/0.html` 与真实章节链接）；
-- 识别“访问异常，请稍后再试”这类反爬/限流页，不再写入空白章节；
-- 重新同步时会自动清理已有垃圾章节和空白章节，再下载真实内容；
-- 无 `concurrentRate` 的书源默认请求间隔改为 1200ms，避免全站同步把站点打到限流。
-
-重新构建并启动 crawler/backend 后，在 Sync 页面对已有书籍执行“重新同步”即可。
-
-### 同步任务报 chapters_book_id_fkey 或 MissingGreenlet
-
-旧版章节身份用的是目录里的位置序号，目录顺序变化后会把同一章当作新章节，并可能在章节入库前写入 `chapters`，触发外键错误；进度回调在会话回滚后再次读取过期 ORM 属性时还会报 `MissingGreenlet`。
-
-现在章节身份改为章节 URL（与 Legado 的 `BookChapter.url` 一致），同步时会自动把旧的位置 ID 升级为 URL，不再重复下载；进度回调也只读写内存中的进度字典，不会在回滚后触发懒加载。需要重新构建并启动 crawler 容器：
-
-```bash
-docker compose up -d --build crawler backend scheduler
-```
-
-如果之前同步产生了重复章节，删除对应书籍后重新同步即可。
-
-如果 `chapters_book_id_fkey` 仍然出现，说明书籍行在写入章节前丢失或被并发删除。现在同步开始前会校验 `books` 行是否存在，缺失时自动用同一 `book_id` 重建书籍行后再写章节；中途被删除也会在后续章节写入前恢复，避免整本书的章节全部失败。
-
-### 任务报 `MissingGreenlet: greenlet_spawn has not been called` 且状态一直卡在“运行中”
-
-（2026-09-11 修复）
-
-发生在一本书同步失败之后：`SyncService` 会 `rollback()` 工作 session，SQLAlchemy 的
-`rollback()` 会把该 session 里**所有 ORM 实例标记为 expired**；旧版的任务错误处理紧接着
-用**同步方式**读取了 `task_obj.progress`，于是触发懒加载 → 抛出 `MissingGreenlet`，
-真正的失败原因被顶掉，`crawl_tasks.status` 也永远停在 `running`。
-
-现在：
-
-- 任务错误处理只使用内存里的进度快照，不再读 ORM 属性；
-- 任务终态（failed / completed / paused / cancelled）会先写 ORM 再 commit，
-  **commit 失败时用独立 session 直接 UPDATE 该行**，因此不会再出现“卡在运行中”的僵尸任务；
-- 重启 crawler 时，所有遗留的 `running` 任务会自动改回 `pending` 重新排队
-  （`_reset_stale_running_tasks()`），无需手动删任务。
-
-### 目录只同步了一页（几百本）就显示“完成”
-
-（2026-09-11 修复）
-
-有些书源的 `exploreUrl` 是**写死的分类 URL**，没有 `{{page}}` 占位符
-（例如風月文學網 h528 的 `http://www.h528.com/post/category/xxx`）。旧版对这类 URL
-每一页请求的都是同一个地址，第 2 页拿到的书全部与第 1 页重复，去重后判定“目录到底了”，
-于是只同步了第一页就显示完成。
-
-现在 crawler 会在抓第 1 页时从页面的分页链接里**自动学习**分页模板
-（`/page/2`、`/index_2.html`、`?page=2`、`?paged=2`），随后 `page>1` 按模板翻页；
-页面返回 404/410 视为“目录结束”，正常结束任务。规则本身带 `{{page}}` 或 JS 模板的书源
-仍然完全按规则执行，不受影响。
-
-> 風月文學網属于“一篇文章=一本书”的短篇站，修好翻页后全站量级很大（每页约 360 本）。
-> 建议先在小范围试跑，必要时用 Sync 页面的“暂停/取消”控制；任务支持断点续跑，
-> 已入库的书与章节不会重复下载。
-
-### 一批书同步失败被判定为“连续失败，已中止任务”
-
-（2026-09-11 调整）
-
-Cloudflare 520/5xx、浏览器超时、连接中断这类**瞬态**错误不再计入“连续失败”计数器，
-因此不会再用“反爬”的名义中止整个任务；连续瞬态失败达到阈值时抛出的错误带“网络/代理”
-字样，会被任务级自动重试识别，由 worker 在 60s/120s 后自动重发（默认重试 2 次）。
-只有**非瞬态**的连续失败才会触发原来的反爬中止逻辑。
-
-## 任务控制
-
-全站同步任务会写入 `crawl_tasks`，前端在 Admin 页面启动后由全局状态持续轮询，离开页面再回来仍会显示当前任务。运行中的任务可以暂停、继续或取消。
-
-同步进度集中在 `/sync` 页面展示：可以发起全站同步、查看当前任务的页数/书籍/章节进度、暂停/继续/取消，以及查看最近任务列表。书源导入现在也会先创建同步任务，再跳转到该页面查看进度。
-
-`/sync` 页面的书源选择框支持多选，一次会为每个选中的书源创建一个全站同步任务；队列 worker 会按 `SYNC_WORKER_CONCURRENCY` 同时运行多个任务，而不是等前一个完成。
-
-## 自动更新与错误章节
-
-- Celery Beat 每天 `03:00` 自动执行 `daily_sync_all`：有 Cookie 的书源同步书架，没有 Cookie 的书源对库内已有书籍逐本检查新章节。它不会自动全站发现新书，发现新书仍需手动发起全站同步。
-- 再次同步同一本书时按章节 URL 去重：已有章节跳过，只有新章节会下载；失败章节会在下次同步时重新尝试，不会永久跳过。
-- 如果某章内容抓错，普通再次同步不会覆盖已存在的章节。管理员可以在阅读页点击“重同步本章”，只重新抓取并覆盖当前章节；也可以回到书籍详情页点击“重新同步”整本检查。
-
-## 书架与书籍
-
-首页 `/` 是书架，只显示当前用户收藏/标记的书籍；`/books` 是书籍页，显示仓库中所有已保存的书籍。书籍详情页和书籍卡片上都可以切换收藏状态。
-
-## 本地添加与手动上传
-
-Admin 的“本地/手动”页提供两种入口：
-
-- 本地 Markdown：填写服务器上的书籍目录路径，目录内可直接放章节 `.md` 文件，也可附带 `metadata.json`。
-- 手动上传：填写书名、作者、简介、标签，粘贴章节文本或选择 `.txt / .md` 文件；章节标题用 `## 章节标题` 分隔。
+管理员的 Home 页面也能勾选多本书后批量删除。

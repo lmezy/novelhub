@@ -37,43 +37,15 @@ relying on tags.
 - The switches apply to every account, including `admin` and `super_admin`.
   Admins are not automatically granted full visibility; set both switches to
   on to see all books.
-- Only admins can toggle another user's switches:
-
-```bash
-curl -X PUT http://localhost:8088/api/admin/users/<user_id>/visibility \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"r18_enabled": true, "non_r18_enabled": true}'
-```
-
-Grant a user the buttons:
-
-```bash
-curl -X PUT http://localhost:8088/api/admin/users/<user_id>/visibility \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"can_manage_visibility": true}'
-```
-
-A granted user can then manage their own visibility:
-
-```bash
-curl -X PUT http://localhost:8088/api/auth/me/visibility \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"r18_enabled": true, "non_r18_enabled": true}'
-```
+- Only admins can toggle another user's switches (`PUT /api/admin/users/<id>/visibility`,
+  body `{"r18_enabled": true, "non_r18_enabled": true}`, 也可只传 `can_manage_visibility`）。
+  被授权的用户可以用 `PUT /api/auth/me/visibility` 管理自己的开关。
 
 - The `r18` / `all-ages` tags are only returned to admins. Normal users never
   see these classification tags, even when their R18 switch is enabled.
 
 ## Migration
 
-```bash
-cd backend
-alembic upgrade head
-```
-
-Docker startup runs migrations automatically. Existing books keep their
-current state as all-ages until they are synced again; run `rebuild index` in
-Admin after migration so search filters include the new `is_r18` field.
+`sources.is_r18` / `books.is_r18` / `users.r18_enabled` 等字段由 Alembic 迁移
+（Docker 启动 backend 时自动执行）。升级后已有书籍保持 all-ages，重新同步才会更新分级；
+迁移后在 Admin 点一次 `rebuild index`，让搜索索引带上 `is_r18` 字段。

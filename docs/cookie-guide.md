@@ -1,152 +1,54 @@
-# Cookie 获取指南
+# Cookie 获取与使用
 
-NovelHub 通过浏览器 Cookie 来登录小说网站。本指南介绍如何获取各网站的 Cookie。
+NovelHub 用浏览器 Cookie 登录书源站点。**绝大多数书源不需要 Cookie**；只有站点要求
+验证码 / 人机验证 / Cloudflare 挑战，或需要登录才能看书架时，才需要导入。
 
----
+## 1. 获取 Cookie
 
-## 通用方法（适用于所有网站）
+**方法 A：DevTools 手动复制**
 
-### 方法 A：浏览器 DevTools 手动复制
-
-1. 用 **Chrome** 或 **Edge** 打开目标小说网站
-2. 正常登录你的账号
-3. 按 `F12` 打开开发者工具
-4. 切换到 **Application**（应用程序）标签
-5. 左侧找到 **Cookies** → 点击网站域名
-6. 你会看到一列 Name/Value 的 cookie 条目
-7. 按以下格式拼接所有 cookie（用 `; ` 分隔）：
+1. 用 Chrome / Edge 打开站点并完成登录（或通过验证码 / Cloudflare 验证）；
+2. `F12` → **Application（应用程序）** → 左侧 **Cookies** → 选站点域名；
+3. 把 Name=Value 拼成一整串，用 `; ` 分隔：
 
 ```
 name1=value1; name2=value2; name3=value3
 ```
 
-8. 复制整串文本，粘贴到 NovelHub 管理后台的 Cookie 输入框
+**方法 B：扩展导出（推荐）**：EditThisCookie → Export → 选 Netscape 或 Header String。
 
-### 方法 B：浏览器扩展一键导出（推荐）
+## 2. 导入 NovelHub
 
-安装 **EditThisCookie**（Chrome/Edge 扩展商店均有）：
+「设置 → 书源」→ 找到该书源 → 点“Cookie / 账号”展开 → 粘贴 Cookie → 保存 → 点“测试”。
 
-1. 登录网站后，点击扩展图标
-2. 点击导出按钮（Export）
-3. 格式选择 **Netscape** 或 **Header String**
-4. 复制导出内容，粘贴到 NovelHub
+同一处还能填书源账号密码，用于自动登录刷新失效的 Cookie。Cookie 以 AES-256-GCM 加密
+存储，请求时原样放进 `Cookie` 头（URL 编码的值不用手工解码）。
 
----
+## 3. 什么时候必须用 Cookie
 
-## AliceSW（爱丽丝书屋）
+| 站点 | 防护 | 处理 |
+|---|---|---|
+| SiS文學網 `b.sis.la` | Cloudflare 挑战页 | 浏览器过验证后导入 Cookie |
+| 御宅屋 `yswhub.cc` | Cloudflare 挑战页 | 同上 |
+| 第一版主 `banzhu…net` | Cloudflare 挑战页 | 同上 |
+| 菠萝猫 `boluomao.com` | GoEdge 图形验证码 | 同上 |
+| 搬山人小说网 `banshanren.com` | 浏览器也会被挑战 | 同上 |
+| 爱丽丝书屋 `alicesw.com` | 无（曾 DNS 污染，插件已用 DoH 绕过） | 一般不需要 |
+| 禁忌书屋 `cool18.com` | 无（页面里的“请稍后再试”是正常文案） | 一般不需要 |
 
-**网站域名可能变化。** 常见域名包括：
+**关键**：浏览器过验证所用的出口 IP 要和 NovelHub 的代理节点一致，否则 Cookie 与 IP
+不匹配，导入后仍会被拦。
 
-- `www.alicesw.com`
-- `www.alicesw.me`
-- `www.alicesw.org`
+## 4. 常见问题
 
-如果默认域名 (`www.alicesw.com`) 无法访问，请自行搜索最新域名，并在创建 Source 时修改 URL。
+- **测试失败**：站点不可达 / 域名变了 / Cookie 过期 / Cookie 绑定了签发时的 IP 或浏览器
+  指纹 / 该书源不支持书架抓取。先确认浏览器里还能正常打开书架页。
+- **提示 No cookie found**：Cookie 的 `source` 必须与书源 ID 完全一致（大小写敏感），
+  例如 `yuedu_b38b98d309e3`。
+- **Cookie 太长**：输入框是 textarea，可以贴整段；JSON 格式可用在线工具转成 Header String。
+- **盗版站换域名**：在「设置 → 书源」编辑书源 URL，重新登录取 Cookie 再更新。
+- **Cookie 失效**：重新登录取新 Cookie 覆盖；填了账号密码的会由定时任务尝试自动刷新。
 
-### 获取步骤
+## 5. 安全提醒
 
-1. 打开 AliceSW 网站并登录
-2. 登录后按 F12 → Application → Cookies
-3. 复制所有 cookie
-4. 在 NovelHub Admin → Cookies → Add Cookie：
-   - **Source**: 填 `alicesw`
-   - **Cookie Data**: 粘贴 cookie 字符串
-   - **Expired At**: 留空或设置过期日期
-
-### 关键 Cookie
-
-通常需要以下 cookie 才能正常工作：
-
-- 会话 cookie（如 `PHPSESSID`、`token`、`user`）
-- 登录态 cookie（如 `remember_me`、`auth`）
-
-### 测试
-
-保存后在 Admin → Sync 页面，输入 `alicesw` 作为 Source ID，选择"书架同步"测试是否成功。
-
----
-
-## Qidian（起点中文网）
-
-网站：`https://www.qidian.com`
-
-### 获取步骤
-
-1. 打开 qidian.com 并登录（可用 QQ/微信/手机号）
-2. F12 → Application → Cookies → `www.qidian.com`
-3. 复制所有 cookie
-4. 在 NovelHub Admin → Cookies → Add Cookie：
-   - **Source**: 填 `qidian`
-   - **Cookie Data**: 粘贴 cookie 字符串
-
-### 关键 Cookie
-
-- `_csrfToken` — CSRF 令牌
-- `qd_uid` / `qd_theme` — 用户标识
-- 登录后自动生成的会话 cookie
-
-### 注意
-
-- 起点部分内容有字体加密，正文抓取可能需要额外处理
-- Cookie 有效期通常较长（数周到数月）
-- 如果开启了两步验证，需要保持浏览器会话活跃
-
----
-
-## Fanqie（番茄小说）
-
-网站：`https://fanqienovel.com`
-
-### 获取步骤
-
-1. 打开 fanqienovel.com 并用手机号登录
-2. F12 → Application → Cookies → `fanqienovel.com`
-3. 复制所有 cookie
-4. 在 NovelHub Admin → Cookies → Add Cookie：
-   - **Source**: 填 `fanqie`
-   - **Cookie Data**: 粘贴 cookie 字符串
-
-### 关键 Cookie
-
-- `novel_web_id` — 设备标识
-- 登录后的 session token
-
-### 注意
-
-- 番茄小说的页面大量使用 JavaScript 渲染，NovelHub 使用 Playwright 浏览器来处理
-- 首次同步可能较慢，因为需要启动 headless 浏览器
-
----
-
-## 常见问题
-
-### Cookie 失效了怎么办？
-
-Cookie 通常有有效期。失效后需要重新登录网站并获取新 cookie，然后在 NovelHub 中更新。
-
-### Cookie 字符串太长粘贴不了？
-
-后台的 cookie 输入框是 textarea，可以容纳很长的内容。如果是从 EditThisCookie 导出的 JSON 格式，可以用 [EditThisCookie JSON to Header String](https://www.convertsimple.com/convert-json-to-cookie-string/) 转换。
-
-### 同步时提示 "No cookie found"
-
-确认 Cookie 的 Source 字段与 Source 的 ID 完全一致（大小写敏感）。
-
-- AliceSW → Source ID: `alicesw`
-- Qidian → Source ID: `qidian`
-- Fanqie → Source ID: `fanqie`
-
-### 盗版站域名变了怎么办？
-
-1. 找到新域名
-2. 在 Admin → Sources 中编辑对应 Source 的 URL
-3. 用新域名登录并获取新 Cookie
-4. 更新 Cookie
-
----
-
-## 安全提醒
-
-- Cookie 包含你的登录凭证，**不要分享给他人**
-- NovelHub 使用 AES-256-GCM 加密存储所有 Cookie
-- 建议使用小号或专用账号，避免主账号风险
+Cookie 等于登录凭证：不要分享、不要提交到仓库或粘贴进聊天记录。建议用专用小号。

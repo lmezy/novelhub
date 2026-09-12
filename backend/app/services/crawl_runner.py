@@ -108,6 +108,37 @@ def _describe_error(exc: BaseException | None) -> str:
     return message if message.strip() else type(exc).__name__
 
 
+# Counters a crawl task accumulates across the attempts of one task row.
+_RESULT_COUNTER_KEYS = (
+    "books_found",
+    "books_synced",
+    "books_failed",
+    "books_filtered",
+    "chapters_created",
+    "chapters_skipped",
+    "chapters_failed",
+)
+
+
+def _carry_result_counters(previous: dict | None, addition: dict | None) -> dict:
+    """Merge one attempt's counters into a crawl-task ``result`` snapshot.
+
+    Automatic retries re-run discovery, so a later attempt only knows its own
+    numbers.  Carrying the earlier ones forward keeps the report truthful: a
+    task that synced 68 books before a proxy outage used to lose those 68 when
+    the retry reported (or failed with) zero.
+    """
+    merged = dict(previous or {})
+    addition = addition or {}
+    for key in _RESULT_COUNTER_KEYS:
+        merged[key] = int(merged.get(key, 0) or 0) + int(addition.get(key, 0) or 0)
+    merged["pages_checked"] = max(
+        int(merged.get("pages_checked", 0) or 0),
+        int(addition.get("pages_checked", 0) or 0),
+    )
+    return merged
+
+
 async def _write_task_row(task_id: str, values: dict[str, Any]) -> bool:
     """Persist crawl-task fields through a dedicated short-lived session.
 
@@ -214,6 +245,26 @@ async def run_crawl_task_async(task_id: str) -> dict:
             return {"status": "skipped", "reason": task_obj.status}
 
         progress_state = dict(task_obj.progress or {})
+        # ``result`` holds what previous attempts already reported while
+        # ``progress`` counters describe the attempt that is starting now.
+        # Keeping the loaded counters here made every retry re-merge the same
+        # numbers (68 synced books became 136 in the report).
+        previous_result = (
+            dict(task_obj.result) if isinstance(task_obj.result, dict) else {}
+        )
+        if not previous_result:
+            # Tasks created before the counters moved into ``result`` only have
+            # numbers in ``progress``; keep those instead of reporting zero.
+            previous_result = {
+                key: int(progress_state.get(key, 0) or 0)
+                for key in _RESULT_COUNTER_KEYS
+            }
+            previous_result["pages_checked"] = int(
+                progress_state.get("pages_checked", 0) or 0
+            )
+        for _key in _RESULT_COUNTER_KEYS:
+            progress_state[_key] = 0
+        progress_state["pages_checked"] = 0
         start_page = int(progress_state.get("next_page") or 1)
         chapter_progress_updates = 0
         db_lock = asyncio.Lock()
@@ -295,7 +346,7 @@ async def run_crawl_task_async(task_id: str) -> dict:
                 )
                 raise TaskCancelled("Task cancelled")
             # Preserve every page result when a task is resumed in batches.
-            previous = task_obj.result if isinstance(task_obj.result, dict) else {}
+            previous = previous_result
             merged = dict(result)
             for key in ("books_found", "books_synced", "books_failed", "books_filtered", "chapters_created", "chapters_skipped", "chapters_failed"):
                 merged[key] = int(previous.get(key, 0) or 0) + int(result.get(key, 0) or 0)
@@ -385,6 +436,7 @@ async def run_crawl_task_async(task_id: str) -> dict:
                     "finished_at": None,
                     "resume_at": _naive_utcnow() + timedelta(seconds=delay),
                     "progress": {**progress_state, "auto_retries": retries + 1},
+                    "result": _carry_result_counters(previous_result, progress_state),
                     "error": message,
                 })
                 logger.warning(
@@ -406,6 +458,7 @@ async def run_crawl_task_async(task_id: str) -> dict:
                 "error": _describe_error(exc),
                 "finished_at": _naive_utcnow(),
                 "progress": dict(progress_state),
+                "result": _carry_result_counters(previous_result, progress_state),
             })
             logger.opt(exception=exc).error("Crawl task {} failed", task_id)
             raise

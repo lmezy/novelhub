@@ -2597,13 +2597,25 @@ class YueduPlugin:
                 if not resolved:
                     continue
                 try:
-                    results.extend(await self._fetch_kind_items(
+                    items = await self._fetch_kind_items(
                         kind_url=kind_url,
                         resolved=resolved,
                         page=page,
                         explore_kind=kind.get("title", ""),
                         options=options,
-                    ))
+                    )
+                    if not items and page <= 1:
+                        # A first catalog page that parses to nothing is the
+                        # signature of a silent failure (proxy/site served an
+                        # error or empty page with HTTP 200).  Record it so the
+                        # log explains why the task saw "0 books".
+                        logger.warning(
+                            "Explore kind {} returned no books on page {}: {}",
+                            kind.get("title", kind_url),
+                            page,
+                            resolved,
+                        )
+                    results.extend(items)
                 except Exception as exc:
                     message = str(exc)
                     described = (

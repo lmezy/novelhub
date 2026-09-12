@@ -1321,6 +1321,72 @@ async def test_discover_and_sync_all_dedupes_and_stops_on_empty():
 
 
 @pytest.mark.asyncio
+async def test_discover_and_sync_all_empty_catalog_with_known_books_is_retryable():
+    """An empty catalog for a source that already has books is a hiccup.
+
+    要撸小说 answered every category page with HTTP 200 and nothing to parse
+    right after the proxy dropped connections; the retry attempt then failed
+    the task with the misleading "书源未返回可同步的书籍" message.
+    """
+    db = _mock_db()
+    db.get.return_value = _source()
+    # 1st scalar: stored cookie lookup, 2nd: "does this source have books?".
+    db.scalar.side_effect = [None, "book-id"]
+
+    plugin = AsyncMock()
+    plugin.set_cookie = MagicMock()
+    plugin.discover_books.return_value = []
+
+    with patch("app.services.sync.get_plugin", return_value=plugin):
+        with pytest.raises(RuntimeError) as excinfo:
+            await SyncService(db).discover_and_sync_all("src1", max_pages=10)
+
+    assert "网络" in str(excinfo.value)
+    from app.services.crawl_runner import _is_transient_task_error
+
+    assert _is_transient_task_error(excinfo.value) is True
+
+
+@pytest.mark.asyncio
+async def test_discover_and_sync_all_empty_catalog_without_books_still_fails():
+    """A brand new source with an empty catalog keeps the actionable error."""
+    db = _mock_db()
+    db.get.return_value = _source()
+    db.scalar.side_effect = [None, None]
+
+    plugin = AsyncMock()
+    plugin.set_cookie = MagicMock()
+    plugin.discover_books.return_value = []
+
+    with patch("app.services.sync.get_plugin", return_value=plugin):
+        with pytest.raises(ValueError, match="未返回可同步的书籍"):
+            await SyncService(db).discover_and_sync_all("src1", max_pages=10)
+
+
+@pytest.mark.asyncio
+async def test_discover_and_sync_all_resume_past_page_budget_completes():
+    """Resuming past ``max_pages`` is "already done", not "no books"."""
+    db = _mock_db()
+    db.get.return_value = _source()
+
+    plugin = AsyncMock()
+    plugin.set_cookie = MagicMock()
+    plugin.discover_books.return_value = []
+
+    with patch("app.services.sync.get_plugin", return_value=plugin):
+        result = await SyncService(db).discover_and_sync_all(
+            "src1",
+            max_pages=3,
+            start_page=4,
+        )
+
+    assert result["done"] is True
+    assert result["books_found"] == 0
+    assert result["next_page"] == 4
+    plugin.discover_books.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_discover_and_sync_all_counts_filtered_books_without_failure():
     db = _mock_db()
     db.get.return_value = _source()

@@ -19,33 +19,9 @@ curl -X GET "http://localhost:8088/api/sources/yuedu_xxx/search?q=keyword&page=1
   -H "Authorization: Bearer $TOKEN"
 ```
 
-Response:
-
-```json
-{
-  "source_id": "yuedu_xxx",
-  "source_name": "Example Source",
-  "query": "keyword",
-  "page": 1,
-  "total": 2,
-  "results": [
-    {
-      "source_id": "yuedu_xxx",
-      "source_name": "Example Source",
-      "name": "Book One",
-      "author": "Author",
-      "url": "https://example.com/novel/123.html",
-      "cover_url": null,
-      "intro": "Description",
-      "kind": "fantasy",
-      "latest_chapter": "Chapter 10",
-      "word_count": null,
-      "in_library": false,
-      "book_id": null
-    }
-  ]
-}
-```
+Response: `{source_id, source_name, query, page, total, results[]}`，其中每个结果含
+`name / author / url / cover_url / intro / kind / latest_chapter / word_count /
+in_library / book_id`（`book_id` 非空表示已入库）。
 
 Then sync a remote result:
 

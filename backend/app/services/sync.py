@@ -1810,12 +1810,47 @@ class SyncService:
         if before_step is not None:
             await before_step()
 
-        # A first-page empty result must remain visible as a failed task.
+        # Every page came back empty.  Why that is decides what the user sees:
+        # a finished task, a transient hiccup worth retrying, or a broken rule.
         if pages_checked == 0 and books_found == 0 and done:
+            if max_pages > 0 and start_page > max_pages:
+                # A task resumed past its own page budget has nothing left to
+                # crawl.  Reporting that as "no books found" turned a task that
+                # had drained its whole catalog into a failed one.
+                return {
+                    "source_id": source_id,
+                    "pages_checked": 0,
+                    "books_found": 0,
+                    "books_synced": 0,
+                    "books_failed": 0,
+                    "books_filtered": 0,
+                    "chapters_created": 0,
+                    "chapters_skipped": 0,
+                    "chapters_failed": 0,
+                    "details": [],
+                    "next_page": start_page,
+                    "done": True,
+                }
             config = source.config if isinstance(source.config, dict) else {}
             if any("<js>" in str(config.get(key) or "") for key in ("ruleExplore", "exploreUrl", "searchUrl")):
                 raise ValueError(
                     "该书源的发现规则依赖 Legado JS，当前环境未能执行；请更换书源或导入可执行的规则。"
+                )
+            known_book = await self.db.scalar(
+                select(Book.id).where(Book.source_id == source_id).limit(1)
+            )
+            if known_book is not None:
+                # The source already has books in the library, so an empty
+                # catalog is a network/proxy/site hiccup rather than a rule
+                # problem: a retried 要撸小说 task answered every category page
+                # with HTTP 200 but nothing to parse right after the proxy
+                # dropped connections.  Raise a message the crawl runner
+                # classifies as transient so it retries instead of failing the
+                # task with a misleading "no books" error.
+                raise RuntimeError(
+                    "书源目录本次未返回任何书籍（网络/代理波动、站点限流或临时验证都可能导致）。"
+                    "已入库的书籍不受影响，任务稍后会自动重试；"
+                    "若持续失败，请检查代理节点或站点验证状态。"
                 )
             raise ValueError("书源未返回可同步的书籍，请检查书源规则、Cookie 或站点验证状态。")
 

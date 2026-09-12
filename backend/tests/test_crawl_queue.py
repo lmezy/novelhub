@@ -293,6 +293,56 @@ async def test_run_crawl_task_async_retries_transient_network_failure():
     assert task.resume_at is not None
     assert task.progress["auto_retries"] == 1
     assert "重试" in task.error
+    # A retry always gets a result snapshot to merge later attempts into.
+    assert task.result["books_found"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_crawl_task_async_carries_counters_across_retries():
+    """A retried task must not lose (or double count) earlier progress."""
+    task = _task(
+        progress={
+            "books_found": 78,
+            "books_synced": 68,
+            "books_failed": 10,
+            "pages_checked": 1,
+            "next_page": 1,
+            "auto_retries": 0,
+        }
+    )
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=task)
+    db.commit = AsyncMock()
+    db.refresh = AsyncMock()
+
+    calls = {"n": 0}
+
+    class FakeSyncService:
+        def __init__(self, db):
+            self.db = db
+
+        async def discover_and_sync_all(self, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # The previous attempt reported 78/68/10; this one finds
+                # nothing more before the proxy drops the connection.
+                raise httpx.ConnectTimeout("")
+            await kwargs["progress_cb"](1, 5, 3, 2)
+            raise httpx.ConnectTimeout("")
+
+    with (
+        patch("app.services.crawl_runner.SessionLocal", return_value=_session_for(db)),
+        patch("app.services.sync.SyncService", FakeSyncService),
+    ):
+        first = await run_crawl_task_async("task-1")
+        second = await run_crawl_task_async("task-1")
+
+    assert first["status"] == "retrying"
+    assert second["status"] == "retrying"
+    assert task.result["books_found"] == 83
+    assert task.result["books_synced"] == 71
+    assert task.result["books_failed"] == 12
+    assert task.progress["auto_retries"] == 2
 
 
 @pytest.mark.asyncio
@@ -443,4 +493,7 @@ async def test_run_crawl_task_async_survives_expired_orm_state_on_failure():
     assert written["finished_at"] is not None
     # The progress snapshot came from memory, never from the expired ORM state.
     assert written["progress"]["next_page"] == 1
-    assert task.progress == {"next_page": 1, "books_failed": 9}
+    # Counters carried from earlier attempts live in ``result``; the attempt
+    # that just started reports its own (empty) progress.
+    assert task.result["books_failed"] == 9
+    assert task.progress["books_failed"] == 0
