@@ -1141,7 +1141,7 @@ async def import_and_sync_all(
     )
 
     # Step 3 & 4: Sync bookshelf + discover for each imported source in parallel
-    from app.core.config import settings, sync_thread_count
+    from app.core.config import sync_source_concurrency
     from app.core.database import SessionLocal
 
     async def _sync_source(src_info):
@@ -1194,13 +1194,15 @@ async def import_and_sync_all(
                     errors.append({"source": source_id, "stage": "discover", "error": str(exc)[:200]})
         return detail, errors
 
-    concurrency = min(
-        max(1, int(getattr(settings, "SYNC_WORKER_CONCURRENCY", 2))),
-        sync_thread_count(),
-    )
-    semaphore = asyncio.Semaphore(concurrency)
+    # One worker per source (see crawl_runner._worker_loop): each source keeps
+    # its own request pacing, so syncing them all at once does not raise the
+    # request rate any single site sees.
+    concurrency = sync_source_concurrency()
+    semaphore = asyncio.Semaphore(concurrency) if concurrency > 0 else None
 
     async def _limited(src_info):
+        if semaphore is None:
+            return await _sync_source(src_info)
         async with semaphore:
             return await _sync_source(src_info)
 

@@ -33,9 +33,20 @@ curl -X POST http://localhost:8088/api/crawl/tasks \
 - 请求间隔优先用书源 JSON 里的 `concurrentRate`，未配置时用 `CRAWL_DELAY_MS`（默认 1200ms），
   另叠加 200–600ms 随机抖动；长任务每 `SYNC_RATE_COOLDOWN_EVERY`（默认 300）次请求暂停
   `SYNC_RATE_COOLDOWN_SECONDS`（默认 10）秒。
+- **书源之间互不排队**：`SYNC_WORKER_CONCURRENCY` 默认 `0` = 每个书源一个 worker 并行跑；
+  设成正数才限制同时运行的书源数。同一个书源同时只会跑一个任务（不同任务按优先级排队）。
 - 并发模型对齐 Legado：`SYNC_THREAD_COUNT`（默认 9，封顶 9）；单任务内书籍并发
-  `SYNC_BOOK_CONCURRENCY`（默认 3）、章节并发 `SYNC_CHAPTER_CONCURRENCY`（默认 9）；
-  `SYNC_WORKER_CONCURRENCY` 控制同时运行多少个书源任务。
+  `SYNC_BOOK_CONCURRENCY`（默认 3）、章节并发 `SYNC_CHAPTER_CONCURRENCY`（默认 9）。
+- 书源目录里的多个分类默认 4 个并发抓取（`YUEDU_EXPLORE_CONCURRENCY`）。
+  **并发数不等于请求频率**：每个书源自己的 `concurrentRate` / `CRAWL_DELAY_MS` 限速器仍然
+  逐个放行请求，并发只是把“等上一页”的空闲时间填满，站点看到的请求频率不变。
+
+> 每个书源同时最多用 1 个任务 session + `SYNC_BOOK_CONCURRENCY` 个书 session，而连接池是
+> `pool_size=10 + max_overflow=20`。同时跑 12 个书源时会接近上限，此时多出来的取连接请求会
+> 排队（不会报错）。如果日志里出现 `PoolTimeout`，把 `SYNC_WORKER_CONCURRENCY` 设成 8 左右即可。
+> 另外线上 crawler 容器限制为 0.5 CPU / 1G 内存，同时跑很多书源时会成为瓶颈；
+> 想真正并行更多书源，需要在 NAS 的 compose 里放宽 crawler 的 `cpus`/`memory`
+> （以及 `YUEDU_PLAYWRIGHT_CONCURRENCY`，每只 Chromium 约 200–300MB）。
 - 无头浏览器（webJs / webView 书源）受 `YUEDU_PLAYWRIGHT_CONCURRENCY`（默认 3）限制，
   并且同样走书源限速，避免几十个 Chromium 同时打一个站点。
 - 429/5xx 自动退避重试；设置 `SYNC_IGNORE_RATE_LIMIT=true` 才会忽略书源自身的限速。
@@ -118,6 +129,11 @@ Admin → 代理里填的是别的主机地址，容器访问不到。crawler/ba
 
 ### 站点要求验证码 / 人机验证 / Cloudflare “Just a moment”
 
+> 2026-09-12 起先看错误里的第二句：写「书源已配置 Cookie 但仍被站点拦截」说明 Cookie
+> 已经发出去了、页面也确实被 WAF 拦了——Cookie 过期，或与当前出口 IP / User-Agent 不匹配
+> （Cloudflare 的 `cf_clearance` 同时绑定这两者）。用与 NovelHub 同一条代理线路的浏览器
+> 重新验证后重新导入即可。只有书源没配 Cookie 时才会提示「把 Cookie 导入书源」。
+
 这类页面在服务端无法绕过（代码也不会去绕）。处理办法：在浏览器里（出口 IP 与代理一致）
 打开站点通过验证，把 Cookie 导入「设置 → 书源 → Cookie / 账号」，再重新同步。
 已知情况：
@@ -127,6 +143,34 @@ Admin → 代理里填的是别的主机地址，容器访问不到。crawler/ba
 - 搬山人小说网（banshanren.com）：连 Playwright 浏览器也会被挑战（2026-09-12 实测：
   同一个任务里连续几十章被判拦截），同样需要 Cookie 或换一个能过验证的代理节点；
 - 禁忌书屋 cool18：页面里出现“请稍后再试”属正常文案，已不会被误判成拦截。
+
+### 配好 Cookie 还是报“验证码/人机验证”，但浏览器里明明是正常页面
+
+2026-09-12 修：Cloudflare 会给**正常页面**也注入一段 bot-management 脚本
+（`/cdn-cgi/challenge-platform/scripts/jsd/main.js`），旧代码把 `challenge-platform`
+当成拦截标记，于是每个页面都被判成验证码页——同步直接中止，错误还提示“请导入 Cookie”
+（用户看到的就是“Cookie 明明导入了还是报拦截”）。现在只有真正的拦截页标记
+（`Just a moment`、`cf_chl_opt`、`chl_page`、`challenge-form`、`turnstile` …）才算拦截。
+
+同一次修复还解决了两类“Cookie 书源同步 0 本书”的原因：
+
+- 书源用 `@js:JSON.stringify({...})` 声明请求头（绅士漫画声明了桌面版 Chrome UA 和
+  Referer），旧代码把这段 JS 直接丢给 `json.loads`，必然解析失败、声明的 UA 被丢掉；
+  站点于是返回**手机版页面**，书源自己的规则匹配不上。现在 `header` 规则会用 Node 运行时
+  求值（带 `baseUrl`），结果按书源缓存，每个请求只是查一次字典。
+- `bookList` / `chapterList` 写成 XPath 风格（`//div[@class='xxx']/ul/li`）时，旧代码按 `@`
+  切碎规则、又把 `//…` 交给 CSS 解析器，两条路都得到 0 个元素；`discover_books` 还会用
+  `/novel/123` 这类路径启发式再过滤一次，把规则本来匹配上的书全部丢掉。现在 `@` 按 Legado
+  的括号配对规则切分，XPath 风格选择器翻译成等价 CSS（`li[1]` 等索引仍按 Legado 语义），
+  且**书源声明了 `bookUrlPattern` 时才用它过滤**，否则以书源自己的 `bookList` 为准。
+
+### 目录正常，但某些书只同步出 1 章、内容是邮箱链接或乱码
+
+个别书源的 `chapterList` 是“元素规则 + `@js:` 脚本”的组合（绅士漫画：
+`//div[@class='gallary_wrap tb']/ul/li[1]@js:…`，脚本用 `java.put` 存图片地址）。旧代码只认
+“整条规则就是 JS”，这种组合解析为空，于是回退到通用链接扫描，把页脚里 Cloudflare 的
+`/cdn-cgi/l/email-protection`（邮箱保护链接）当成唯一章节。现在会先取元素、再把这个脚本
+当作一步执行，脚本只做 `java.put` 时保留原元素。
 
 ### 书源发现规则是 `<js>` / `@js:` 脚本，同步报无法执行
 

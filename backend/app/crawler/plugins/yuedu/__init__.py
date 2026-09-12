@@ -269,14 +269,39 @@ TOC_NOISE_TITLES = {
     "开始阅读",
 }
 
+# Cloudflare challenge gates.  Every marker here is specific to a real
+# interstitial: none of them appear on an ordinary page that merely loads
+# Cloudflare's bot-management script (``/cdn-cgi/challenge-platform/scripts/
+# jsd/main.js``).  ``challenge-platform`` and ``cf-chl`` used to sit in
+# STRONG_BLOCK_MARKERS as bare substrings, which flagged *every* page of a
+# Cloudflare-fronted site (御宅屋 yswhub.cc, 禁忌书屋 cool18, 搬山人 ...) as a
+# captcha gate -- even ones that had already been fetched successfully with a
+# valid Cookie -- and produced the misleading "please import a Cookie" error.
+CF_CHALLENGE_MARKERS = (
+    "just a moment",
+    "managed challenge",
+    "verify you are human",
+    "cf-turnstile",
+    "cf-challenge",
+    "attention required",
+    "cf_chl_opt",
+    "cf-chl-",
+    "chl_page",
+    "challenge-form",
+    "cf-please-wait",
+    "请启用javascript",
+    "请开启javascript",
+    "浏览器安全检查",
+    "正在验证您的浏览器",
+    "正在检查您的浏览器",
+)
+
 STRONG_BLOCK_MARKERS = (
     "输入验证码后可继续访问",
     "验证码后可继续访问",
     "人机验证",
     "滑动验证",
     "limit_box",
-    "challenge-platform",
-    "cf-chl",
     "访问过于频繁",
     "请求过于频繁",
     "操作过于频繁",
@@ -296,21 +321,9 @@ STRONG_BLOCK_MARKERS = (
     "被限制访问",
     "ip 已被限制",
     "ip已被限制",
-    # Cloudflare / Turnstile / generic JS challenge gates.  The rendered body
-    # of a Cloudflare "Just a moment..." page carries these markers (and often
-    # ``cf-chl``), so treat them as a hard block until the browser has a chance
-    # to solve the challenge and reload.
-    "just a moment",
-    "managed challenge",
-    "verify you are human",
-    "cf-turnstile",
-    "cf-challenge",
-    "attention required",
-    "请启用javascript",
-    "请开启javascript",
-    "浏览器安全检查",
-    "正在验证您的浏览器",
-    "正在检查您的浏览器",
+    # Cloudflare / Turnstile / generic JS challenge gates, declared above so
+    # this list and ``_is_challenge_page`` cannot drift apart.
+    *CF_CHALLENGE_MARKERS,
 )
 
 # Weak markers need a confirmation phrase to avoid false positives on
@@ -403,6 +416,10 @@ class YueduPlugin:
     # {host: {"ip": ip, "expires": epoch_seconds}}
     _doh_cache: dict[str, dict[str, float | str]] = {}
     _doh_lock = asyncio.Lock()
+    # ``{base_url + rule: headers}`` memo for the source's ``header`` rule: the
+    # rule is a JS script in many exported sources, and evaluating it on every
+    # request would be pure overhead.
+    _header_rule_cache: dict[str, dict[str, str]] = {}
     _doh_providers = (
         # Tencent public DNS works from CN networks; try it first.
         "https://doh.pub/dns-query",
@@ -672,6 +689,11 @@ class YueduPlugin:
             self.engine.parse_toc(toc_html),
             toc_url,
         )
+        # Whether the source's own ``ruleToc`` produced the list.  A rule that
+        # matched is authoritative about what a chapter URL looks like; the
+        # URL-shape heuristic below is only for the generic scanner, which
+        # happily returns navigation links.
+        toc_from_rules = bool(toc)
         android_toc_rule = self._uses_android_js_rule("ruleToc", "chapterList")
         if not toc and not android_toc_rule:
             # The configured ruleToc may be outdated. Fall back to the generic
@@ -804,7 +826,10 @@ class YueduPlugin:
             if ch_url.rstrip("/") == identity_url.rstrip("/"):
                 self_chapter_title = self_chapter_title or title
                 continue
-            if not self._is_chapter_url(ch_url, identity_url):
+            if not toc_from_rules and not self._is_chapter_url(
+                ch_url,
+                identity_url,
+            ):
                 continue
             if (
                 title in ("目录", "简介", "上一章", "下一章", "返回目录", "首页", "开始阅读")
@@ -2581,21 +2606,21 @@ class YueduPlugin:
 
         kinds = self.get_explore_kinds()
         if kinds:
-            results = []
             blocked_errors: list[str] = []
             unavailable_errors: list[str] = []
             transport_errors: list[str] = []
-            for kind in kinds:
+
+            async def _fetch_kind(kind: dict[str, Any]) -> list[dict[str, Any]]:
                 kind_url = str(kind.get("url", "")).strip()
                 if not kind_url:
-                    continue
+                    return []
                 try:
                     resolved, options = self._resolve_kind(kind_url, page)
                 except Exception as exc:
                     logger.warning(f"Explore kind URL failed: {kind_url} ({exc})")
-                    continue
+                    return []
                 if not resolved:
-                    continue
+                    return []
                 try:
                     items = await self._fetch_kind_items(
                         kind_url=kind_url,
@@ -2610,12 +2635,12 @@ class YueduPlugin:
                         # error or empty page with HTTP 200).  Record it so the
                         # log explains why the task saw "0 books".
                         logger.warning(
-                            "Explore kind {} returned no books on page {}: {}",
+                            "Explore kind %s returned no books on page %s: %s",
                             kind.get("title", kind_url),
                             page,
                             resolved,
                         )
-                    results.extend(items)
+                    return items
                 except Exception as exc:
                     message = str(exc)
                     described = (
@@ -2648,6 +2673,28 @@ class YueduPlugin:
                         kind.get("title", kind_url),
                         described,
                     )
+                    return []
+
+            # A source's catalog categories are independent pages.  Fetching
+            # them one after another left the source's own rate limiter idle
+            # between requests (wait for a page, then wait for the interval);
+            # running a few at once keeps the limiter busy without letting the
+            # site see a higher request rate, because ``_sleep_rate_limit``
+            # still spaces every request start for this source.
+            try:
+                explore_concurrency = max(
+                    1, int(os.getenv("YUEDU_EXPLORE_CONCURRENCY", "4") or 4)
+                )
+            except (TypeError, ValueError):
+                explore_concurrency = 4
+            semaphore = asyncio.Semaphore(explore_concurrency)
+
+            async def _bounded(kind: dict[str, Any]) -> list[dict[str, Any]]:
+                async with semaphore:
+                    return await _fetch_kind(kind)
+
+            grouped = await asyncio.gather(*(_bounded(kind) for kind in kinds))
+            results = [item for items in grouped for item in items]
             if not results and blocked_errors:
                 # Every discover category was gated by an anti-bot / captcha
                 # page. Surface the first one so crawl tasks show a real
@@ -3081,13 +3128,33 @@ class YueduPlugin:
                 self._normalize_explore_item(item, page_url)
                 for item in usable_items
             ]
-            filtered_items = [
-                item for item in normalized_items
-                if self._is_book_url(
+            # The source's own ``bookList`` rule already decided which links are
+            # books, so without a ``bookUrlPattern`` the URL only has to be a
+            # usable detail link on this site -- Legado accepts such rules as
+            # written.  Running our path heuristic on top dropped whole sites
+            # whose detail URLs are not in the ``/novel/123`` shape (绅士漫画:
+            # ``/photos-index-aid-354422.html``), even though the rule matched
+            # them correctly, which surfaced as "同步 0 本书".
+            declared_pattern = str(
+                self.config.get("bookUrlPattern", "") or ""
+            ).strip()
+            filtered_items = []
+            for item in normalized_items:
+                book_url = self._make_absolute(
                     self._explore_item_url(item),
-                    require_pattern=True,
+                    page_url,
                 )
-            ]
+                if not book_url.startswith(("http://", "https://")):
+                    continue
+                if book_url.rstrip("/") == (page_url or "").rstrip("/"):
+                    continue
+                if declared_pattern and not self._is_book_url(
+                    book_url,
+                    require_pattern=True,
+                ):
+                    continue
+                item["bookUrl"] = book_url
+                filtered_items.append(item)
             if filtered_items:
                 return filtered_items
 
@@ -3134,6 +3201,9 @@ class YueduPlugin:
         items = await self.fetch_explore(url=url, page=page)
         link_base = self._make_absolute(url, self.base_url) if url else self.base_url
         books: list[RemoteShelfBook] = []
+        declared_pattern = str(
+            self.config.get("bookUrlPattern", "") or ""
+        ).strip()
         for item in items:
             book_url = self._explore_item_url(item)
             if not book_url:
@@ -3141,7 +3211,13 @@ class YueduPlugin:
             full_url = self._make_absolute(book_url, link_base)
             if not full_url.startswith(("http://", "https://")):
                 continue
-            if not self._is_book_url(full_url, require_pattern=True):
+            # Only second-guess the source when it declares a
+            # ``bookUrlPattern``; otherwise its ``bookList`` rule is the
+            # authority (see ``_explore_items_from_html``).
+            if declared_pattern and not self._is_book_url(
+                full_url,
+                require_pattern=True,
+            ):
                 continue
             books.append(RemoteShelfBook(
                 source_book_id=self._book_id_from_url(full_url),
@@ -3584,11 +3660,7 @@ class YueduPlugin:
                 if self._is_blocked_page(rendered):
                     # Even after waiting the challenge never cleared; surface
                     # a clear hint instead of parsing the WAF gate as content.
-                    raise RuntimeError(
-                        "Site returned an anti-bot/captcha page (网站要求验证码/人机验证，"
-                        "请在浏览器中访问该网站通过验证后，把 Cookie 导入书源再同步): "
-                        + url
-                    )
+                    raise self._blocked_page_error(url)
                 self._capture_playwright_cookies(await context.cookies())
 
                 # Legado webJs may mutate the DOM or return the rendered
@@ -3609,11 +3681,7 @@ class YueduPlugin:
                     html = rendered
 
                 if self._is_blocked_page(html):
-                    raise RuntimeError(
-                        "Site returned an anti-bot/captcha page (网站要求验证码/人机验证，"
-                        "请在浏览器中访问该网站通过验证后，把 Cookie 导入书源再同步): "
-                        + url
-                    )
+                    raise self._blocked_page_error(url)
 
                 await context.close()
                 return html
@@ -3684,38 +3752,9 @@ class YueduPlugin:
 
         header_rule = self.config.get("header", "")
         if header_rule:
-            try:
-                if "JSON.stringify" in header_rule:
-                    m = re.search(r'JSON\.stringify\((\{.+?\})\)', header_rule, re.DOTALL)
-                    if m:
-                        custom_headers = json.loads(m.group(1))
-                        headers.update(custom_headers)
-                elif header_rule.startswith("{"):
-                    custom_headers = json.loads(header_rule)
-                    headers.update(custom_headers)
-                elif header_rule.startswith("@js:") or "<js>" in header_rule:
-                    js = header_rule
-                    if js.startswith("@js:"):
-                        js = js[4:]
-                    m = re.search(r'JSON\.stringify\((\{.+?\})\)', js, re.DOTALL)
-                    if not m:
-                        m = re.search(
-                            r'"(?:User-Agent|Content-Type|Cookie|Referer|Accept)[^}]*}',
-                            js,
-                            re.IGNORECASE,
-                        )
-                    if m:
-                        try:
-                            hdr_str = m.group(0)
-                            if not hdr_str.startswith("{"):
-                                hdr_str = "{" + hdr_str + "}"
-                            hdr_str = re.sub(r'(\w+):', r'"\1":', hdr_str)
-                            custom_headers = json.loads(hdr_str)
-                            headers.update(custom_headers)
-                        except (json.JSONDecodeError, ValueError):
-                            pass
-            except Exception:
-                pass
+            custom_headers = self._custom_headers(header_rule)
+            if custom_headers:
+                headers.update(custom_headers)
 
         if extra:
             headers.update(extra)
@@ -3725,6 +3764,120 @@ class YueduPlugin:
                 self._cookie,
             )
         return headers
+
+    def _custom_headers(self, header_rule: Any) -> dict[str, str]:
+        """Resolve a Legado ``header`` rule into concrete request headers.
+
+        Sources express this rule as plain JSON *or* as a ``@js:`` script, e.g.
+        绅士漫画's::
+
+            @js:
+            JSON.stringify({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ...",
+              "Referer": baseUrl,
+              "Accept-Language": "zh-CN,zh;q=0.9"
+            })
+
+        That form used to be fed to ``json.loads`` directly, which always failed
+        (``baseUrl`` is not valid JSON and the object spans lines), so the
+        declared desktop User-Agent and Referer were silently dropped.  The
+        source then received the plugin's mobile UA: 绅士漫画 serves a different
+        mobile document that its own ``ruleExplore``/``ruleToc`` cannot match,
+        so the sync reported "0 books", and Cloudflare sources saw a UA that no
+        longer matched the ``cf_clearance`` the browser had obtained.
+
+        The rule is evaluated through the Node runtime (with ``baseUrl`` in
+        scope, like Legado) and the result is cached per source + rule, so the
+        per-request cost stays a dict lookup.
+        """
+        rule = str(header_rule or "").strip()
+        if not rule:
+            return {}
+        cache_key = f"{self.base_url}\u0000{rule}"
+        cache = self.__class__._header_rule_cache
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return dict(cached)
+
+        parsed = self._parse_header_rule(rule)
+        if len(cache) > 256:
+            cache.clear()
+        cache[cache_key] = parsed
+        return dict(parsed)
+
+    def _parse_header_rule(self, rule: str) -> dict[str, str]:
+        """Best-effort parse of one ``header`` rule (never raises)."""
+        candidates: list[Any] = []
+        is_js = rule.startswith("@js:") or "<js>" in rule
+        js_code = rule[4:].strip() if rule.startswith("@js:") else rule
+
+        if not is_js:
+            try:
+                candidates.append(json.loads(rule))
+            except (json.JSONDecodeError, ValueError):
+                pass
+        else:
+            try:
+                from app.crawler.plugins.yuedu.js_runtime import JsRuntime
+
+                evaluated = JsRuntime.get_instance().eval_js_sync(
+                    js_code,
+                    "",
+                    context={
+                        "baseUrl": self.base_url,
+                        "sourceUrl": self.base_url,
+                        "bookUrl": self.base_url,
+                        "url": self.base_url,
+                    },
+                )
+                if isinstance(evaluated, str):
+                    try:
+                        evaluated = json.loads(evaluated)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                candidates.append(evaluated)
+            except Exception as exc:  # pragma: no cover - runtime optional
+                logger.debug("header rule JS evaluation failed: %s", exc)
+
+        # Pattern fallback for environments without Node.js: pull the
+        # ``JSON.stringify({...})`` literal (or a bare header object) out of the
+        # script and quote unquoted keys.  Values that are JS expressions
+        # (``baseUrl``) are substituted from the source URL.
+        js_object: str | None = None
+        match = re.search(r"JSON\.stringify\((\{.+?\})\)", js_code, re.DOTALL)
+        if match is not None:
+            js_object = match.group(1)
+        elif is_js:
+            match = re.search(
+                r'\{[^{}]*"(?:User-Agent|Content-Type|Cookie|Referer|Accept)[^{}]*\}',
+                js_code,
+                re.IGNORECASE,
+            )
+            if match is not None:
+                js_object = match.group(0)
+        if js_object is not None:
+            literal = re.sub(
+                r'(?<![A-Za-z0-9_"\':/.-])baseUrl(?![A-Za-z0-9_"-])',
+                json.dumps(self.base_url),
+                js_object,
+            )
+            literal = re.sub(r'([{,]\s*)([A-Za-z_][\w\-]*)\s*:', r'\1"\2":', literal)
+            literal = re.sub(r",\s*}", "}", literal)
+            try:
+                candidates.append(json.loads(literal))
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                cleaned = {
+                    str(key): str(value)
+                    for key, value in candidate.items()
+                    if key and value is not None and not isinstance(value, (dict, list))
+                }
+                if cleaned:
+                    return cleaned
+        return {}
 
     @staticmethod
     def _merge_cookie_strings(*values: str) -> str:
@@ -4128,11 +4281,7 @@ class YueduPlugin:
                             )
                         if browser_html:
                             return browser_html
-                        raise RuntimeError(
-                            "Site returned an anti-bot/captcha page (网站要求验证码/人机验证，"
-                            "请在浏览器中访问该网站通过验证后，把 Cookie 导入书源再同步): "
-                            + url
-                        )
+                        raise self._blocked_page_error(url)
                     if resp.status_code in (429, 500, 502, 503, 504):
                         retry_after = resp.headers.get("Retry-After", "")
                         wait = (
@@ -4174,11 +4323,7 @@ class YueduPlugin:
                             )
                         if browser_html:
                             return browser_html
-                        raise RuntimeError(
-                            "Site returned an anti-bot/captcha page (网站要求验证码/人机验证，"
-                            "请在浏览器中访问该网站通过验证后，把 Cookie 导入书源再同步): "
-                            + url
-                        )
+                        raise self._blocked_page_error(url)
                     return text
                 except httpx.HTTPError as exc:
                     last_error = exc
@@ -4258,6 +4403,30 @@ class YueduPlugin:
                 return any(confirm in lowered for confirm in confirmations)
         return False
 
+    def _captcha_hint(self) -> str:
+        """Hint text for a WAF/captcha page, tailored to the source's state.
+
+        The old wording always told the user to import a Cookie, which is
+        actively misleading once a Cookie *is* configured: the page was fetched
+        with it and still came back as a gate, so the Cookie is stale or bound
+        to another IP/User-Agent (Cloudflare's ``cf_clearance`` is tied to both
+        the address that solved the challenge and the browser's UA).
+        """
+        if self._cookie:
+            return (
+                "书源已配置 Cookie 但仍被站点拦截：Cookie 可能已过期，或与当前出口 "
+                "IP / User-Agent 不匹配。请在与 NovelHub 相同的代理节点下用浏览器重新"
+                "通过验证，再重新导入 Cookie；或先换一条代理线路重试"
+            )
+        return "请在浏览器中访问该网站通过验证后，把 Cookie 导入书源再同步"
+
+    def _blocked_page_error(self, url: str) -> RuntimeError:
+        """The "the site gated us" error, with an accurate hint."""
+        return RuntimeError(
+            "Site returned an anti-bot/captcha page (网站要求验证码/人机验证，"
+            f"{self._captcha_hint()}): {url}"
+        )
+
     @staticmethod
     def _looks_like_upstream_error(html: str) -> bool:
         """Detect a Cloudflare / origin 5xx error page (e.g. "Error code 520 /
@@ -4309,20 +4478,14 @@ class YueduPlugin:
         # Cloudflare sets the title to "Just a moment..." while a challenge runs.
         if re.search(r"<title[^>]*>\s*just a moment", lowered):
             return True
-        if any(
-            marker in lowered
-            for marker in (
-                "cf-chl",
-                "cf-challenge",
-                "cf-turnstile",
-                "cf_chl_opt",
-                "challenge-platform",
-                "managed challenge",
-                "verify you are human",
-                "attention required",
-                "browser check",
-            )
-        ):
+        # Only markers that belong to a real interstitial count here.  A bare
+        # ``challenge-platform`` match is Cloudflare's always-on bot-management
+        # script (``/cdn-cgi/challenge-platform/scripts/jsd/main.js``), which is
+        # injected into ordinary pages too; waiting 25s on it and then reporting
+        # "captcha" made every Cloudflare-fronted source look blocked.
+        if any(marker in lowered for marker in CF_CHALLENGE_MARKERS):
+            return True
+        if "browser check" in lowered:
             return True
         return False
 
@@ -4488,11 +4651,7 @@ class YueduPlugin:
                         # The WAF blocked plain HTTP *and* the browser could not
                         # clear the challenge.  Surface a clear hint instead of a
                         # bare httpx 403/520 that hides the real cause.
-                        raise RuntimeError(
-                            "Site returned an anti-bot/captcha page (网站要求验证码/人机验证，"
-                            "请在浏览器中访问该网站通过验证后，把 Cookie 导入书源再同步): "
-                            + url
-                        )
+                        raise self._blocked_page_error(url)
                     if resp.status_code in (429, 500, 502, 503, 504):
                         retry_after = resp.headers.get("Retry-After", "")
                         wait = (
@@ -4534,11 +4693,7 @@ class YueduPlugin:
                             )
                         if browser_html:
                             return browser_html
-                        raise RuntimeError(
-                            "Site returned an anti-bot/captcha page (网站要求验证码/人机验证，"
-                            "请在浏览器中访问该网站通过验证后，把 Cookie 导入书源再同步): "
-                            + url
-                        )
+                        raise self._blocked_page_error(url)
                     return text
                 except httpx.ConnectError as exc:
                     # DNS pollution bypass: when the direct connect fails and
@@ -4717,7 +4872,7 @@ class YueduPlugin:
                 last_error = exc
                 break
         if last_error is not None:
-            logger.warning("Failed to fetch cover {}: {}", url, last_error)
+            logger.warning("Failed to fetch cover %s: %s", url, last_error)
         return None
 
     def _decode_inline_cover_rule(self, data: bytes) -> bytes:
@@ -4745,7 +4900,7 @@ class YueduPlugin:
             unpadder = padding.PKCS7(algorithms.AES.block_size).unpadder()
             return unpadder.update(padded) + unpadder.finalize()
         except Exception as exc:
-            logger.debug("Could not decode inline cover rule: {}", exc)
+            logger.debug("Could not decode inline cover rule: %s", exc)
             return data
 
     async def fetch_content_image(
@@ -4837,7 +4992,7 @@ class YueduPlugin:
                 last_error = exc
                 break
         if last_error is not None:
-            logger.warning("Failed to fetch content image {}: {}", url, last_error)
+            logger.warning("Failed to fetch content image %s: %s", url, last_error)
         return None
 
     def get_search_check_keyword(self, default: str = "\u6211\u7684") -> str:

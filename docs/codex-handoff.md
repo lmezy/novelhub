@@ -43,9 +43,11 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 
 ## 2. 当前状态（2026-09-12）
 
-- 后端全量测试 **406 passed**：`cd backend && python -m pytest -q`
+- 后端全量测试 **421 passed**：`cd backend && python -m pytest -q`
 - Source Engine 闭环已完成并可用：导入书源 → 搜索 → 目录 → 正文 → Storage/DB/搜索 →
   网页阅读。当前工作重心是**同步稳定性与线上排错**，不是新增架构能力。
+- 并发模型：**一个书源一个 worker**（`SYNC_WORKER_CONCURRENCY=0` 默认不限），书源之间
+  不再排队；同一书源同时只跑一个任务。
 - 线上仍跑着旧镜像；本地改动要 `docker compose build backend crawler` +
   `docker compose up -d backend crawler` 才生效。
 - 待用户处理（代码修不了，属站点侧防护，见第 4 节）：SiS文學網 / 御宅屋 /
@@ -75,6 +77,10 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 | 自动同步漏跑 / 后台无限量爬 | 每天模式是“分钟精确匹配”；自动任务 `max_pages=0` | 间隔模式 + 有界 `AUTO_SYNC_MAX_PAGES`（默认 3） |
 | 每次同步都重抓同一页 | 进度里的 `next_page` 存的是“本次正在处理的页” | 设计如此：重开任务会重扫该页，靠章节 URL 去重 |
 | 重试后报“书源未返回可同步的书籍”，但前一次已同步 68 本 | 重试尝试的目录全部返回 200 但解析为空，被判成书源没书 | 见第 5 节（2026-09-12） |
+| 配好 Cookie 仍报“验证码/人机验证”，浏览器里页面正常 | Cloudflare 正常页面也注入 `challenge-platform/scripts/jsd/main.js`，被判成拦截 | 见第 8 节 |
+| Cookie 书源同步 0 本书（绅士漫画/wn09.shop） | ①`header` 的 `@js:` 规则没执行，声明 UA 被丢→站点返回手机版页面 ②`bookList` 的 XPath 风格规则解析出 0 元素 ③`discover_books` 又用 `/novel/123` 路径启发式把规则命中的书全部过滤 | 见第 8 节 |
+| 全站同步里第 4 个书源排队几小时 | 全局只有 `SYNC_WORKER_CONCURRENCY`(3) 个槽位 | 见第 8 节 |
+| 目录只出 1 章、章节是 `/cdn-cgi/l/email-protection` | `chapterList` 是“元素规则 + `@js:` 脚本”，引擎只认整条 JS，回退后被通用链接扫描捡到邮箱保护链接 | 见第 8 节 |
 
 ---
 
@@ -151,3 +157,82 @@ Cookie 其实都正常，用户看到的是一条指向错误方向的报错，�
 **验证**：`cd backend && python -m pytest -q` → **406 passed**（新增 5 项：空目录有书→瞬态、
 空目录无书→原错误、resume 超预算→完成、重试计数不丢不重、cookie 健康检查过期 ORM 不崩）。
 线上复核：`discover_books(page=1)` 当前稳定返回 10 本/分类，代理正常时可正常翻页。
+
+## 8. 2026-09-12：Cookie 书源仍报验证码、同步 0 本；全站同步只跑 3 个书源
+
+**现象**：
+
+1. 御宅屋（yswhub.cc，已导入 Cookie）任务失败：
+   `Site returned an anti-bot/captcha page (… 请在浏览器中访问该网站通过验证后，把 Cookie
+   导入书源再同步)`——而同一个 Cookie 在浏览器里页面完全正常。
+2. 绅士漫画（wn09.shop，刚导入 Chrome Cookie）全站同步解析出 0 本书。
+3. 要同步第 4 个书源时它排队约 4 小时才轮到（“每次只同步三个书源”）。
+4. 御宅屋 / 绅士漫画的书只同步出 1 章，URL 是 `/cdn-cgi/l/email-protection`。
+
+**根因**（都在线上实测复现）：
+
+1. **WAF 误判**：Cloudflare 会给正常页面注入 bot-management 脚本
+   `/cdn-cgi/challenge-platform/scripts/jsd/main.js`；`challenge-platform` 是裸子串标记，
+   于是**每个** Cloudflare 站点（御宅屋/禁忌书屋/搬山人…）的每个页面都被判成验证码页，
+   直接中止任务并给出“请导入 Cookie”的错误方向。实测浏览器已经拿到 140KB 正常页面，
+   `_is_blocked_page` 返回 True。
+2. **`header` 规则是 JS 时被丢弃**：绅士漫画的 header 是
+   `@js:JSON.stringify({"User-Agent":"…Chrome/142…","Referer":baseUrl,…})`，旧代码交给
+   `json.loads` 必然失败（`baseUrl` 不是合法 JSON），插件于是用默认的 Android UA 请求，
+   站点返回**手机版文档**（实测 50KB、无 `gallary_wrap`），书源自己的规则自然解析不到
+   书籍（桌面版 UA 下是 68KB、含 `gallary_wrap`）。
+3. **XPath 风格列表规则解析为 0 元素**：`bookList=//div[@class='gallary_wrap']/ul/li`。
+   ①`_get_elements` 用 `rule.split("@")` 切分，属性选择器里的 `@` 把规则撕碎；
+   ②`_legado_before_elements` 把 `//…` 交给 CSS 解析器，soupsieve 抛
+   `Invalid character '/'`，被 `except` 吞掉后返回空。`discover_books` 还有第三层过滤：
+   用 `/novel/123` 形状的路径启发式把规则已命中的 URL 全部丢掉。
+4. **队列只有全局 3 槽**：`SYNC_WORKER_CONCURRENCY=3`，一个跑几小时的全站任务占满槽位，
+   第 4 个书源一直 `pending`（线上 15:16 建的任务 19:26 才启动）。
+5. **`chapterList` 是“元素规则 + `@js:` 脚本”**：`_js_code_from_rule` 只认整条规则是 JS，
+   组合规则返回空 → 回退到通用链接扫描 → 把页脚 Cloudflare 邮箱保护链接当成章节。
+
+**改动**：
+
+| 文件 | 改动 |
+|---|---|
+| `backend/app/crawler/plugins/yuedu/__init__.py` | 抽出 `CF_CHALLENGE_MARKERS`：删掉裸标记 `challenge-platform`/`cf-chl`，改用真实的拦截页标记（`just a moment`/`cf_chl_opt`/`cf-chl-`/`chl_page`/`challenge-form`/`cf-turnstile`…），`_is_challenge_page` 共用同一份列表（顺带省掉正常页面 25s 的假等待） |
+| 同上 | `@js:` 形式的 `header` 规则用 `JsRuntime` 求值（带 `baseUrl`/`sourceUrl`），纯 JSON/无 Node 时走正则兜底；结果按 `baseUrl+规则` 缓存 |
+| 同上 | 拦截错误文案区分「没配 Cookie」/「配了 Cookie 仍被拦（过期或 IP/UA 不匹配）」；顺手修掉 4 处对 stdlib logger 用 loguru `{}` 占位符导致诊断被 TypeError 吞掉的调用 |
+| 同上 | `_explore_items_from_html`/`discover_books`：先解析相对 URL，只有书源声明了 `bookUrlPattern` 才用路径启发式过滤，否则以书源 `bookList` 为准 |
+| 同上 | `fetch_book`：目录来自 `ruleToc` 时不再用 `_is_chapter_url` 形状启发式二次过滤（规则命中即权威） |
+| 同上 | `fetch_explore`：同一书源的多个目录分类默认 4 路并发（`YUEDU_EXPLORE_CONCURRENCY`），请求频率仍由该书源限速器决定 |
+| `backend/app/crawler/plugins/yuedu/rule_engine.py` | `_split_element_steps`：按 Legado 的括号配对规则切分 `@`（`RuleAnalyzer`） |
+| 同上 | `_xpath_list_rule_to_css`/`_xpath_step_to_css`：把 `//div[@class='x']/ul/li`、`//li[1]`、`//a[@href]` 翻译成等价 CSS；无法翻译的（`text()`/`contains()`/`::` 轴/嵌套谓词）返回 None，保持原行为 |
+| 同上 | `_eval_list_rule`：支持“元素规则 + `@js:` 步骤”（脚本只做 `java.put` 时保留元素） |
+| 同上 | `_eval_xpath`：先拆 `##pattern##replacement` 再求值，并对结果应用替换；兜底 CSS 失败返回 None 而不是抛异常（原来一条封面规则能中断整本书同步） |
+| `backend/app/services/crawl_runner.py` | worker 改为**一个书源一个 worker**：`SYNC_WORKER_CONCURRENCY<=0` 不限；`_next_pending_tasks()` 返回 `(task_id, source)` 并按“已在跑的 source”排除；同一书源永不并发跑两个任务 |
+| `backend/app/core/config.py` | `SYNC_WORKER_CONCURRENCY` 默认 0（=不限），新增 `sync_source_concurrency()` |
+| `scheduler/app/tasks.py`、`backend/app/api/routes/yuedu.py` | 每日同步 / 批量导入同步同样改为“一个书源一个 worker” |
+| `backend/app/core/logging.py` | 新增 `InterceptHandler` + `install_stdlib_logging_bridge()`，插件的 stdlib 日志进入 loguru（有级别/时间戳），`crawl_runner.main()` 启动时安装 |
+
+**验证**：
+
+- `cd backend && python -m pytest -q` → **421 passed**（新增 15 项：假拦截回归、JS header 规则
+  含无 Node 兜底、header 缓存、Cookie 文案、`@` 配对切分、XPath→CSS 与不支持形态、XPath 变换、
+  组合 TOC 规则、目录并发、书源过滤开关、worker 一源一 worker/同源不并发/不限并发）。
+- 线上影子回归（把改动后的 `__init__.py`/`rule_engine.py` 传到容器 `/tmp` 后跑真实站点，
+  不动线上代码）：
+  - 绅士漫画 `yuedu_f34d61039a65`：改动前 `discover_books(page=1)` → **0 本、UA 是安卓**；
+    改动后 → **399 本、UA 是书源声明的 Chrome/142**，`fetch_book` 得到正确书名 + 1 章
+    （`全话阅读` → `/photos-view-id-…html`），章节正文 111 字符（图片标签）。
+  - 御宅屋 `yuedu_123bca8ecb6a`：浏览器能拿到 140KB 正常页面（标题「耽美小说_御宅屋|御书屋」），
+    页面里唯一命中的“拦截标记”是 `challenge-platform` JSD 脚本 → 这就是误判来源；
+    新标记列表下该页面不再被判拦截。
+
+**未做/已知**：
+
+- 依赖完整 Legado Android 运行时（`Reload(...)`/`java.importScript`）的书源仍建议换源（UAA）。
+- 漫画站的 `ruleContent` 仍依赖 `java.ajax`/`java.put` 链路，正文是图片标签；
+  阅读器是否渲染图片内容属于前端话题，不在本次改动范围。
+- “一个书源一个 worker”意味着一口气可以跑满所有书源：每源约占 1 个任务连接 +
+  `SYNC_BOOK_CONCURRENCY` 个书连接，而连接池是 10+20。书源特别多时用
+  `SYNC_WORKER_CONCURRENCY=8` 之类的上限，或改大 `pool_size`。
+  线上 crawler 容器限 0.5 CPU / 1G 内存，并行度提高后建议在 NAS compose 里放宽，
+  否则 CPU 会先到瓶颈（`YUEDU_PLAYWRIGHT_CONCURRENCY` 也要按内存调整）。
+- `tests/` 与 `app/**/__pycache__` 里的 `.pyc` 会被本地测试改写（仓库一直在跟踪它们），
+  提交时一并带上即可。

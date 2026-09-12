@@ -543,6 +543,35 @@ class YueduRuleEngine:
                 self._is_json_context = False
 
         self._is_json_context = False
+        # Legado also allows a JS step *after* an element rule, e.g. 绅士漫画's
+        # ``chapterList``: ``//div[@class='gallary_wrap tb']/ul/li[1]@js:...``.
+        # The script mostly prepares values with ``java.put`` and returns
+        # ``result`` unchanged, so the selected elements survive.  Without this
+        # the list was empty and the TOC fell back to scanning every anchor on
+        # the page (which picked up the uploader's ``cdn-cgi/l/email-protection``
+        # link as the only "chapter").
+        js_pos = rule.find("@js:")
+        if js_pos > 0:
+            head = rule[:js_pos].strip()
+            js_code = rule[js_pos + 4:].strip()
+            elements = self._get_elements(raw, head) if head else []
+            if not elements or not js_code:
+                return elements
+            source_html = "\n".join(str(element) for element in elements)
+            try:
+                js_result = self._try_eval_js(js_code, source_html)
+            except Exception:
+                js_result = None
+            if isinstance(js_result, list):
+                return list(reversed(js_result)) if reverse else js_result
+            if isinstance(js_result, dict):
+                return [js_result]
+            if js_result is None or str(js_result).strip() == source_html.strip():
+                # The script only populated variables (java.put) and echoed its
+                # input; keep the elements it ran against.
+                return list(reversed(elements)) if reverse else elements
+            return list(reversed([js_result])) if reverse else [js_result]
+
         return self._get_elements(raw, rule)
 
     def _js_code_from_rule(self, rule: str) -> str | None:
@@ -574,14 +603,30 @@ class YueduRuleEngine:
             return []
 
         elements: list[Tag] = [root]
-        for segment in rule.split("@"):
-            segment = segment.strip()
-            if not segment:
-                continue
+        for segment in self._split_element_steps(rule):
             elements = self._select_elements_chain(elements, segment)
         if reverse:
             elements.reverse()
         return elements
+
+    @staticmethod
+    def _split_element_steps(rule: str) -> list[str]:
+        """Split a rule chain on ``@`` the way Legado does.
+
+        ``@`` separates rule steps, but XPath-ish attribute selectors contain
+        one as well: ``//div[@class='gallary_wrap']/ul/li``.  Legado's
+        ``RuleAnalyzer.splitRule("@")`` skips separators inside balanced
+        ``[]``/``()`` pairs (and quotes).  A naive ``str.split("@")`` tore that
+        rule into ``//div`` + ``class='gallary_wrap']/ul/li``, so every source
+        whose ``bookList`` / ``chapterList`` used ``[@class=...]`` parsed to
+        **zero** books or chapters -- e.g. 绅士漫画 (wn09.shop), whose catalog
+        rule is exactly ``//div[@class='gallary_wrap']/ul/li``.
+        """
+        try:
+            steps = _RuleAnalyzer(rule).split_rule("@")
+        except Exception:
+            steps = rule.split("@")
+        return [step.strip() for step in steps if step.strip()]
 
     def _select_elements_chain(
         self,
@@ -688,6 +733,19 @@ class YueduRuleEngine:
                     node.parent for node in el.find_all(string=True)
                     if node.parent is not None and value in str(node)
                 ]
+        # Legado book sources are free to write ``bookList`` / ``chapterList``
+        # in XPath syntax ("//div[@class='gallary_wrap']/ul/li").  soupsieve
+        # rejects a leading "/", and the exception below used to swallow the
+        # rule and return "no elements" -- so such sources silently discovered
+        # 0 books / 0 chapters.  Translate the subset of XPath that appears in
+        # list rules into CSS and let soupsieve do the selection.
+        if before.startswith(("/", ".")) or "//" in before:
+            css = YueduRuleEngine._xpath_list_rule_to_css(before)
+            if css:
+                try:
+                    return el.select(css)
+                except Exception:
+                    pass
         try:
             return el.select(normalize_css_selector(before))
         except Exception:
@@ -695,6 +753,94 @@ class YueduRuleEngine:
             # selector. Jsoup/Legado treat that as a text search, so fall back
             # to elements whose own text contains the label.
             return YueduRuleEngine._text_matching_elements(el, before)
+
+    @staticmethod
+    def _xpath_list_rule_to_css(rule: str) -> str | None:
+        """Translate an XPath-ish element list rule into a CSS selector.
+
+        Only the shape that book sources actually use in ``bookList`` /
+        ``chapterList`` is supported -- child/descendant steps, attribute
+        predicates (``[@class='x']``, ``[@href]``) and numeric position
+        (``li[1]`` -> ``li:nth-of-type(1)``).  Anything else (axes, ``text()``,
+        ``contains()``, nested predicates) returns ``None`` so callers keep
+        their previous behaviour instead of mis-selecting elements.
+        """
+        text = (rule or "").strip()
+        if text.lower().startswith("@xpath:"):
+            text = text[7:].strip()
+        if not text.startswith(("/", ".")):
+            return None
+        # Drop the leading "/", "//", "./" or ".//" prefix.
+        text = re.sub(r"^\.?//?", "", text, count=1).strip()
+        if not text:
+            return None
+
+        steps: list[tuple[str, str]] = []
+        buffer = ""
+        combinator = " "
+        index = 0
+        length = len(text)
+        while index < length:
+            char = text[index]
+            if char == "[":
+                end = text.find("]", index)
+                if end == -1:
+                    return None
+                buffer += text[index:end + 1]
+                index = end + 1
+                continue
+            if char == "/":
+                end = index
+                while end < length and text[end] == "/":
+                    end += 1
+                if not buffer.strip():
+                    return None
+                steps.append((combinator, buffer.strip()))
+                buffer = ""
+                combinator = " " if end - index > 1 else " > "
+                index = end
+                continue
+            buffer += char
+            index += 1
+        if buffer.strip():
+            steps.append((combinator, buffer.strip()))
+        if not steps:
+            return None
+
+        css_parts: list[str] = []
+        for position, (comb, step) in enumerate(steps):
+            converted = YueduRuleEngine._xpath_step_to_css(step)
+            if converted is None:
+                return None
+            css_parts.append(("" if position == 0 else comb) + converted)
+        return "".join(css_parts)
+
+    @staticmethod
+    def _xpath_step_to_css(step: str) -> str | None:
+        match = re.fullmatch(
+            r"(?P<tag>[A-Za-z][\w-]*|\*)?(?P<preds>(?:\[[^\]]*\])*)",
+            step.strip(),
+        )
+        if not match:
+            return None
+        css = match.group("tag") or "*"
+        for predicate in re.findall(r"\[([^\]]*)\]", match.group("preds") or ""):
+            predicate = predicate.strip()
+            if predicate.startswith("@"):
+                body = predicate[1:].strip()
+                attr = re.fullmatch(
+                    r"(?P<attr>[\w:.-]+)(?P<rest>\s*(?:[!^$*~|]?=)\s*\S.*)?",
+                    body,
+                )
+                if not attr:
+                    return None
+                css += f"[{body}]"
+                continue
+            if re.fullmatch(r"\d+", predicate):
+                css += f":nth-of-type({predicate})"
+                continue
+            return None
+        return css
 
     @staticmethod
     def _text_matching_elements(el: Tag, needle: str) -> list[Tag]:
@@ -1049,10 +1195,17 @@ class YueduRuleEngine:
         soup = self._ensure_soup(raw)
         if soup is None:
             return None
+        # A Legado field rule may append a regex transform to an XPath selector
+        # (``//div[@class='x']/img/@src##^//##https://``).  Feeding the whole
+        # string to lxml raised XPathEvalError, and the CSS fallback then raised
+        # SelectorSyntaxError out of ``_eval_xpath`` -- one such cover rule
+        # aborted the whole book sync.  Split the transform off, evaluate the
+        # selector, then post-process each value like Legado does.
+        selector, transform = self._split_xpath_transform(rule)
         try:
             from lxml import etree
             tree = etree.HTML(str(raw))
-            elements = tree.xpath(rule)
+            elements = tree.xpath(selector)
             if not elements:
                 return None
             texts = []
@@ -1063,10 +1216,29 @@ class YueduRuleEngine:
                     texts.append(el.text_content().strip())
                 else:
                     texts.append((el.text or "").strip())
+            if transform:
+                texts = [self._apply_replace_regex(t, transform) for t in texts]
             return "\n".join(t for t in texts if t) if texts else None
         except Exception:
-            results = soup.select(normalize_css_selector(rule))
-            return "\n".join(r.get_text("\n", strip=True) for r in results) if results else None
+            try:
+                results = soup.select(normalize_css_selector(selector))
+            except Exception:
+                return None
+            if not results:
+                return None
+            texts = [r.get_text("\n", strip=True) for r in results]
+            if transform:
+                texts = [self._apply_replace_regex(t, transform) for t in texts]
+            return "\n".join(t for t in texts if t) or None
+
+    @staticmethod
+    def _split_xpath_transform(rule: str) -> tuple[str, str]:
+        """Split ``selector##pattern##replacement`` into its two parts."""
+        text = str(rule or "")
+        if "##" not in text:
+            return text, ""
+        selector, _, transform = text.partition("##")
+        return selector.strip(), "##" + transform
 
     def _apply_replace_regex(self, text: str, rule: Any) -> str:
         if isinstance(rule, list):

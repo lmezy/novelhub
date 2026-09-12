@@ -476,6 +476,59 @@ def test_build_headers_merges_source_and_session_cookies():
     assert plugin._build_headers()["Cookie"] == "isSimplified=1; session=abc"
 
 
+# 绅士漫画 (wn09.shop) declares its headers as a JS rule that references
+# ``baseUrl``; the old parser fed that script straight to json.loads, so the
+# desktop User-Agent and Referer were silently dropped and the site answered
+# with its mobile document (which the source's own rules cannot parse -> 0
+# books).
+WN09_HEADER_RULE = (
+    "@js:\nJSON.stringify({\n"
+    '  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+    'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",\n'
+    "  \"Referer\": baseUrl,\n"
+    '  "Accept-Language": "zh-CN,zh;q=0.9"\n'
+    "})"
+)
+
+
+@pytest.mark.parametrize("with_js_runtime", [True, False])
+def test_build_headers_evaluates_js_header_rule(with_js_runtime):
+    """The declared desktop UA must survive, with or without Node.js."""
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.wn09.shop/",
+        "header": WN09_HEADER_RULE,
+    })
+    YueduPlugin._header_rule_cache.clear()
+    patcher = (
+        patch("app.crawler.plugins.yuedu.js_runtime.JsRuntime.get_instance",
+              side_effect=RuntimeError("node missing"))
+        if not with_js_runtime
+        else patch.object(plugin, "_parse_header_rule", wraps=plugin._parse_header_rule)
+    )
+    with patcher:
+        headers = plugin._build_headers()
+
+    assert headers["User-Agent"].endswith("Chrome/142.0.0.0 Safari/537.36")
+    assert headers["Referer"] == "https://www.wn09.shop/"
+    assert headers["Accept-Language"] == "zh-CN,zh;q=0.9"
+
+
+def test_header_rule_is_cached_per_source():
+    YueduPlugin._header_rule_cache.clear()
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.wn09.shop/",
+        "header": WN09_HEADER_RULE,
+    })
+    with patch.object(
+        plugin, "_parse_header_rule", wraps=plugin._parse_header_rule
+    ) as parse:
+        plugin._build_headers()
+        plugin._build_headers()
+        plugin._build_headers()
+
+    assert parse.call_count == 1
+
+
 def test_403_fallback_uses_desktop_ua_and_referer():
     plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
     fallback = plugin._with_403_fallback({
@@ -639,6 +692,104 @@ async def test_fetch_explore_falls_back_when_rule_matches_container():
     assert len(items) == 2
     assert items[0]["bookUrl"] == "https://example.com/novel/123.html"
     assert items[1]["bookUrl"] == "https://example.com/novel/456.html"
+
+
+@pytest.mark.asyncio
+async def test_fetch_explore_fetches_categories_concurrently():
+    """Catalog categories of one source are fetched in parallel.
+
+    Sequentially fetching the 20+ ``ruleExplore`` kinds of a big source left the
+    source's rate limiter idle between pages (wait for page N, then wait for the
+    interval).  Fetching a few at once removes that idle time; the per-source
+    ``concurrentRate`` limiter still decides how often a request may start, so
+    the site sees the same request rate.
+    """
+    explore = json.dumps([
+        {"title": f"分类{i}", "url": f"https://example.com/list/{i}.html"}
+        for i in range(4)
+    ])
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "ruleSearch": {},
+        "exploreUrl": explore,
+    })
+
+    in_flight = 0
+    peak = 0
+
+    async def fake_kind_items(kind_url, resolved, page, explore_kind, options):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.05)
+        in_flight -= 1
+        return [{
+            "name": explore_kind,
+            "bookUrl": f"https://example.com/novel/{explore_kind}.html",
+        }]
+
+    with patch.object(plugin, "_fetch_kind_items", side_effect=fake_kind_items):
+        books = await plugin.discover_books(page=1)
+
+    assert [book.title for book in books] == [
+        "分类0", "分类1", "分类2", "分类3",
+    ]
+    assert peak > 1
+
+
+@pytest.mark.asyncio
+async def test_explore_rule_items_survive_without_book_url_pattern():
+    """绅士漫画 lists albums as ``/photos-index-aid-123.html``.
+
+    The source declares no ``bookUrlPattern``, so its own ``ruleExplore`` rule
+    decides what a book link is (as Legado does).  Running the plugin's
+    ``/novel/123``-shaped path heuristic on top rejected every one of them and
+    the source synced 0 books.
+    """
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.wn09.shop/",
+        "ruleExplore": {
+            "bookList": "//div[@class='gallary_wrap']/ul/li",
+            "name": "a@text",
+            "bookUrl": "a@href",
+        },
+    })
+    html = (
+        '<div class="gallary_wrap"><ul>'
+        '<li><a href="/photos-index-aid-1.html">书一</a></li>'
+        '<li><a href="/photos-index-aid-2.html">书二</a></li>'
+        '</ul></div>'
+    )
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        books = await plugin.discover_books(page=1)
+
+    assert [book.title for book in books] == ["书一", "书二"]
+    assert books[1].url == "https://www.wn09.shop/photos-index-aid-2.html"
+
+
+@pytest.mark.asyncio
+async def test_explore_items_still_filtered_when_pattern_declared():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "bookUrlPattern": r"https?://example\.com/novel/\d+\.html",
+        "ruleExplore": {
+            "bookList": "//ul[@class='list']/li",
+            "name": "a@text",
+            "bookUrl": "a@href",
+        },
+    })
+    html = (
+        '<ul class="list">'
+        '<li><a href="/novel/1.html">正片</a></li>'
+        '<li><a href="/rank/2.html">榜单</a></li>'
+        '</ul>'
+    )
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        books = await plugin.discover_books(page=1)
+
+    assert [book.url for book in books] == ["https://example.com/novel/1.html"]
 
 
 @pytest.mark.asyncio
@@ -2383,6 +2534,52 @@ def test_is_blocked_page_detects_cloudflare_challenge():
         "</head><body>Attention Required! | Cloudflare</body></html>"
     )
     assert YueduPlugin._is_blocked_page(html) is True
+
+
+# A real 御宅屋 (yswhub.cc) page fetched successfully with an imported Cookie:
+# the only "block" marker it contained was Cloudflare's always-on bot-management
+# script, which is injected into ordinary pages of every Cloudflare-fronted site.
+CLOUDFLARE_JSD_PAGE = (
+    "<!DOCTYPE html><html lang=\"zh-CN\"><head>"
+    "<title>耽美小说_御宅屋|御书屋</title><meta charset=\"utf-8\">"
+    "<script>window.__CF$cv$params={r:'a39eb8b63be9ce17',t:'MTc4OTIxMzcwMA=='};"
+    "var a=document.createElement('script');"
+    "a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';"
+    "document.getElementsByTagName('head')[0].appendChild(a);</script>"
+    "</head><body><div class=\"novel-list\"><a href=\"/book/1.html\">作品一</a>"
+    "</div></body></html>"
+)
+
+
+def test_is_blocked_page_ignores_cloudflare_bot_management_script():
+    """Regression: 御宅屋 pages were reported as captcha gates.
+
+    ``challenge-platform`` was matched as a bare substring, so the JSD
+    bot-management script that Cloudflare injects into *normal* pages made every
+    page of the site look blocked -- the sync aborted with "please import a
+    Cookie" even though the Cookie worked and the page had been downloaded.
+    """
+    assert YueduPlugin._is_blocked_page(CLOUDFLARE_JSD_PAGE) is False
+    assert YueduPlugin._is_challenge_page(CLOUDFLARE_JSD_PAGE) is False
+    # The real challenge gate is still detected.
+    assert YueduPlugin._is_blocked_page(
+        '<html><head><title>Just a moment...</title>'
+        '<script src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page">'
+        '</script></head><body></body></html>'
+    ) is True
+
+
+def test_blocked_page_error_tells_the_truth_about_a_configured_cookie():
+    plugin = YueduPlugin({"bookSourceUrl": "https://yswhub.cc"})
+    without = str(plugin._blocked_page_error("https://yswhub.cc/sort/1_1.html"))
+    assert "把 Cookie 导入书源" in without
+
+    plugin.set_cookie("ss_userid=283; cf_clearance=old")
+    with_cookie = str(plugin._blocked_page_error("https://yswhub.cc/sort/1_1.html"))
+    assert "已配置 Cookie" in with_cookie
+    assert "把 Cookie 导入书源再同步" not in with_cookie
+    # Callers still classify the message as an anti-bot gate.
+    assert "anti-bot" in with_cookie
 
 
 @pytest.mark.asyncio

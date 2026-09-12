@@ -43,6 +43,15 @@ name1=value1; name2=value2; name3=value3
 
 - **测试失败**：站点不可达 / 域名变了 / Cookie 过期 / Cookie 绑定了签发时的 IP 或浏览器
   指纹 / 该书源不支持书架抓取。先确认浏览器里还能正常打开书架页。
+- **导入后同步仍报“验证码/人机验证”**：2026-09-12 起错误信息会区分两种情况——
+  写「书源已配置 Cookie 但仍被站点拦截」时，Cookie 确实发出去了、站点仍然拦，说明
+  Cookie 过期或与当前出口 IP / User-Agent 不匹配（Cloudflare 的 `cf_clearance` 同时绑定
+  这两者，手机版 UA 与浏览器桌面版 UA 不通用）。处理：在与 NovelHub 相同的代理节点下用浏览器
+  重新过验证，再重新导入；或先换一条代理线路。
+- **Cookie 正常但同步 0 本书**：多数不是 Cookie 的问题，而是书源的请求头规则
+  （`@js:JSON.stringify({...})`）或 XPath 风格的 `bookList` 之前没被正确执行，站点返回的
+  页面/结构对不上。这类问题已在 2026-09-12 修好，重新同步即可（见
+  [full-site-sync.md](full-site-sync.md) 对应小节）。
 - **提示 No cookie found**：Cookie 的 `source` 必须与书源 ID 完全一致（大小写敏感），
   例如 `yuedu_b38b98d309e3`。
 - **Cookie 太长**：输入框是 textarea，可以贴整段；JSON 格式可用在线工具转成 Header String。

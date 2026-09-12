@@ -192,6 +192,23 @@ def test_sync_thread_count_caps_at_legado_max():
         assert sync_thread_count() == 9
 
 
+def test_sync_source_concurrency_means_one_worker_per_source_by_default():
+    """``SYNC_WORKER_CONCURRENCY <= 0`` must mean "no global cap".
+
+    With the old default of 3, a fourth full-site task queued behind three
+    multi-hour tasks (~4h online).  Legado gives every source its own worker and
+    its own ``concurrentRate`` limiter, so sources sync independently.
+    """
+    from app.core.config import settings, sync_source_concurrency
+
+    with patch.object(settings, "SYNC_WORKER_CONCURRENCY", 0):
+        assert sync_source_concurrency() == 0
+    with patch.object(settings, "SYNC_WORKER_CONCURRENCY", -1):
+        assert sync_source_concurrency() == 0
+    with patch.object(settings, "SYNC_WORKER_CONCURRENCY", 5):
+        assert sync_source_concurrency() == 5
+
+
 @pytest.mark.asyncio
 async def test_find_same_title_books_filters_normalized_title():
     db = _mock_db()

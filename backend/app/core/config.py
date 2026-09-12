@@ -60,7 +60,11 @@ class Settings(BaseSettings):
     SYNC_BOOK_CONTINUOUS:bool=False
     SYNC_IGNORE_RATE_LIMIT:bool=False
     SYNC_THREAD_COUNT:int=9
-    SYNC_WORKER_CONCURRENCY:int=3
+    # How many book sources may sync at the same time.  0 (or less) means
+    # "one worker per source": every source runs in its own task and a source
+    # never runs two tasks at once, so a long full-site sync of one site can no
+    # longer block the other eleven.  Set a positive number to keep a ceiling.
+    SYNC_WORKER_CONCURRENCY:int=0
     SYNC_PAGE_BATCH_SIZE:int=0
     SYNC_BATCH_INTERVAL_MS:int=5000
 
@@ -70,4 +74,19 @@ settings=Settings()
 def sync_thread_count() -> int:
     """Effective concurrent thread pool size, capped like Legado's MAX_THREAD."""
     return max(1, min(int(settings.SYNC_THREAD_COUNT), 9))
+
+
+def sync_source_concurrency() -> int:
+    """How many *book sources* may sync in parallel.
+
+    ``0`` means unlimited (one worker per source, which is what Legado does:
+    every source carries its own ``concurrentRate`` limiter, so running many
+    sources at once does not increase the request rate any single site sees).
+    A positive value keeps a global ceiling for small hosts.
+    """
+    try:
+        value = int(getattr(settings, "SYNC_WORKER_CONCURRENCY", 0))
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
 

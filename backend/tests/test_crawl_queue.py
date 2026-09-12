@@ -8,7 +8,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.exc import MissingGreenlet
 
 from app.services.crawl_runner import (
-    _next_pending_task_ids,
+    _next_pending_tasks,
     _worker_loop,
     run_crawl_task_async,
 )
@@ -111,19 +111,20 @@ async def test_resume_paused_task_requeues_it():
 
 
 @pytest.mark.asyncio
-async def test_next_pending_task_ids_returns_batch():
-    db = AsyncMock()
-    db.scalars = AsyncMock(
-        return_value=SimpleNamespace(all=lambda: ["task-a", "task-b"])
+async def test_next_pending_tasks_returns_batch():
+    rows = SimpleNamespace(
+        all=lambda: [("task-a", "yuedu_a"), ("task-b", "yuedu_b")]
     )
+    db = AsyncMock()
+    db.execute = AsyncMock(return_value=rows)
     session = AsyncMock()
     session.__aenter__ = AsyncMock(return_value=db)
     session.__aexit__ = AsyncMock(return_value=False)
 
     with patch("app.services.crawl_runner.SessionLocal", return_value=session):
-        ids = await _next_pending_task_ids(3)
+        pairs = await _next_pending_tasks(3)
 
-    assert ids == ["task-a", "task-b"]
+    assert pairs == [("task-a", "yuedu_a"), ("task-b", "yuedu_b")]
 
 
 @pytest.mark.asyncio
@@ -377,15 +378,15 @@ async def test_worker_loop_picks_up_new_task_while_another_is_running():
     release_a = asyncio.Event()
     all_started = asyncio.Event()
 
-    async def fake_next(limit: int) -> list[str]:
+    async def fake_next(limit: int, exclude_sources=None) -> list[tuple[str, str]]:
         nonlocal calls
         calls += 1
         if calls == 1:
-            return ["task-a"]
+            return [("task-a", "yuedu_a")]
         if calls == 2:
             return []
         if calls == 3:
-            return ["task-b"]
+            return [("task-b", "yuedu_b")]
         return []
 
     async def fake_run(task_id: str) -> dict:
@@ -398,9 +399,8 @@ async def test_worker_loop_picks_up_new_task_while_another_is_running():
 
     with (
         patch.object(settings, "SYNC_WORKER_CONCURRENCY", 2),
-        patch("app.services.crawl_runner.sync_thread_count", return_value=9),
         patch(
-            "app.services.crawl_runner._next_pending_task_ids",
+            "app.services.crawl_runner._next_pending_tasks",
             side_effect=fake_next,
         ),
         patch(
@@ -420,6 +420,112 @@ async def test_worker_loop_picks_up_new_task_while_another_is_running():
                 pass
 
     assert started_tasks == {"task-a", "task-b"}
+
+
+@pytest.mark.asyncio
+async def test_worker_loop_runs_one_worker_per_source_when_uncapped():
+    """``SYNC_WORKER_CONCURRENCY=0`` must not queue sources behind three slots.
+
+    Online a fourth full-site task waited ~4h behind three long h528 / 要撸 /
+    禁忌书屋 tasks, because the pool had exactly ``SYNC_WORKER_CONCURRENCY``
+    (3) slots.  Every source now gets its own worker while each source still
+    keeps its own request pacing.
+    """
+    tasks = [("task-1", "src-1"), ("task-2", "src-2"), ("task-3", "src-3"),
+             ("task-4", "src-4")]
+    started: list[str] = []
+    all_started = asyncio.Event()
+    release = asyncio.Event()
+    served = False
+
+    async def fake_next(limit, exclude_sources=None):
+        nonlocal served
+        if served:
+            return []
+        served = True
+        return list(tasks)
+
+    async def fake_run(task_id: str) -> dict:
+        started.append(task_id)
+        if len(started) >= len(tasks):
+            all_started.set()
+        await release.wait()
+        return {"status": "completed", "task_id": task_id}
+
+    with (
+        patch.object(settings, "SYNC_WORKER_CONCURRENCY", 0),
+        patch(
+            "app.services.crawl_runner._next_pending_tasks",
+            side_effect=fake_next,
+        ),
+        patch(
+            "app.services.crawl_runner.run_crawl_task_async",
+            side_effect=fake_run,
+        ),
+    ):
+        worker = asyncio.create_task(_worker_loop())
+        try:
+            await asyncio.wait_for(all_started.wait(), timeout=5)
+        finally:
+            release.set()
+            worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
+
+    assert sorted(started) == ["task-1", "task-2", "task-3", "task-4"]
+
+
+@pytest.mark.asyncio
+async def test_worker_loop_never_runs_two_tasks_of_the_same_source():
+    """Two queued tasks for one source must not hit that site at once."""
+    pending = [("task-1", "src-1"), ("task-2", "src-1")]
+    concurrency_seen: list[str] = []
+    overlapping = False
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def fake_next(limit, exclude_sources=None):
+        if exclude_sources and "src-1" in exclude_sources:
+            return []
+        return list(pending)
+
+    async def fake_run(task_id: str) -> dict:
+        nonlocal overlapping
+        if concurrency_seen:
+            overlapping = True
+        concurrency_seen.append(task_id)
+        started.set()
+        await release.wait()
+        concurrency_seen.remove(task_id)
+        return {"status": "completed", "task_id": task_id}
+
+    with (
+        patch.object(settings, "SYNC_WORKER_CONCURRENCY", 0),
+        patch(
+            "app.services.crawl_runner._next_pending_tasks",
+            side_effect=fake_next,
+        ),
+        patch(
+            "app.services.crawl_runner.run_crawl_task_async",
+            side_effect=fake_run,
+        ),
+    ):
+        worker = asyncio.create_task(_worker_loop())
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            await asyncio.sleep(0.5)
+        finally:
+            release.set()
+            worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
+
+    assert overlapping is False
+    assert concurrency_seen == []
 
 
 @pytest.mark.asyncio

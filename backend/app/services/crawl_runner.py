@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from loguru import logger
 from sqlalchemy import select, update
 
-from app.core.config import settings, sync_thread_count
+from app.core.config import settings, sync_source_concurrency
 from app.core.database import SessionLocal
 from app.models import CrawlTask
 
@@ -196,19 +196,30 @@ async def _apply_task_state(task_obj, db, task_id: str, values: dict[str, Any]) 
     await _write_task_row(task_id, values)
 
 
-async def _next_pending_task_ids(limit: int = 1) -> list[str]:
+async def _next_pending_tasks(
+    limit: int = 1,
+    exclude_sources: set[str] | None = None,
+) -> list[tuple[str, str]]:
+    """Pending ``(task_id, source)`` pairs in priority order.
+
+    ``exclude_sources`` keeps a source that is already syncing out of the
+    result: every source gets its own worker, but one source must never run two
+    tasks at once (that is what would break a site's ``concurrentRate``).
+    """
     async with SessionLocal() as db:
-        rows = await db.scalars(
-            select(CrawlTask.id)
-            .where(
-                CrawlTask.status == "pending",
-                (CrawlTask.resume_at.is_(None))
-                | (CrawlTask.resume_at <= _naive_utcnow()),
-            )
-            .order_by(CrawlTask.priority.desc(), CrawlTask.created_at.asc())
-            .limit(limit)
+        query = select(CrawlTask.id, CrawlTask.source).where(
+            CrawlTask.status == "pending",
+            (CrawlTask.resume_at.is_(None))
+            | (CrawlTask.resume_at <= _naive_utcnow()),
         )
-        return list(rows.all())
+        if exclude_sources:
+            query = query.where(CrawlTask.source.notin_(exclude_sources))
+        rows = await db.execute(
+            query.order_by(
+                CrawlTask.priority.desc(), CrawlTask.created_at.asc()
+            ).limit(limit)
+        )
+        return [(row[0], row[1]) for row in rows.all()]
 
 
 async def _reset_stale_running_tasks() -> None:
@@ -465,37 +476,56 @@ async def run_crawl_task_async(task_id: str) -> dict:
 
 
 async def _worker_loop() -> None:
-    concurrency = min(
-        max(1, int(getattr(settings, "SYNC_WORKER_CONCURRENCY", 2))),
-        sync_thread_count(),
-    )
-    claimed: set[str] = set()
-    active: dict[asyncio.Task, str] = {}
+    """Run every book source in its own worker, in parallel.
 
-    async def _run_guarded(task_id: str) -> None:
+    The previous loop used one global pool (``SYNC_WORKER_CONCURRENCY``,
+    default 3), so a fourth source waited behind three multi-hour full-site
+    tasks.  Legado behaves differently: each source carries its own
+    ``concurrentRate`` limiter, so sources sync independently and the *site*
+    still sees only the request rate it declared.
+
+    ``SYNC_WORKER_CONCURRENCY <= 0`` (the default) therefore means "one worker
+    per source"; a positive value keeps a global ceiling for small hosts.
+    A single source never runs two tasks at once.
+    """
+    limit = sync_source_concurrency()
+    claimed: set[str] = set()
+    active: dict[asyncio.Task, tuple[str, str]] = {}
+    running_sources: set[str] = set()
+
+    async def _run_guarded(task_id: str, source: str) -> None:
         try:
             await run_crawl_task_async(task_id)
         except Exception as exc:
             logger.error("Crawl task {} stopped: {}", task_id, exc)
+        finally:
+            running_sources.discard(source)
+
+    def _free_slots() -> int:
+        if limit <= 0:
+            # Bounded batch: enough to fill every empty slot without loading an
+            # unbounded pending backlog into memory.
+            return 32
+        return max(1, limit - len(active))
 
     while True:
-        while len(active) < concurrency:
-            candidates = await _next_pending_task_ids(concurrency)
+        while limit <= 0 or len(active) < limit:
+            candidates = await _next_pending_tasks(_free_slots(), running_sources)
             if not candidates:
                 break
             started_any = False
-            for task_id in candidates:
-                if len(active) >= concurrency:
+            for task_id, source in candidates:
+                if limit > 0 and len(active) >= limit:
                     break
-                if task_id in claimed:
+                if task_id in claimed or source in running_sources:
                     continue
                 claimed.add(task_id)
-                task = asyncio.create_task(_run_guarded(task_id))
-                active[task] = task_id
+                running_sources.add(source)
+                task = asyncio.create_task(_run_guarded(task_id, source))
+                active[task] = (task_id, source)
                 started_any = True
             if not started_any:
                 # All candidates are already claimed but not yet running.
-                await asyncio.sleep(0.1)
                 break
 
         if not active:
@@ -511,8 +541,9 @@ async def _worker_loop() -> None:
             timeout=1.0,
         )
         for finished in done:
-            task_id = active.pop(finished)
+            task_id, source = active.pop(finished)
             claimed.discard(task_id)
+            running_sources.discard(source)
             if finished.cancelled():
                 logger.warning("Crawl task {} cancelled", task_id)
                 continue
@@ -528,4 +559,10 @@ async def main_async() -> None:
 
 
 def main() -> None:
+    # The queue worker used to run with loguru's default handler only, so every
+    # standard-library log line from the plugin layer (the "why did this source
+    # return 0 books" diagnostics) was printed as bare text without a level.
+    from app.core.logging import install_stdlib_logging_bridge
+
+    install_stdlib_logging_bridge()
     asyncio.run(main_async())
