@@ -13,6 +13,12 @@ class ReadingProgress(Base):
     id = Column(String, primary_key=True)
     user_id = Column(String, ForeignKey("users.id"))
     book_id = Column(String, ForeignKey("books.id"))
-    chapter_id = Column(String, ForeignKey("chapters.id"))
+    # A re-sync replaces stale chapters; clearing this pointer (instead of
+    # refusing the delete) keeps the progress row alive.
+    chapter_id = Column(
+        String,
+        ForeignKey("chapters.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     position = Column(Integer, default=0)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

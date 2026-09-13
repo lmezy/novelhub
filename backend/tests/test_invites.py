@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Response
 
 from app.api.routes.invites import create_invite, delete_invite, list_invites
 from app.api.routes.auth import register
@@ -108,6 +108,7 @@ async def test_register_consumes_one_time_invite():
             password="New_pass1",
             invite_code="ABC123",
         ),
+        Response(),
         db,
     )
 

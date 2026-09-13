@@ -1,4 +1,4 @@
-from fastapi import Depends, Header, HTTPException
+from fastapi import Depends, Header, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,6 +9,28 @@ from app.services.jwt import decode_token
 
 
 bearer_scheme = HTTPBearer(auto_error=False)
+
+# ``<img src="/api/chapters/…">`` cannot send an Authorization header, so a
+# chapter's in-content images would answer 401 for every reader even though
+# the HTML around them is authenticated.  The login endpoints therefore also
+# drop the same JWT into an HttpOnly cookie scoped to the chapter routes, and
+# those routes accept either credential.
+MEDIA_COOKIE_NAME = "novelhub_media"
+MEDIA_COOKIE_PATH = "/api/chapters"
+
+
+async def _user_from_jwt(token: str, db: AsyncSession) -> User | None:
+    """Resolve a JWT (bearer or cookie) to its user, or None when invalid."""
+    if not token:
+        return None
+    try:
+        payload = decode_token(token)
+    except JWTError:
+        return None
+    user_id = payload.get("sub")
+    if not user_id:
+        return None
+    return await db.get(User, user_id)
 
 
 async def get_current_user(
@@ -30,6 +52,30 @@ async def get_current_user(
     user = await db.get(User, user_id)
     if user is None:
         raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+
+async def get_current_user_media(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    """Authenticate a media request via bearer token or the media cookie.
+
+    Chapter images are embedded as plain ``<img>`` tags, which browsers fetch
+    without the ``Authorization`` header the rest of the API uses.  Accepting
+    the login cookie for these read-only routes keeps the images behind the
+    same visibility rules as the chapter text itself.
+    """
+    token = credentials.credentials if credentials is not None else ""
+    if not token:
+        token = request.cookies.get(MEDIA_COOKIE_NAME, "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing authorization")
+
+    user = await _user_from_jwt(token, db)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid authorization")
     return user
 
 

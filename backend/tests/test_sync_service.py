@@ -985,6 +985,49 @@ async def test_reconcile_chapter_ids_drops_anti_bot_junk_chapters():
 
 
 @pytest.mark.asyncio
+async def test_reconcile_chapter_ids_detaches_references_before_deleting():
+    """A stale chapter cannot be deleted while a reader points at it.
+
+    Re-syncing a book drops chapters that were saved from an anti-bot page so
+    they can be fetched again.  When the user had read one of them, the
+    ``reading_progress`` foreign key made the delete fail and the whole book
+    sync with it (``ForeignKeyViolationError`` on 绅士漫画).
+    """
+    stale = Chapter(
+        id="c1",
+        book_id="book-1",
+        chapter_number=1,
+        source_chapter_id="https://example.com/book/1/a.html",
+        title="第一章",
+        content_path="/stale/000001.md",
+    )
+    remote_chapters = [
+        RemoteChapter(
+            source_chapter_id="https://example.com/book/1/a.html",
+            title="第一章",
+            url="https://example.com/book/1/a.html",
+            chapter_number=1,
+        ),
+    ]
+    db = AsyncMock()
+    db.scalars = AsyncMock(return_value=SimpleNamespace(all=lambda: [stale]))
+    db.flush = AsyncMock()
+    db.delete = AsyncMock()
+
+    service = SyncService(db)
+    service.storage = MagicMock()
+    service.storage.read_chapter.return_value = "#第一章\n\n"
+
+    result = await service._reconcile_chapter_ids("book-1", remote_chapters)
+
+    assert result == set()
+    assert db.delete.await_count == 1
+    statements = [str(call.args[0]) for call in db.execute.await_args_list]
+    assert any("UPDATE reading_progress" in text for text in statements)
+    assert any("reading_progress.chapter_id" in text for text in statements)
+
+
+@pytest.mark.asyncio
 async def test_chapter_has_real_content_rejects_anti_bot_text():
     db = AsyncMock()
     service = SyncService(db)

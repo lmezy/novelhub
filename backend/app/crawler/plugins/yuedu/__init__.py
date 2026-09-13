@@ -335,6 +335,20 @@ WEAK_BLOCK_MARKERS = (
     "限流",
 )
 
+# Phrases that confirm a weak marker.  They are only trusted when they sit
+# right next to the marker: a bare substring search over the whole document
+# made 御宅屋 (yswhub.cc) look rate-limited because its sidebar listed a novel
+# called 《限流情缘一线牵》 while Cloudflare's always-on bot-management snippet
+# (``/cdn-cgi/challenge-platform/scripts/jsd/main.js``) put the word
+# "challenge" 800 characters further down the page.
+WEAK_BLOCK_CONFIRMATIONS = (
+    "验证码", "继续访问", "稍后再试", "后再试", "频繁", "限流",
+    "captcha", "challenge", "security",
+)
+
+# How far away a weak marker's confirmation may sit (either side).
+WEAK_BLOCK_WINDOW = 120
+
 # Phrases that also occur in ordinary site chrome -- 禁忌书屋's report button
 # ships `alert('举报失败，请稍后再试')`, which used to flag every thread page as
 # a captcha gate.  They only count when a verification/rate-limit word sits
@@ -400,6 +414,37 @@ def has_contextual_block_marker(text: str) -> bool:
     return False
 
 
+def has_weak_block_marker(text: str) -> bool:
+    """Whether a vague rate-limit phrase is confirmed right next to it.
+
+    The confirmation is looked up in a small window on either side of the
+    marker (and never inside the marker itself, which otherwise confirms
+    itself).  Searching the whole document instead paired a novel title that
+    happened to contain "限流" with an unrelated "challenge" string in a
+    Cloudflare script far away, which aborted whole 御宅屋 sync tasks.
+    """
+    lowered = str(text or "").lower()
+    if not lowered:
+        return False
+    for marker in WEAK_BLOCK_MARKERS:
+        start = 0
+        while True:
+            index = lowered.find(marker, start)
+            if index == -1:
+                break
+            start = index + len(marker)
+            window = (
+                lowered[max(0, index - WEAK_BLOCK_WINDOW): index]
+                + lowered[start: start + WEAK_BLOCK_WINDOW]
+            )
+            if any(
+                confirmation in window
+                for confirmation in WEAK_BLOCK_CONFIRMATIONS
+            ):
+                return True
+    return False
+
+
 class YueduPlugin:
     """A NovelSourcePlugin implementation driven by a YueDu book source JSON."""
 
@@ -441,6 +486,10 @@ class YueduPlugin:
         # so Legado/NovelHub have to page through ``.../page/2`` themselves.
         # ``{base_url: template}`` where the template contains ``{page}``.
         self._explore_page_templates: dict[str, str] = {}
+        # ``{fetched_url: one-line page summary}`` for catalog pages that
+        # parsed to zero books, so the "returned no books" warning can say
+        # what the site actually answered instead of only the URL.
+        self._explore_page_diagnostics: dict[str, str] = {}
         # ``{kind_url: page-1 URL}`` memo so a ``<js>`` rule is not evaluated
         # twice per page.
         self._explore_kind_bases: dict[str, str] = {}
@@ -2895,12 +2944,18 @@ class YueduPlugin:
                         # A first catalog page that parses to nothing is the
                         # signature of a silent failure (proxy/site served an
                         # error or empty page with HTTP 200).  Record it so the
-                        # log explains why the task saw "0 books".
+                        # log explains why the task saw "0 books" -- including
+                        # what the site answered, since the same code works
+                        # again minutes later when it was a transient hiccup.
                         logger.warning(
-                            "Explore kind %s returned no books on page %s: %s",
+                            "Explore kind %s returned no books on page %s: %s [%s]",
                             kind.get("title", kind_url),
                             page,
                             resolved,
+                            self._explore_page_diagnostics.get(
+                                resolved,
+                                "page not captured",
+                            ),
                         )
                     return items
                 except Exception as exc:
@@ -3348,12 +3403,34 @@ class YueduPlugin:
         if learn_page_template:
             self._remember_page_template(request_url, html)
         items = self._explore_items_from_html(html, request_url)
+        if not items:
+            self._explore_page_diagnostics[request_url] = (
+                self._describe_fetched_page(html)
+            )
         if not explore_kind:
             return items
         return [
             {**item, "exploreKind": explore_kind}
             for item in items
         ]
+
+    @staticmethod
+    def _describe_fetched_page(html: str) -> str:
+        """One-line summary of a fetched page, for empty-catalog warnings.
+
+        A catalog page that parses to zero books is either a real end of the
+        catalog or a silent failure (the proxy or site answered 200 with an
+        error/blank document).  The byte count, title and first visible words
+        tell those apart, which the URL alone never could.
+        """
+        text = str(html or "")
+        title = ""
+        match = re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.S)
+        if match:
+            title = " ".join(match.group(1).split())[:60]
+        body = re.sub(r"<(script|style)\b.*?</\1\s*>", " ", text, flags=re.I | re.S)
+        body = " ".join(re.sub(r"<[^>]+>", " ", body).split())[:80]
+        return f"bytes={len(text)} title={title!r} text={body!r}"
 
     def _explore_kind_for_url(self, url: str, page: int) -> str:
         """Recover a configured category when the caller selects one URL."""
@@ -4656,14 +4733,9 @@ class YueduPlugin:
             return True
         if has_contextual_block_marker(lowered):
             return True
-        confirmations = (
-            "验证码", "继续访问", "稍后再试", "后再试", "频繁", "限流",
-            "captcha", "challenge", "security",
-        )
-        for marker in WEAK_BLOCK_MARKERS:
-            if marker in lowered:
-                return any(confirm in lowered for confirm in confirmations)
-        return False
+        # Weak markers only count with a confirmation phrase beside them;
+        # see ``has_weak_block_marker``.
+        return has_weak_block_marker(lowered)
 
     def _captcha_hint(self) -> str:
         """Hint text for a WAF/captcha page, tailored to the source's state.

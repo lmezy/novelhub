@@ -6,9 +6,45 @@ import re
 from app.core.config import settings
 
 
+# Filesystems cap a single path component at 255 bytes, which long
+# Japanese/Chinese titles blow past: syncing 绅士漫画 failed a whole book with
+# ``[Errno 36] File name too long`` for titles such as
+# 「[とろとろ夢ばなな (夢木ばなな)]「あれぇ、ちょっと舐めたら…」」.
+# 240 leaves room for the ``.md``/``_display.png`` suffixes and stays valid on
+# the strictest filesystems in use.
+MAX_SEGMENT_BYTES = 240
+
+
 def safe_segment(value: str) -> str:
     normalized = re.sub(r'[\\/:*?"<>|]+', "_", value).strip()
-    return normalized or "unknown"
+    normalized = normalized or "unknown"
+    return _truncate_segment(normalized)
+
+
+def _truncate_segment(segment: str, limit: int = MAX_SEGMENT_BYTES) -> str:
+    """Shorten a path segment to ``limit`` bytes without splitting a character.
+
+    A digest of the full value keeps two different long titles from collapsing
+    into the same directory, and the same title always maps to the same name,
+    so re-syncs keep writing to the folder they created before.
+    """
+    encoded = segment.encode("utf-8")
+    if len(encoded) <= limit:
+        return segment
+
+    digest = hashlib.sha1(encoded).hexdigest()[:8]
+    suffix = f"~{digest}"
+    budget = max(1, limit - len(suffix.encode("utf-8")))
+    truncated = encoded[:budget]
+    while truncated:
+        try:
+            head = truncated.decode("utf-8")
+            break
+        except UnicodeDecodeError:
+            truncated = truncated[:-1]
+    else:
+        head = ""
+    return f"{head}{suffix}"
 
 
 class BookStorage:

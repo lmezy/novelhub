@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.models import Book, Chapter, User
 from app.schemas.chapter import ChapterContentOut, ChapterOut
-from app.services.auth import get_current_user, require_admin
+from app.services.auth import get_current_user, get_current_user_media, require_admin
 from app.services.storage import BookStorage
 from app.services.sync import SyncService
 from app.services.visibility import ensure_book_visible
@@ -105,7 +105,7 @@ async def get_chapter_content_chunk(
 async def get_chapter_image(
     chapter_id: str,
     filename: str,
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user_media),
     db: AsyncSession = Depends(get_db),
 ):
     chapter = await db.get(Chapter, chapter_id)

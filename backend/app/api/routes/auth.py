@@ -1,10 +1,11 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.models import Invite, User
 from app.schemas.auth import RegisterResult, TokenOut
@@ -18,7 +19,11 @@ from app.schemas.user import (
     UserSelfVisibilityUpdate,
     UserSettingsUpdate,
 )
-from app.services.auth import get_current_user
+from app.services.auth import (
+    MEDIA_COOKIE_NAME,
+    MEDIA_COOKIE_PATH,
+    get_current_user,
+)
 from app.services.jwt import create_token
 from app.services.security import hash_password, verify_password
 from app.services.settings import get_registration_approval_enabled
@@ -30,8 +35,38 @@ from app.services.validation import password_error
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
+def _set_media_cookie(response: Response, token: str) -> None:
+    """Mirror the JWT into the cookie chapter images are allowed to use.
+
+    ``<img src="/api/chapters/…">`` requests carry no Authorization header, so
+    without this every image in a synced chapter answered 401.  The cookie is
+    scoped to the chapter routes, HttpOnly, and expires with the token itself.
+    """
+    if not token:
+        return
+    response.set_cookie(
+        key=MEDIA_COOKIE_NAME,
+        value=token,
+        max_age=max(1, int(settings.JWT_EXPIRE_MINUTES)) * 60,
+        path=MEDIA_COOKIE_PATH,
+        httponly=True,
+        samesite="lax",
+    )
+
+
+def _bearer_token(request: Request) -> str:
+    header = request.headers.get("Authorization", "")
+    if header.lower().startswith("bearer "):
+        return header[7:].strip()
+    return ""
+
+
 @router.post("/register", response_model=RegisterResult, status_code=201)
-async def register(payload: UserCreate, db: AsyncSession = Depends(get_db)):
+async def register(
+    payload: UserCreate,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
     if not payload.invite_code:
         raise HTTPException(status_code=400, detail="Invite code is required")
     now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -77,15 +112,21 @@ async def register(payload: UserCreate, db: AsyncSession = Depends(get_db)):
     await db.refresh(user)
     if approval_enabled:
         return RegisterResult(status="pending", user=user)
+    access_token = create_token(user.id)
+    _set_media_cookie(response, access_token)
     return RegisterResult(
         status="approved",
-        access_token=create_token(user.id),
+        access_token=access_token,
         user=user,
     )
 
 
 @router.post("/login", response_model=TokenOut)
-async def login(payload: UserLogin, db: AsyncSession = Depends(get_db)):
+async def login(
+    payload: UserLogin,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
     identifier = (payload.username or "").strip()
     user = await db.scalar(
         select(User).where(
@@ -99,11 +140,20 @@ async def login(payload: UserLogin, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=401, detail="Invalid username or password")
     if not user.approved and user.role not in ("admin", "super_admin"):
         raise HTTPException(status_code=403, detail="Account pending approval")
-    return TokenOut(access_token=create_token(user.id), user=user)
+    access_token = create_token(user.id)
+    _set_media_cookie(response, access_token)
+    return TokenOut(access_token=access_token, user=user)
 
 
 @router.get("/me", response_model=UserOut)
-async def me(current_user: User = Depends(get_current_user)):
+async def me(
+    request: Request,
+    response: Response,
+    current_user: User = Depends(get_current_user),
+):
+    # Sessions created before the media cookie existed (or whose cookie
+    # expired) heal on the next app boot instead of needing a re-login.
+    _set_media_cookie(response, _bearer_token(request))
     return current_user
 
 

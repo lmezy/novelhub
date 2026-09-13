@@ -4,7 +4,7 @@ from uuid import uuid4
 from collections.abc import Awaitable, Callable
 from urllib.parse import urljoin, urlparse
 
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -19,8 +19,11 @@ from app.models import (
     Book,
     BookFavorite,
     BookTag,
+    BookVersion,
     Chapter,
     Cookie,
+    Bookmark,
+    ReadingProgress,
     Source,
     SourceChange,
     Tag,
@@ -1175,10 +1178,33 @@ class SyncService:
                 stale_ids.append(source_id)
         for source_id in stale_ids:
             chapter = by_id.pop(source_id)
+            await self._release_chapter_references(chapter.id)
             await self.db.delete(chapter)
 
         await self.db.flush()
         return set(by_id)
+
+    async def _release_chapter_references(self, chapter_id: str) -> None:
+        """Detach rows that point at a chapter about to be replaced.
+
+        ``bookmarks`` / ``chapter_embeddings`` cascade on delete, but
+        ``reading_progress`` (and the legacy ``book_versions`` table) do not,
+        so deleting a stale chapter used to abort the whole book sync with a
+        ForeignKeyViolation.  A progress row keeps the book and its position
+        so "继续阅读" still lists the book; only the dangling pointer is
+        cleared (the replacement chapter gets a new id anyway).
+        """
+        await self.db.execute(
+            update(ReadingProgress)
+            .where(ReadingProgress.chapter_id == chapter_id)
+            .values(chapter_id=None)
+        )
+        await self.db.execute(
+            delete(BookVersion).where(BookVersion.chapter_id == chapter_id)
+        )
+        await self.db.execute(
+            delete(Bookmark).where(Bookmark.chapter_id == chapter_id)
+        )
 
     # Content markers that indicate an anti-bot / captcha page was saved
     # instead of real chapter text.  Chapters matching these are dropped on

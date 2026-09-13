@@ -2271,6 +2271,58 @@ def test_is_blocked_page_ignores_context_free_alert_text():
     ) is True
 
 
+def test_is_blocked_page_ignores_novel_title_that_contains_weak_marker():
+    """御宅屋 chapter pages list related novels in the sidebar.
+
+    One of them is called 《限流情缘一线牵》, and Cloudflare injects
+    ``/cdn-cgi/challenge-platform/scripts/jsd/main.js`` into every page.  The
+    bare "限流" plus the far-away "challenge" used to flag a perfectly normal
+    140KB chapter page, which aborted the whole sync task with a bogus
+    "please import a Cookie" hint.
+    """
+    html = (
+        '<html><head><title>创世之书：少年激斗篇 - 御宅屋</title></head><body>'
+        '<div id="nr1"><p>正文内容……</p></div>'
+        '<div class="footer-list"><ul><li>'
+        '<a href="/read/91122.html">限流情缘一线牵</a>'
+        '</li></ul></div>'
+        '<script>var t={r:"a3a",t:"MTc4"};var a=document.createElement("script");'
+        'a.src="/cdn-cgi/challenge-platform/scripts/jsd/main.js";'
+        'document.head.appendChild(a);</script>'
+        '</body></html>'
+    )
+
+    assert YueduPlugin._is_blocked_page(html) is False
+
+
+def test_is_blocked_page_weak_marker_needs_confirmation_beside_it():
+    # The marker alone (a novel title, a menu entry) is not a gate.
+    assert YueduPlugin._is_blocked_page("<p>限流</p>") is False
+    assert YueduPlugin._is_blocked_page("<p>请求频繁</p>") is False
+    # Beside a confirmation phrase it still is one.
+    assert YueduPlugin._is_blocked_page(
+        "<p>请求频繁，请稍后继续访问</p>"
+    ) is True
+    # A confirmation on the other side of the page (for example the words
+    # inside a challenge script) no longer confirms the marker.
+    assert YueduPlugin._is_blocked_page(
+        "<p>请求频繁</p><div>" + "正文内容" * 200 + "</div>"
+        "<script>var challenge = '/cdn-cgi/challenge-platform/main.js';</script>"
+    ) is False
+
+
+def test_describe_fetched_page_summarizes_an_empty_catalog_page():
+    summary = YueduPlugin._describe_fetched_page(
+        "<html><head><title>提示信息</title></head><body>"
+        "<script>var x=1;</script><p>  您的请求过于频繁  </p></body></html>"
+    )
+
+    assert "bytes=" in summary
+    assert "'提示信息'" in summary
+    assert "您的请求过于频繁" in summary
+    assert "var x" not in summary
+
+
 REMOVED_NOTICE_HTML = (
     '<html><head><title>提示信息</title></head><body><script>'
     'let msg = "小说被禁用或已删除！";'

@@ -47,6 +47,12 @@
   [full-site-sync.md](full-site-sync.md) “日志一直刷 JsRuntime JS error…”
 - 漫画书章节报 `Chapter returned empty content` → [full-site-sync.md](full-site-sync.md)
   “漫画书章节报 Chapter returned empty content”
+- 漫画章节的图片打不开、请求返回 401 → [full-site-sync.md](full-site-sync.md)
+  “漫画章节显示的是打不开的图片，图片请求返回 401”
+- 正常页面被判成限流/反爬、整本书同步中止 → [full-site-sync.md](full-site-sync.md)
+  “正常页面被判成“限流/反爬”，整本书同步中止”
+- 同步某本书报 `[Errno 36] File name too long` → [full-site-sync.md](full-site-sync.md)
+  “个别书报 [Errno 36] File name too long”
 - 想连服务器看真实任务与日志 → [codex-handoff.md](codex-handoff.md) 第 1、5 节
 
 ## 文档维护约定

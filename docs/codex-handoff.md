@@ -85,6 +85,10 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 | 日志一直刷 `JsRuntime JS error: Cannot read properties of null (reading '0')` | jsoup shim 的 `java.getString` 只认 CSS，书源的 XPath 规则返回空串；且 shim 把“上一步结果”当成 `java.getString` 的求值内容（Legado 用的是当前列表项/页面） | 见第 10 节 |
 | 日志出现 `java.getWebViewUA is not a function` / `Unexpected end of JSON input` | shim 缺 `getWebViewUA()`；`java.get(key)` 被当成 HTTP 请求（Legado 单参数是 `java.put` 的变量存储） | 见第 10 节 |
 | 漫画书章节报 `Chapter returned empty content` | 章节规则失效后通用解析只找文字容器，图片型章节没有兜底 | 见第 10 节 |
+| 正常页面被判“限流/反爬”，一本书就中止整个任务 | 弱标记（`限流` 等）在整页任意位置找确认词，书名《限流情缘一线牵》+ CF 脚本里的 `challenge` 即命中 | 见第 12 节 |
+| 漫画章节图片全部打不开 / 图片请求 401 | 图片靠 `<img>` 加载、不带 Bearer；接口只认 Bearer | 见第 12 节 |
+| 个别书报 `[Errno 36] File name too long` | 书名做目录名，超过文件系统 255 字节分量上限 | 见第 12 节 |
+| 重同步某本书报 `reading_progress_chapter_id_fkey` 外键错误 | 删除失效章节时用户阅读进度仍指向它 | 见第 12 节 |
 
 ---
 
@@ -354,3 +358,63 @@ Cookie 其实都正常，用户看到的是一条指向错误方向的报错，�
 **验证**：`cd backend && python -m pytest -q` → **439 passed**。
 线上影子回归（只放容器 `/tmp/shadow`，不动线上代码）：`photos-index-aid-343500` 的正文从 1 条
 裸 URL 变为 **12 张图片**，每张使用当前页面独立签名，广告图未混入。
+
+## 12. 2026-09-13：御宅屋任务被误判反爬；绅士漫画图片 401、长标题写不进去
+
+**现象**（线上 `novelhub-crawler` 日志 + `crawl_tasks`）：
+
+1. 御宅屋（`yuedu_123bca8ecb6a`）任务同步到 293 本后失败：
+   `Browser request failed: https://yswhub.cc/read/91116.html (RuntimeError: Site returned an
+   anti-bot/captcha page …)`；同一个 URL 用浏览器打开完全正常。
+2. 要撸小说（`yuedu_b38b98d309e3`）任务报“书源目录本次未返回任何书籍（网络/代理波动…）”
+   （全分类页解析 0 本），以及若干章节 520。
+3. 绅士漫画（`yuedu_f34d61039a65`）章节正文是本地图片，但阅读器里每张图都打不开
+   （图片请求 401）；同一书源另有书报 `[Errno 36] File name too long`、
+   `ForeignKeyViolationError: reading_progress_chapter_id_fkey`。
+
+**根因**（都在线上实测复现，不动线上代码）：
+
+1. **弱标记在整页范围确认**：`_is_blocked_page` 的弱标记（`限流` 等）只要在页面任意位置找到确认词就
+   判定命中。yswhub 侧栏的相关书籍里有本《限流情缘一线牵》（`限流`），而 Cloudflare 的
+   bot-management 脚本必然含 `challenge`（相隔 792 字符），于是每个章节页都被判限流。
+   关掉检测器后实测该页是 13113 字节的正常页面（标题「创世之书：少年激斗篇…」），
+   `fetch_book`/`fetch_chapter_content` 都能出正文 —— 纯粹误判，且 `_record_outcome` 对
+   anti-bot 直接 `raise`，一本书就能中止整个任务。
+2. **要撸小说**：探针实测 11 个分类页都能出 10 本、章节正文正常，属于代理/站点那一轮的静默
+   失败（HTTP 200 但无列表），现有“瞬态 → 自动重试”逻辑是对的，只是日志只有 URL、看不出
+   站点回了什么页面。
+3. **绅士漫画图片 401**：章节里存的是 `/api/chapters/<章节 id>/images/<文件>`（实测抽样 40 章
+   全是本地图片、没有外链），而浏览器取 `<img>` 不带 `Authorization` 头，该接口只认 Bearer。
+4. **长标题**：书目录用「作者/书名」命名，单分量 255 字节上限；御宅屋/绅士漫画的日中文标题
+   可达 345 字节。容器里用线上代码 `os.makedirs` 复现出与日志一致的
+   `[Errno 36] File name too long`。
+5. **FK**：重同步会把旧的空/反爬章节删掉重抓，`reading_progress.chapter_id` 是普通外键，
+   用户读过其中一章时删除失败 → 整本书同步失败。
+
+**改动**：
+
+| 文件 | 改动 |
+|---|---|
+| `backend/app/crawler/plugins/yuedu/__init__.py` | 新增 `WEAK_BLOCK_CONFIRMATIONS`/`WEAK_BLOCK_WINDOW`/`has_weak_block_marker`：弱标记的确认词必须在前后 120 字符内（且不包含标记自身），`_is_blocked_page` 改用它；`_explore_page_diagnostics` + `_describe_fetched_page`：分类页解析 0 本时把「字节数/标题/正文开头」写进 `Explore kind … returned no books` 警告 |
+| `backend/app/services/auth.py` | 新增 `MEDIA_COOKIE_NAME`/`MEDIA_COOKIE_PATH`、`_user_from_jwt`、`get_current_user_media`（Bearer 或媒体 Cookie 均可，权限/可见性判断不变） |
+| `backend/app/api/routes/auth.py` | `login`/`register`/`me` 种 `novelhub_media` Cookie（HttpOnly、SameSite=lax、Path=/api/chapters、随 JWT 过期），老会话下次打开应用即自愈 |
+| `backend/app/api/routes/chapters.py` | 章节图片接口改用 `get_current_user_media` |
+| `backend/app/services/storage.py` | `safe_segment` 对超过 `MAX_SEGMENT_BYTES`(240) 的分量按 UTF-8 边界截断并追加 `~sha1[:8]`，同名稳定、异名不撞 |
+| `backend/app/services/sync.py` | 删除失效章节前 `_release_chapter_references`：`reading_progress` 置空、`book_versions`/`bookmarks` 清理，不再让一本书的删除失败拖垮同步 |
+| `backend/app/models/reading_progress.py`、`backend/alembic/versions/0031_reading_progress_chapter_set_null.py` | `reading_progress.chapter_id` 外键改为 `ON DELETE SET NULL`（迁移用 pg_constraint 查名，可重复执行） |
+| `backend/tests/test_yuedu_plugin.py`、`test_chapter_image_auth.py`、`test_sync_service.py`、`test_cover_storage.py`、`test_invites.py`、`test_migrations.py` | 新增 15 项回归（yswhub 书名误判、弱标记邻近确认、页面摘要、Cookie/Bearer/无凭据三种图片鉴权、图片路由依赖、失效章节先解引用、长标题截断与落盘、迁移 head） |
+
+**验证**：`cd backend && python -m pytest -q` → **454 passed**。线上影子回归（只放容器 `/tmp`，
+不动线上代码/数据库）：
+
+- 御宅屋 91116：线上插件 `_get` 抛 anti-bot；改动后的插件同一 URL 返回 13113 字节、
+  `_is_blocked_page=False`，`fetch_book`→《创世之书：少年激斗篇》+ 2719 字正文；
+  构造的真实限流页仍判 True。
+- 绅士漫画图片：把改后的 backend 复制到容器 `/tmp/shadow_backend` 起 18099 端口影子服务，
+  `/auth/me` 下发 `novelhub_media=…; HttpOnly; Max-Age=86400; Path=/api/chapters; SameSite=lax`，
+  带该 Cookie 取图片 → **200 image/gif 5181 字节**；无凭据/坏 Cookie → 401；Bearer 仍 200。
+- 长标题：线上逻辑 `os.makedirs` 复现 `File name too long`，改后同一书名写出 238 字节分量且文件存在。
+- 迁移 0031：在线上库用事务跑一遍 `DO $$…$$` → 约束变为 `ON DELETE SET NULL`，`ROLLBACK` 后恢复原样（数据库未改动）。
+
+**未做/已知**：要撸小说的 520 与“目录 0 本”是站点/代理侧瞬态，代码按设计自动重试；
+章节 5xx 连续 5 章会跳过该书（第 11 节）。老会话在升级后需要刷新一次页面才会带上媒体 Cookie。
