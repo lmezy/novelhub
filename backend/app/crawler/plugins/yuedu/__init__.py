@@ -995,6 +995,20 @@ class YueduPlugin:
         return manifest
 
     @staticmethod
+    def _gallery_page_limit() -> int:
+        """Upper bound for one image-album walk (``YUEDU_GALLERY_MAX_PAGES``).
+
+        Album pages hand out exactly one image per request, so the walk stops
+        when the source stops offering a next page; this cap only exists to
+        keep a broken/looping "next" link from fetching forever.
+        """
+        try:
+            value = int(os.getenv("YUEDU_GALLERY_MAX_PAGES", "512") or 512)
+        except (TypeError, ValueError):
+            value = 512
+        return max(20, min(value, 5000))
+
+    @staticmethod
     def _gallery_next_url(html: str, current_url: str) -> str:
         """Find the next page of an image gallery.
 
@@ -1930,13 +1944,15 @@ class YueduPlugin:
                 content = generic_content
         parts = [content] if content else []
 
-        # Follow nextContentUrl for multi-page chapters
+        # Follow nextContentUrl for multi-page chapters.  Manga/photo albums
+        # paginate one image per page, so the walk has to run until the album
+        # itself ends (no next link left), not until the source's
+        # ``imgInfoList`` manifest is used up: that manifest only describes the
+        # first album index page (12 entries for 绅士漫画), and stopping there
+        # truncated every album to 12 images no matter how many it really has.
         gallery_limit = len(self._chapter_image_manifest)
-        max_pages = 20
-        if gallery_limit > 1:
-            # Manga/photo albums paginate one image per page; allow the number
-            # of pages the source's own manifest declares (with a hard cap).
-            max_pages = min(max(20, gallery_limit + 1), 512)
+        gallery_mode = gallery_limit > 1
+        max_pages = self._gallery_page_limit() if gallery_mode else 20
         seen_content_urls = {chapter.url}
         content_semaphore = asyncio.Semaphore(self._thread_count())
 
@@ -1954,21 +1970,13 @@ class YueduPlugin:
                 and url.startswith(("http://", "https://"))
             )
         ]
-        if (
-            gallery_limit > 1
-            and self._count_content_images(content) < gallery_limit
-        ):
+        if gallery_mode:
             gallery_next = self._gallery_next_url(html, chapter.url)
             if gallery_next and gallery_next not in seen_content_urls:
                 pending_content_urls.append(gallery_next)
         seen_content_urls.update(pending_content_urls)
         pages_fetched = 0
         while pending_content_urls and pages_fetched < max_pages:
-            if (
-                gallery_limit > 1
-                and self._count_content_images("\n".join(parts)) >= gallery_limit
-            ):
-                break
             eligible = [
                 url
                 for url in pending_content_urls
@@ -2008,15 +2016,20 @@ class YueduPlugin:
                         and url.startswith(("http://", "https://"))
                     )
                 ]
-                if (
-                    gallery_limit > 1
-                    and self._count_content_images("\n".join(parts)) < gallery_limit
-                ):
+                if gallery_mode:
                     gallery_next = self._gallery_next_url(next_html, next_url)
                     if gallery_next and gallery_next not in seen_content_urls:
                         next_candidates.append(gallery_next)
                 pending_content_urls.extend(next_candidates)
             seen_content_urls.update(pending_content_urls)
+
+        if gallery_mode and pages_fetched >= max_pages:
+            logger.warning(
+                "Gallery walk stopped at the page cap (%s pages) for %s; "
+                "raise YUEDU_GALLERY_MAX_PAGES if this album is really larger",
+                max_pages,
+                chapter.url,
+            )
 
         content = self._dedupe_content_images("\n".join(parts))
 
@@ -4577,6 +4590,7 @@ class YueduPlugin:
         async def _request(proxy: str | None) -> str:
             nonlocal headers
             last_error: httpx.HTTPError | None = None
+            last_status: int | None = None
             for attempt in range(3):
                 try:
                     client = await self._get_http_client(proxy)
@@ -4628,6 +4642,11 @@ class YueduPlugin:
                             if retry_after and retry_after.replace(".", "", 1).isdigit()
                             else 2 ** attempt
                         )
+                        # Remember why the last attempt failed: this branch
+                        # never sets ``last_error``, so without it the final
+                        # error was a bare "Request failed after retries" that
+                        # hid a repeated upstream 5xx.
+                        last_status = resp.status_code
                         await asyncio.sleep(wait + random.uniform(0.5, 1.5))
                         continue
                     resp.raise_for_status()
@@ -4671,7 +4690,10 @@ class YueduPlugin:
 
             if last_error is not None:
                 raise last_error
-            raise RuntimeError(f"Request failed after retries: {url}")
+            raise RuntimeError(
+                f"Request failed after retries: {url}"
+                + (f" (HTTP {last_status})" if last_status else "")
+            )
 
         last_error: httpx.HTTPError | None = None
         for proxy in self._ordered_transports(proxy_url):
@@ -4941,6 +4963,7 @@ class YueduPlugin:
         async def _request(proxy: str | None) -> str:
             nonlocal headers
             last_error: httpx.HTTPError | None = None
+            last_status: int | None = None
             # Set when a polluted system DNS forced a DoH-resolved IP rewrite.
             doh_target: tuple[str, str] | None = None
             for attempt in range(3):
@@ -4993,6 +5016,11 @@ class YueduPlugin:
                             if retry_after and retry_after.replace(".", "", 1).isdigit()
                             else 2 ** attempt
                         )
+                        # Remember the status: this branch never sets
+                        # ``last_error``, so the final error would otherwise be
+                        # a bare "Request failed after retries" that hides a
+                        # repeatedly failing upstream 5xx.
+                        last_status = resp.status_code
                         await asyncio.sleep(wait + random.uniform(0.5, 1.5))
                         continue
                     resp.raise_for_status()
@@ -5075,7 +5103,10 @@ class YueduPlugin:
 
             if last_error is not None:
                 raise last_error
-            raise RuntimeError(f"Request failed after retries: {url}")
+            raise RuntimeError(
+                f"Request failed after retries: {url}"
+                + (f" (HTTP {last_status})" if last_status else "")
+            )
 
         last_error: httpx.HTTPError | None = None
         for proxy in self._ordered_transports(proxy_url):

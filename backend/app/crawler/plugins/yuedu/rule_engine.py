@@ -687,6 +687,13 @@ class YueduRuleEngine:
         """Split a Legado element rule into selector, index mode, and indexes."""
         rule = rule.strip()
         if rule.endswith("]"):
+            # XPath rules carry 1-based position predicates
+            # (``//div[@class='gallary_wrap tb']/ul/li[1]``); a trailing ``[n]``
+            # there is *not* a Legado index.  Reading it as one selected the
+            # second element instead of the first, which made 绅士漫画 skip the
+            # album's cover image and start every chapter at image 00002.
+            if "//" in rule or rule.startswith(("/", ".//", "./")):
+                return rule, " ", []
             start = rule.rfind("[")
             if start != -1:
                 inner = rule[start + 1:-1].strip()
@@ -866,7 +873,10 @@ class YueduRuleEngine:
                 css += f"[{body}]"
                 continue
             if re.fullmatch(r"\d+", predicate):
-                css += f":nth-of-type({predicate})"
+                # XPath positions are 1-based.  Legado sources also write
+                # ``li[0]`` meaning "the first one", which XPath would reject
+                # outright, so it maps to the first element as well.
+                css += f":nth-of-type({max(1, int(predicate))})"
                 continue
             return None
         return css

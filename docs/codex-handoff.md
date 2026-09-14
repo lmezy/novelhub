@@ -89,6 +89,10 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 | 漫画章节图片全部打不开 / 图片请求 401 | 图片靠 `<img>` 加载、不带 Bearer；接口只认 Bearer | 见第 12 节 |
 | 个别书报 `[Errno 36] File name too long` | 书名做目录名，超过文件系统 255 字节分量上限 | 见第 12 节 |
 | 重同步某本书报 `reading_progress_chapter_id_fkey` 外键错误 | 删除失效章节时用户阅读进度仍指向它 | 见第 12 节 |
+| 日志里 `Failed to sync book … (url): `（错误文本为空）→ 满 10 本中止整个任务 | httpx 超时异常 `str()` 是空串，旧代码只按文本判定瞬态，代理抖动被当成规则/Cookie 失败 | 见第 13 节 |
+| 同一份任务日志里 `Task … got Future … attached to a different loop` | Celery 任务每次 `asyncio.get_event_loop()` 换循环，SQLAlchemy 连接池里的 asyncpg 连接绑在旧循环上 | 见第 13 节 |
+| 漫画书每个章节固定只有 12 张图片 | 书源 `imgInfoList` 只含相册第 1 个索引页（12 条），旧代码拿它当页数上限 | 见第 13 节 |
+| 相册第一张（封面）总是丢 | `//…/li[1]` 被当成 0-based Legado 索引（= 第二个 li）；Legado 对 `/` 开头规则走 XPath（1-based） | 见第 13 节 |
 
 ---
 
@@ -418,3 +422,75 @@ Cookie 其实都正常，用户看到的是一条指向错误方向的报错，�
 
 **未做/已知**：要撸小说的 520 与“目录 0 本”是站点/代理侧瞬态，代码按设计自动重试；
 章节 5xx 连续 5 章会跳过该书（第 11 节）。老会话在升级后需要刷新一次页面才会带上媒体 Cookie。
+
+## 13. 2026-09-14：代理抖动被误判成反爬（4 个全站任务被中止）；漫画相册固定只剩 12 张
+
+**现象**（线上 `novelhub-crawler` 日志 + `crawl_tasks`）：
+
+1. 09-13 21:45 的 4 个全站任务（風月文學網 h528 / 御宅屋 / 禁忌书屋 / 绅士漫画）全部以
+   `同步连续失败超过 10 本，已中止任务以避免持续请求被反爬的站点` 收尾，用户看到的是
+   “检查书源规则、Cookie 或站点验证状态”，但书源与 Cookie 都正常。
+2. 这些失败的书在日志里是 `Failed to sync book <书名> (<url>): ` ——**冒号后面什么都没有**，
+   按站点统计：h528 34/43、御宅屋 25/25、绅士漫画 22/23、禁忌书屋 19/19 都是空错误文本。
+3. 日志里每个 beat 周期偶发 `Task tasks.auto_sync_check[…] raised unexpected: RuntimeError(
+   "Task <Task …> got Future … attached to a different loop")`。
+4. 绅士漫画每本书的章节正文永远只有 12 张图（相册实际 90+ 张），且从第 2 张开始
+   （封面 `00001` 缺失）。
+
+**根因**（都在线上容器里实测复现）：
+
+1. **空错误文本 = httpx 超时**：容器内 httpx 0.28.1 实测 `http://10.255.255.1:81`（黑洞地址）
+   抛出 `ConnectTimeout`，`str(exc)` 是**空串**（`ConnectError` 才有 "All connection attempts
+   failed"）。`SyncService._is_transient_book_fetch` / `_is_transient_chapter_error` 只按错误
+   **文本**判定瞬态，空文本必然落到“非瞬态（规则/Cookie）”分支：代理/mihomo 抖动时连错
+   10 本就把整个任务判失败，并且日志、`crawl_tasks.error` 里都看不出真正原因。
+   （`crawl_runner._is_transient_task_error` 早就按类名兜底，只有书/章这一层漏了。）
+2. **`Request failed after retries: <url>` 同样漏判**：`_get`/`_post` 里 429/5xx 的重试分支
+   `continue` 时不设置 `last_error`，3 次都失败后抛的是这条没有“5xx/timeout/connection”
+   字样的消息，于是 h528 一整批 5xx 也被算成非瞬态。
+3. **Celery 每次任务换事件循环**：`scheduler/app/tasks.py` 6 个任务都用
+   `asyncio.get_event_loop().run_until_complete(...)`；SQLAlchemy 异步引擎的连接池把
+   asyncpg 连接绑在创建它的循环上，第二次任务拿到旧连接就报 “attached to a different loop”。
+   线上复现：同一函数连调 3 次，第 2 次必挂；改成“每进程复用一个循环”后连调 4 次全过。
+4. **12 张图片**：绅士漫画 `chapterList` 的 `@js:` 脚本要跨相册索引页（`photos-index-page-N-aid-X`）
+   `java.ajax` 汇总 `imgInfoList`，服务端只拿到第 1 页的 12 条；而 `fetch_chapter_content`
+   把 `len(imgInfoList)` 当成相册页数上限（`max_pages = max(20, gallery_limit+1)`，且
+   数量达标就 `break`），正文的相册链在第 12 张被截断。顺带 `sync._process_content_images`
+   的 `MAX_CONTENT_IMAGES_PER_CHAPTER = 50` 也会在 50 张处截断。
+5. **封面丢失**：`//div[@class='gallary_wrap tb']/ul/li[1]` 以 `/` 开头，Legado
+   （`AnalyzeRule.kt`: “ruleStr.startsWith("/") -> Mode.XPath”）按 **XPath** 解析，位置是
+   1-based；`_parse_legado_index` 却把结尾的 `[1]` 当成 0-based Legado 索引，选中了第二个
+   `li`（= 相册第 2 张的 view 页），于是章节从 `00002` 开始。
+
+**改动**：
+
+| 文件 | 改动 |
+|---|---|
+| `backend/app/services/sync.py` | 新增 `TRANSIENT_EXCEPTION_NAMES`/`_exception_names`：按异常 **MRO 类名**判定瞬态（`TimeoutError`/`TimeoutException`/`TransportError`/`ConnectTimeout`/`ReadTimeout`/`PoolTimeout`/`RemoteProtocolError`…），书级与章级分类都先走类型判定；`Request failed after retries` 补进瞬态标记 |
+| 同上 | 新增 `describe_error()`：`str(exc)` 为空时回退到异常类名并带上 `__cause__/__context__`，替换书/章/封面失败、书架同步、`details[].error` 里所有 `str(exc)`，日志再也不会出现“冒号后空白” |
+| 同上 | 新增 `content_image_limit()`（默认 `MAX_CONTENT_IMAGES_PER_CHAPTER=512`，可用环境变量覆盖）替代写死的 50 张；目录整轮 0 本时把插件的分类页诊断（字节数/标题/正文开头）追加进错误文本，520 不再伪装成“书源规则问题” |
+| `backend/app/core/config.py` | 新增 `MAX_CONTENT_IMAGES_PER_CHAPTER:int=512` |
+| 同上 | 新增 `_is_truncated_gallery()`，`_reconcile_chapter_ids` 按书源 `imgInfoList` 长度把旧的「正好 N 张图」章节判为过期：受影响的漫画书再同步一次就会自动重抓完整相册 |
+| `backend/app/crawler/plugins/yuedu/__init__.py` | 相册模式不再按 `imgInfoList` 长度截断：沿“下一张/下一页”走到相册结束，上限 `YUEDU_GALLERY_MAX_PAGES`（默认 512）并在触顶时告警；`_gallery_page_limit()` 新helper；429/5xx 重试分支记录状态码，`Request failed after retries` 现在带 `(HTTP 5xx)` |
+| `backend/app/crawler/plugins/yuedu/rule_engine.py` | `_parse_legado_index`：`/`、`//`、`./` 开头的规则一律按 XPath 处理，结尾 `[n]` 不再当 0-based 索引；`_xpath_step_to_css` 位置谓词按 1-based（`[0]` 兼容为第一个） |
+| `scheduler/app/tasks.py` | 新增 `_run_async()`：每个 worker 进程复用一个事件循环（`asyncio.new_event_loop` + `set_event_loop`），6 个任务全部改用它，连接池不再跨循环 |
+| `backend/tests/test_sync_service.py`、`test_yuedu_plugin.py`、`test_rule_engine_legado.py` | 新增 9 项回归：空文本超时=瞬态、`describe_error`、图片上限可配置、空目录错误带站点诊断、截断相册判过期、相册走到结束、页数上限生效、`//…/li[1]` 取第一个、章节目录 URL 取第一个 `li` |
+
+**验证**：
+
+- `cd backend && python -m pytest -q` → **461 passed**。
+- 线上影子回归（只把改动文件放进容器 `/tmp`，不动线上代码/数据）：
+  - 绅士漫画 `photos-index-aid-384155`（标题写着 80 ish images）：线上插件 `fetch_book` 得到
+    的章节 URL 是 `photos-view-id-32938410`（第 2 张）；改后是 `…32938411`（第 1 张），
+    `fetch_chapter_content` 返回 **91 张图**（`![00001]` … `![00091]`），旧代码同一本书是 12 张。
+  - Celery 循环问题：容器内同一函数连调 3 次，旧写法第 2 次报 `got Future … attached to a
+    different loop`，新写法（复用一个循环）连调 4 次全部成功；改后的 `tasks.py` 在容器内
+    可正常导入并连续执行。
+  - httpx 空文本：容器内实测 `ConnectTimeout` 的 `str()` 为 `''`，新分类返回瞬态、新错误
+    文本为 `ConnectTimeout`（旧代码为空白）。
+
+**未做/已知**：相册正文是「一张图一次请求」，一本 90 张的漫画约 90 次页面请求 + 90 次图片
+下载，受书源 `concurrentRate`/`CRAWL_DELAY_MS` 限速，全站同步这类相册站会明显变慢；
+需要限量时调 `YUEDU_GALLERY_MAX_PAGES` 或只同步书架。旧数据的 12 张章节会在**下一次
+同书同步**时自动重抓（`_is_truncated_gallery`）；相册本来就 ≤12 张书每次同步都会重抓一遍，
+量小可接受。

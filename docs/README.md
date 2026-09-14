@@ -47,6 +47,10 @@
   [full-site-sync.md](full-site-sync.md) “日志一直刷 JsRuntime JS error…”
 - 漫画书章节报 `Chapter returned empty content` → [full-site-sync.md](full-site-sync.md)
   “漫画书章节报 Chapter returned empty content”
+- 漫画书每个章节都只有 12 张图片（相册明明更长） → [full-site-sync.md](full-site-sync.md)
+  “漫画书不管原本多少页，每个章节都只有 12 张图片”
+- 一批书同步失败后报“同步连续失败超过 N 本”，日志里错误文本是空白 →
+  [full-site-sync.md](full-site-sync.md) “一批书同步失败后报…”
 - 漫画章节的图片打不开、请求返回 401 → [full-site-sync.md](full-site-sync.md)
   “漫画章节显示的是打不开的图片，图片请求返回 401”
 - 正常页面被判成限流/反爬、整本书同步中止 → [full-site-sync.md](full-site-sync.md)

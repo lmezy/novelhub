@@ -14,6 +14,27 @@ from celery_app import app
 from loguru import logger
 
 
+_task_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _run_async(coro):
+    """Run a coroutine on one dedicated event loop per worker process.
+
+    These tasks used ``asyncio.get_event_loop().run_until_complete(...)``,
+    which hands out a fresh loop whenever the worker thread does not have one
+    yet.  SQLAlchemy's async engine keeps pooled asyncpg connections, and those
+    are bound to the loop that created them, so the next task died with
+    ``got Future <...> attached to a different loop`` before it could read a
+    single setting (seen in the crawler container every few beat ticks).
+    Reusing one loop keeps the pool valid for the whole worker process.
+    """
+    global _task_loop
+    if _task_loop is None or _task_loop.is_closed():
+        _task_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_task_loop)
+    return _task_loop.run_until_complete(coro)
+
+
 def _naive_utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -35,41 +56,37 @@ def _auto_sync_max_pages() -> int:
 @app.task(name="tasks.daily_sync_all")
 def daily_sync_all() -> dict:
     """Daily beat task: sync all enabled sources."""
-    return asyncio.get_event_loop().run_until_complete(_daily_sync_all_async())
+    return _run_async(_daily_sync_all_async())
 
 
 @app.task(name="tasks.sync_single_source")
 def sync_single_source(source_id: str) -> dict:
     """Sync a single source by its ID."""
-    return asyncio.get_event_loop().run_until_complete(
-        _sync_single_source_async(source_id)
-    )
+    return _run_async(_sync_single_source_async(source_id))
 
 
 @app.task(name="tasks.resync_all_books")
 def resync_all_books() -> dict:
     """Resync every book in the library (checks for new chapters)."""
-    return asyncio.get_event_loop().run_until_complete(_resync_all_books_async())
+    return _run_async(_resync_all_books_async())
 
 
 @app.task(name="tasks.check_cookie_health")
 def check_cookie_health() -> dict:
     """Periodic task: validate all cookies and auto-refresh expired ones."""
-    return asyncio.get_event_loop().run_until_complete(_check_cookie_health_async())
+    return _run_async(_check_cookie_health_async())
 
 
 @app.task(name="tasks.crawl_all_source")
 def crawl_all_source(source_id: str, max_pages: int = 0, task_id: str | None = None) -> dict:
     """Crawl every discoverable book from a source in the background."""
-    return asyncio.get_event_loop().run_until_complete(
-        _crawl_all_source_async(source_id, max_pages, task_id)
-    )
+    return _run_async(_crawl_all_source_async(source_id, max_pages, task_id))
 
 
 @app.task(name="tasks.auto_sync_check")
 def auto_sync_check() -> dict:
     """Check app settings and enqueue configured automatic sync tasks."""
-    return asyncio.get_event_loop().run_until_complete(_auto_sync_check_async())
+    return _run_async(_auto_sync_check_async())
 
 
 async def _auto_sync_check_async() -> dict:

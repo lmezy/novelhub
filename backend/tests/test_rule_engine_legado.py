@@ -280,10 +280,37 @@ def test_list_rule_with_trailing_js_step_keeps_the_elements():
     entries = engine.parse_toc(html)
 
     assert len(entries) == 1
-    # ``[1]`` is Legado's element index (0-based), not an XPath position, so
-    # this selects the second ``li`` -- the same element Legado would use.
-    assert entries[0]["chapterUrl"] == "/photos-view-id-2.html"
+    # The rule starts with ``//``, so Legado parses it as XPath
+    # (``AnalyzeRule.kt``: "//XPath特征很明显,无需配置单独的识别标头"), where
+    # positions are 1-based.  Reading ``li[1]`` as a 0-based Legado index used
+    # to pick the *second* ``li``, which made 绅士漫画 start every album at the
+    # second image (its cover entry is the first ``li``).
+    assert entries[0]["chapterUrl"] == "/photos-view-id-1.html"
     assert entries[0]["chapterName"] == "全话阅读"
+
+
+def test_xpath_position_predicate_is_one_based():
+    """``//li[1]``/``//li[2]`` must select the first/second element."""
+    engine = YueduRuleEngine({"bookSourceUrl": "https://www.example.com/"})
+    html = (
+        '<div class="gallary_wrap tb"><ul>'
+        '<li class="tb" id="a">一</li>'
+        '<li class="tb" id="b">二</li>'
+        '<li class="tb" id="c">三</li>'
+        '</ul></div>'
+    )
+
+    first = engine._get_elements(
+        html, "//div[@class='gallary_wrap tb']/ul/li[1]"
+    )
+    second = engine._get_elements(
+        html, "//div[@class='gallary_wrap tb']/ul/li[2]"
+    )
+
+    assert [el.get("id") for el in first] == ["a"]
+    assert [el.get("id") for el in second] == ["b"]
+    # ``li[0]`` is not valid XPath, but sources write it meaning "the first".
+    assert [el.get("id") for el in engine._get_elements(html, "//ul/li[0]")] == ["a"]
 
 
 def test_unbalanced_rule_raises_instead_of_recursing():

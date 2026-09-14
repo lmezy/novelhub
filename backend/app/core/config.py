@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     # pages.  The task is retried later instead of hammering every chapter
     # of a book while the origin is unavailable.
     SYNC_MAX_CONSECUTIVE_CHAPTER_FAILURES:int=5
+    # Upper bound for the images downloaded and rewritten inside a single
+    # chapter.  Manga/photo albums routinely hold 100+ pages, so this has to
+    # stay well above the old 50-image cap.
+    MAX_CONTENT_IMAGES_PER_CHAPTER:int=512
     SYNC_IGNORE_RATE_LIMIT:bool=False
     SYNC_THREAD_COUNT:int=9
     # How many book sources may sync at the same time.  0 (or less) means

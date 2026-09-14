@@ -120,7 +120,117 @@ HTML_IMG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 MD_IMG_RE = re.compile(
     r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+[\"'][^\"']*[\"'])?\)"
 )
-MAX_CONTENT_IMAGES_PER_CHAPTER = 50
+CONTENT_IMAGE_RE = re.compile(
+    r"!\[[^\]]*\]\([^)]*\)|<img\b[^>]*\bsrc=",
+    re.IGNORECASE,
+)
+MAX_CONTENT_IMAGES_PER_CHAPTER = 512
+
+# Exception class names that always mean "the network/proxy hiccuped", even
+# when the exception carries no message at all.  HTTPX and asyncio timeouts are
+# created without arguments, so ``str(exc)`` is empty; matching on message text
+# alone classified them as deterministic rule/Cookie failures, and ten of them
+# in a row aborted the whole task with a misleading "被反爬" message.
+TRANSIENT_EXCEPTION_NAMES = frozenset({
+    "TimeoutError",           # asyncio.TimeoutError / playwright TimeoutError
+    "ConnectionError",
+    "ConnectTimeout",
+    "ReadTimeout",
+    "WriteTimeout",
+    "PoolTimeout",
+    "ConnectError",
+    "ReadError",
+    "WriteError",
+    "RemoteProtocolError",
+    "TransportError",         # HTTPX base class for the above
+    "TimeoutException",       # HTTPX timeout base class
+    "RequestError",           # HTTPX request base class
+    "NetworkError",
+    "ClientConnectionError",
+    "ServerDisconnectedError",
+})
+
+# Book-level transient markers (a book that failed for one of these is retried
+# later; "empty content" counts here because a source can answer with an empty
+# page while a site is degraded).
+TRANSIENT_BOOK_MARKERS = (
+    "5xx", "browser request failed", "timeout", "timed out",
+    "connection", "connect error", "unknown error", "error code 5",
+    "upstream server returned", "empty content",
+    # ``_get``/``_post`` only give up after three attempts, and the 429/5xx
+    # retry branch used to leave ``last_error`` empty, so this string is the
+    # "the site kept answering 5xx" signature (风月文学網 sweeps).
+    "request failed after retries",
+)
+
+# Chapter-level markers.  Deliberately narrower than the book set: an empty
+# chapter must not be treated as a network hiccup, otherwise five broken
+# chapters in a row would abort a book that is merely badly parsed.
+TRANSIENT_CHAPTER_MARKERS = (
+    "5xx", "upstream server returned", "browser request failed",
+    "timeout", "timed out", "connection", "connect error", "network",
+    "request failed after retries",
+)
+
+
+def _exception_names(exc: BaseException) -> set[str]:
+    """All class names in an exception's MRO (works without importing HTTPX)."""
+    return {cls.__name__ for cls in type(exc).__mro__}
+
+
+def describe_error(exc: BaseException | None) -> str:
+    """Human-readable error text that never comes back empty.
+
+    ``httpx.ReadTimeout()`` and ``asyncio.TimeoutError()`` stringify to "",
+    which made crawl logs and task errors read like
+    ``Failed to sync book X (url): `` with no cause at all.
+    """
+    if exc is None:
+        return "Unknown error"
+    text = str(exc).strip()
+    cause = exc.__cause__ or exc.__context__
+    if cause is not None and cause is not exc:
+        cause_text = str(cause).strip() or type(cause).__name__
+        if not text:
+            text = cause_text
+        elif cause_text not in text:
+            text = f"{text} ({cause_text})"
+    return text or type(exc).__name__
+
+
+def content_image_limit() -> int:
+    """How many images one chapter may download (``MAX_CONTENT_IMAGES_PER_CHAPTER``)."""
+    try:
+        value = int(
+            getattr(
+                settings,
+                "MAX_CONTENT_IMAGES_PER_CHAPTER",
+                MAX_CONTENT_IMAGES_PER_CHAPTER,
+            )
+        )
+    except (TypeError, ValueError):
+        value = MAX_CONTENT_IMAGES_PER_CHAPTER
+    return max(1, value)
+
+
+def _last_explore_diagnosis(plugin) -> str:
+    """Append what the site actually answered to an "empty catalog" error.
+
+    The yuedu plugin records a one-line summary (bytes, title, first words) for
+    every catalog page that parsed to zero books.  Without it a Cloudflare
+    "520: Web server is returning an unknown error" page looks exactly like a
+    source whose discovery rules stopped matching the site.
+    """
+    diagnostics = getattr(plugin, "_explore_page_diagnostics", None)
+    if not isinstance(diagnostics, dict) or not diagnostics:
+        return ""
+    url, summary = list(diagnostics.items())[-1]
+    summary = " ".join(str(summary or "").split())
+    if not summary:
+        return ""
+    if len(summary) > 200:
+        summary = summary[:200] + "…"
+    return f" 最近一次分类页：{url} → {summary}"
 
 
 class SyncService:
@@ -208,13 +318,10 @@ class SyncService:
         """Whether a failed book fetch is a transient error worth retrying
         (Cloudflare 5xx / upstream error, browser load timeout, or a dropped
         connection) rather than a deterministic rule/Cookie problem."""
+        if _exception_names(exc) & TRANSIENT_EXCEPTION_NAMES:
+            return True
         message = str(exc).lower()
-        transient_markers = (
-            "5xx", "browser request failed", "timeout", "timed out",
-            "connection", "connect error", "unknown error", "error code 5",
-            "upstream server returned", "empty content",
-        )
-        if any(marker in message for marker in transient_markers):
+        if any(marker in message for marker in TRANSIENT_BOOK_MARKERS):
             return True
         response = getattr(exc, "response", None)
         status = getattr(response, "status_code", None)
@@ -229,20 +336,10 @@ class SyncService:
         stopping the current book early for: continuing only sends dozens of
         doomed requests while the origin is down.
         """
+        if _exception_names(exc) & TRANSIENT_EXCEPTION_NAMES:
+            return True
         message = str(exc).lower()
-        return any(
-            marker in message
-            for marker in (
-                "5xx",
-                "upstream server returned",
-                "browser request failed",
-                "timeout",
-                "timed out",
-                "connection",
-                "connect error",
-                "network",
-            )
-        )
+        return any(marker in message for marker in TRANSIENT_CHAPTER_MARKERS)
 
     @staticmethod
     def _chapter_concurrency(config: dict | None) -> int:
@@ -506,7 +603,7 @@ class SyncService:
             refs.append((match.group(0), match.group(2), match.group(1)))
         if not refs:
             return content
-        refs = refs[:MAX_CONTENT_IMAGES_PER_CHAPTER]
+        refs = refs[:content_image_limit()]
 
         replaced: dict[str, str] = {}
         for original, src, alt in refs:
@@ -775,6 +872,7 @@ class SyncService:
         existing_source_ids = await self._reconcile_chapter_ids(
             book_id,
             remote_book.chapters,
+            gallery_size=len(getattr(plugin, "_chapter_image_manifest", []) or []),
         )
 
         missing_chapters = [
@@ -844,13 +942,13 @@ class SyncService:
                             "chapter_number": remote_chapter.chapter_number,
                             "title": remote_chapter.title,
                             "url": remote_chapter.url,
-                            "error": str(error)[:300],
+                            "error": describe_error(error)[:300],
                         })
                         logger.warning(
                             "Chapter {} blocked by anti-bot/captcha ({}): {}",
                             remote_chapter.title,
                             remote_chapter.url,
-                            error,
+                            describe_error(error),
                         )
                         await _report_progress(remote_chapter)
                         if consecutive_blocked >= 5:
@@ -869,13 +967,13 @@ class SyncService:
                         "chapter_number": remote_chapter.chapter_number,
                         "title": remote_chapter.title,
                         "url": remote_chapter.url,
-                        "error": str(error)[:300],
+                        "error": describe_error(error)[:300],
                     })
                     logger.warning(
                         "Failed to sync chapter {} ({}): {}",
                         remote_chapter.title,
                         remote_chapter.url,
-                        error,
+                        describe_error(error),
                     )
                     await _report_progress(remote_chapter)
                     if consecutive_transient >= max_consecutive_transient:
@@ -944,13 +1042,13 @@ class SyncService:
                         "chapter_number": remote_chapter.chapter_number,
                         "title": remote_chapter.title,
                         "url": remote_chapter.url,
-                        "error": str(exc)[:300],
+                        "error": describe_error(exc)[:300],
                     })
                     logger.warning(
                         "Failed to sync chapter {} ({}): {}",
                         remote_chapter.title,
                         remote_chapter.url,
-                        exc,
+                        describe_error(exc),
                     )
                     await _report_progress(remote_chapter)
                     continue
@@ -960,13 +1058,13 @@ class SyncService:
                         "chapter_number": remote_chapter.chapter_number,
                         "title": remote_chapter.title,
                         "url": remote_chapter.url,
-                        "error": str(exc)[:300],
+                        "error": describe_error(exc)[:300],
                     })
                     logger.warning(
                         "Failed to sync chapter {} ({}): {}",
                         remote_chapter.title,
                         remote_chapter.url,
-                        exc,
+                        describe_error(exc),
                     )
                 await _report_progress(remote_chapter)
         finally:
@@ -1031,7 +1129,7 @@ class SyncService:
             result = await fetch(cover_url)
             data = result[0] if isinstance(result, tuple) else result
         except Exception as exc:
-            logger.warning("Failed to fetch cover {}: {}", cover_url, exc)
+            logger.warning("Failed to fetch cover {}: {}", cover_url, describe_error(exc))
             book.cover = cover_url
             return cover_url
 
@@ -1103,6 +1201,7 @@ class SyncService:
         self,
         book_id: str,
         remote_chapters: list,
+        gallery_size: int = 0,
     ) -> set[str]:
         """Return existing source chapter ids, upgrading legacy numeric ids to URLs.
 
@@ -1112,6 +1211,11 @@ class SyncService:
 
         Blank chapters (from anti-bot/error pages) and obvious TOC junk (nav,
         ads, "查看所有章节") are dropped so a re-sync can fetch real content.
+
+        ``gallery_size`` is the source's declared ``imgInfoList`` length; any
+        stored image-only chapter that stops exactly there is the old
+        12-image truncation (see ``_is_truncated_gallery``) and is dropped so
+        the album can be fetched again.
         """
         rows = await self.db.scalars(
             select(Chapter).where(Chapter.book_id == book_id)
@@ -1166,6 +1270,8 @@ class SyncService:
                 # A persisted path, on the other hand, means we can safely
                 # remove a known empty/anti-bot artifact.
                 if chapter.content_path and not self._chapter_has_real_content(chapter):
+                    stale_ids.append(source_id)
+                elif self._is_truncated_gallery(chapter, gallery_size):
                     stale_ids.append(source_id)
             elif self._looks_like_junk_chapter(chapter, remote_hosts):
                 stale_ids.append(source_id)
@@ -1264,6 +1370,33 @@ class SyncService:
             return has_image_refs
         return True
 
+    def _is_truncated_gallery(self, chapter: Chapter, gallery_size: int) -> bool:
+        """Whether a stored album chapter is the old "exactly N images" cut.
+
+        The gallery walk used to stop as soon as it held as many images as the
+        source's ``imgInfoList`` manifest -- one album *index* page, 12 entries
+        for 绅士漫画 -- so every album was truncated to that length.  A stored
+        image-only chapter with that exact ceiling is the artifact, and a
+        re-sync replaces it with the whole album.  Albums that really are that
+        short simply come back unchanged.
+        """
+        if gallery_size <= 1 or not chapter.content_path:
+            return False
+        try:
+            content = self.storage.read_chapter(chapter.content_path)
+        except Exception:
+            return False
+        if not isinstance(content, str) or not content:
+            return False
+        body = re.sub(r"^#.*(?:\r?\n|$)", "", content, flags=re.M)
+        body = re.sub(r"<img\b[^>]*>", "", body)
+        body = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", body)
+        if body.strip():
+            # Text next to the pictures: a normal chapter, not a photo album.
+            return False
+        count = len(CONTENT_IMAGE_RE.findall(content))
+        return 0 < count <= gallery_size
+
     @staticmethod
     def _looks_like_junk_chapter(chapter: Chapter, remote_hosts: set[str]) -> bool:
         title = SyncService._normalize_title_for_match(chapter.title)
@@ -1360,7 +1493,7 @@ class SyncService:
                 results.append({
                     "url": shelf_book.url,
                     "status": "failed",
-                    "error": str(exc),
+                    "error": describe_error(exc),
                     "created_chapters": 0,
                     "skipped_chapters": 0,
                     "failed_chapters": [],
@@ -1598,12 +1731,12 @@ class SyncService:
                     books_synced += 1
                 except Exception as exc:
                     await self.db.rollback()
-                    details.append({
+                details.append({
                         "title": sb.title,
                         "author": sb.author,
                         "url": sb.url,
                         "synced": False,
-                        "error": str(exc),
+                        "error": describe_error(exc),
                     })
         else:
             for sb in shelf_books:
@@ -1764,14 +1897,14 @@ class SyncService:
                         "Failed to sync book {} ({}): {}",
                         sb.title,
                         sb.url,
-                        outcome,
+                        describe_error(outcome),
                     )
                     details.append({
                         "title": sb.title,
                         "author": sb.author,
                         "url": sb.url,
                         "synced": False,
-                        "error": str(outcome),
+                        "error": describe_error(outcome),
                         "failed_chapters": [],
                     })
                 else:
@@ -1939,6 +2072,7 @@ class SyncService:
                     "书源目录本次未返回任何书籍（网络/代理波动、站点限流或临时验证都可能导致）。"
                     "已入库的书籍不受影响，任务稍后会自动重试；"
                     "若持续失败，请检查代理节点或站点验证状态。"
+                    + _last_explore_diagnosis(plugin)
                 )
             raise ValueError("书源未返回可同步的书籍，请检查书源规则、Cookie 或站点验证状态。")
 

@@ -125,16 +125,23 @@ def test_gallery_next_url_uses_next_link_not_previous():
 
 
 @pytest.mark.asyncio
-async def test_fetch_chapter_content_walks_gallery_pages_to_manifest_limit():
+async def test_fetch_chapter_content_walks_gallery_until_the_album_ends():
+    """The album walk must not stop at the source's ``imgInfoList`` length.
+
+    绅士漫画's TOC script only describes the first album index page (12
+    entries), so stopping there truncated every album to 12 images even when
+    the album had 90+.  The walk now ends when the site stops offering a next
+    page.
+    """
     plugin = YueduPlugin({
         "bookSourceUrl": "https://www.wn09.shop/",
         "concurrentRate": "0",
         "ruleContent": {"content": "meta[name='missing']@content"},
     })
+    # Manifest shorter than the real album: 2 entries, 4 pages of images.
     plugin._chapter_image_manifest = [
         {"imgName": "002", "imgExtension": "jpg"},
         {"imgName": "003", "imgExtension": "jpg"},
-        {"imgName": "004", "imgExtension": "jpg"},
     ]
     pages = {
         "https://reader.test/view/1": """
@@ -153,6 +160,11 @@ async def test_fetch_chapter_content_walks_gallery_pages_to_manifest_limit():
             src="//img.test/data/1/004.jpg?verify=4"></span>
           <a class="btnnext" href="/view/4">下一張</a>
         """,
+        # Last page of the album: no next link left.
+        "https://reader.test/view/4": """
+          <span id="imgarea"><img id="picarea"
+            src="//img.test/data/1/005.jpg?verify=5"></span>
+        """,
     }
     get = AsyncMock(side_effect=lambda url: pages[url])
     chapter = SimpleNamespace(
@@ -168,8 +180,47 @@ async def test_fetch_chapter_content_walks_gallery_pages_to_manifest_limit():
         "![](https://img.test/data/1/002.jpg?verify=2)",
         "![](https://img.test/data/1/003.jpg?verify=3)",
         "![](https://img.test/data/1/004.jpg?verify=4)",
+        "![](https://img.test/data/1/005.jpg?verify=5)",
     ]
-    assert get.await_count == 3
+    assert get.await_count == 4
+
+
+@pytest.mark.asyncio
+async def test_fetch_chapter_content_gallery_walk_respects_page_cap(monkeypatch):
+    """A looping "next" link must be cut off by ``YUEDU_GALLERY_MAX_PAGES``."""
+    monkeypatch.setenv("YUEDU_GALLERY_MAX_PAGES", "20")
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.wn09.shop/",
+        "concurrentRate": "0",
+        "ruleContent": {"content": "meta[name='missing']@content"},
+    })
+    plugin._chapter_image_manifest = [
+        {"imgName": "002", "imgExtension": "jpg"},
+        {"imgName": "003", "imgExtension": "jpg"},
+    ]
+
+    def page(number: int) -> str:
+        return (
+            '<span id="imgarea"><img id="picarea" '
+            f'src="//img.test/data/1/{number:03d}.jpg"></span>'
+            f'<a class="btnnext" href="/view/{number + 1}">下一張</a>'
+        )
+
+    async def fake_get(url: str) -> str:
+        return page(int(url.rsplit("/", 1)[-1]))
+
+    chapter = SimpleNamespace(
+        title="全话阅读",
+        url="https://reader.test/view/1",
+        tags="",
+    )
+
+    with patch.object(plugin, "_get", AsyncMock(side_effect=fake_get)):
+        content = await plugin.fetch_chapter_content(chapter)
+
+    images = [line for line in content.splitlines() if line.startswith("![")]
+    assert len(images) == 21  # the entry page plus the 20 capped pages
+    assert YueduPlugin._gallery_page_limit() == 20
 
 
 def test_parse_bookshelf_direct_anchor_fallback():

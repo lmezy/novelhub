@@ -56,6 +56,12 @@ def test_transient_book_fetch_classification():
     assert SyncService._is_transient_book_fetch(
         RuntimeError("Browser request failed: https://example.com/book/1")
     ) is True
+    # 风月文学網 answered 5xx on every attempt until the transient retries ran
+    # out; the old classification counted that as a rule failure and aborted
+    # the whole task after ten books.
+    assert SyncService._is_transient_book_fetch(
+        RuntimeError("Request failed after retries: http://www.h528.com/post/1.html")
+    ) is True
     assert SyncService._is_transient_book_fetch(
         ValueError("Book page returned no usable metadata/chapters")
     ) is False
@@ -90,6 +96,84 @@ def test_transient_chapter_classification_excludes_empty_content():
     assert SyncService._is_transient_chapter_error(
         RuntimeError("Chapter returned empty content: https://example.com/read/1")
     ) is False
+
+
+def test_message_less_network_errors_count_as_transient():
+    """httpx/asyncio timeouts stringify to "", so classification must use types.
+
+    Live crawler logs showed dozens of ``Failed to sync book X (url): `` lines:
+    the empty message was an ``httpx.ReadTimeout``, it was counted as a rule
+    failure, and ten of them aborted the whole task with a misleading
+    "被反爬" error.
+
+    Verified in the crawler container (httpx 0.28.1): a real connect timeout
+    surfaces as ``ConnectTimeout`` whose ``str()`` is ``''`` -- the class name
+    is the only signal available.
+    """
+    httpx = pytest.importorskip("httpx")
+    timeouts = [
+        asyncio.TimeoutError(),
+        TimeoutError(),
+        httpx.ReadTimeout(""),
+        httpx.ConnectTimeout(""),
+        httpx.ReadError(""),
+        httpx.ConnectError(""),
+        httpx.RemoteProtocolError(""),
+    ]
+
+    for exc in timeouts:
+        assert str(exc) == ""
+        assert SyncService._is_transient_book_fetch(exc) is True
+        assert SyncService._is_transient_chapter_error(exc) is True
+
+    # A deterministic parse/rule failure must stay non-transient.
+    assert SyncService._is_transient_book_fetch(
+        ValueError("Book page returned no usable metadata/chapters")
+    ) is False
+
+
+def test_describe_error_never_returns_empty_text():
+    from app.services.sync import describe_error
+
+    assert describe_error(asyncio.TimeoutError()) == "TimeoutError"
+    assert describe_error(RuntimeError("boom")) == "boom"
+
+    # The cause chain is surfaced so a wrapped timeout still explains itself.
+    wrapped = RuntimeError("Chapter fetch failed")
+    wrapped.__cause__ = asyncio.TimeoutError()
+    assert describe_error(wrapped) == "Chapter fetch failed (TimeoutError)"
+
+
+def test_content_image_limit_defaults_above_manga_album_size(monkeypatch):
+    """Albums hold 100+ images; the old 50-image cap silently dropped the rest."""
+    from app.core.config import settings
+    from app.services.sync import content_image_limit
+
+    assert content_image_limit() >= 100
+    monkeypatch.setattr(
+        settings, "MAX_CONTENT_IMAGES_PER_CHAPTER", 7, raising=False
+    )
+    assert content_image_limit() == 7
+
+
+def test_empty_catalog_error_reports_what_the_site_answered():
+    """A Cloudflare 520 must not look like a book source whose rules broke."""
+    from app.services.sync import _last_explore_diagnosis
+
+    plugin = SimpleNamespace(
+        _explore_page_diagnostics={
+            "https://www.yaoluku.com/sort/1/": (
+                "bytes=7095 title='yaoluku.com | 520: Web server is "
+                "returning an unknown error' text='520 ...'"
+            )
+        }
+    )
+    hint = _last_explore_diagnosis(plugin)
+
+    assert "https://www.yaoluku.com/sort/1/" in hint
+    assert "520" in hint
+    assert _last_explore_diagnosis(SimpleNamespace()) == ""
+    assert _last_explore_diagnosis(SimpleNamespace(_explore_page_diagnostics={})) == ""
 
 
 def test_clean_sync_tags_drops_title_and_author_fragments():
@@ -1092,6 +1176,39 @@ async def test_chapter_without_storage_path_is_not_healthy():
     )
 
     assert service._chapter_has_real_content(chapter) is False
+
+
+@pytest.mark.asyncio
+async def test_truncated_gallery_chapter_is_refetched():
+    """A 12-image album chapter is the old cap, not a real end of the album."""
+    service = SyncService(AsyncMock())
+    service.storage = MagicMock()
+    chapter = Chapter(
+        id="c-manga",
+        book_id="book-1",
+        chapter_number=1,
+        source_chapter_id="https://example.com/photos-view-id-1.html",
+        title="全话阅读",
+        content_path="/x/000001.md",
+    )
+    twelve = "#全话阅读\n\n" + "\n".join(
+        f"![](https://img.example/data/1/{n:05d}.jpg?verify={n})"
+        for n in range(2, 14)
+    )
+
+    service.storage.read_chapter.return_value = twelve
+    assert service._is_truncated_gallery(chapter, gallery_size=12) is True
+
+    # Not stale when the source declares no manifest page for this book...
+    assert service._is_truncated_gallery(chapter, gallery_size=0) is False
+    # ...or once the chapter holds more images than that manifest page.
+    service.storage.read_chapter.return_value = twelve + (
+        "\n![](https://img.example/data/1/00014.jpg?verify=14)"
+    )
+    assert service._is_truncated_gallery(chapter, gallery_size=12) is False
+    # Text chapters are never treated as truncated albums.
+    service.storage.read_chapter.return_value = "#第一章\n\n正文内容" + twelve
+    assert service._is_truncated_gallery(chapter, gallery_size=12) is False
 
 
 @pytest.mark.asyncio
