@@ -144,6 +144,39 @@ def test_describe_error_never_returns_empty_text():
     assert describe_error(wrapped) == "Chapter fetch failed (TimeoutError)"
 
 
+def test_anyio_and_deque_transport_noise_counts_as_transient():
+    """A proxy hiccup must not abort a task with "被反爬".
+
+    2026-09-14 (crawler container): the shared HTTP client was torn down while
+    a dozen books/chapters were in flight, so unrelated books failed almost
+    simultaneously with ``ClosedResourceError()`` and
+    ``IndexError("pop from an empty deque")``.  Both were classified as
+    deterministic rule/Cookie failures, ten in a row aborted the whole task and
+    the user was told to re-check their book source.
+    """
+    from app.services.sync import SyncService
+
+    # Neither anyio's stream errors nor the deque IndexError necessarily need
+    # anyio installed to be classified, so stand-ins with the real names are
+    # enough.
+    closed = type("ClosedResourceError", (Exception,), {})()
+    broken = type("BrokenResourceError", (Exception,), {})()
+    for exc in (
+        closed,
+        IndexError("pop from an empty deque"),
+        broken,
+    ):
+        assert SyncService._is_transient_book_fetch(exc) is True
+        assert SyncService._is_transient_chapter_error(exc) is True
+
+    # The rule stays narrow: unrelated programming errors are still treated as
+    # real book-source problems.
+    assert SyncService._is_transient_book_fetch(
+        IndexError("list index out of range")
+    ) is False
+    assert SyncService._is_transient_chapter_error(KeyError("chapters")) is False
+
+
 def test_content_image_limit_defaults_above_manga_album_size(monkeypatch):
     """Albums hold 100+ images; the old 50-image cap silently dropped the rest."""
     from app.core.config import settings

@@ -450,6 +450,9 @@ class YueduPlugin:
 
     name = "yuedu"
     _clients: dict[str | None, httpx.AsyncClient] = {}
+    # Clients replaced by ``_reset_http_client``.  They are closed by a
+    # background task after the in-flight requests holding them finished.
+    _retired_clients: list[tuple[asyncio.Task, asyncio.AbstractEventLoop]] = []
     # Transport health, keyed by "<source base url>::proxy|direct".  A proxy
     # (or a direct connection) that just hung or refused is remembered so the
     # next request does not pay for the dead path first.
@@ -577,20 +580,86 @@ class YueduPlugin:
             return client
 
     async def _reset_http_client(self, proxy: str | None) -> None:
-        """Drop the pooled client for ``proxy`` so the retry reconnects.
+        """Retire the pooled client for ``proxy`` so the retry reconnects.
 
         httpx happily reuses a pooled socket that the peer already dropped
         (proxies that restarted, upstream nodes that vanished), and only
-        reports it after the read timeout.  Closing and forgetting the client
-        forces the retry onto a brand new connection.
+        reports it after the read timeout.  Forgetting the client forces the
+        retry onto a brand new connection.
+
+        The retired client is *not* closed on the spot: one process syncs
+        several books and chapters at once over a single shared client, so
+        tearing it down under their feet failed every in-flight request at the
+        same instant -- on 2026-09-14 a proxy hiccup made 30 unrelated books
+        fail within 20 seconds and two tasks abort with a bogus "被反爬"
+        message.  The retired client keeps serving the requests that already
+        hold it and is closed after ``YUEDU_HTTP_RETIRE_SECONDS`` (default 45s,
+        longer than the 25s read timeout).
         """
         async with self._client_lock:
             client = self.__class__._clients.pop(proxy, None)
         if client is not None:
+            self.__class__._retire_http_client(client)
+
+    @classmethod
+    def _retire_http_client(cls, client: httpx.AsyncClient) -> None:
+        """Close a replaced client once requests holding it had time to finish."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop (sync teardown): close what we can immediately.
+            try:
+                asyncio.run(client.aclose())
+            except Exception:
+                pass
+            return
+
+        task = loop.create_task(
+            cls._close_retired_client(client, cls._retire_grace_seconds())
+        )
+        cls._retired_clients.append((task, loop))
+        # Long proxy outages must not leave an unbounded pile of half-retired
+        # pools alive; the oldest one has had the longest grace period, so
+        # cancelling it still closes it (the close lives in a ``finally``).
+        limit = cls._max_retired_clients()
+        while len(cls._retired_clients) > limit:
+            oldest, oldest_loop = cls._retired_clients.pop(0)
+            if not oldest.done():
+                try:
+                    oldest_loop.call_soon_threadsafe(oldest.cancel)
+                except RuntimeError:
+                    pass
+        task.add_done_callback(cls._forget_retired_client)
+
+    @classmethod
+    def _forget_retired_client(cls, task: asyncio.Task) -> None:
+        for index, (entry, _loop) in enumerate(cls._retired_clients):
+            if entry is task:
+                del cls._retired_clients[index]
+                return
+
+    @staticmethod
+    async def _close_retired_client(client: httpx.AsyncClient, delay: float) -> None:
+        try:
+            if delay > 0:
+                await asyncio.sleep(delay)
+        finally:
             try:
                 await client.aclose()
             except Exception:
                 pass
+
+    @classmethod
+    def _retire_grace_seconds(cls) -> float:
+        # Read timeout is 25s; wait longer than that before closing.
+        return max(0.0, cls._env_float("YUEDU_HTTP_RETIRE_SECONDS", 45.0))
+
+    @classmethod
+    def _max_retired_clients(cls) -> int:
+        try:
+            return max(1, int(os.getenv("YUEDU_HTTP_MAX_RETIRED_CLIENTS", "4") or 4))
+        except (TypeError, ValueError):
+            return 4
 
     def _transport_key(self, proxy: str | None) -> str:
         return f"{self.base_url or 'default'}::{'proxy' if proxy else 'direct'}"
@@ -5357,7 +5426,13 @@ class YueduPlugin:
                 last_error = exc
                 break
         if last_error is not None:
-            logger.warning("Failed to fetch content image %s: %s", url, last_error)
+            # HTTPX timeouts stringify to "", which produced log lines ending in
+            # "…: " with no cause at all.
+            logger.warning(
+                "Failed to fetch content image %s: %s",
+                url,
+                str(last_error).strip() or type(last_error).__name__,
+            )
         return None
 
     def get_search_check_keyword(self, default: str = "\u6211\u7684") -> str:

@@ -76,12 +76,20 @@ def _instantiate(plugin_name: str, config: dict[str, Any] | None = None) -> Nove
 
 
 async def _lookup_source_async(source_id: str) -> NovelSourcePlugin:
-    """Look up a Source record using its own async session."""
-    from app.core.database import SessionLocal
+    """Look up a Source record using its own async session.
+
+    Uses the unpooled ``LookupSessionLocal``: this helper runs either through
+    ``asyncio.run`` (no loop yet) or in a helper thread's throwaway loop, and a
+    *pooled* asyncpg connection handed back from such a loop stays bound to it.
+    The next caller on the real loop then dies with "got Future ... attached to
+    a different loop" / "Exception terminating connection", which is what the
+    crawler container logged on every cookie health check.
+    """
+    from app.core.database import LookupSessionLocal
     from app.models import Source
     from sqlalchemy import select
 
-    async with SessionLocal() as db:
+    async with LookupSessionLocal() as db:
         source = await db.get(Source, source_id)
         if source is None:
             raise ValueError(f"Source not found: {source_id}")

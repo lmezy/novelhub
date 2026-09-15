@@ -1549,6 +1549,119 @@ def test_ordered_transports_prefers_last_success_and_demotes_failures():
 
 
 @pytest.mark.asyncio
+async def test_reset_http_client_retires_without_killing_in_flight_requests(monkeypatch):
+    """Replacing a shared client must not tear it down under other requests.
+
+    2026-09-14: one proxy hiccup closed the shared client while a dozen books
+    and chapters were in flight, so 30 unrelated books failed within 20s and
+    two tasks aborted with a bogus "被反爬" error.  The client that already
+    served the retry is now retired, i.e. closed only after the longest
+    request lifetime has passed.
+    """
+    YueduPlugin._clients.clear()
+    YueduPlugin._retired_clients.clear()
+    monkeypatch.setattr(
+        YueduPlugin, "_retire_grace_seconds", staticmethod(lambda: 0.0)
+    )
+    plugin = YueduPlugin({"bookSourceUrl": "https://retire.example.com"})
+
+    closed: list[str] = []
+
+    class FakeClient:
+        def __init__(self, name):
+            self.name = name
+
+        async def aclose(self):
+            closed.append(self.name)
+
+    shared = FakeClient("shared")
+    YueduPlugin._clients["http://127.0.0.1:27890"] = shared
+
+    await plugin._reset_http_client("http://127.0.0.1:27890")
+
+    # Forgotten immediately (so the retry dials fresh) but not closed yet.
+    assert YueduPlugin._clients == {}
+    assert closed == []
+    assert "http://127.0.0.1:27890" not in YueduPlugin._clients
+
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert closed == ["shared"]
+    assert YueduPlugin._retired_clients == []
+
+
+@pytest.mark.asyncio
+async def test_retired_clients_are_bounded(monkeypatch):
+    """A long proxy outage must not pile up unbounded retired pools."""
+    """A long proxy outage must not pile up unbounded retired pools."""
+    YueduPlugin._retired_clients.clear()
+    monkeypatch.setattr(
+        YueduPlugin, "_retire_grace_seconds", staticmethod(lambda: 3600.0)
+    )
+    monkeypatch.setenv("YUEDU_HTTP_MAX_RETIRED_CLIENTS", "2")
+    plugin = YueduPlugin({"bookSourceUrl": "https://bounded.example.com"})
+
+    closed: list[str] = []
+
+    class FakeClient:
+        def __init__(self, name):
+            self.name = name
+
+        async def aclose(self):
+            closed.append(self.name)
+
+    try:
+        for index in range(4):
+            client = FakeClient(f"c{index}")
+            YueduPlugin._clients["http://proxy"] = client
+            await plugin._reset_http_client("http://proxy")
+
+        assert len(YueduPlugin._retired_clients) <= 2
+        for _ in range(5):
+            await asyncio.sleep(0)
+        # The two oldest were cancelled, which still closes them.
+        assert closed == ["c0", "c1"]
+    finally:
+        for task, _loop in list(YueduPlugin._retired_clients):
+            task.cancel()
+        YueduPlugin._retired_clients.clear()
+        YueduPlugin._clients.clear()
+
+
+@pytest.mark.asyncio
+async def test_content_image_failure_log_keeps_the_exception_type(caplog):
+    """``httpx.ReadTimeout()`` stringifies to "", so the log ended in ": "."""
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://images.example.com",
+        "concurrentRate": "0",
+    })
+    request = httpx.Request("GET", "https://images.example.com/a.jpg")
+
+    class FakeClient:
+        async def get(self, url, headers=None):
+            raise httpx.ReadTimeout("", request=request)
+
+    with (
+        patch.object(
+            plugin, "_get_http_client", AsyncMock(return_value=FakeClient())
+        ),
+        patch(
+            "app.services.proxy_config.get_proxy_config",
+            return_value=ProxyConfig(enabled=False),
+        ),
+        patch("asyncio.sleep", AsyncMock()),
+    ):
+        with caplog.at_level("WARNING"):
+            result = await plugin.fetch_content_image(
+                "https://images.example.com/a.jpg"
+            )
+
+    assert result is None
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("ReadTimeout" in message for message in messages), messages
+
+
+@pytest.mark.asyncio
 async def test_get_uses_browser_fallback_for_http_block_response():
     plugin = YueduPlugin({
         "bookSourceUrl": "https://example.com",

@@ -148,7 +148,23 @@ TRANSIENT_EXCEPTION_NAMES = frozenset({
     "NetworkError",
     "ClientConnectionError",
     "ServerDisconnectedError",
+    # anyio stream errors.  HTTPX runs on anyio, and when a pooled client or
+    # its socket is torn down (proxy restart, mihomo reload) the in-flight
+    # requests surface these instead of a HTTPX exception; they stringify to
+    # "" so only the class name reveals what happened (crawler container,
+    # 2026-09-14 burst).
+    "ClosedResourceError",
+    "BrokenResourceError",
+    "BusyResourceError",
+    "IncompleteReadError",
 })
+
+# Concurrency artefacts raised from inside the transport/browser stack while a
+# shared client is being replaced -- never a book-source rule problem, but they
+# carry a message instead of a HTTPX class name, so they are matched on text.
+TRANSIENT_MESSAGE_MARKERS = (
+    "pop from an empty deque",
+)
 
 # Book-level transient markers (a book that failed for one of these is retried
 # later; "empty content" counts here because a source can answer with an empty
@@ -321,6 +337,10 @@ class SyncService:
         if _exception_names(exc) & TRANSIENT_EXCEPTION_NAMES:
             return True
         message = str(exc).lower()
+        if any(marker in message for marker in TRANSIENT_MESSAGE_MARKERS):
+            # Never a rule/Cookie answer: ten of these in a row used to abort
+            # the whole task with a misleading "被反爬" message.
+            return True
         if any(marker in message for marker in TRANSIENT_BOOK_MARKERS):
             return True
         response = getattr(exc, "response", None)
@@ -339,6 +359,8 @@ class SyncService:
         if _exception_names(exc) & TRANSIENT_EXCEPTION_NAMES:
             return True
         message = str(exc).lower()
+        if any(marker in message for marker in TRANSIENT_MESSAGE_MARKERS):
+            return True
         return any(marker in message for marker in TRANSIENT_CHAPTER_MARKERS)
 
     @staticmethod

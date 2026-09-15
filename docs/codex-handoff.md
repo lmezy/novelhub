@@ -43,7 +43,7 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 
 ## 2. 当前状态（2026-09-12）
 
-- 后端全量测试 **434 passed**：`cd backend && python -m pytest -q`
+- 后端全量测试 **467 passed**：`cd backend && python -m pytest -q`
 - Source Engine 闭环已完成并可用：导入书源 → 搜索 → 目录 → 正文 → Storage/DB/搜索 →
   网页阅读。当前工作重心是**同步稳定性与线上排错**，不是新增架构能力。
 - 并发模型：**一个书源一个 worker**（`SYNC_WORKER_CONCURRENCY=0` 默认不限），书源之间
@@ -93,6 +93,9 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 | 同一份任务日志里 `Task … got Future … attached to a different loop` | Celery 任务每次 `asyncio.get_event_loop()` 换循环，SQLAlchemy 连接池里的 asyncpg 连接绑在旧循环上 | 见第 13 节 |
 | 漫画书每个章节固定只有 12 张图片 | 书源 `imgInfoList` 只含相册第 1 个索引页（12 条），旧代码拿它当页数上限 | 见第 13 节 |
 | 相册第一张（封面）总是丢 | `//…/li[1]` 被当成 0-based Legado 索引（= 第二个 li）；Legado 对 `/` 开头规则走 XPath（1-based） | 见第 13 节 |
+| 一批不相关的书/章节在同一瞬间失败：`ReadError` / `ClosedResourceError` / `pop from an empty deque`，最后报「同步连续失败超过 10 本…反爬」 | 重试路径 `aclose()` 了进程内共享的 httpx 客户端，正在用它的其它并发请求当场全挂 | 见第 14 节 |
+| 日志刷 `Exception terminating connection <AdaptedConnection …>`（Event loop is closed）+ `got Future … attached to a different loop` + `get_plugin failed for '<source id>'` | `registry.get_plugin(<source id>)` 用**池化**引擎在一次性事件循环（helper 线程里的 `asyncio.run`）里查库，把绑在死循环上的 asyncpg 连接还进了共享连接池 | 见第 14 节 |
+| 日志里 `Failed to fetch content image <url>: `（冒号后空白） | 图片下载失败时直接打印 httpx 异常，`str(exc)` 是空串 | 见第 14 节 |
 
 ---
 
@@ -494,3 +497,67 @@ Cookie 其实都正常，用户看到的是一条指向错误方向的报错，�
 需要限量时调 `YUEDU_GALLERY_MAX_PAGES` 或只同步书架。旧数据的 12 张章节会在**下一次
 同书同步**时自动重抓（`_is_truncated_gallery`）；相册本来就 ≤12 张书每次同步都会重抓一遍，
 量小可接受。
+
+## 14. 2026-09-15：代理抖动一次打断所有并发同步；连接池被一次性事件循环污染
+
+**现象**（线上 `novelhub-crawler` 日志 + `crawl_tasks`，用户报「同步书源时 crawler 里有报错」）：
+
+1. 09-14 23:36–23:57 出现一阵「同一瞬间多本不相关的书失败」：日志里是
+   `Failed to sync book …: pop from an empty deque`（29 条）夹杂 `ClosedResourceError` /
+   `ReadError`，20 秒内 30 本失败，`ed747ff1`（绅士漫画）与 `357cca4f`（御宅屋）两个全站任务
+   被判「同步连续失败超过 10 本…反爬」中止 —— 书源与 Cookie 都是好的。
+2. 09-15 02:00–02:04（每天 2 点的 cookie 健康检查）每 60 秒一条
+   `Exception terminating connection <AdaptedConnection …>` + `Event loop is closed`，
+   伴随 `Task … got Future … attached to a different loop`、
+   `get_plugin failed for 'yuedu_7f952bd23f9a'`；该次检查报 `10 failed`。
+3. 同一批日志里还有 `Failed to fetch content image <url>: `（冒号后空白，看不出原因）。
+4. 09-15 18:55–18:59 要撸小说/h528 的 502/520 属站点/代理侧，不改代码。
+
+**根因**（都在线上容器里复现）：
+
+1. **共享 httpx 客户端被当场拆掉**：`_get`/`_post` 的重试分支只要遇到传输错误就
+   `await _reset_http_client(proxy)`，而它 `pop` 出**进程内共享**的客户端并立即
+   `aclose()`。一个书源一个 worker + 书/章并发之后，同一时刻有十几个请求共用这个客户端，
+   代理一抖 → 其中一个请求的重试把客户端关掉 → 其它请求同时失败。线上容器实测：
+   部署版代码 + 6 个并发取书，只要 1 次 reset，6 个请求全部 `ReadError`；
+   同一脚本改后 45 秒内 267 次 reset → 0 失败。
+   异常类型取决于请求处于哪一步（连接中 / 读 body / 流被关），所以同阵里既有 `ReadError`、
+   `ClosedResourceError`，也有 `IndexError: pop from an empty deque`（`deque.pop()` 空队列
+   就是这条消息；anyio 自己的 socket 读队列会把它转成 `ClosedResourceError`）。
+   `ClosedResourceError` 与 deque 文本都不在瞬态名单里 → 记满 10 本 → 任务被误判「反爬」。
+2. **`get_plugin(<source id>)` 把池化连接还给了死循环**：`registry.get_plugin` 查 source id
+   时，没有运行中的 loop 就直接 `asyncio.run(...)`，有 loop（celery 任务、FastAPI）时又开
+   helper 线程 `asyncio.run(...)`。两者都跑在**一次性事件循环**上，用的却是共享的**池化**
+   引擎：连接归还后仍绑在那个已关闭的 loop 上，下一个任务在真正的 loop 上取到它 →
+   `attached to a different loop` / 关连接时 `Event loop is closed`。线上容器实测：先正常
+   查一次库（连接入池），再 `get_plugin('yuedu_2ca378a79b50')`，立刻复现这两条错误 +
+   `get_plugin failed`（正是 2 点那批日志）。
+3. 图片下载失败走的是 `logger.warning("…: %s", last_error)`，httpx 异常 `str()` 为空。
+
+**改动**：
+
+| 文件 | 改动 |
+|---|---|
+| `backend/app/core/database.py` | 新增 `lookup_engine` + `LookupSessionLocal`（`poolclass=NullPool`）：一次性/异地 loop 上的短查询用完即关，绝不进共享池 |
+| `backend/app/crawler/registry.py` | `_lookup_source_async` 改用 `LookupSessionLocal` |
+| `backend/app/crawler/plugins/yuedu/__init__.py` | `_reset_http_client` 改为**退休**旧客户端：先从 `_clients` 摘掉（重试立刻用新连接池），由后台任务在 `YUEDU_HTTP_RETIRE_SECONDS`（默认 45s > 25s 读超时）后关闭；`YUEDU_HTTP_MAX_RETIRED_CLIENTS`（默认 4）限制积压，溢出时取消最老的（关闭写在 `finally`，取消也会关） |
+| 同上 | `fetch_content_image` 失败日志在 `str(exc)` 为空时打印异常类名 |
+| `backend/app/services/sync.py` | `TRANSIENT_EXCEPTION_NAMES` 增加 anyio 流错误（`ClosedResourceError`/`BrokenResourceError`/`BusyResourceError`/`IncompleteReadError`）；新增 `TRANSIENT_MESSAGE_MARKERS`（`pop from an empty deque`），书级/章级分类都先过它 |
+| `backend/tests/test_yuedu_plugin.py`、`test_sync_service.py`、`test_registry_lookup.py` | 新增 6 项回归：退休不立刻关、退休数量有上限、图片失败日志带类型、anyio/deque 判瞬态且不误伤普通 `IndexError`、lookup 引擎是 NullPool、registry 用未池化的 session |
+
+**验证**：
+
+- `cd backend && python -m pytest -q` → **467 passed**。
+- 线上影子回归（把改动后的 3 个文件写进容器 `/tmp/shadow_backend` 并前置 `sys.path`，
+  不动线上镜像/数据）：
+  - 连接池：改动前 `get_plugin('yuedu_2ca378a79b50')` 报
+    `Exception terminating connection … Event loop is closed` +
+    `got Future … attached to a different loop`，最后 `Unknown plugin or source`；
+    改动后连续 3 次都正常解析出 `YueduPlugin`，共享池查询全程正常，没有任何 loop 报错。
+  - 客户端退休：改动前「1 次 reset → 6 个并发取书全失败（6×`ReadError`）」；改动后同一
+    脚本、45 秒内 267 次 reset → 0 失败。
+
+**未做/已知**：要撸小说 520、h528 502、御宅屋偶发 `Chapter returned empty content`、
+Playwright `Page.goto` 超时都属站点/代理侧，代码按设计重试；本节的改动只保证「代理抖动
+不再误伤同一进程里的其它并发同步，也不会再被误判成反爬」。改动要
+`docker compose build backend crawler` + `up -d` 后才在线上生效。
