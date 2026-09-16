@@ -62,6 +62,7 @@
   “日志刷 `Failed to fetch content image …`，章节里图片缺失”
 - 同步某本书报 `[Errno 36] File name too long` → [full-site-sync.md](full-site-sync.md)
   “个别书报 [Errno 36] File name too long”
+- 想让小说和漫画分页显示 / 漫画书被算成小说 → [codex-handoff.md](codex-handoff.md) 第 16 节
 - 想连服务器看真实任务与日志 → [codex-handoff.md](codex-handoff.md) 第 1、5 节
 
 ## 文档维护约定

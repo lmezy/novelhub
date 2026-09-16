@@ -624,3 +624,50 @@ Playwright `Page.goto` 超时都属站点/代理侧，代码按设计重试；�
 普通页面的 `<noscript>`，误判代价远大于收益；真正的 Cloudflare JS 挑战仍由 `_is_challenge_page`
 与 CF 标记识别。要撸小说 520、h528 502 等站点侧错误不变。改动要
 `docker compose build backend crawler` + `up -d` 后才在线上生效。
+
+## 16. 2026-09-16：小说和漫画混在一起（需求：小说一页、漫画一页）
+
+**现象**：书库只有一个列表，23k 本书里混着绅士漫画的 1849 本图集；用户要求「小说一页、
+漫画一页」。数据里**没有**任何 novel/comic 字段，只有书源（`sources.config->>'bookSourceType'`）
+和各自的书标签/分类能间接看出来。
+
+**根因**：`books` 表只区分 R18 与全年龄，没有「阅读形态」这一维度，前端也就只能混排。
+
+**判定规则**（`backend/app/services/book_kind.py`，不为单站点写死）：
+
+1. 书源自报图片源（Legado `bookSourceType == 2`，线上只有绅士漫画 `yuedu_f34d61039a65`，1849 本）；
+2. 书的标签/分类命中漫画关键词（漫画/漫畫/图集/圖集/画集/畫集/写真/寫真/comic/manga/webtoon）；
+3. 章节正文只有图片标记、去掉标记后几乎没有文字（兜底：自报 text 的图源也能认出来）。
+   注意 `動漫改編` 是風月文學網的**小说**标签，故意不在关键词里。
+
+自动判定只会从 novel 升到 comic，不会反向降级；只有管理员「重新识别」勾了严格重算才会改写。
+
+**改动**：
+
+| 文件 | 改动 |
+|---|---|
+| `backend/app/models/book.py` | 新增 `books.kind`（`novel`/`comic`，默认 `novel`）+ `ix_books_kind` |
+| `backend/app/services/book_kind.py` | 新增：`is_comic_source / is_comic_label(s) / is_comic_content / resolve_kind / classify_book`，以及 `reclassify_books()`（分批重算，可选读正文） |
+| `backend/app/services/sync.py` | 同步时按书源+标签定 kind，章节正文判定为图集时把书升为 comic（`sync_book`、`resync_chapter`、`_ensure_book_row`） |
+| `backend/app/api/routes/books.py` | `/books/browse`、`/books/home`、`/books/favorites` 支持 `kind=novel|comic`；新增 `POST /books/reclassify?scan_content=&source_id=&force=`（管理员；`force` 才允许把误判的漫画改回小说）；`BookOut.kind` |
+| `backend/app/api/routes/categories.py` | `GET /categories?kind=` 只返回该类型下真实存在的分类 |
+| `backend/app/services/visibility.py` | 抽出 `apply_book_visibility()` 供 books/categories 共用（逻辑不变） |
+| `backend/alembic/versions/0032_book_kind.py` | 加列 + 索引 + 回填（书源类型 2、标签/分类关键词） |
+| `frontend/src/router/index.ts`、`pages/BooksPage.vue` | 新增 `/novels`、`/comics`，复用书库页逻辑，按 `kind` 过滤分类/书源/分页/搜索跳转，页头加「全部/小说/漫画」切换 |
+| `frontend/src/pages/AdminPage.vue` | 设置 → 索引 → 「小说 / 漫画识别 → 重新识别」（可勾选读正文 / 严格重算），对应 `POST /books/reclassify` |
+| `frontend/src/components/NavBar.vue`、`pages/HomePage.vue`、`components/BookCard.vue`、`stores/i18n.ts` | 导航加「小说 / 漫画 / 书库」；书架按类型筛选（存 `novelhub_shelf_kind`）；卡片给漫画加标记 |
+| `backend/tests/test_book_kind.py`、`test_migrations.py` | 新增分类回归 + head 断言更新到 `0032_book_kind` |
+
+**验证**：
+
+- `cd backend && python -m pytest -q` → **483 passed**。
+- 线上只读核算回填口径：`image_source` 1849 本、`label_tags` 1191 本、`label_categories` 1187 本，
+  合并后 **comics 1856 / novels 21566**（总数 23422，两边互补）。
+- 用真实正文跑 `is_comic_content()`：绅士漫画随机 10 章全部 `True`；7 个小说书源随机 10 章
+  （含 72 字符的残章）全部 `False`。
+- 前端 `vue-tsc --noEmit` 无错误、`vite build` 成功。
+
+**未做/已知**：全文搜索（Meilisearch）不按 kind 过滤，`/novels`、`/comics` 页里的搜索结果仍是
+全库结果；旧书由迁移回填，剩下判错的（图源自报 text、目录被解析成图集）用「设置 → 索引 →
+小说 / 漫画识别 → 重新识别」或 `POST /api/books/reclassify?scan_content=true&source_id=<书源>` 重算。改动要
+`docker compose build backend crawler frontend` + `up -d` 后在线上生效（迁移由 backend 启动时自动执行）。

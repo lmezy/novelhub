@@ -1,19 +1,43 @@
 ﻿from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
-from app.models import Book, User
+from app.models import Book, BookCategory, Category, User
 from app.repositories.category import CategoryRepository
 from app.schemas.category import BookCategoryAssign, CategoryCreate, CategoryOut
 from app.services.auth import get_current_user, require_admin
-from app.services.visibility import can_view_r18, ensure_book_visible
+from app.services.book_kind import KINDS
+from app.services.visibility import apply_book_visibility, can_view_r18, ensure_book_visible
 
 router = APIRouter(prefix="/categories", tags=["categories"])
 
 
 @router.get("", response_model=list[CategoryOut])
-async def list_categories(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+async def list_categories(
+    kind: str | None = None,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List categories; ``kind`` keeps only genres holding that kind of book.
+
+    The novel and comic pages pass their own ``kind`` so their category bar
+    never offers a genre that only exists on the other page.
+    """
     repo = CategoryRepository(db)
+    value = str(kind or "").strip().lower()
+    if value in KINDS:
+        query = (
+            select(Category)
+            .join(BookCategory, BookCategory.category_id == Category.id)
+            .join(Book, Book.id == BookCategory.book_id)
+            .where(Book.kind == value)
+        )
+        query = apply_book_visibility(query, user)
+        if not can_view_r18(user):
+            query = query.where(Category.is_r18 == False)
+        rows = await db.scalars(query.distinct().order_by(Category.name))
+        return list(rows)
     return await repo.list_all(include_r18=can_view_r18(user))
 
 

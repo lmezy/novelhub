@@ -40,6 +40,30 @@ const sources = ref<SourceItem[]>([])
 const homeSources = ref<SourceSection[]>([])
 const homeSourcesLoading = ref(false)
 
+// The shelf shows novels and comics on the same page; this keeps them apart
+// without hiding either.  ``all`` keeps the previous mixed behaviour.
+type ShelfKind = "" | "novel" | "comic"
+const shelfKind = ref<ShelfKind>((localStorage.getItem("novelhub_shelf_kind") as ShelfKind) || "")
+const shelfBooks = computed(() =>
+  shelfKind.value
+    ? favoriteBooks.value.filter((book) => (book.kind || "novel") === shelfKind.value)
+    : favoriteBooks.value
+)
+const shelfKindCounts = computed(() => ({
+  all: favoriteBooks.value.length,
+  novel: favoriteBooks.value.filter((book) => (book.kind || "novel") === "novel").length,
+  comic: favoriteBooks.value.filter((book) => book.kind === "comic").length,
+}))
+
+function setShelfKind(kind: ShelfKind) {
+  shelfKind.value = kind
+  selectedIds.value = []
+  try {
+    if (kind) localStorage.setItem("novelhub_shelf_kind", kind)
+    else localStorage.removeItem("novelhub_shelf_kind")
+  } catch { /* storage is optional */ }
+}
+
 function searchByField(field: "author" | "tags" | "category", value: string) {
   router.push({ path: "/search", query: { field, q: value } })
 }
@@ -47,8 +71,8 @@ function searchByField(field: "author" | "tags" | "category", value: string) {
 const showCovers = computed(() => auth.user?.settings?.show_covers !== false)
 
 const allSelected = computed(() =>
-  favoriteBooks.value.length > 0 &&
-  selectedIds.value.length === favoriteBooks.value.length
+  shelfBooks.value.length > 0 &&
+  shelfBooks.value.every((book) => selectedIds.value.includes(book.id))
 )
 
 
@@ -211,12 +235,12 @@ function toggleSelect(id: string) {
 }
 
 function selectAll() {
-  selectedIds.value = favoriteBooks.value.map((book) => book.id)
+  selectedIds.value = shelfBooks.value.map((book) => book.id)
 }
 
 function invertSelection() {
   const selected = new Set(selectedIds.value)
-  selectedIds.value = favoriteBooks.value
+  selectedIds.value = shelfBooks.value
     .filter((book) => !selected.has(book.id))
     .map((book) => book.id)
 }
@@ -490,6 +514,23 @@ onMounted(async () => {
         </div>
 
         <div class="flex flex-wrap items-center gap-2 mb-4">
+          <div class="inline-flex items-center gap-1 rounded border border-border dark:border-gray-700 p-0.5">
+            <button
+              @click="setShelfKind('')"
+              class="text-xs px-2.5 py-1 rounded"
+              :class="shelfKind === '' ? 'bg-accent text-white' : 'text-muted dark:text-gray-400 hover:bg-accent/5'"
+            >{{ i18n.t('kind_all') }} ({{ shelfKindCounts.all }})</button>
+            <button
+              @click="setShelfKind('novel')"
+              class="text-xs px-2.5 py-1 rounded"
+              :class="shelfKind === 'novel' ? 'bg-accent text-white' : 'text-muted dark:text-gray-400 hover:bg-accent/5'"
+            >{{ i18n.t('kind_novels') }} ({{ shelfKindCounts.novel }})</button>
+            <button
+              @click="setShelfKind('comic')"
+              class="text-xs px-2.5 py-1 rounded"
+              :class="shelfKind === 'comic' ? 'bg-accent text-white' : 'text-muted dark:text-gray-400 hover:bg-accent/5'"
+            >{{ i18n.t('kind_comics') }} ({{ shelfKindCounts.comic }})</button>
+          </div>
           <button
             @click="selectGroup('')"
             class="text-xs px-3 py-1.5 rounded border"
@@ -524,9 +565,9 @@ onMounted(async () => {
         <p v-if="favoriteLoading" class="text-muted dark:text-gray-400">{{ i18n.t('home_loading') }}</p>
         <p v-else-if="favoriteError" class="text-red-600">{{ favoriteError }}</p>
 
-        <div v-else-if="favoriteBooks.length === 0" class="text-center py-16">
-          <p class="text-muted dark:text-gray-400 text-lg mb-2">{{ i18n.t('home_shelf_empty') }}</p>
-          <p class="text-sm text-muted dark:text-gray-400">{{ i18n.t('home_shelf_empty_hint') }}</p>
+        <div v-else-if="shelfBooks.length === 0" class="text-center py-16">
+          <p class="text-muted dark:text-gray-400 text-lg mb-2">{{ favoriteBooks.length === 0 ? i18n.t('home_shelf_empty') : i18n.t('home_shelf_kind_empty') }}</p>
+          <p class="text-sm text-muted dark:text-gray-400">{{ favoriteBooks.length === 0 ? i18n.t('home_shelf_empty_hint') : i18n.t('home_shelf_kind_empty_hint') }}</p>
           <router-link
             to="/books"
             class="inline-block mt-4 text-sm text-accent hover:underline"
@@ -559,7 +600,7 @@ onMounted(async () => {
 
           <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
           <router-link
-            v-for="book in favoriteBooks"
+            v-for="book in shelfBooks"
             :key="book.id"
             :to="'/books/' + book.id"
             class="relative group block p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 hover:shadow-md hover:border-accent/30 transition-all duration-200 no-underline"
@@ -618,6 +659,10 @@ onMounted(async () => {
               {{ book.description || i18n.t('home_no_desc') }}
             </p>
             <div class="flex items-center gap-2">
+              <span
+                v-if="book.kind === 'comic'"
+                class="text-xs px-2 py-0.5 rounded-full bg-purple-100 text-purple-700 dark:bg-purple-900/60 dark:text-purple-300"
+              >{{ i18n.t('kind_comics') }}</span>
               <span
                 class="text-xs px-2 py-0.5 rounded-full"
                 :class="book.status === 'completed' ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'"

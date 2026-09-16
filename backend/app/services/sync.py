@@ -35,6 +35,12 @@ from app.services.search import search_service
 from app.services.cookie_crypto import safe_decrypt_cookie
 from app.services.r18 import detect_r18
 from app.services.auto_categorize import classify_category_names
+from app.services.book_kind import (
+    KIND_COMIC,
+    is_comic_content,
+    normalize_kind,
+    resolve_kind,
+)
 
 
 class SyncPaused(Exception):
@@ -806,6 +812,16 @@ class SyncService:
             book.id,
             sorted([*source_tags, classification_tag]),
         )
+        # Novel or comic is a property of the source and the book's own labels
+        # (a book source that declares ``bookSourceType: 2`` is an image
+        # source); the chapter bodies below can still promote the book when a
+        # comic source wrongly declares itself as text.
+        book.kind = resolve_kind(
+            source=source,
+            labels=[*source_tags, *candidate_categories],
+            current=book.kind,
+        )
+        book_kind = normalize_kind(book.kind)
         # Persist the book before chapter downloads so a later chapter failure
         # cannot leave chapters pointing at an uncommitted book row.
         await self.db.commit()
@@ -872,6 +888,7 @@ class SyncService:
             "status": book.status,
             "is_r18": book_is_r18,
             "owner_id": source.owner_id,
+            "kind": book_kind,
         }
         created = 0
         skipped = 0
@@ -1030,6 +1047,16 @@ class SyncService:
                             )
                         book_row_verified = True
                     self.db.add(chapter)
+                    # A chapter that is nothing but image markup is a gallery
+                    # page: the book is a comic even when its source claims to
+                    # be a text source.
+                    if book_kind != KIND_COMIC and is_comic_content(content):
+                        book_kind = KIND_COMIC
+                        await self.db.execute(
+                            update(Book)
+                            .where(Book.id == book_id)
+                            .values(kind=KIND_COMIC)
+                        )
                     await self.db.flush()
                     # Commit per chapter so a later failure cannot lose earlier work.
                     await self.db.commit()
@@ -1602,6 +1629,8 @@ class SyncService:
         chapter.source_chapter_id = remote_chapter.source_chapter_id
         chapter.content_path = content_path
         chapter.hash = content_hash
+        if normalize_kind(book.kind) != KIND_COMIC and is_comic_content(content):
+            book.kind = KIND_COMIC
         await self.db.commit()
 
         search_service.index_chapter({

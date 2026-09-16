@@ -56,6 +56,33 @@ const auth = useAuthStore()
 const booksStore = useBooksStore()
 const i18n = useI18nStore()
 
+// ``/novels`` and ``/comics`` reuse this page with a fixed ``kind`` so the
+// library can be split without duplicating the search and filter logic.
+const props = withDefaults(
+  defineProps<{ kind?: "novel" | "comic" | "" }>(),
+  { kind: "" },
+)
+const bookKind = computed<"" | "novel" | "comic">(() =>
+  props.kind === "novel" || props.kind === "comic" ? props.kind : "",
+)
+const listPath = computed(() =>
+  bookKind.value === "comic" ? "/comics" : bookKind.value === "novel" ? "/novels" : "/books",
+)
+const kindTitle = computed(() =>
+  bookKind.value === "comic"
+    ? i18n.t("comics_title")
+    : bookKind.value === "novel"
+      ? i18n.t("novels_title")
+      : i18n.t("books_title"),
+)
+const kindSubtitle = computed(() =>
+  bookKind.value === "comic"
+    ? i18n.t("comics_subtitle")
+    : bookKind.value === "novel"
+      ? i18n.t("novels_subtitle")
+      : i18n.t("books_subtitle"),
+)
+
 const categories = ref<CategoryItem[]>([])
 const sources = ref<SourceItem[]>([])
 const home = ref<HomeData | null>(null)
@@ -130,7 +157,7 @@ const fuzzyFields: SearchField[] = ["title", "author", "chapter_title", "descrip
 
 async function loadNavigation() {
   const [categoryRows, sourceRows] = await Promise.all([
-    api.get<CategoryItem[]>("/categories"),
+    api.get<CategoryItem[]>(bookKind.value ? "/categories?kind=" + bookKind.value : "/categories"),
     api.get<any[]>("/sources"),
   ])
   categories.value = categoryRows
@@ -141,7 +168,9 @@ async function loadNavigation() {
 }
 
 async function loadHome() {
-  home.value = await api.get<HomeData>("/books/home?section_limit=6")
+  const params = new URLSearchParams({ section_limit: "6" })
+  if (bookKind.value) params.set("kind", bookKind.value)
+  home.value = await api.get<HomeData>("/books/home?" + params)
   await loadHomeSources()
 }
 
@@ -150,7 +179,8 @@ async function loadHomeSources() {
   const results = await Promise.all(
     sources.value.map(async (source) => {
       try {
-        const res = await api.get<BookPage>("/books/browse?source_id=" + encodeURIComponent(source.id) + "&limit=6")
+        const kindParam = bookKind.value ? "&kind=" + bookKind.value : ""
+        const res = await api.get<BookPage>("/books/browse?source_id=" + encodeURIComponent(source.id) + "&limit=6" + kindParam)
         return { source, total: res.total, books: res.items }
       } catch {
         return { source, total: 0, books: [] }
@@ -164,6 +194,7 @@ async function loadBrowse() {
   const params = new URLSearchParams({ offset: String(currentOffset.value), limit: "24" })
   if (activeCategory.value) params.set("category", activeCategory.value)
   if (activeSource.value) params.set("source_id", activeSource.value)
+  if (bookKind.value) params.set("kind", bookKind.value)
   page.value = await api.get<BookPage>("/books/browse?" + params)
 }
 
@@ -219,31 +250,31 @@ async function loadCurrentView() {
 }
 
 function changeSearchPage(offset: number) {
-  router.push({ path: "/books", query: { q: String(route.query.q || ""), field: String(route.query.field || "title"), offset: String(Math.max(0, offset)) } })
+  router.push({ path: listPath.value, query: { q: String(route.query.q || ""), field: String(route.query.field || "title"), offset: String(Math.max(0, offset)) } })
 }
 
 function submitSearch() {
   const q = searchQuery.value.trim()
   if (!q) {
-    router.push({ path: "/books" })
+    router.push({ path: listPath.value })
     return
   }
   advancedActive.value = false
   advancedOpen.value = false
-  router.push({ path: "/books", query: { q, field: searchField.value } })
+  router.push({ path: listPath.value, query: { q, field: searchField.value } })
 }
 
 function openCategory(name: string) {
-  router.push({ path: "/books", query: { category: name } })
+  router.push({ path: listPath.value, query: { category: name } })
 }
 
 function changeSource(event: Event) {
   const source = (event.target as HTMLSelectElement).value
-  router.push({ path: "/books", query: { ...(activeCategory.value ? { category: activeCategory.value } : {}), ...(source ? { source } : {}) } })
+  router.push({ path: listPath.value, query: { ...(activeCategory.value ? { category: activeCategory.value } : {}), ...(source ? { source } : {}) } })
 }
 
 function searchByField(field: "author" | "tags" | "category", value: string) {
-  router.push({ path: "/books", query: { field, q: value } })
+  router.push({ path: listPath.value, query: { field, q: value } })
 }
 
 function goToHit(hit: SearchHit) {
@@ -302,7 +333,7 @@ async function deleteSourceBooks() {
 }
 
 function changePage(offset: number) {
-  router.push({ path: "/books", query: { ...route.query, offset: String(Math.max(0, offset)) } })
+  router.push({ path: listPath.value, query: { ...route.query, offset: String(Math.max(0, offset)) } })
 }
 
 function changeAdvancedPage(offset: number) {
@@ -358,7 +389,7 @@ async function runAdvancedSearch(offset = 0) {
     advancedTotal.value = res.total
     advancedActive.value = true
     writeSessionCache(ADVANCED_CACHE_KEY, { conditions: conditions.value, match: match.value, results: res.hits, total: res.total, offset })
-    await router.replace({ path: "/books", query: { advanced: "1", offset: String(offset) } })
+    await router.replace({ path: listPath.value, query: { advanced: "1", offset: String(offset) } })
   } catch (e) {
     advancedError.value = e instanceof Error ? e.message : i18n.t("search_failed")
   } finally {
@@ -409,6 +440,13 @@ async function syncRemoteBook(item: RemoteBook) {
 
 watch(() => route.query, loadCurrentView, { deep: true })
 
+// ``/novels`` and ``/comics`` share this component, so switching between them
+// changes the prop without changing the route query.
+watch(bookKind, async () => {
+  try { await loadNavigation() } catch { categories.value = [] }
+  await loadCurrentView()
+})
+
 onMounted(async () => {
   if (isSearching.value || isAdvancedRoute.value) {
     await Promise.all([
@@ -428,8 +466,26 @@ onMounted(async () => {
 
     <main class="mx-auto max-w-6xl px-4 pb-12 pt-7">
       <header class="mb-6 text-center">
-        <h1 class="text-2xl font-bold">{{ i18n.t('books_title') }}</h1>
-        <p class="mt-1 text-sm text-muted dark:text-gray-400">{{ i18n.t('books_subtitle') }}</p>
+        <h1 class="text-2xl font-bold">{{ kindTitle }}</h1>
+        <p class="mt-1 text-sm text-muted dark:text-gray-400">{{ kindSubtitle }}</p>
+
+        <div class="mt-4 flex items-center justify-center gap-2" :title="i18n.t('books_kind_switch')">
+          <button
+            @click="router.push('/books')"
+            class="rounded border px-3 py-1.5 text-xs transition-colors"
+            :class="bookKind === '' ? 'border-accent bg-accent text-white' : 'border-border text-muted hover:bg-accent/5 dark:border-gray-700 dark:text-gray-400'"
+          >{{ i18n.t('kind_all') }}</button>
+          <button
+            @click="router.push('/novels')"
+            class="rounded border px-3 py-1.5 text-xs transition-colors"
+            :class="bookKind === 'novel' ? 'border-accent bg-accent text-white' : 'border-border text-muted hover:bg-accent/5 dark:border-gray-700 dark:text-gray-400'"
+          >{{ i18n.t('kind_novels') }}</button>
+          <button
+            @click="router.push('/comics')"
+            class="rounded border px-3 py-1.5 text-xs transition-colors"
+            :class="bookKind === 'comic' ? 'border-accent bg-accent text-white' : 'border-border text-muted hover:bg-accent/5 dark:border-gray-700 dark:text-gray-400'"
+          >{{ i18n.t('kind_comics') }}</button>
+        </div>
 
         <div class="mx-auto mt-5 flex max-w-2xl items-center justify-center gap-2">
           <div class="flex rounded-lg border border-border bg-surface overflow-hidden dark:border-gray-700 dark:bg-gray-900">
@@ -542,7 +598,7 @@ onMounted(async () => {
       </div>
 
       <nav class="mb-7 flex items-center gap-2 overflow-x-auto border-y border-border py-3 dark:border-gray-800">
-        <button @click="router.push('/books')" class="shrink-0 rounded px-3 py-1.5 text-xs" :class="!activeCategory && !activeSource && !isSearching && !advancedActive ? 'bg-accent text-white' : 'text-muted hover:bg-black/5 dark:text-gray-400 dark:hover:bg-white/5'">{{ i18n.t('books_all_categories') }}</button>
+        <button @click="router.push(listPath)" class="shrink-0 rounded px-3 py-1.5 text-xs" :class="!activeCategory && !activeSource && !isSearching && !advancedActive ? 'bg-accent text-white' : 'text-muted hover:bg-black/5 dark:text-gray-400 dark:hover:bg-white/5'">{{ i18n.t('books_all_categories') }}</button>
         <button v-for="category in categories" :key="category.id" @click="openCategory(category.name)" class="shrink-0 rounded px-3 py-1.5 text-xs" :class="activeCategory === category.name ? 'bg-accent text-white' : 'text-muted hover:bg-black/5 dark:text-gray-400 dark:hover:bg-white/5'">{{ category.name }}</button>
       </nav>
 
@@ -623,7 +679,7 @@ onMounted(async () => {
       <template v-else-if="isSearching">
         <div class="mb-4 flex items-center justify-between">
           <div>
-            <button @click="router.push('/books')" class="text-xs text-accent hover:underline">{{ i18n.t('books_back_home') }}</button>
+            <button @click="router.push(listPath)" class="text-xs text-accent hover:underline">{{ i18n.t('books_back_home') }}</button>
             <h2 class="mt-1 text-lg font-semibold">{{ i18n.t('search_results_count', { n: searchTotal }) }}</h2>
           </div>
         </div>
@@ -650,8 +706,8 @@ onMounted(async () => {
       <template v-else-if="isBrowsing">
         <div class="mb-5 flex flex-wrap items-end justify-between gap-3">
           <div>
-            <button @click="router.push('/books')" class="text-xs text-accent hover:underline">{{ i18n.t('books_back_home') }}</button>
-            <h2 class="mt-1 text-xl font-semibold">{{ activeCategory || sourceNameMap[activeSource] || i18n.t('books_title') }}</h2>
+            <button @click="router.push(listPath)" class="text-xs text-accent hover:underline">{{ i18n.t('books_back_home') }}</button>
+            <h2 class="mt-1 text-xl font-semibold">{{ activeCategory || sourceNameMap[activeSource] || kindTitle }}</h2>
             <p class="mt-1 text-xs text-muted dark:text-gray-400">{{ i18n.t('home_books_count', { n: page.total }) }}</p>
           </div>
           <select :value="activeSource" @change="changeSource" class="rounded border border-border bg-surface px-3 py-2 text-xs dark:border-gray-700 dark:bg-gray-900">
@@ -707,7 +763,7 @@ onMounted(async () => {
           <div v-for="section in homeSources" :key="section.source.id" class="mb-8">
             <div class="mb-3 flex items-center justify-between">
               <h3 class="text-sm font-semibold text-muted dark:text-gray-400">{{ section.source.name }}</h3>
-              <button @click="router.push({ path: '/books', query: { source: section.source.id } })" class="text-xs text-accent hover:underline">{{ i18n.t('books_view_all_source') }} ({{ section.total }}) ›</button>
+              <button @click="router.push({ path: listPath, query: { source: section.source.id } })" class="text-xs text-accent hover:underline">{{ i18n.t('books_view_all_source') }} ({{ section.total }}) ›</button>
             </div>
             <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
               <BookCard v-for="book in section.books" :key="book.id" :book="book" :show-cover="showCovers" :source-name="book.source_id ? sourceNameMap[book.source_id] : ''" @favorite="toggleFavorite" @search="searchByField" />
@@ -715,7 +771,7 @@ onMounted(async () => {
           </div>
         </section>
 
-        <div v-if="home.total === 0" class="py-16 text-center"><p class="text-muted dark:text-gray-400">{{ i18n.t('books_empty') }}</p><router-link to="/settings" class="mt-3 inline-block text-sm text-accent hover:underline">{{ i18n.t('books_empty_hint') }}</router-link></div>
+        <div v-if="home.total === 0" class="py-16 text-center"><p class="text-muted dark:text-gray-400">{{ bookKind === 'comic' ? i18n.t('books_kind_empty_comics') : bookKind === 'novel' ? i18n.t('books_kind_empty_novels') : i18n.t('books_empty') }}</p><router-link to="/settings" class="mt-3 inline-block text-sm text-accent hover:underline">{{ i18n.t('books_empty_hint') }}</router-link></div>
       </template>
     </main>
   </div>

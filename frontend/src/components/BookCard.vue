@@ -52,7 +52,11 @@ const i18n = useI18nStore()
       class="mt-1 block max-w-full truncate text-left text-xs text-muted transition-colors hover:text-accent dark:text-gray-400"
       :title="i18n.t('book_author_search')"
     >{{ book.author_name }}</button>
-    <div v-if="book.category_names?.length" class="mt-2 flex flex-wrap gap-1">
+    <div v-if="book.kind === 'comic' || book.category_names?.length" class="mt-2 flex flex-wrap gap-1">
+      <span
+        v-if="book.kind === 'comic'"
+        class="rounded bg-purple-100 px-1.5 py-0.5 text-[11px] text-purple-700 dark:bg-purple-900/60 dark:text-purple-300"
+      >{{ i18n.t('kind_comics') }}</span>
       <button
         v-for="category in book.category_names.slice(0, 2)"
         :key="category"

@@ -47,6 +47,10 @@ Scheduler 容器：Celery Beat（定时同步、cookie 健康检查）
 
 - 数据库只存元数据：Book（标题/作者/来源/分类/状态）、Chapter（标题/顺序/URL/Hash）、
   Source（规则）、Reading（进度）。**正文不入库**。
+- Book 的 `kind`（`novel`/`comic`）是**派生字段**：由书源类型、书籍标签/分类、章节正文形态
+   判定（`backend/app/services/book_kind.py`），用于把小说和漫画分到不同页面；同步时自动更新，
+   老数据靠 Alembic 回填 + `POST /api/books/reclassify` 重算。前端 `/novels`、`/comics` 共用
+   `BooksPage.vue`，只按 `kind` 过滤。
 - 正文以 Markdown 落 Storage：`storage/books/{author}/{title}/000001.md` + `metadata.json`。
 - 更新必须是增量：拉目录 → 按章节 URL/Hash 比对 → 只下载新增 → 更新索引；
   支持断点恢复与失败重试。

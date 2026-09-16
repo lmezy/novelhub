@@ -1,5 +1,7 @@
 """R18 visibility helpers shared by API routes."""
 
+from sqlalchemy import or_
+
 from app.models import Book, User
 
 
@@ -61,3 +63,21 @@ def visible_tags(user: User, tag_names: list[str]) -> list[str]:
     if not can_view_r18(user):
         visible = [name for name in visible if name not in R18_TAGS]
     return visible
+
+
+def apply_book_visibility(query, user: User, book=Book):
+    """Restrict a book query to the rows ``user`` is allowed to see."""
+    if user.role not in ("admin", "super_admin"):
+        query = query.where(or_(
+            book.owner_id.is_(None),
+            book.owner_id == user.id,
+            book.is_public == True,
+        ))
+    conditions = []
+    if can_view_all_ages(user):
+        conditions.append(book.is_r18 == False)
+    if can_view_r18(user):
+        conditions.append(book.is_r18 == True)
+    if not conditions:
+        return query.where(book.id == "__none__")
+    return query.where(or_(*conditions))

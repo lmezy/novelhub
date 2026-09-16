@@ -1146,6 +1146,37 @@ async function rebuildIndex() {
   }
 }
 
+// Novel/comic classification maintenance: the migration backfills existing
+// books, this re-runs the rules (optionally reading chapter bodies) so a new
+// image source does not need a manual DB fix.
+const kindScanContent = ref(true)
+const kindForce = ref(false)
+const kindReclassifying = ref(false)
+const kindResult = ref("")
+const kindError = ref("")
+
+async function reclassifyKinds() {
+  kindReclassifying.value = true
+  kindError.value = ""
+  kindResult.value = ""
+  try {
+    const res = await api.post<any>(
+      "/books/reclassify?scan_content=" + (kindScanContent.value ? "true" : "false")
+        + "&force=" + (kindForce.value ? "true" : "false"),
+    )
+    kindResult.value = i18n.t("admin_kind_done", {
+      books: res.books ?? 0,
+      comics: res.comics ?? 0,
+      novels: res.novels ?? 0,
+      updated: res.updated ?? 0,
+    })
+  } catch (e) {
+    kindError.value = e instanceof Error ? e.message : i18n.t('admin_kind_failed')
+  } finally {
+    kindReclassifying.value = false
+  }
+}
+
 const healthStatus = ref<any>(null)
 
 async function loadStatus() {
@@ -1737,6 +1768,26 @@ onUnmounted(() => {
             :disabled="indexRebuilding"
             class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50"
           >{{ indexRebuilding ? i18n.t('admin_index_rebuilding') : i18n.t('admin_index_rebuild') }}</button>
+        </div>
+
+        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
+          <h2 class="text-sm font-semibold mb-2">{{ i18n.t('admin_kind_title') }}</h2>
+          <p class="text-xs text-muted dark:text-gray-400 mb-4">{{ i18n.t('admin_kind_hint') }}</p>
+          <p v-if="kindError" class="text-sm text-red-600 mb-3">{{ kindError }}</p>
+          <p v-if="kindResult" class="text-sm text-green-700 mb-3">{{ kindResult }}</p>
+          <label class="flex items-center gap-2 mb-4 text-xs text-muted dark:text-gray-400 cursor-pointer">
+            <input v-model="kindScanContent" type="checkbox" class="rounded" />
+            <span>{{ i18n.t('admin_kind_scan') }}</span>
+          </label>
+          <label class="flex items-center gap-2 mb-4 text-xs text-muted dark:text-gray-400 cursor-pointer">
+            <input v-model="kindForce" type="checkbox" class="rounded" />
+            <span>{{ i18n.t('admin_kind_force') }}</span>
+          </label>
+          <button
+            @click="reclassifyKinds"
+            :disabled="kindReclassifying"
+            class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50"
+          >{{ kindReclassifying ? i18n.t('admin_kind_running') : i18n.t('admin_kind_run') }}</button>
         </div>
       </section>
 

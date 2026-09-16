@@ -42,7 +42,9 @@ function closeMenu() {
 
       <div class="hidden sm:flex items-center gap-4">
         <router-link to="/" class="text-sm text-muted hover:text-ink no-underline transition-colors">{{ i18n.t('nav_shelf') }}</router-link>
-        <router-link to="/books" class="text-sm text-muted hover:text-ink no-underline transition-colors">{{ i18n.t('nav_books') }}</router-link>
+        <router-link to="/novels" class="text-sm text-muted hover:text-ink no-underline transition-colors">{{ i18n.t('nav_novels') }}</router-link>
+        <router-link to="/comics" class="text-sm text-muted hover:text-ink no-underline transition-colors">{{ i18n.t('nav_comics') }}</router-link>
+        <router-link to="/books" class="text-sm text-muted hover:text-ink no-underline transition-colors">{{ i18n.t('nav_library') }}</router-link>
         <template v-if="auth.user">
           <router-link to="/sync" class="text-sm text-muted hover:text-ink no-underline transition-colors">{{ i18n.t('nav_sync') }}</router-link>
           <router-link to="/settings" class="text-sm text-muted hover:text-ink no-underline transition-colors">{{ i18n.t('nav_admin') }}</router-link>
@@ -63,7 +65,9 @@ function closeMenu() {
 
     <div v-if="menuOpen" class="sm:hidden border-t border-border bg-surface px-4 py-3 space-y-2">
       <router-link to="/" @click="closeMenu" class="block text-sm text-muted hover:text-ink no-underline py-1">{{ i18n.t('nav_shelf') }}</router-link>
-      <router-link to="/books" @click="closeMenu" class="block text-sm text-muted hover:text-ink no-underline py-1">{{ i18n.t('nav_books') }}</router-link>
+      <router-link to="/novels" @click="closeMenu" class="block text-sm text-muted hover:text-ink no-underline py-1">{{ i18n.t('nav_novels') }}</router-link>
+      <router-link to="/comics" @click="closeMenu" class="block text-sm text-muted hover:text-ink no-underline py-1">{{ i18n.t('nav_comics') }}</router-link>
+      <router-link to="/books" @click="closeMenu" class="block text-sm text-muted hover:text-ink no-underline py-1">{{ i18n.t('nav_library') }}</router-link>
       <template v-if="auth.user">
         <router-link to="/sync" @click="closeMenu" class="block text-sm text-muted hover:text-ink no-underline py-1">{{ i18n.t('nav_sync') }}</router-link>
         <router-link to="/settings" @click="closeMenu" class="block text-sm text-muted hover:text-ink no-underline py-1">{{ i18n.t('nav_admin') }}</router-link>

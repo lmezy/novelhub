@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Index, String, Text, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -9,6 +9,7 @@ class Book(Base):
     __tablename__ = "books"
     __table_args__ = (
         UniqueConstraint("source_id", "source_book_id", name="uq_books_source_external_id"),
+        Index("ix_books_kind", "kind"),
     )
 
     id = Column(String, primary_key=True)
@@ -20,6 +21,16 @@ class Book(Base):
     is_r18 = Column(Boolean, default=False, nullable=False)
     is_public = Column(Boolean, default=False, nullable=False)
     all_ages_confirmed = Column(Boolean, default=False, nullable=False)
+    # ``novel`` or ``comic``.  Comics are read as image galleries, novels as
+    # text, so the library keeps them on separate pages.  The value is derived
+    # from the book source and the stored chapters (see ``app.services.book_kind``)
+    # and defaults to ``novel`` for every book imported before the column existed.
+    kind = Column(
+        String(16),
+        default="novel",
+        server_default="novel",
+        nullable=False,
+    )
     cover = Column(String(255))
     display_cover = Column(String(255))
     description = Column(Text)

@@ -188,6 +188,39 @@ curl -X POST http://localhost:8088/api/sync/book \
 - 搜索页支持书籍、章节全文搜索；
 - 配置 AI 后，阅读器侧栏可使用 AI 问答、章节摘要和 RAG 语义检索。
 
+### 11. 小说与漫画分页
+
+书库把「文字小说」和「图片漫画」分开显示：
+
+- 顶部导航的 **小说**（`/novels`）与 **漫画**（`/comics`）各占一页，**书库**（`/books`）
+  是包含两者的全部列表，页头也有「全部 / 小说 / 漫画」切换；
+- 个人书架可选「全部 / 小说 / 漫画」筛选，选择会记住；
+- 一本书属于哪一类由系统判定：书源自报图片类型（Legado `bookSourceType: 2`）、
+  标签/分类含「漫画 / 图集 / 写真」等关键词，或章节正文只有图片没有文字；
+- 判定在每次同步时自动更新；导入新书源后如果分类不对，用管理员接口重算：
+
+也可以直接在网页里点：**设置 → 索引 → 小说 / 漫画识别 → 重新识别**：
+
+- 勾选「同时读取章节正文」会逐本读第一章，能识别把自己声明成文本源的漫画书（书多时较慢）；
+- 勾选「严格重算」会按规则重新判定，把误判成漫画的书改回小说；默认只把小说升级成漫画，
+  不会反向改动。只靠正文识别的漫画，严格重算时请同时勾选读正文。
+
+接口版本：
+
+```bash
+curl -X POST "http://localhost:8088/api/books/reclassify?scan_content=true" \
+  -H "Authorization: Bearer $TOKEN"
+# 只重算一个书源（更快）：
+curl -X POST "http://localhost:8088/api/books/reclassify?scan_content=true&source_id=yuedu_xxx" \
+  -H "Authorization: Bearer $TOKEN"
+# 严格重算（允许把误判的漫画改回小说）：
+curl -X POST "http://localhost:8088/api/books/reclassify?scan_content=true&force=true" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+`scan_content=true` 会读取每本书的第一章正文，用来识别「自报为文本源、正文其实是图集」
+的漫画书；书多时耗时较长，可先不加该参数。
+
 ## Services
 
 | Service | Port | Notes |

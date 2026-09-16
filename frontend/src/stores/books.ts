@@ -12,6 +12,7 @@ export interface Book {
   cover: string | null
   status: string | null
   is_r18?: boolean
+  kind?: "novel" | "comic"
   is_favorite?: boolean
   owner_id?: string | null
   is_public?: boolean

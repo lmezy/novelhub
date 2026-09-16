@@ -13,6 +13,11 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.models import Book, BookCategory, BookFavorite, BookFavoriteGroup, BookTag, Category, Chapter, Source, Tag, User
 from app.services.book_enrichment import analyze_book_text
+from app.services.book_kind import (
+    KINDS,
+    normalize_kind,
+    reclassify_books as reclassify_book_kinds,
+)
 from app.services.auth import get_current_user, require_admin
 from app.services.book_cleanup import delete_books
 from app.services.bookshelf import favorite_group_ids_by_book
@@ -23,6 +28,7 @@ from app.services.search import search_service
 from app.services.storage import BookStorage
 from app.services.sync import SyncService
 from app.services.visibility import (
+    apply_book_visibility,
     can_view_r18,
     can_view_all_ages,
     ensure_book_visible,
@@ -69,6 +75,14 @@ class SetBookCoverRequest(BaseModel):
 
 class PublishBookRequest(BaseModel):
     confirm_all_ages: bool = False
+
+
+def _apply_kind_filter(query, kind: str | None):
+    """Restrict a book query to novels or comics when ``kind`` is given."""
+    value = str(kind or "").strip().lower()
+    if value in KINDS:
+        return query.where(Book.kind == value)
+    return query
 
 
 def _normalize_book_title(title: str) -> str:
@@ -123,6 +137,7 @@ def _serialize_book(
         ),
         is_public=book.is_public,
         all_ages_confirmed=book.all_ages_confirmed,
+        kind=normalize_kind(getattr(book, "kind", None)),
         is_favorite=is_favorite,
         created_at=book.created_at,
         updated_at=book.updated_at,
@@ -135,18 +150,7 @@ def _serialize_book(
 
 
 def _apply_book_visibility(query, user: User):
-    if user.role not in ("admin", "super_admin"):
-        query = query.where(or_(
-            Book.owner_id.is_(None),
-            Book.owner_id == user.id,
-            Book.is_public == True,
-        ))
-    conditions = []
-    if can_view_all_ages(user):
-        conditions.append(Book.is_r18 == False)
-    if can_view_r18(user):
-        conditions.append(Book.is_r18 == True)
-    return query.where(or_(*conditions)) if conditions else query.where(Book.id == "__none__")
+    return apply_book_visibility(query, user)
 
 
 async def _serialize_books(db: AsyncSession, books: list[Book], user: User) -> list[BookOut]:
@@ -182,17 +186,18 @@ async def list_books(user: User = Depends(get_current_user), db: AsyncSession = 
 @router.get("/home", response_model=BookHomeOut)
 async def get_books_home(
     section_limit: int = Query(6, ge=1, le=12),
+    kind: str | None = Query(None, description="novel | comic"),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    total = int(await db.scalar(_apply_book_visibility(
+    total = int(await db.scalar(_apply_kind_filter(_apply_book_visibility(
         select(func.count()).select_from(Book), user
-    )) or 0)
+    ), kind)) or 0)
     latest_rows = await db.scalars(
-        _apply_book_visibility(
+        _apply_kind_filter(_apply_book_visibility(
             select(Book).options(selectinload(Book.tags), selectinload(Book.categories)),
             user,
-        ).order_by(Book.updated_at.desc()).limit(section_limit)
+        ), kind).order_by(Book.updated_at.desc()).limit(section_limit)
     )
     latest_books = list(latest_rows.unique().all())
 
@@ -209,17 +214,18 @@ async def get_books_home(
             ).where(BookCategory.category_id == category.id),
             user,
         )
+        count_query = _apply_kind_filter(count_query, kind)
         category_total = int(await db.scalar(count_query) or 0)
         if not category_total:
             continue
         rows = await db.scalars(
-            _apply_book_visibility(
+            _apply_kind_filter(_apply_book_visibility(
                 select(Book)
                 .join(BookCategory, BookCategory.book_id == Book.id)
                 .options(selectinload(Book.tags), selectinload(Book.categories))
                 .where(BookCategory.category_id == category.id),
                 user,
-            ).order_by(Book.updated_at.desc()).limit(section_limit)
+            ), kind).order_by(Book.updated_at.desc()).limit(section_limit)
         )
         books = list(rows.unique().all())
         section_rows.append((category, category_total, books))
@@ -251,6 +257,7 @@ async def get_books_home(
 async def browse_books(
     category: str | None = None,
     source_id: str | None = None,
+    kind: str | None = Query(None, description="novel | comic"),
     offset: int = Query(0, ge=0),
     limit: int = Query(24, ge=1, le=48),
     user: User = Depends(get_current_user),
@@ -270,12 +277,14 @@ async def browse_books(
     if source_id:
         query = query.where(Book.source_id == source_id)
         count_query = count_query.where(Book.source_id == source_id)
-    total = int(await db.scalar(_apply_book_visibility(count_query, user)) or 0)
+    total = int(await db.scalar(
+        _apply_kind_filter(_apply_book_visibility(count_query, user), kind)
+    ) or 0)
     rows = await db.scalars(
-        _apply_book_visibility(
+        _apply_kind_filter(_apply_book_visibility(
             query.options(selectinload(Book.tags), selectinload(Book.categories)),
             user,
-        ).order_by(Book.updated_at.desc()).offset(offset).limit(limit)
+        ), kind).order_by(Book.updated_at.desc()).offset(offset).limit(limit)
     )
     books = list(rows.unique().all())
     return BookPageOut(
@@ -283,6 +292,33 @@ async def browse_books(
         total=total,
         offset=offset,
         limit=limit,
+    )
+
+
+@router.post("/reclassify", dependencies=[Depends(require_admin)])
+async def reclassify_book_kinds_endpoint(
+    scan_content: bool = Query(
+        True,
+        description="Read stored chapters to catch galleries from text sources",
+    ),
+    source_id: str | None = Query(None, description="Only re-check one source"),
+    force: bool = Query(
+        False,
+        description="Re-derive from scratch instead of only promoting to comic",
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    """Recompute novel/comic for the whole library (or one source).
+
+    The migration backfills the obvious cases; this endpoint is the escape
+    hatch for galleries whose source does not declare an image type and for
+    re-checking a source after its rules changed.
+    """
+    return await reclassify_book_kinds(
+        db,
+        scan_content=scan_content,
+        source_id=source_id,
+        force=force,
     )
 
 
@@ -443,6 +479,7 @@ async def create_book(payload: BookCreate, user: User = Depends(get_current_user
 @router.get("/favorites", response_model=list[BookOut])
 async def list_favorite_books(
     group_id: str | None = None,
+    kind: str | None = Query(None, description="novel | comic"),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -464,6 +501,7 @@ async def list_favorite_books(
             Book.owner_id == user.id,
             Book.is_public == True,
         ))
+    query = _apply_kind_filter(query, kind)
     conditions = []
     if can_view_all_ages(user):
         conditions.append(Book.is_r18 == False)
