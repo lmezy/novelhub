@@ -96,6 +96,9 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 | 一批不相关的书/章节在同一瞬间失败：`ReadError` / `ClosedResourceError` / `pop from an empty deque`，最后报「同步连续失败超过 10 本…反爬」 | 重试路径 `aclose()` 了进程内共享的 httpx 客户端，正在用它的其它并发请求当场全挂 | 见第 14 节 |
 | 日志刷 `Exception terminating connection <AdaptedConnection …>`（Event loop is closed）+ `got Future … attached to a different loop` + `get_plugin failed for '<source id>'` | `registry.get_plugin(<source id>)` 用**池化**引擎在一次性事件循环（helper 线程里的 `asyncio.run`）里查库，把绑在死循环上的 asyncpg 连接还进了共享连接池 | 见第 14 节 |
 | 日志里 `Failed to fetch content image <url>: `（冒号后空白） | 图片下载失败时直接打印 httpx 异常，`str(exc)` 是空串 | 见第 14 节 |
+| 風月文學網任务每次都报“验证码/人机验证”失败，浏览器里页面正常 | 正文里“我的手**已被限制**在厚实手套中”命中强标记 `已被限制`（整页裸子串） | 见第 15 节 |
+| 禁忌书屋任务报“验证码/人机验证”，浏览器正常 | 正文“经过严格的**身份验证**”+ 同段“无**人机**”：`身份验证` 是上下文标记、`人机` 是确认词，而 `人机`⊂`无人机` | 见第 15 节 |
+| 日志刷 `Failed to fetch content image …`（ClosedResourceError / ConnectError / 404） | 图片下载不重试 anyio 流错误、代理失败后只试直连、`404` 也重试 3 次 | 见第 15 节 |
 
 ---
 
@@ -560,4 +563,60 @@ Cookie 其实都正常，用户看到的是一条指向错误方向的报错，�
 **未做/已知**：要撸小说 520、h528 502、御宅屋偶发 `Chapter returned empty content`、
 Playwright `Page.goto` 超时都属站点/代理侧，代码按设计重试；本节的改动只保证「代理抖动
 不再误伤同一进程里的其它并发同步，也不会再被误判成反爬」。改动要
+`docker compose build backend crawler` + `up -d` 后才在线上生效。
+
+## 15. 2026-09-16：正文里的词把正常页面判成验证码页（風月文學網/禁忌书屋任务必失败）；正文图片大面积取不到
+
+**现象**（线上 `novelhub-crawler` 日志 + `crawl_tasks`，用户报「同步书源时 crawler 里有报错」）：
+
+1. 風月文學網 h528（`yuedu_2ca378a79b50`）的全站任务每次都在同一本书上失败：
+   `Browser request failed: http://www.h528.com/post/20050.html (RuntimeError: Site returned an
+   anti-bot/captcha page …)`；09-14、09-16 两次任务报的是同一本书（《隸孃（01-12）》），
+   也就是**每次重试都必然撞死**，书源根本跑不完。
+2. 禁忌书屋 cool18（`yuedu_7f952bd23f9a`）同样以 captcha 收尾（`tid=14521293`）。
+3. 24h 内 `WARNING` 2836 条，绝大多数是 `Failed to fetch content image <url>: <原因>`：
+   `ConnectError` 528、`404 Not Found` 478、`ClosedResourceError` 444、`ConnectTimeout` 80，
+   加 `Configured proxy … retrying direct` 657 条。
+
+**根因**（都在线上容器里用真实页面复现，页面已存 `/tmp/h528.html`、`/tmp/cool18.html`）：
+
+1. **强标记是整页裸子串**：`STRONG_BLOCK_MARKERS` 里的 `已被限制` 命中了 h528《隸孃》正文
+   「而是我的手**已被限制**在厚實手套中」——Playwright 明明渲染出 166KB 的正常正文
+   （`<title>隸孃（01-12）- 風月文學網`），仍被判成拦截页。
+2. **确认词太短**：cool18 正文「经过严格的**身份验证**和安检后」附近有「无**人机**在天空中
+   盘旋」——`身份验证` 是上下文标记、`人机` 在确认词表里，而 `人机` 是 `无人机` 的一部分，
+   于是 86KB 的正常帖子被判定需要人机验证。同一页的 `alert('举报失败，请稍后再试')` 是站点
+   公共脚本（第 12 节已处理过），这次是另一条路径。
+3. **图片下载路径只认 httpx 异常**：连接在请求中途断开时抛的是 anyio 的
+   `ClosedResourceError` / `pop from an empty deque`，落到 `except Exception` 直接放弃（不重试）；
+   代理失败后立刻改走直连，而 `img.321cdn.com` / `img5.wnimg2.cfd` 直连必然 `ConnectError`
+   （线上实测：走代理 3/5 成功，直连 0/5）；`404` 也会重试 3 次并退避，
+   `img.321cdn.com/img/88.webp` 一天被重试 478 次。
+4. 附带：图片 CDN 失败会去 `_mark_transport_failure(proxy)`，而线路健康度是按**书源域名**
+   记录的，于是 CDN 抖动会把书源页面的代理线路打进 60s 冷却，让页面请求先去试直连。
+
+**改动**：
+
+| 文件 | 改动 |
+|---|---|
+| `backend/app/crawler/plugins/yuedu/__init__.py` | 新增 `PROSE_GATE_MARKERS`（`已被限制`、`被限制访问`、`请启用javascript`、`请开启javascript`）并从 `STRONG_BLOCK_MARKERS` / `CF_CHALLENGE_MARKERS` 移入 `CONTEXTUAL_BLOCK_MARKERS`（需 90 字符内有确认词）；`CONTEXTUAL_BLOCK_HINTS` 的 `人机`→`人机验证`、`频繁`→`访问频繁/请求频繁/操作频繁/过于频繁`；`WEAK_BLOCK_CONFIRMATIONS` 同样去掉裸 `频繁` |
+| 同上 | `has_contextual_block_marker`：标记自身与确认词同名时跳过该次（不再自己确认自己），窗口其余部分保持原样（`您的账号已被限制访问` 仍能命中） |
+| 同上 | 新增 `is_transient_transport_error()`（httpx 传输错误 + anyio 流错误 + `pop from an empty deque`，普通 `IndexError`/`HTTPStatusError` 不算）并在 `_get`/`_post`/图片/封面的重试循环里用它，遇到这类错误先 `_reset_http_client` 再原地重试 |
+| 同上 | `fetch_content_image`/`fetch_cover`：换掉坏连接后重试同一线路、`404`/`410` 立即放弃并写入 `_missing_image_urls`（30 分钟 TTL，去重死链）、图片 CDN 失败不再污染书源线路健康度、封面失败日志补异常类名 |
+| `backend/tests/test_yuedu_plugin.py` | 新增 8 项回归：真实正文（已被限制/身份验证+无人机）不再误判、真实拦截页仍被识别、标记不自证、`频繁` 裸词不再确认、流错误判瞬态而普通 IndexError/HTTPStatusError 不判、图片遇流错误重试一次即成功、`404` 只请求一次且第二次命中缓存、`_get` 遇流错误重试 |
+
+**验证**：
+
+- `cd backend && python -m pytest -q` → **475 passed**。
+- 线上影子回归（把改动后的 `__init__.py` 写到容器 `/tmp/shadow_yuedu.py`，前置加载，不动线上镜像/数据）：
+  - 两个真实页面：部署版 `_is_blocked_page` 都是 `True`，改动后都是 `False`；
+    Cloudflare 挑战页 / `limit_box` / `访问过于频繁` / GoEdge 验证码页四种真实拦截页两边都仍是 `True`。
+  - `fetch_book`：h528 那本书部署版 33.7s 后抛 captcha 错，改动后 4.7s 成功（1 章、正文 110242 字符）；
+    cool18 那帖部署版 35.9s 抛错，改动后 2.3s 成功（正文 56195 字符）。
+  - 正文图片：三张以前必失败的 `img.321cdn.com` 图改动后都取到字节（1.0–1.9s）；
+    `img/88.webp` 第一次 1.59s 返回 None，第二次 **0.00s** 命中缓存不再发请求。
+
+**未做/已知**：`请启用JavaScript` 单独出现（没有验证码/挑战等确认词）不再算拦截页——它太常见于
+普通页面的 `<noscript>`，误判代价远大于收益；真正的 Cloudflare JS 挑战仍由 `_is_challenge_page`
+与 CF 标记识别。要撸小说 520、h528 502 等站点侧错误不变。改动要
 `docker compose build backend crawler` + `up -d` 后才在线上生效。

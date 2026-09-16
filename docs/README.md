@@ -55,6 +55,11 @@
   “漫画章节显示的是打不开的图片，图片请求返回 401”
 - 正常页面被判成限流/反爬、整本书同步中止 → [full-site-sync.md](full-site-sync.md)
   “正常页面被判成“限流/反爬”，整本书同步中止”
+- 正常页面被判成验证码页（正文里有“已被限制 / 身份验证 / 无人机”） →
+  [full-site-sync.md](full-site-sync.md)
+  “正常页面被判成验证码页：小说正文里出现了“已被限制 / 身份验证”这类词”
+- 日志刷 `Failed to fetch content image …`、章节缺图 → [full-site-sync.md](full-site-sync.md)
+  “日志刷 `Failed to fetch content image …`，章节里图片缺失”
 - 同步某本书报 `[Errno 36] File name too long` → [full-site-sync.md](full-site-sync.md)
   “个别书报 [Errno 36] File name too long”
 - 想连服务器看真实任务与日志 → [codex-handoff.md](codex-handoff.md) 第 1、5 节

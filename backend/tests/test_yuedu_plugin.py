@@ -1661,6 +1661,155 @@ async def test_content_image_failure_log_keeps_the_exception_type(caplog):
     assert any("ReadTimeout" in message for message in messages), messages
 
 
+class ClosedResourceError(Exception):
+    """Stand-in for ``anyio.ClosedResourceError`` (matched by class name)."""
+
+
+def _fake_http_client(results):
+    """Minimal ``httpx.AsyncClient`` stand-in replaying ``results`` in order."""
+    client = SimpleNamespace(calls=0)
+
+    async def get(url, headers=None):
+        result = results[min(client.calls, len(results) - 1)]
+        client.calls += 1
+        if isinstance(result, Exception):
+            raise result
+        result.request = httpx.Request("GET", url)
+        return result
+
+    client.get = get
+    return client
+
+
+def test_transient_transport_error_classification():
+    """Only socket/stream failures may be retried in place."""
+    from app.crawler.plugins.yuedu import is_transient_transport_error
+
+    assert is_transient_transport_error(ClosedResourceError("")) is True
+    assert is_transient_transport_error(IndexError("pop from an empty deque")) is True
+    assert is_transient_transport_error(httpx.ConnectTimeout("")) is True
+    # Server errors and our own bugs must not be retried as if they were
+    # network blips.
+    assert is_transient_transport_error(httpx.ConnectError("")) is True
+    assert (
+        is_transient_transport_error(
+            httpx.HTTPStatusError(
+                "404",
+                request=httpx.Request("GET", "https://example.com/a"),
+                response=httpx.Response(404),
+            )
+        )
+        is False
+    )
+    assert is_transient_transport_error(IndexError("list index out of range")) is False
+    assert is_transient_transport_error(RuntimeError("no content")) is False
+
+
+@pytest.mark.asyncio
+async def test_fetch_content_image_retries_after_stream_error():
+    """A socket closed under an in-flight request is not a permanent failure.
+
+    The proxy restarting mid-sync used to surface as
+    ``ClosedResourceError``/``pop from an empty deque``, which is not an
+    ``httpx`` error: the image (or chapter) was dropped without a retry.
+    """
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://images.example.com",
+        "concurrentRate": "0",
+    })
+    payload = b"x" * 256
+    client = _fake_http_client([
+        ClosedResourceError(""),
+        httpx.Response(
+            200,
+            content=payload,
+            headers={"content-type": "image/webp"},
+        ),
+    ])
+    reset = AsyncMock()
+
+    with (
+        patch.object(plugin, "_get_http_client", AsyncMock(return_value=client)),
+        patch.object(plugin, "_reset_http_client", reset),
+        patch(
+            "app.services.proxy_config.get_proxy_config",
+            return_value=ProxyConfig(enabled=False),
+        ),
+        patch("asyncio.sleep", AsyncMock()),
+    ):
+        result = await plugin.fetch_content_image(
+            "https://img.321cdn.com/uploads/a.webp"
+        )
+
+    assert result == (payload, "image/webp")
+    assert client.calls == 2
+    reset.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fetch_content_image_does_not_retry_a_permanent_404():
+    """321cdn's placeholder ``/img/88.webp`` 404s for every chapter.
+
+    Retrying it three times with backoff produced 478 wasted requests in one
+    24h window, so a 404 is now final and remembered for the next reference.
+    """
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://images.example.com",
+        "concurrentRate": "0",
+    })
+    YueduPlugin._missing_image_urls.clear()
+    url = "https://img.321cdn.com/img/88.webp"
+    client = _fake_http_client([httpx.Response(404, content=b"not found")])
+
+    try:
+        with (
+            patch.object(plugin, "_get_http_client", AsyncMock(return_value=client)),
+            patch(
+                "app.services.proxy_config.get_proxy_config",
+                return_value=ProxyConfig(enabled=False),
+            ),
+            patch("asyncio.sleep", AsyncMock()),
+        ):
+            assert await plugin.fetch_content_image(url) is None
+            assert client.calls == 1
+            # The second chapter referencing the same dead URL costs nothing.
+            assert await plugin.fetch_content_image(url) is None
+    finally:
+        YueduPlugin._missing_image_urls.clear()
+
+    assert client.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_get_retries_after_stream_error():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "concurrentRate": "0",
+    })
+    client = _fake_http_client([
+        ClosedResourceError(""),
+        httpx.Response(
+            200,
+            content="<html><body>正文内容</body></html>".encode(),
+            headers={"content-type": "text/html"},
+        ),
+    ])
+
+    with (
+        patch.object(plugin, "_get_http_client", AsyncMock(return_value=client)),
+        patch.object(plugin, "_reset_http_client", AsyncMock()),
+        patch(
+            "app.services.proxy_config.get_proxy_config",
+            return_value=ProxyConfig(enabled=False),
+        ),
+        patch("asyncio.sleep", AsyncMock()),
+    ):
+        html = await plugin._get("https://example.com/book/1.html")
+
+    assert "正文内容" in html
+    assert client.calls == 2
+
+
 @pytest.mark.asyncio
 async def test_get_uses_browser_fallback_for_http_block_response():
     plugin = YueduPlugin({
@@ -2473,6 +2622,72 @@ def test_is_blocked_page_weak_marker_needs_confirmation_beside_it():
         "<p>请求频繁</p><div>" + "正文内容" * 200 + "</div>"
         "<script>var challenge = '/cdn-cgi/challenge-platform/main.js';</script>"
     ) is False
+
+
+def test_has_contextual_block_marker_does_not_confirm_itself():
+    """A phrase that is both a marker and a confirmation is still ambiguous."""
+    from app.crawler.plugins.yuedu import has_contextual_block_marker
+
+    # 已被限制 on its own is prose ("his hands were restrained").
+    assert has_contextual_block_marker("他的手已被限制在厚實手套中") is False
+    assert has_contextual_block_marker("您的账号已被限制访问") is True
+
+
+def test_is_blocked_page_ignores_prose_that_mentions_being_restrained():
+    """風月文學網 (h528) 《隸孃》 says 我的手已被限制在厚實手套中.
+
+    ``已被限制`` was a bare substring in STRONG_BLOCK_MARKERS, so the browser
+    rendered the 166KB article page correctly and NovelHub still reported
+    "anti-bot/captcha page" -- which aborted that source's whole full-site task
+    on every retry, because the same book is fetched first each time.
+    """
+    html = (
+        "<html><head><title>隸孃（01-12） - 風月文學網</title></head><body>"
+        "<div id='nr1'><p>開始就是好事，我真的好想，伸手抱著他那誘人的臀部，"
+        "但我沒辦法，不是因爲沒命令，而是我的手已被限制在厚實手套中，"
+        "它是一整塊如肉塊墊的形狀。</p></div></body></html>"
+    )
+
+    assert YueduPlugin._is_blocked_page(html) is False
+    # A gate that really restricts the visitor is still detected.
+    assert YueduPlugin._is_blocked_page(
+        "<html><title>提示</title><p>您的账号已被限制访问，请完成验证</p></html>"
+    ) is True
+
+
+def test_is_blocked_page_ignores_identity_check_in_novel_prose():
+    """禁忌书屋 (cool18) prose: 经过严格的身份验证 … 无人机.
+
+    ``身份验证`` is a contextual marker and the confirmation list held the bare
+    ``人机``, so the word 无人机 ("drone") inside the story confirmed the marker
+    and flagged every such thread page as a captcha gate.  The page's own
+    ``alert('举报失败，请稍后再试')`` is ordinary chrome too.
+    """
+    html = (
+        "<html><head><title>【淫乱的柯南世界线】（28-32）- 禁忌书屋</title></head>"
+        "<body><div id='content-section'><p>"
+        "UBCS的武装巡逻队牵着军犬在外围巡逻，无人机在天空中无声盘旋。"
+        "不过小兰和园子已经算是「熟客」，经过严格的身份验证和安检后，"
+        "她们被允许进入内部生活区。"
+        "</p><script>alert('举报失败，请稍后再试');</script>"
+        "</div></body></html>"
+    )
+
+    assert YueduPlugin._is_blocked_page(html) is False
+    # A page that really asks for a human check is still detected.
+    assert YueduPlugin._is_blocked_page(
+        "<html><title>安全验证</title><p>请完成人机验证后继续访问</p></html>"
+    ) is True
+
+
+def test_is_blocked_page_weak_marker_needs_a_gate_confirmation():
+    """The bare word 频繁 is narration; a gate spells out what is too frequent."""
+    assert YueduPlugin._is_blocked_page(
+        "<p>这家书店最近频繁限流，老板只好换了个更大的仓库</p>"
+    ) is False
+    assert YueduPlugin._is_blocked_page(
+        "<p>访问过于频繁，请稍后再试</p>"
+    ) is True
 
 
 def test_describe_fetched_page_summarizes_an_empty_catalog_page():

@@ -289,8 +289,6 @@ CF_CHALLENGE_MARKERS = (
     "chl_page",
     "challenge-form",
     "cf-please-wait",
-    "请启用javascript",
-    "请开启javascript",
     "浏览器安全检查",
     "正在验证您的浏览器",
     "正在检查您的浏览器",
@@ -317,13 +315,25 @@ STRONG_BLOCK_MARKERS = (
     "verify/captcha",
     "安全网关",
     "访问被拒绝",
-    "已被限制",
-    "被限制访问",
     "ip 已被限制",
     "ip已被限制",
     # Cloudflare / Turnstile / generic JS challenge gates, declared above so
     # this list and ``_is_challenge_page`` cannot drift apart.
     *CF_CHALLENGE_MARKERS,
+)
+
+# Phrases that are *also* ordinary Chinese prose, so a bare substring search
+# over a whole page is not evidence of a gate: 風月文學網's 《隸孃》 says
+# ``我的手已被限制在厚實手套中`` and the phrase used to abort that source's
+# whole sync task.  They count only with a confirmation phrase beside them,
+# like the weak markers below.
+PROSE_GATE_MARKERS = (
+    "已被限制",
+    "被限制访问",
+    # ``<noscript>请启用JavaScript</noscript>`` ships on plenty of ordinary
+    # pages; only a gate that also asks for verification is a block.
+    "请启用javascript",
+    "请开启javascript",
 )
 
 # Weak markers need a confirmation phrase to avoid false positives on
@@ -342,7 +352,11 @@ WEAK_BLOCK_MARKERS = (
 # (``/cdn-cgi/challenge-platform/scripts/jsd/main.js``) put the word
 # "challenge" 800 characters further down the page.
 WEAK_BLOCK_CONFIRMATIONS = (
-    "验证码", "继续访问", "稍后再试", "后再试", "频繁", "限流",
+    "验证码", "继续访问", "稍后再试", "后再试", "限流",
+    # Not the bare "频繁": ordinary narration ("他频繁出入") would confirm a
+    # marker that merely shares the word.  Rate-limit gates spell out
+    # "访问过于频繁" / "请求频繁" instead.
+    "访问频繁", "请求频繁", "操作频繁", "过于频繁",
     "captcha", "challenge", "security",
 )
 
@@ -359,11 +373,19 @@ CONTEXTUAL_BLOCK_MARKERS = (
     "请完成验证",
     "安全验证",
     "身份验证",
+    *PROSE_GATE_MARKERS,
 )
 CONTEXTUAL_BLOCK_HINTS = (
     "验证码",
-    "人机",
-    "频繁",
+    # ``人机`` alone matched 无人机 ("drone") in 禁忌书屋's novel text and
+    # flagged a perfectly normal thread page as a captcha gate.
+    "人机验证",
+    # ``频繁`` alone matched ordinary narration; the gate always spells out
+    # what is too frequent.
+    "访问频繁",
+    "请求频繁",
+    "操作频繁",
+    "过于频繁",
     "限流",
     "访问异常",
     "访问被拒绝",
@@ -397,7 +419,14 @@ REMOVED_PAGE_MARKERS = (
 
 
 def has_contextual_block_marker(text: str) -> bool:
-    """Whether an ambiguous block phrase appears in a blocking context."""
+    """Whether an ambiguous block phrase appears in a blocking context.
+
+    The confirmation is looked up in a window on either side of the marker.  A
+    phrase that is itself listed as both a marker and a confirmation is skipped
+    for its own occurrence (it cannot confirm itself), which otherwise put
+    every page that merely mentions it back in the "captcha" bucket (風月文學網's
+    《隸孃》 says ``我的手已被限制在厚實手套中``).
+    """
     lowered = str(text or "").lower()
     if not lowered:
         return False
@@ -408,8 +437,11 @@ def has_contextual_block_marker(text: str) -> bool:
             if index == -1:
                 break
             window = lowered[max(0, index - 90): index + len(marker) + 90]
-            if any(hint in window for hint in CONTEXTUAL_BLOCK_HINTS):
-                return True
+            for hint in CONTEXTUAL_BLOCK_HINTS:
+                if hint == marker:
+                    continue
+                if hint in window:
+                    return True
             start = index + len(marker)
     return False
 
@@ -445,6 +477,44 @@ def has_weak_block_marker(text: str) -> bool:
     return False
 
 
+# Socket/stream failures a retry can recover from.  ``httpx`` reports its own
+# problems as ``httpx.TransportError``, but a connection that dies under an
+# in-flight request surfaces as an AnyIO stream error instead
+# (``ClosedResourceError``, ``BrokenResourceError``, ``EndOfStream``) or even
+# as ``IndexError: pop from an empty deque`` from the stream's read queue.
+# Those used to slip past every ``except httpx.HTTPError`` clause, so one proxy
+# hiccup dropped a chapter/image instead of dialing again.
+TRANSIENT_TRANSPORT_ERROR_NAMES = (
+    "ConnectError",
+    "ConnectTimeout",
+    "ReadError",
+    "ReadTimeout",
+    "WriteError",
+    "WriteTimeout",
+    "PoolTimeout",
+    "RemoteProtocolError",
+    "TransportError",
+    "ClosedResourceError",
+    "BrokenResourceError",
+    "BusyResourceError",
+    "IncompleteReadError",
+    "EndOfStream",
+    "WouldBlock",
+)
+
+
+def is_transient_transport_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is a socket/stream failure that is worth retrying."""
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    if any(
+        klass.__name__ in TRANSIENT_TRANSPORT_ERROR_NAMES
+        for klass in type(exc).__mro__
+    ):
+        return True
+    return isinstance(exc, IndexError) and "pop from an empty deque" in str(exc)
+
+
 class YueduPlugin:
     """A NovelSourcePlugin implementation driven by a YueDu book source JSON."""
 
@@ -458,6 +528,13 @@ class YueduPlugin:
     # next request does not pay for the dead path first.
     _transport_bad_until: dict[str, float] = {}
     _transport_preferred: dict[str, str] = {}
+    # ``{image url: expiry}`` for images a CDN answered 404/410 on.  Manga
+    # pages reference placeholders (321cdn's ``/img/88.webp``) that never
+    # exist; the response is permanent, so remembering it stops every chapter
+    # from paying three retries for the same dead URL.
+    _missing_image_urls: dict[str, float] = {}
+    _missing_image_ttl = 1800.0
+    _missing_image_limit = 2048
     _rate_locks: dict[str, asyncio.Lock] = {}
     _rate_state: dict[str, dict[str, float | int]] = {}
     # DoH (DNS over HTTPS) cache for bypassing polluted system DNS.
@@ -660,6 +737,23 @@ class YueduPlugin:
             return max(1, int(os.getenv("YUEDU_HTTP_MAX_RETIRED_CLIENTS", "4") or 4))
         except (TypeError, ValueError):
             return 4
+
+    @classmethod
+    def _image_known_missing(cls, url: str) -> bool:
+        """Whether a CDN already answered 404/410 for ``url`` recently."""
+        expiry = cls._missing_image_urls.get(url)
+        if expiry is None:
+            return False
+        if expiry < time.monotonic():
+            cls._missing_image_urls.pop(url, None)
+            return False
+        return True
+
+    @classmethod
+    def _remember_missing_image(cls, url: str) -> None:
+        if len(cls._missing_image_urls) >= cls._missing_image_limit:
+            cls._missing_image_urls.clear()
+        cls._missing_image_urls[url] = time.monotonic() + cls._missing_image_ttl
 
     def _transport_key(self, proxy: str | None) -> str:
         return f"{self.base_url or 'default'}::{'proxy' if proxy else 'direct'}"
@@ -4756,6 +4850,15 @@ class YueduPlugin:
                     last_error = exc
                     if attempt < 2:
                         await asyncio.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
+                except Exception as exc:
+                    # AnyIO stream errors from a half-dead pooled socket are
+                    # not httpx errors, so they need the same retry path.
+                    if not is_transient_transport_error(exc):
+                        raise
+                    await self._reset_http_client(proxy)
+                    last_error = exc
+                    if attempt < 2:
+                        await asyncio.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
 
             if last_error is not None:
                 raise last_error
@@ -5169,6 +5272,18 @@ class YueduPlugin:
                     last_error = exc
                     if attempt < 2:
                         await asyncio.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
+                except Exception as exc:
+                    # A socket that dies under an in-flight request surfaces as
+                    # an AnyIO stream error (``ClosedResourceError``, ``pop
+                    # from an empty deque``) rather than an httpx one.  Without
+                    # this branch the book/chapter failed outright instead of
+                    # dialing again on a fresh connection.
+                    if not is_transient_transport_error(exc):
+                        raise
+                    await self._reset_http_client(proxy)
+                    last_error = exc
+                    if attempt < 2:
+                        await asyncio.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
 
             if last_error is not None:
                 raise last_error
@@ -5219,7 +5334,6 @@ class YueduPlugin:
     async def fetch_cover(self, url: str) -> tuple[bytes, str] | None:
         """Fetch a cover image, applying coverDecodeJs when configured."""
         import asyncio
-        import httpx
 
         if not url.startswith(("http://", "https://")):
             return None
@@ -5228,6 +5342,8 @@ class YueduPlugin:
         # of the path (which turns into a 404 for otherwise valid images).
         clean_url, _ = self._split_options_suffix(url)
         url = clean_url or url
+        if self._image_known_missing(url):
+            return None
         await self._sleep_rate_limit()
         headers = self._build_headers({
             "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
@@ -5245,9 +5361,11 @@ class YueduPlugin:
         except Exception:
             pass
 
-        async def _request(proxy: str | None) -> tuple[bytes, str]:
+        async def _request(proxy: str | None) -> tuple[bytes, str] | None:
+            """Fetch over one transport; ``None`` means "gone for good"."""
             nonlocal headers
-            last_error: httpx.HTTPError | None = None
+            last_error: Exception | None = None
+            last_status: int | None = None
             for attempt in range(3):
                 try:
                     client = await self._get_http_client(proxy)
@@ -5256,6 +5374,14 @@ class YueduPlugin:
                         headers = self._with_403_fallback(headers)
                         await asyncio.sleep(1.0 + random.uniform(0.5, 1.0))
                         continue
+                    if resp.status_code in (404, 410):
+                        self._remember_missing_image(url)
+                        logger.debug(
+                            "Cover missing (HTTP %s): %s",
+                            resp.status_code,
+                            url,
+                        )
+                        return None
                     if resp.status_code in (429, 500, 502, 503, 504):
                         retry_after = resp.headers.get("Retry-After", "")
                         wait = (
@@ -5263,36 +5389,35 @@ class YueduPlugin:
                             if retry_after and retry_after.replace(".", "", 1).isdigit()
                             else 2 ** attempt
                         )
+                        last_status = resp.status_code
                         await asyncio.sleep(wait + random.uniform(0.5, 1.5))
                         continue
                     resp.raise_for_status()
                     self._capture_cookie_jar(resp)
                     return resp.content, resp.headers.get("content-type", "")
-                except httpx.HTTPError as exc:
+                except Exception as exc:
+                    if not is_transient_transport_error(exc):
+                        raise
                     last_error = exc
+                    await self._reset_http_client(proxy)
                     if attempt < 2:
                         await asyncio.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
             if last_error is not None:
                 raise last_error
-            raise RuntimeError(f"Request failed after retries: {url}")
+            raise RuntimeError(
+                f"Request failed after retries: {url}"
+                + (f" (HTTP {last_status})" if last_status else "")
+            )
 
         last_error: Exception | None = None
         for proxy in self._ordered_transports(proxy_url):
             try:
-                data, content_type = await _request(proxy)
-                if not data or len(data) < 128:
-                    return None
-                data = self._decode_inline_cover_rule(data)
-                if self.engine:
-                    decoded = self.engine.decode_cover(data)
-                    if decoded:
-                        data = decoded
-                return data, content_type
-            except httpx.RequestError as exc:
+                result = await _request(proxy)
+            except Exception as exc:
+                if not is_transient_transport_error(exc):
+                    last_error = exc
+                    break
                 last_error = exc
-                self._mark_transport_failure(proxy)
-                if isinstance(exc, httpx.TransportError):
-                    await self._reset_http_client(proxy)
                 if proxy is None:
                     break
                 logger.warning(
@@ -5302,11 +5427,24 @@ class YueduPlugin:
                     type(exc).__name__,
                     f": {exc}" if str(exc) else "",
                 )
-            except Exception as exc:
-                last_error = exc
-                break
+                continue
+            if result is None:
+                return None
+            data, content_type = result
+            if not data or len(data) < 128:
+                return None
+            data = self._decode_inline_cover_rule(data)
+            if self.engine:
+                decoded = self.engine.decode_cover(data)
+                if decoded:
+                    data = decoded
+            return data, content_type
         if last_error is not None:
-            logger.warning("Failed to fetch cover %s: %s", url, last_error)
+            logger.warning(
+                "Failed to fetch cover %s: %s",
+                url,
+                str(last_error).strip() or type(last_error).__name__,
+            )
         return None
 
     def _decode_inline_cover_rule(self, data: bytes) -> bytes:
@@ -5344,12 +5482,13 @@ class YueduPlugin:
     ) -> tuple[bytes, str] | None:
         """Fetch one in-content image, applying imageDecode when configured."""
         import asyncio
-        import httpx
 
         if not url.startswith(("http://", "https://")):
             return None
         clean_url, _ = self._split_options_suffix(url)
         url = clean_url or url
+        if self._image_known_missing(url):
+            return None
         await self._sleep_rate_limit()
         headers = self._build_headers({
             "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
@@ -5366,9 +5505,11 @@ class YueduPlugin:
         except Exception:
             pass
 
-        async def _request(proxy: str | None) -> tuple[bytes, str]:
+        async def _request(proxy: str | None) -> tuple[bytes, str] | None:
+            """Fetch over one transport; ``None`` means "gone for good"."""
             nonlocal headers
-            last_error: httpx.HTTPError | None = None
+            last_error: Exception | None = None
+            last_status: int | None = None
             for attempt in range(3):
                 try:
                     client = await self._get_http_client(proxy)
@@ -5377,6 +5518,17 @@ class YueduPlugin:
                         headers = self._with_403_fallback(headers)
                         await asyncio.sleep(1.0 + random.uniform(0.5, 1.0))
                         continue
+                    if resp.status_code in (404, 410):
+                        # Permanent answer, not a blip: the CDN will not start
+                        # serving it during this sync, so do not spend the
+                        # retry budget (and the source's rate limit) on it.
+                        self._remember_missing_image(url)
+                        logger.debug(
+                            "Content image missing (HTTP %s): %s",
+                            resp.status_code,
+                            url,
+                        )
+                        return None
                     if resp.status_code in (429, 500, 502, 503, 504):
                         retry_after = resp.headers.get("Retry-After", "")
                         wait = (
@@ -5384,35 +5536,41 @@ class YueduPlugin:
                             if retry_after and retry_after.replace(".", "", 1).isdigit()
                             else 2 ** attempt
                         )
+                        last_status = resp.status_code
                         await asyncio.sleep(wait + random.uniform(0.5, 1.5))
                         continue
                     resp.raise_for_status()
                     self._capture_cookie_jar(resp)
                     return resp.content, resp.headers.get("content-type", "")
-                except httpx.HTTPError as exc:
+                except Exception as exc:
+                    # Includes httpx transport errors *and* the AnyIO stream
+                    # errors a half-dead pooled socket raises; both recover on
+                    # a fresh connection.
+                    if not is_transient_transport_error(exc):
+                        raise
                     last_error = exc
+                    await self._reset_http_client(proxy)
                     if attempt < 2:
                         await asyncio.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
             if last_error is not None:
                 raise last_error
-            raise RuntimeError(f"Request failed after retries: {url}")
+            raise RuntimeError(
+                f"Request failed after retries: {url}"
+                + (f" (HTTP {last_status})" if last_status else "")
+            )
 
         last_error: Exception | None = None
         for proxy in self._ordered_transports(proxy_url):
             try:
-                data, content_type = await _request(proxy)
-                if not data or len(data) < 128:
-                    return None
-                if self.engine:
-                    decoded = self.engine.decode_content_image(data)
-                    if decoded:
-                        data = decoded
-                return data, content_type
-            except httpx.RequestError as exc:
+                result = await _request(proxy)
+            except Exception as exc:
+                if not is_transient_transport_error(exc):
+                    last_error = exc
+                    break
                 last_error = exc
-                self._mark_transport_failure(proxy)
-                if isinstance(exc, httpx.TransportError):
-                    await self._reset_http_client(proxy)
+                # An image CDN failing says nothing about the book site, so it
+                # must not push the *source's* transport into cooldown; that
+                # made the next page request try the dead direct path first.
                 if proxy is None:
                     break
                 logger.warning(
@@ -5422,9 +5580,17 @@ class YueduPlugin:
                     type(exc).__name__,
                     f": {exc}" if str(exc) else "",
                 )
-            except Exception as exc:
-                last_error = exc
-                break
+                continue
+            if result is None:
+                return None
+            data, content_type = result
+            if not data or len(data) < 128:
+                return None
+            if self.engine:
+                decoded = self.engine.decode_content_image(data)
+                if decoded:
+                    data = decoded
+            return data, content_type
         if last_error is not None:
             # HTTPX timeouts stringify to "", which produced log lines ending in
             # "…: " with no cause at all.
