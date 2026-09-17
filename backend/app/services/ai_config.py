@@ -107,7 +107,10 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
         "label": "DeepSeek",
         "kind": "openai",
         "base_url": "https://api.deepseek.com/v1",
-        "model": "deepseek-chat",
+        # Model names on this endpoint change: a wrong name is answered with
+        # 400 "The supported API model names are ..." (the admin UI turns that
+        # answer into clickable buttons) and /v1/models lists the truth.
+        "model": "deepseek-flash",
         "embedding_model": "",
     },
     "qwen": {

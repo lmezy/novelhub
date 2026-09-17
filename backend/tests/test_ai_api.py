@@ -317,17 +317,80 @@ async def test_admin_update_ai_validates_ranges():
 
 
 @pytest.mark.asyncio
-async def test_admin_test_ai_reports_provider_failure():
+async def test_admin_test_ai_passes_the_diagnostics_through():
     db = fake_db()
-    client = MagicMock()
-    client.test_connection = AsyncMock(side_effect=AIError("无法连接 AI 服务（ConnectError）。"))
-    with patch("app.api.routes.admin.LLMClient", return_value=client):
+    diagnostics = {
+        "ok": False,
+        "chat": {"ok": False, "error": "无法连接 AI 服务（ConnectError）。"},
+        "available_models": ["deepseek-flash"],
+    }
+    probe = AsyncMock(return_value=diagnostics)
+    with patch("app.api.routes.admin.diagnose", probe):
         resp = await call("POST", "/api/admin/ai/test?test_embeddings=false", db)
 
     body = resp.json()
     assert resp.status_code == 200
     assert body["ok"] is False
     assert "无法连接" in body["chat"]["error"]
+    assert body["available_models"] == ["deepseek-flash"]
+    assert probe.await_args.kwargs["test_embeddings"] is False
+
+
+# ---------------------------------------------------------------------------
+# model discovery (wrong model name is the most common misconfiguration)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_admin_models_route_returns_the_server_list():
+    db = fake_db()
+    service = MagicMock()
+    service.list_models = AsyncMock(return_value=["deepseek-flash", "deepseek-v4-pro"])
+    with patch("app.api.routes.admin.LLMClient", return_value=service):
+        resp = await call("POST", "/api/admin/ai/models", db,
+                          json={"provider": "deepseek", "base_url": "https://api.deepseek.com/v1"})
+
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["ok"] is True
+    assert body["models"] == ["deepseek-flash", "deepseek-v4-pro"]
+    assert body["endpoint"] == "https://api.deepseek.com/v1/models"
+
+
+@pytest.mark.asyncio
+async def test_admin_models_route_reports_a_provider_without_models_endpoint():
+    db = fake_db()
+    service = MagicMock()
+    service.list_models = AsyncMock(side_effect=AIError("无法获取模型列表：HTTP 404"))
+    with patch("app.api.routes.admin.LLMClient", return_value=service):
+        resp = await call("POST", "/api/admin/ai/models", db, json={})
+
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["ok"] is False
+    assert "404" in body["error"]
+
+
+@pytest.mark.asyncio
+async def test_admin_test_ai_offers_the_model_names_from_the_error():
+    """A 400 that names the supported models must surface them for one click."""
+    db = fake_db()
+    diagnostics = {
+        "ok": False,
+        "chat": {"ok": False, "status": 400, "error":
+                 "模型名不被支持：当前填的是「DeepSeek-V4.1-Flash」，该服务只接受 "
+                 "deepseek-flash、deepseek-v4-pro。"},
+        "available_models": ["deepseek-flash", "deepseek-v4-pro"],
+        "current_model": "DeepSeek-V4.1-Flash",
+    }
+    with patch("app.api.routes.admin.diagnose",
+               AsyncMock(return_value=diagnostics)):
+        resp = await call("POST", "/api/admin/ai/test?test_embeddings=false", db)
+
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["available_models"] == ["deepseek-flash", "deepseek-v4-pro"]
+    assert body["current_model"] == "DeepSeek-V4.1-Flash"
 
 
 # ---------------------------------------------------------------------------

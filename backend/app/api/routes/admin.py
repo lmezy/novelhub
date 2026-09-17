@@ -1,3 +1,4 @@
+from dataclasses import replace
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -18,7 +19,13 @@ from app.schemas.admin import (
     UserR18Update,
 )
 from app.services.auth import get_current_user, require_admin, require_super_admin
-from app.services.ai_client import AIError, LLMClient
+from app.services.ai_client import (
+    AIError,
+    LLMClient,
+    diagnose,
+    extract_supported_models,
+    models_endpoint,
+)
 from app.services.ai_config import (
     MASKED_KEY,
     get_ai_config,
@@ -363,31 +370,50 @@ async def admin_test_ai(test_embeddings: bool = True,
                         current_user: User = Depends(require_admin)):
     """Round-trip a tiny completion (and an embedding) through the provider."""
     cfg = await get_ai_config(db)
+    return await diagnose(cfg, test_embeddings=test_embeddings)
+
+
+class AIModelsRequest(BaseModel):
+    provider: str | None = None
+    base_url: str | None = None
+    #: Empty keeps the stored key, so the admin can list models before saving.
+    api_key: str | None = None
+
+
+@router.post("/ai/models")
+async def admin_ai_models(payload: AIModelsRequest | None = None,
+                          db: AsyncSession = Depends(get_db),
+                          current_user: User = Depends(require_admin)):
+    """List the model ids the configured (or not-yet-saved) endpoint serves."""
+    cfg = await get_ai_config(db)
+    payload = payload or AIModelsRequest()
+    overrides: dict = {}
+    if payload.provider:
+        overrides["provider"] = payload.provider
+    if payload.base_url is not None and payload.base_url.strip():
+        overrides["base_url"] = payload.base_url.strip()
+    if payload.api_key:
+        overrides["api_key"] = payload.api_key
+    if overrides:
+        cfg = replace(cfg, **overrides)
+
     client = LLMClient(cfg)
-    results: dict = {}
     try:
-        results["chat"] = await client.test_connection()
+        models = await client.list_models()
     except AIError as exc:
-        results["chat"] = {"ok": False, "error": str(exc), "status": exc.status}
+        return {
+            "ok": False,
+            "error": str(exc),
+            "models": extract_supported_models(str(exc)),
+            "base_url": cfg.effective_base_url,
+        }
     except Exception as exc:  # pragma: no cover - defensive
-        results["chat"] = {"ok": False, "error": str(exc) or type(exc).__name__}
+        return {"ok": False, "error": str(exc) or type(exc).__name__, "models": []}
 
-    if test_embeddings:
-        if not cfg.embeddings_supported:
-            results["embeddings"] = {
-                "ok": False,
-                "error": "当前配置没有可用的 Embedding 服务/模型（RAG 语义检索会不可用）。",
-            }
-        else:
-            try:
-                results["embeddings"] = await client.test_embeddings()
-            except AIError as exc:
-                results["embeddings"] = {"ok": False, "error": str(exc)}
-            except Exception as exc:  # pragma: no cover - defensive
-                results["embeddings"] = {"ok": False, "error": str(exc) or type(exc).__name__}
-
-    results["ok"] = bool(results.get("chat", {}).get("ok"))
-    if "embeddings" in results:
-        results["ok"] = results["ok"] and bool(results["embeddings"].get("ok"))
-    return results
+    return {
+        "ok": True,
+        "models": models,
+        "base_url": cfg.effective_base_url,
+        "endpoint": models_endpoint(cfg.effective_base_url, cfg.kind),
+    }
 

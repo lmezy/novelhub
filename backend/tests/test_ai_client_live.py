@@ -25,8 +25,29 @@ RECEIVED: list[dict] = []
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
 
+    #: Model name the stub rejects the way a real provider does, naming the
+    #: models it does accept.
+    BAD_MODEL = "wrong-model"
+    SUPPORTED = ["deepseek-flash", "deepseek-v4-pro"]
+
     def log_message(self, *args):  # keep pytest output clean
         return
+
+    def _json(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):  # noqa: N802 - http.server API
+        RECEIVED.append({"path": self.path, "method": "GET"})
+        if self.path.endswith("/models"):
+            self._json(200, {"data": [{"id": name} for name in
+                                      self.SUPPORTED + ["bge-m3"]]})
+            return
+        self._json(404, {"error": "not found"})
 
     def _body(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
@@ -40,10 +61,18 @@ class _Handler(BaseHTTPRequestHandler):
         payload = self._body()
         RECEIVED.append({
             "path": self.path,
+            "method": "POST",
             "auth": self.headers.get("Authorization"),
             "api_key": self.headers.get("x-api-key"),
             "payload": payload,
         })
+
+        if payload.get("model") == self.BAD_MODEL:
+            self._json(400, {"error": {"message":
+                "The supported API model names are "
+                + ", ".join(self.SUPPORTED)
+                + f", but you passed {self.BAD_MODEL}."}})
+            return
 
         if self.path.endswith("/embeddings"):
             body = json.dumps({
@@ -186,6 +215,35 @@ async def test_anthropic_chat_over_a_real_socket(llm_server):
     assert request["api_key"] == "sk-live"
     assert request["auth"] is None
     assert request["payload"]["system"] == "sys"
+
+
+@pytest.mark.asyncio
+async def test_list_models_over_a_real_socket(llm_server):
+    models = await LLMClient(config_for(llm_server)).list_models()
+
+    assert models == ["bge-m3", "deepseek-flash", "deepseek-v4-pro"]
+    assert RECEIVED[0]["method"] == "GET"
+    assert RECEIVED[0]["path"] == "/v1/models"
+
+
+@pytest.mark.asyncio
+async def test_wrong_model_name_is_explained_and_the_names_are_offered(llm_server):
+    """The exact failure mode of a typo'd model name (deepseek-flash vs …)."""
+    from app.services.ai_client import AIError, diagnose
+
+    cfg = config_for(llm_server, model="wrong-model")
+
+    with pytest.raises(AIError) as excinfo:
+        await LLMClient(cfg).chat([{"role": "user", "content": "hi"}], retries=0)
+    assert "模型名不被支持" in str(excinfo.value)
+    assert "deepseek-flash" in str(excinfo.value)
+    assert "wrong-model" in str(excinfo.value)
+
+    result = await diagnose(cfg, test_embeddings=False)
+
+    assert result["ok"] is False
+    assert result["available_models"] == ["deepseek-flash", "deepseek-v4-pro"]
+    assert result["current_model"] == "wrong-model"
 
 
 # ---------------------------------------------------------------------------

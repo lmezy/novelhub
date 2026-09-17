@@ -70,6 +70,8 @@
 - 想让小说和漫画分页显示 / 漫画书被算成小说 → [codex-handoff.md](codex-handoff.md) 第 16 节
 - AI 侧栏提示未配置 / 回答总从第 1 章说起 / 回答不出字（流式被缓冲）→
   [ai-assistant.md](ai-assistant.md) “排错”
+- AI 测试连接报 400 `The supported API model names are …`（模型名不对）→
+  [ai-assistant.md](ai-assistant.md) “排错” + [codex-handoff.md](codex-handoff.md) 第 19 节
 - 想连服务器看真实任务与日志 → [codex-handoff.md](codex-handoff.md) 第 1、5 节
 
 ## 文档维护约定

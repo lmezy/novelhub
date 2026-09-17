@@ -564,6 +564,18 @@ const aiTesting = ref(false)
 const aiTestResult = ref<any>(null)
 const aiApiKeyInput = ref("")
 const aiEmbeddingKeyInput = ref("")
+const aiModels = ref<string[]>([])
+const aiModelsLoading = ref(false)
+const aiModelsError = ref("")
+
+const EMBEDDING_HINT_RE = /embed|bge|gte|m3|rerank/i
+const chatModelOptions = computed(() =>
+  aiModels.value.filter((m) => !EMBEDDING_HINT_RE.test(m)),
+)
+const embeddingModelOptions = computed(() => {
+  const picked = aiModels.value.filter((m) => EMBEDDING_HINT_RE.test(m))
+  return picked.length ? picked : aiModels.value
+})
 
 const aiIndexBookId = ref("")
 const aiIndexBusy = ref(false)
@@ -639,11 +651,45 @@ async function testAIConfig() {
   aiError.value = ""
   try {
     aiTestResult.value = await api.post<any>("/admin/ai/test", {})
+    if (aiTestResult.value?.available_models?.length) {
+      aiModels.value = aiTestResult.value.available_models
+    }
   } catch (e) {
     aiError.value = e instanceof Error ? e.message : i18n.t('admin_ai_test_failed')
   } finally {
     aiTesting.value = false
   }
+}
+
+async function loadAIModels() {
+  aiModelsLoading.value = true
+  aiModelsError.value = ""
+  try {
+    const body: any = {
+      provider: aiForm.value.provider,
+      base_url: aiForm.value.base_url,
+    }
+    // Use the key the admin just typed, otherwise the stored one.
+    if (aiApiKeyInput.value) body.api_key = aiApiKeyInput.value
+    const res = await api.post<any>("/admin/ai/models", body)
+    aiModels.value = res.models || []
+    if (!res.ok) {
+      aiModelsError.value = res.error || i18n.t('admin_ai_models_failed')
+      return
+    }
+    // Fill an empty field with a model the server just confirmed it accepts,
+    // preferring a chat model for the chat field.
+    const chat = res.models.find((m: string) => !EMBEDDING_HINT_RE.test(m))
+    if (!aiForm.value.model && chat) aiForm.value.model = chat
+  } catch (e) {
+    aiModelsError.value = e instanceof Error ? e.message : i18n.t('admin_ai_models_failed')
+  } finally {
+    aiModelsLoading.value = false
+  }
+}
+
+function applyModel(target: "model" | "embedding_model", value: string) {
+  aiForm.value[target] = value
 }
 
 async function loadIndexedBooks() {
@@ -2670,8 +2716,35 @@ onUnmounted(() => {
               </label>
               <label class="block">
                 <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_model') }}</span>
-                <input v-model="aiForm.model" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+                <div class="flex gap-2">
+                  <input v-model="aiForm.model" class="flex-1 min-w-0 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+                  <button
+                    type="button"
+                    @click="loadAIModels"
+                    :disabled="aiModelsLoading"
+                    class="px-2 py-2 rounded border border-border dark:border-gray-700 text-xs hover:bg-accent/10 disabled:opacity-50 shrink-0"
+                  >{{ aiModelsLoading ? i18n.t('admin_ai_models_fetching') : i18n.t('admin_ai_models_fetch') }}</button>
+                </div>
               </label>
+            </div>
+
+            <p v-if="aiModelsError" class="text-xs text-amber-600 dark:text-amber-400 mb-2 break-words">{{ aiModelsError }}</p>
+            <div v-if="chatModelOptions.length" class="mb-3">
+              <span class="block text-[11px] text-muted dark:text-gray-400 mb-1">
+                {{ i18n.t('admin_ai_models_available', { n: chatModelOptions.length }) }}
+              </span>
+              <div class="flex flex-wrap gap-1.5">
+                <button
+                  v-for="model in chatModelOptions"
+                  :key="model"
+                  type="button"
+                  @click="applyModel('model', model)"
+                  class="text-[11px] px-2 py-0.5 rounded border transition-colors"
+                  :class="aiForm.model === model
+                    ? 'border-accent text-accent bg-accent/10'
+                    : 'border-border dark:border-gray-700 text-muted dark:text-gray-400 hover:text-accent'"
+                >{{ model }}</button>
+              </div>
             </div>
 
             <div class="mb-3">
@@ -2756,6 +2829,24 @@ onUnmounted(() => {
                   <span v-else><br />{{ i18n.t('admin_ai_test_direct') }}</span>
                 </p>
                 <p v-else class="text-red-500 break-words">{{ aiTestResult.chat?.error }}</p>
+                <div v-if="!aiTestResult.chat?.ok && aiTestResult.available_models?.length" class="mt-2">
+                  <span class="block text-[11px] text-muted dark:text-gray-400 mb-1">
+                    {{ i18n.t('admin_ai_models_apply') }}
+                  </span>
+                  <div class="flex flex-wrap gap-1.5">
+                    <button
+                      v-for="model in aiTestResult.available_models"
+                      :key="model"
+                      type="button"
+                      @click="applyModel('model', model)"
+                      class="text-[11px] px-2 py-0.5 rounded border transition-colors"
+                      :class="aiForm.model === model
+                        ? 'border-accent text-accent bg-accent/10'
+                        : 'border-border dark:border-gray-700 text-muted dark:text-gray-400 hover:text-accent'"
+                    >{{ model }}</button>
+                  </div>
+                  <p class="text-[11px] text-muted dark:text-gray-400 mt-1">{{ i18n.t('admin_ai_models_apply_hint') }}</p>
+                </div>
               </div>
               <div v-if="aiTestResult.embeddings" class="p-3 rounded border" :class="aiTestResult.embeddings.ok ? 'border-green-500/40 bg-green-500/5' : 'border-amber-500/40 bg-amber-500/5'">
                 <p class="font-medium mb-1">{{ i18n.t('admin_ai_test_embeddings') }}</p>
@@ -2787,6 +2878,21 @@ onUnmounted(() => {
               <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_embedding_model') }}</span>
               <input v-model="aiForm.embedding_model" :placeholder="aiConfig?.effective_embedding_model" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
             </label>
+          </div>
+          <div v-if="aiModels.length" class="mb-3">
+            <span class="block text-[11px] text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_models_embedding') }}</span>
+            <div class="flex flex-wrap gap-1.5">
+              <button
+                v-for="model in embeddingModelOptions"
+                :key="model"
+                type="button"
+                @click="applyModel('embedding_model', model)"
+                class="text-[11px] px-2 py-0.5 rounded border transition-colors"
+                :class="aiForm.embedding_model === model
+                  ? 'border-accent text-accent bg-accent/10'
+                  : 'border-border dark:border-gray-700 text-muted dark:text-gray-400 hover:text-accent'"
+              >{{ model }}</button>
+            </div>
           </div>
           <div class="mb-3">
             <label class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_embedding_base_url') }}</label>

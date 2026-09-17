@@ -43,7 +43,7 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 
 ## 2. 当前状态（2026-09-17）
 
-- 后端全量测试 **560 passed**：`cd backend && python -m pytest -q`
+- 后端全量测试 **569 passed**：`cd backend && python -m pytest -q`
 - Source Engine 闭环已完成并可用：导入书源 → 搜索 → 目录 → 正文 → Storage/DB/搜索 →
   网页阅读。当前工作重心是**同步稳定性与线上排错**，不是新增架构能力。
 - **AI 功能已补齐**（第 18 节）：后端配置/上下文/流式/划词/RAG + 前端 AI 设置页与阅读器
@@ -802,3 +802,42 @@ Playwright `Page.goto` 超时都属站点/代理侧，代码按设计重试；�
   章节内容变了要手动 `force=true` 重建。
 - 向量检索是进程内余弦计算（numpy），单本上限 2000 片段；书特别大时需要调 `max_chunks`
   或后续换成 pgvector。
+
+## 19. 2026-09-17：AI 测试连接报 400「模型名不被支持」（DeepSeek 模型名已变）
+
+**现象**：用户在 **设置 → AI** 填好 DeepSeek 的 API Key 后点「测试连接」，对话接口报
+`AI 服务拒绝了请求（HTTP 400）：通常是模型名不被支持或参数超限。服务端信息：
+{"error":{"message":"The supported API model names are deepseek-flash, deepseek-v4-pro,
+but you passed DeepSeek-V4.1-Flash."}}`
+
+**根因**：不是 Key、不是代理、不是网络 —— 模型名写错。第 18 节的预设里 DeepSeek 默认模型是
+`deepseek-chat`，而当前该端点只接受 `deepseek-flash` / `deepseek-v4-pro`；用户手填的
+`DeepSeek-V4.1-Flash` 两者都不是。代码这边的两个问题：① 预设的默认模型名会随厂商改版过期；
+② 报错虽然把服务端原文带出来了，但要用户自己肉眼从 JSON 里挑名字，而且没有别的办法问服务端
+「你到底提供哪些模型」。
+
+**改动**：
+
+| 文件 | 改动 |
+|---|---|
+| `backend/app/services/ai_client.py` | 新增 `extract_supported_models()`：从 `supported API model names are X, Y` 这类报错里提取模型名；新增 `models_endpoint()` + `LLMClient.list_models()`（`GET {base}/models`，兼容 `data`/`models`/裸数组三种响应，Anthropic 自动补 `/v1`）；`_error_hint` 在 400 且能解析出模型名时直接给结论（「当前填的是 X，该服务只接受 Y、Z」）；新增 `diagnose()` 把「测对话 + 失败时找可用模型名 + 测向量」收敛成一处 |
+| `backend/app/api/routes/admin.py` | 新增 `POST /admin/ai/models`（可用表单里**尚未保存**的 provider/base_url/api_key 去查，Key 留空则用已存的）；`POST /admin/ai/test` 改用 `diagnose()`，失败时响应带 `available_models` + `current_model` |
+| `backend/app/api/routes/ai.py` | `/ai/test` 同样改用 `diagnose()`（去掉重复实现） |
+| `backend/app/services/ai_config.py` | DeepSeek 预设默认模型 `deepseek-chat` → `deepseek-flash`（附注释：模型名会变，正解是按钮拉取） |
+| `frontend/src/pages/AdminPage.vue` | 「模型」旁边加 **拉取模型** 按钮 + 可用模型按钮（点一下填入，向量字段单独一组候选，会过滤出 embedding 类模型）；「测试连接」失败且带 `available_models` 时，把这些名字做成按钮并提示「填入后记得保存再测」 |
+| `frontend/src/stores/i18n.ts`、`docs/ai-assistant.md`、`README.md` | 新增词条；排错表补 400 这一行；DeepSeek 默认模型改成 `deepseek-flash` |
+
+**验证**：
+
+- `cd backend && python -m pytest -q` → **569 passed**（新增 9 项）。
+  - 用用户贴的**原始报错文本**做断言：`extract_supported_models()` →
+    `["deepseek-flash", "deepseek-v4-pro"]`，普通报错返回空；`_error_hint(400, …)` 会输出
+    「模型名不被支持：当前填的是「DeepSeek-V4.1-Flash」，该服务只接受 deepseek-flash、
+    deepseek-v4-pro」。
+  - `tests/test_ai_client_live.py` 的本地桩服务新增 `GET /v1/models` 与「模型名不对就返回 400
+    并列出可用名字」两条路径：验证 `list_models()` 打到 `/v1/models`、`chat()` 拿到的错误文本
+    包含正确模型名、`diagnose()` 在失败时给出 `available_models`。
+- 前端 `npm run typecheck` / `npm run build` 通过。
+
+**给用户的处置**：把「模型」改成 `deepseek-flash`（或 `deepseek-v4-pro`）→ 保存 → 重新
+「测试连接」；以后模型名再变，直接点「拉取模型」按服务端返回的列表选。

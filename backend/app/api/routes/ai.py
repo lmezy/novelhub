@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.models import Book, User
 from app.services.ai import AIService
-from app.services.ai_client import AIError, LLMClient
+from app.services.ai_client import AIError, diagnose
 from app.services.ai_config import get_ai_config
 from app.services.auth import get_current_user, require_admin
 from app.services.visibility import ensure_book_visible
@@ -331,30 +331,4 @@ async def ai_test(payload: AITestRequest | None = None,
     settings form); this alias stays for API clients.
     """
     cfg = await get_ai_config(db)
-    client = LLMClient(cfg)
-    results: dict[str, Any] = {}
-    try:
-        results["chat"] = await client.test_connection()
-    except AIError as exc:
-        results["chat"] = {"ok": False, "error": str(exc), "status": exc.status}
-    except Exception as exc:  # pragma: no cover - defensive
-        results["chat"] = {"ok": False, "error": str(exc)}
-
-    if payload is not None and payload.test_embeddings:
-        if not cfg.embeddings_supported:
-            results["embeddings"] = {
-                "ok": False,
-                "error": "当前配置没有可用的 Embedding 服务/模型。",
-            }
-        else:
-            try:
-                results["embeddings"] = await client.test_embeddings()
-            except AIError as exc:
-                results["embeddings"] = {"ok": False, "error": str(exc)}
-            except Exception as exc:  # pragma: no cover - defensive
-                results["embeddings"] = {"ok": False, "error": str(exc)}
-
-    results["ok"] = bool(results.get("chat", {}).get("ok"))
-    if "embeddings" in results:
-        results["ok"] = results["ok"] and bool(results["embeddings"].get("ok"))
-    return results
+    return await diagnose(cfg, test_embeddings=bool(payload and payload.test_embeddings))

@@ -190,7 +190,9 @@ def test_env_fallback_uses_provider_preset():
 
     assert cfg.provider == "deepseek"
     assert cfg.effective_base_url == "https://api.deepseek.com/v1"
-    assert cfg.effective_model == "deepseek-chat"
+    # Renamed by the vendor before; the admin UI's "fetch models" button and the
+    # 400 error text (which lists the accepted names) are the real safety net.
+    assert cfg.effective_model == "deepseek-flash"
     assert cfg.configured is True
 
 
@@ -590,6 +592,59 @@ def test_strip_markup_removes_images_and_title():
     assert "![封面]" not in cleaned
     assert cleaned.startswith("正文段落")
     assert "\n\n\n" not in cleaned
+
+
+def test_supported_model_names_are_extracted_from_a_real_error():
+    """The provider answers with the names it accepts; do not make users guess."""
+    from app.services.ai_client import extract_supported_models
+
+    message = (
+        '{"error":{"message":"The supported API model names are deepseek-flash, '
+        'deepseek-v4-pro, but you passed DeepSeek-V4.1-Flash.",'
+        '"type":"invalid_request_error"}}'
+    )
+
+    assert extract_supported_models(message) == ["deepseek-flash", "deepseek-v4-pro"]
+    assert extract_supported_models("rate limit exceeded") == []
+    assert extract_supported_models("") == []
+
+
+def test_model_list_endpoint_normalisation():
+    from app.services.ai_client import models_endpoint, parse_model_ids
+
+    assert models_endpoint("https://api.deepseek.com/v1", "openai") == \
+        "https://api.deepseek.com/v1/models"
+    assert models_endpoint("https://api.anthropic.com", "anthropic") == \
+        "https://api.anthropic.com/v1/models"
+    assert models_endpoint("http://host:8000/v1/models/", "openai") == \
+        "http://host:8000/v1/models"
+
+    assert parse_model_ids({"data": [{"id": "b"}, {"id": "a"}]}) == ["a", "b"]
+    assert parse_model_ids(["x"]) == ["x"]
+    assert parse_model_ids({"models": [{"name": "y"}]}) == ["y"]
+    assert parse_model_ids({"unexpected": 1}) == []
+
+
+def test_400_with_supported_names_says_which_model_to_use():
+    from app.services.ai_client import _error_hint
+
+    cfg = configured_config(provider="deepseek", model="DeepSeek-V4.1-Flash")
+    hint = _error_hint(400, (
+        '{"error":{"message":"The supported API model names are deepseek-flash, '
+        'deepseek-v4-pro, but you passed DeepSeek-V4.1-Flash."}}'
+    ), cfg)
+
+    assert "模型名不被支持" in hint
+    assert "DeepSeek-V4.1-Flash" in hint
+    assert "deepseek-flash" in hint and "deepseek-v4-pro" in hint
+
+
+def test_400_without_model_names_still_mentions_the_model_field():
+    from app.services.ai_client import _error_hint
+
+    hint = _error_hint(400, '{"error":"bad request"}', configured_config())
+
+    assert "模型名" in hint
 
 
 # ---------------------------------------------------------------------------

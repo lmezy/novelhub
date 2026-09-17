@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import ssl
 import time
 from typing import Any, AsyncIterator, Iterable, Sequence
@@ -125,6 +126,63 @@ def _embeddings_endpoint(base_url: str) -> str:
     return base + "/embeddings"
 
 
+def models_endpoint(base_url: str, kind: str) -> str:
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        raise AIError("AI 服务地址（Base URL）未配置。")
+    lowered = base.lower()
+    if lowered.endswith("/models"):
+        return base
+    if kind == "anthropic" and not lowered.endswith("/v1"):
+        return base + "/v1/models"
+    return base + "/models"
+
+
+#: ``{"error":{"message":"The supported API model names are deepseek-flash,
+#: deepseek-v4-pro, but you passed ..."}}`` -- providers do answer with the
+#: names they accept, so surface them instead of making the admin guess.
+_SUPPORTED_MODELS_RE = re.compile(
+    r"supported\s+(?:api\s+)?model\s+names?\s+are\s*[:：]?\s*(.+?)(?:,?\s*but\s+you\s+passed|[.;。]|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def extract_supported_models(text: str) -> list[str]:
+    """Model names a provider listed in an error message (may be empty)."""
+    match = _SUPPORTED_MODELS_RE.search(str(text or ""))
+    if not match:
+        return []
+    raw = match.group(1)
+    names = [
+        piece.strip().strip('"\'`')
+        for piece in re.split(r"[,、，/]|\s+or\s+", raw)
+    ]
+    # Keep plausible model ids only ("deepseek-flash", "gpt-4o", "Qwen/Qwen2.5").
+    cleaned = [n for n in names if n and " " not in n and len(n) <= 80]
+    seen: set[str] = set()
+    return [n for n in cleaned if not (n in seen or seen.add(n))]
+
+
+def parse_model_ids(data: Any) -> list[str]:
+    """Extract model ids from an OpenAI/Anthropic ``/models`` response."""
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        items = (data.get("data") or data.get("models")
+                 or data.get("result") or data.get("items") or [])
+    else:
+        items = []
+    ids: list[str] = []
+    for item in items:
+        if isinstance(item, str):
+            ids.append(item)
+        elif isinstance(item, dict):
+            value = item.get("id") or item.get("name") or item.get("model")
+            if value:
+                ids.append(str(value))
+    return sorted({i for i in ids if i})
+
+
 def _headers(cfg: AIConfig, *, api_key: str = "") -> dict[str, str]:
     key = api_key or cfg.api_key
     if cfg.kind == "anthropic":
@@ -202,6 +260,7 @@ def build_payload(cfg: AIConfig, messages: Sequence[dict[str, str]], *,
 def _error_hint(status: int, body: str, cfg: AIConfig) -> str:
     snippet = (body or "").strip().replace("\n", " ")[:300]
     where = cfg.effective_base_url or "AI 服务"
+    supported = extract_supported_models(body)
     if status in (401, 403):
         base = f"AI 服务拒绝了这个 API Key（HTTP {status}）。请检查 Key 是否正确、是否有该模型的权限。"
     elif status == 404:
@@ -209,8 +268,15 @@ def _error_hint(status: int, body: str, cfg: AIConfig) -> str:
                 f"与模型名（当前 {cfg.effective_model}）。")
     elif status == 429:
         base = "AI 服务限流（HTTP 429）：请求过于频繁或余额/配额不足，稍后重试。"
+    elif status == 400 and supported:
+        base = (
+            f"模型名不被支持：当前填的是「{cfg.effective_model}」，"
+            f"该服务只接受 {'、'.join(supported)}。"
+            "请在「模型」里改成其中一个（或点「拉取模型」让服务列出可用模型）。"
+        )
     elif status == 400:
-        base = "AI 服务拒绝了请求（HTTP 400）：通常是模型名不被支持或参数超限。"
+        base = ("AI 服务拒绝了请求（HTTP 400）：通常是模型名不被支持或参数超限。"
+                "可以点「拉取模型」看服务端实际提供哪些模型。")
     elif 500 <= status < 600:
         base = f"AI 服务上游错误（HTTP {status}），通常是服务端临时故障，可稍后重试。"
     else:
@@ -515,6 +581,39 @@ class LLMClient:
 
     # -- diagnostics --------------------------------------------------------
 
+    async def list_models(self) -> list[str]:
+        """Ask the provider which model ids it serves (``GET {base}/models``)."""
+        url = models_endpoint(self.cfg.effective_base_url, self.cfg.kind)
+        headers = _headers(self.cfg)
+        try:
+            async with self._client(timeout=min(self.cfg.timeout, 30.0)) as client:
+                response = await client.get(url, headers=headers)
+                body = self._snippet(response)
+                if response.status_code >= 400:
+                    hint = _error_hint(response.status_code, body, self.cfg)
+                    raise AIError(
+                        f"无法获取模型列表：{hint}",
+                        status=response.status_code,
+                        provider=self.cfg.provider,
+                    )
+                data = response.json()
+        except AIError:
+            raise
+        except Exception as exc:
+            raise AIError(
+                "无法获取模型列表：" + _transport_hint(exc, self.cfg, self.proxy_url),
+                provider=self.cfg.provider,
+                detail=str(exc) or type(exc).__name__,
+            ) from exc
+
+        models = parse_model_ids(data)
+        if not models:
+            raise AIError(
+                f"{url} 没有返回任何模型（有些服务不提供 /models 接口）。"
+                "请手动填写模型名，或从「测试连接」的报错里复制服务端给出的可用模型。"
+            )
+        return models
+
     async def test_connection(self) -> dict[str, Any]:
         """Round-trip a tiny completion so the admin gets a yes/no + reason."""
         started = time.monotonic()
@@ -561,10 +660,67 @@ def describe_model_chain(models: Iterable[str]) -> str:
     return " -> ".join(str(m) for m in models if m)
 
 
+async def diagnose(cfg: AIConfig, *, test_embeddings: bool = True) -> dict[str, Any]:
+    """Probe the configured provider for the admin UI.
+
+    On a failed chat probe the response carries ``available_models`` when the
+    provider either named the models it accepts in the error body or answers
+    ``/models`` -- a wrong model name is by far the most common misconfiguration
+    (``The supported API model names are deepseek-flash, deepseek-v4-pro``).
+    """
+    client = LLMClient(cfg)
+    results: dict[str, Any] = {}
+
+    try:
+        results["chat"] = await client.test_connection()
+    except AIError as exc:
+        results["chat"] = {"ok": False, "error": str(exc), "status": exc.status}
+    except Exception as exc:  # pragma: no cover - defensive
+        results["chat"] = {"ok": False, "error": str(exc) or type(exc).__name__}
+
+    if not results["chat"].get("ok"):
+        models = extract_supported_models(str(results["chat"].get("error") or ""))
+        if not models:
+            try:
+                models = await client.list_models()
+            except AIError:
+                models = []
+            except Exception:  # pragma: no cover - defensive
+                models = []
+        if models:
+            results["available_models"] = models
+            results["current_model"] = cfg.effective_model
+
+    if test_embeddings:
+        if not cfg.embeddings_supported:
+            results["embeddings"] = {
+                "ok": False,
+                "error": "当前配置没有可用的 Embedding 服务/模型（RAG 语义检索会不可用）。",
+            }
+        else:
+            try:
+                results["embeddings"] = await client.test_embeddings()
+            except AIError as exc:
+                results["embeddings"] = {"ok": False, "error": str(exc)}
+            except Exception as exc:  # pragma: no cover - defensive
+                results["embeddings"] = {
+                    "ok": False, "error": str(exc) or type(exc).__name__,
+                }
+
+    results["ok"] = bool(results.get("chat", {}).get("ok"))
+    if "embeddings" in results:
+        results["ok"] = results["ok"] and bool(results["embeddings"].get("ok"))
+    return results
+
+
 __all__ = [
     "AIError",
     "LLMClient",
     "LLMResult",
     "build_payload",
+    "diagnose",
+    "extract_supported_models",
+    "models_endpoint",
+    "parse_model_ids",
     "resolve_proxy_url",
 ]

@@ -11,7 +11,7 @@ AI 配置存在数据库里（`app_settings`，键名 `ai_*`），改完立即�
 |---|---|
 | 启用 AI 功能 | 总开关。OpenAI 兼容且填了 Key 时默认开启 |
 | 提供方 | OpenAI / DeepSeek / 通义千问 / Kimi / 智谱 / SiliconFlow / Ollama / Hermes / Claude / 自定义 |
-| 模型 | 留空用提供方默认值（如 `deepseek-chat`、`qwen-plus`、`claude-3-5-haiku-latest`） |
+| 模型 | 留空用提供方默认值（如 `deepseek-flash`、`qwen-plus`、`claude-3-5-haiku-latest`）；旁边的 **「拉取模型」** 会调 `{base}/models` 列出服务端真正提供的模型，点一下即填入 |
 | 接口地址 | 留空用提供方默认值。OpenAI 兼容端点写到 `/v1` 即可，会自动补 `/chat/completions`；Claude 会自动补 `/v1/messages` |
 | API Key | AES-GCM 加密入库，接口只回掩码；本地 Ollama 这类服务可以留空 |
 | Temperature / 最大输出 token / 超时 | 生成参数 |
@@ -27,7 +27,7 @@ AI 配置存在数据库里（`app_settings`，键名 `ai_*`），改完立即�
 
 | 提供方 | Base URL | 对话模型 | 向量模型 |
 |---|---|---|---|
-| DeepSeek | `https://api.deepseek.com/v1` | `deepseek-chat` | 无（要 RAG 需另配向量提供方） |
+| DeepSeek | `https://api.deepseek.com/v1` | `deepseek-flash`（另有 `deepseek-v4-pro`） | 无（要 RAG 需另配向量提供方） |
 | 通义千问 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus` | `text-embedding-v3` |
 | 智谱 GLM | `https://open.bigmodel.cn/api/paas/v4` | `glm-4-flash` | `embedding-3` |
 | SiliconFlow | `https://api.siliconflow.cn/v1` | `Qwen/Qwen2.5-7B-Instruct` | `BAAI/bge-m3` |
@@ -97,7 +97,8 @@ curl "http://localhost:8088/api/rag/index?limit=50" -H "Authorization: Bearer $T
 | HTTP 401 / 403 | Key 不对、没该模型权限，或填的是别家的 Key |
 | HTTP 404 | Base URL 路径或模型名不对；对比「测试连接」里显示的请求地址 |
 | `无法连接 AI 服务` | 国内直连 OpenAI / Anthropic 需要打开「使用代理」；代理地址填 mihomo 的混合端口 |
-| 429 | 限流或余额不足，稍后重试 |
+| HTTP 400 `The supported API model names are …` | **模型名写错了**。服务端会把自己接受的模型名列出来，前端会把这些名字做成按钮，点一下填进「模型」→ 保存 → 重新测试。也可以点「拉取模型」让服务列出全部可用模型。 |
+| HTTP 429 | 限流或余额/配额不足，稍后重试 |
 | 回答里说「给出的片段里没有提到」 | 该书没建 RAG 索引，只带了当前章节附近；建索引后再问 |
 | RAG 相关报「需要一个支持向量化的服务」 | 向量提供方/模型没配；DeepSeek 不提供 embedding，需另选一个向量提供方 |
 | 摘要只覆盖了一部分章节 | 超出「最多章节数」上限，结果里会标注「已等距抽样」 |
