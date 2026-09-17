@@ -859,8 +859,9 @@ watch(
     try {
       chapters.value = await store.fetchChapters(newId as string)
     } catch { /* non-fatal */ }
-    await loadAlternates()
-    await loadBookmarks()
+    // Same reasoning as onMounted: do not block the chapter on these.
+    void loadAlternates()
+    void loadBookmarks()
     if (isMobileLayout.value) nextTick(refreshMobileLayout)
   },
 )
@@ -876,8 +877,12 @@ onMounted(async () => {
   try {
     chapters.value = await store.fetchChapters(bookId.value)
   } catch { /* non-fatal */ }
-  await loadAlternates()
-  await loadBookmarks()
+  // The chapter body is what the reader is waiting for. The "read on another
+  // source" list and the bookmark list are secondary, so they must not sit in
+  // front of it: awaiting them here used to delay the first paint of a chapter
+  // by as long as /books/{id}/sources took.
+  void loadAlternates()
+  void loadBookmarks()
   await loadChapter(chapterId.value)
   window.addEventListener("pagehide", flushPageProgressKeepalive)
 })

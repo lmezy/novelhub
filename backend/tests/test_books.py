@@ -80,6 +80,10 @@ async def test_list_book_sources_calls_unique_before_all():
     )
 
     assert [s.id for s in result.sources] == ["current", "other"]
+    # The same-title match must be pushed into SQL. Doing it in Python meant
+    # loading every book in the library, which took 10s on the live install.
+    statement = db.scalars.call_args.args[0]
+    assert "regexp_replace" in str(statement)
 
 
 @pytest.mark.asyncio

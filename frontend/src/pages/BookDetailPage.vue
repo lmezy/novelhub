@@ -371,28 +371,36 @@ function switchSource(id: string) {
 }
 
 onMounted(async () => {
+  // Render the book and its chapter list first: everything below is
+  // decoration that used to hold the whole page (and the reader link) behind
+  // the slowest request, including "read on another source", which scans the
+  // library for the same title.
   try {
     book.value = await store.fetchBook(route.params.id as string)
     favorite.value = book.value.is_favorite || false
     chapters.value = await store.fetchChapters(route.params.id as string)
-    await loadCustomTags()
-    await loadCategories()
-    initCategorySelection()
-    await loadShelfGroups()
-    await loadBookGroups()
-    await loadAlternates()
-    if (auth.user) {
-      try {
-        const p = await api.get<any>('/progress/' + route.params.id)
-        if (p) savedChapterId.value = p.chapter_id
-      } catch { /* non-critical */ }
-    }
-    await loadBookmarks()
   } catch (e) {
     error.value = e instanceof Error ? e.message : i18n.t('book_load_failed')
   } finally {
     loading.value = false
   }
+  void (async () => {
+    try {
+      // "继续阅读" points at the saved chapter, so it is the one piece of the
+      // secondary data worth asking for first.
+      if (auth.user) {
+        const p = await api.get<any>('/progress/' + route.params.id)
+        if (p) savedChapterId.value = p.chapter_id
+      }
+      await loadCustomTags()
+      await loadCategories()
+      initCategorySelection()
+      await loadShelfGroups()
+      await loadBookGroups()
+      await loadAlternates()
+      await loadBookmarks()
+    } catch { /* secondary data must never break the page */ }
+  })()
 })
 </script>
 

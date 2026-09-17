@@ -400,6 +400,10 @@ async def test_find_same_title_books_filters_normalized_title():
     )
 
     assert [b.id for b in result] == ["a", "b"]
+    # Called once per global book sync, so the match has to happen in SQL:
+    # normalising in Python loaded the whole books table every time.
+    statement = db.scalars.call_args.args[0]
+    assert "regexp_replace" in str(statement)
 
 
 @pytest.mark.asyncio

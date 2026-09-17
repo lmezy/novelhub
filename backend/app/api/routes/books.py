@@ -1,14 +1,14 @@
-import re
 from uuid import uuid4
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import FileResponse, RedirectResponse, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import RedirectResponse, Response
 from pydantic import BaseModel
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.file_response import cached_file_response
 from app.core.config import settings
 from app.core.database import get_db
 from app.models import Book, BookCategory, BookFavorite, BookFavoriteGroup, BookTag, Category, Chapter, Source, Tag, User
@@ -20,6 +20,7 @@ from app.services.book_kind import (
 )
 from app.services.auth import get_current_user, require_admin
 from app.services.book_cleanup import delete_books
+from app.services.book_title import normalize_title, normalized_title_sql
 from app.services.bookshelf import favorite_group_ids_by_book
 from app.services.custom_tags import list_book_custom_tags_map
 from app.services.epub import EpubService
@@ -86,11 +87,8 @@ def _apply_kind_filter(query, kind: str | None):
 
 
 def _normalize_book_title(title: str) -> str:
-    return re.sub(
-        r"[\s《》「」『』〈〉（）【】\[\]\"'“”‘’]+",
-        "",
-        title or "",
-    ).lower()
+    """Fold a title for the "other sources" comparison (see ``book_title``)."""
+    return normalize_title(title)
 
 
 def _book_cover_value(book: Book) -> str | None:
@@ -527,7 +525,7 @@ async def list_favorite_books(
 
 
 @router.get("/{book_id}/cover")
-async def get_book_cover(book_id: str, db: AsyncSession = Depends(get_db)):
+async def get_book_cover(book_id: str, request: Request, db: AsyncSession = Depends(get_db)):
     """Serve a locally stored cover image, or redirect to the remote URL."""
     book = await db.get(Book, book_id)
     if book is None:
@@ -540,7 +538,9 @@ async def get_book_cover(book_id: str, db: AsyncSession = Depends(get_db)):
     cover_path = Path(settings.STORAGE_PATH).parent / cover_value
     if not cover_path.is_file():
         raise HTTPException(status_code=404, detail="Cover not found")
-    return FileResponse(cover_path)
+    # A re-sync overwrites the cover file, so keep the max-age short and let
+    # the etag/304 do the work after that.
+    return cached_file_response(request, cover_path, max_age=300)
 
 
 @router.put("/{book_id}/cover")
@@ -852,7 +852,16 @@ async def list_book_sources(
     if not ensure_book_visible(user, book):
         raise HTTPException(status_code=404, detail="Book not found")
 
-    query = select(Book).options(selectinload(Book.author)).where(Book.id != book_id)
+    normalized = _normalize_book_title(book.title)
+    query = select(Book).options(selectinload(Book.author)).where(
+        Book.id != book_id,
+        # Narrow in the database: normalising titles in Python meant loading
+        # every book in the library (eager tags/categories included) and this
+        # call took 10s on a 24k-book library.  The Python comparison below
+        # stays as the authority -- it can only ever drop a row, never invent
+        # one -- but the database is what keeps this fast.
+        normalized_title_sql(Book.title) == normalized,
+    )
     if user.role not in ("admin", "super_admin"):
         query = query.where(or_(
             Book.owner_id.is_(None),
@@ -866,7 +875,6 @@ async def list_book_sources(
         conditions.append(Book.is_r18 == True)
     query = query.where(or_(*conditions)) if conditions else query.where(Book.id == "__none__")
 
-    normalized = _normalize_book_title(book.title)
     candidates = [
         b
         for b in (await db.scalars(query)).unique().all()

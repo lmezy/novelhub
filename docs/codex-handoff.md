@@ -43,7 +43,7 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 
 ## 2. 当前状态（2026-09-18）
 
-- 后端全量测试 **631 passed**：`cd backend && python -m pytest -q`
+- 后端全量测试 **641 passed**：`cd backend && python -m pytest -q`
 - Source Engine 闭环已完成并可用：导入书源 → 搜索 → 目录 → 正文 → Storage/DB/搜索 →
   网页阅读。当前工作重心是**同步稳定性与线上排错**，不是新增架构能力。
 - **AI 功能已补齐**（第 18 节）：后端配置/上下文/流式/划词/RAG + 前端 AI 设置页与阅读器
@@ -53,6 +53,10 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 - **每书源可配「同步间隔」**（第 21 节）：`sources.sync_interval_seconds`，
   设置 → 书源 → 编辑里填「秒/请求」，不填沿用书源 `concurrentRate`。给搬山人这类有拉取
   间隔限制的站点用。
+- **阅读路径已提速**（第 22 节）：`/books/{id}/sources` 12s → 0.12s（同名书匹配下推到 SQL，
+  同步路径同一个 helper 也一起受益）；章节图片/封面补 `Cache-Control` 与 **304**；
+  阅读器与书详情页的次要请求不再挡在正文前面。详见
+  [reading-performance.md](reading-performance.md)。
 - 线上仍跑着旧镜像；本地改动要 `docker compose build backend crawler` +
   `docker compose up -d backend crawler` 才生效（AI/前端改动还要加 `frontend`）。
 - 待用户处理（代码修不了，属站点侧防护，见第 4 节）：SiS文學網 / 御宅屋 /
@@ -971,4 +975,83 @@ docker logs --tail 5000 novelhub-crawler 2>&1 | grep -E "ERROR|Traceback"
   比较 → **Cookie 被判过期的时刻偏晚 8 小时**；`services/token_service.py`、`api/routes/source_changes.py`、
   `services/account.py` 写的是 UTC（与自身比较一致，但前端显示早 8 小时）。要统一就照
   `core/clock.py` 的说明一次性改完，别只改一半。
+
+---
+
+## 22. 2026-09-18：点开书籍/章节要等很久（`/books/{id}/sources` 12 秒 + 图片零缓存）
+
+**需求**：「点击书籍或者漫画之后，资源要加载很长时间，点击章节后也需要加载很长时间才能加载正文或者图片」。
+
+**排查（只读线上，未改任何线上数据/配置）**：在 NAS 上直接对着 nginx 计时每个阅读路径接口：
+
+```bash
+curl -s -o /dev/null -w '%{http_code} %{time_total}s %{size_download}\n' \
+  -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18088/api/books/<id>/sources
+```
+
+| 接口 | 实测 |
+|---|---|
+| `GET /api/books/{id}` | 0.028s |
+| `GET /api/books/{id}/chapters`（2484 章，675 KB） | 0.13s |
+| **`GET /api/books/{id}/sources`** | **10.31s / 11.18s** |
+| `GET /api/chapters/{id}`（正文） | 0.026s |
+| `GET /api/chapters/{id}/images/{f}`（394 KB webp） | 0.037s |
+| `GET /api/books/home` | 0.86s |
+
+前端两处串行 `await` 正好把慢接口放在正文前面：`ReaderPage.onMounted` 是
+`fetchChapters → loadAlternates(10s) → loadBookmarks → loadChapter`；
+`BookDetailPage.onMounted` 的 `loading=false` 在最后，所以整页都在等它。
+
+**根因 1（性能）**：`list_book_sources` 与 `SyncService._find_same_title_books` 都是**把整库查出来再在
+Python 里比标题**：`select(Book).options(selectinload(Book.author))`，而 `Book.tags` 是
+`lazy="joined"`、`categories`/`custom_tags` 是 selectin，等于对 24k 本书做了全量 eager load。
+后者还在**每本全站书同步结束时**调用（`_handle_global_r18_conflicts`），所以同步也在被它拖慢、
+crawler 长期 100% CPU。
+
+**根因 2（正确性陷阱）**：Python 的 `\s` 匹配 `\xa0`(NBSP)，Postgres 的 `[[:space:]]` 不匹配。
+全库 23,979 条书名里正好 4 条含 NBSP——如果把归一化直接下推到 SQL 而不管这个差异，
+这 4 本书的「其他书源」会静默消失。
+
+**根因 3（图片）**：`starlette.responses.FileResponse` 只处理 `Range`，**不处理 `If-None-Match`**，
+且响应里没有 `Cache-Control`。实测带 `If-None-Match` 命中时仍返回 `200` + 394,658 字节，
+即每次重看一页都在重新下载整张图。线上图片 47,300 张 / 31.5 GB（中位数 408 KB，最大 14.8 MB，
+>1MB 的有 8,465 张共 18.8 GB）。
+
+**改动**：
+
+| 文件 | 改动 |
+|---|---|
+| `backend/app/services/book_title.py`（新） | 归一化模式的**唯一定义**：括号/引号 + 所有非 ASCII 空格逐个列出 + `\s`；`normalize_title()`（Python）与 `normalized_title_sql()`（`regexp_replace(lower(col), :pattern, '', 'g')`，模式走**绑定参数**，避免模式里的引号转义问题） |
+| `backend/app/api/routes/books.py` | `list_book_sources` 把标题匹配推进 SQL（Python 比较保留为最终确认，它只会删行不会多行）；`_normalize_book_title` 改为调用共享的 `normalize_title`；封面改用 `cached_file_response` |
+| `backend/app/services/sync.py` | `_find_same_title_books` 同样推进 SQL；标题归一化为空时直接返回空（不再全表扫描） |
+| `backend/app/api/file_response.py`（新） | `cached_file_response(request, path, max_age=..., immutable=...)`：补 `Cache-Control`，并实现 `If-None-Match`/`If-Modified-Since` → **304**（含 `W/`、逗号列表、`*` 处理）；给 `FileResponse` 传 `stat_result`，构造时就有 etag |
+| `backend/app/api/routes/chapters.py` | 章节图片：`private, max-age=604800, immutable`（文件名是源 URL hash 且从**不覆盖**已有文件）；封面：`max-age=300` + 304（重新同步会覆盖同名封面文件） |
+| `frontend/src/pages/ReaderPage.vue` | `onMounted` / bookId watcher：正文优先，`loadAlternates()`、`loadBookmarks()` 改后台跑 |
+| `frontend/src/pages/BookDetailPage.vue` | 先渲染书籍+章节目录并结束 loading；进度（「继续阅读」目标）、标签、分类、分组、其他书源、书签全部移入后台异步块 |
+| `docs/reading-performance.md`（新） | 阅读路径的请求清单、实测数字、三条「别踩回去」的约束、仍慢的地方（大图） |
+
+**验证**：
+
+- 线上只读复现（用真实 ORM + 真实配置跑新旧两版查询体，`book_title.py` 以独立模块推入容器 `/tmp` 导入，
+  **没有修改容器里的代码、没有重启容器**）：
+  - OLD `12.26s` / `11.64s` → NEW `0.127s` / `0.100s`，候选数量一致。
+  - 全库 23,979 条书名：Python 归一化 vs Postgres 归一化 **0 处不一致**（含那 4 条 NBSP）。
+  - 抽样 60 本来自全部 181 个同名组（365 本有同名伙伴，最大一组 3 本）：
+    **新旧返回的候选集合完全一致，0 处 mismatch**。
+- `cd backend && python -m pytest -q` → **641 passed**（新增 10 项：
+  `test_book_title.py` 4 项含 NBSP/全角/引号/转义与 SQL 渲染；`test_file_response_cache.py`
+  6 项含 etag 命中 304、`W/` 与列表形式、陈旧 etag 仍回 200、`If-Modified-Since`）。
+  另在两处既有测试里加了「语句里必须有 `regexp_replace`」的断言，防止有人改回 Python 全表过滤。
+- 前端 `npm run typecheck`、`npm run build` 通过。
+- 顺带清理：验证用的临时脚本与推入容器 `/tmp` 的文件已删除（容器代码未改）。
+
+**未做/已知**：
+
+- **仍然只改本地代码**。线上生效要 `docker compose build backend frontend` + `up -d`
+  （本次**没有**新迁移，`0034` 是上一轮的）。
+- 大图问题（>5MB 的 571 张）**没解决**：一章 20 张图在中等带宽下就是几十秒，
+  属于上传带宽限制。要做「按需缩放 + 缓存」需要 Pillow 和清晰度取舍，等用户确认。
+- `GET /api/books/home` 0.86s（首页并发聚合多个书源 browse）与章节目录一次返回全部章节
+  （2484 章 675 KB）本次未动。
+
 

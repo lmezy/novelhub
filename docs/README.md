@@ -20,6 +20,7 @@
 | [source-search.md](source-search.md) | 书源搜索 → 入库闭环与 API |
 | [r18-access.md](r18-access.md) | R18 书源标记、书籍分级、可见性规则 |
 | [crawl-queue.md](crawl-queue.md) | 爬取队列：暂停 / 继续 / 取消 / 置顶 |
+| [reading-performance.md](reading-performance.md) | 阅读路径性能：打开书籍/章节慢的原因、图片缓存、别踩回去的坑 |
 
 ## 同步与排错（最常用）
 
@@ -74,6 +75,8 @@
   [ai-assistant.md](ai-assistant.md) “排错” + [codex-handoff.md](codex-handoff.md) 第 19 节
 - 同步失败想让 AI 说明原因 / AI 能不能自动改书源 → [ai-assistant.md](ai-assistant.md)
   “同步报错诊断” + [codex-handoff.md](codex-handoff.md) 第 20 节
+- **点开书籍/漫画要等很久、点进章节正文或图片也要等很久** →
+  [reading-performance.md](reading-performance.md) + [codex-handoff.md](codex-handoff.md) 第 22 节
 - 想连服务器看真实任务与日志 → [codex-handoff.md](codex-handoff.md) 第 1、5 节
 
 ## 文档维护约定

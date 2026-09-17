@@ -1,8 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.file_response import cached_file_response
 from app.core.database import get_db
 from app.models import Book, Chapter, User
 from app.schemas.chapter import ChapterContentOut, ChapterOut
@@ -105,6 +105,7 @@ async def get_chapter_content_chunk(
 async def get_chapter_image(
     chapter_id: str,
     filename: str,
+    request: Request,
     user: User = Depends(get_current_user_media),
     db: AsyncSession = Depends(get_db),
 ):
@@ -118,7 +119,11 @@ async def get_chapter_image(
         path = BookStorage().chapter_image_path(book.id, filename)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Image not found")
-    return FileResponse(path)
+    # One week, immutable: the filename is a hash of the source URL and the
+    # file is never overwritten, so the browser can even skip revalidation.
+    # Without this the reader re-downloaded every image on every visit (up to
+    # 14 MB per file).
+    return cached_file_response(request, path, max_age=604800, immutable=True)
 
 
 @router.post("/chapters/{chapter_id}/sync", dependencies=[Depends(require_admin)])

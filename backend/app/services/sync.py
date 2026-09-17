@@ -35,6 +35,7 @@ from app.services.search import search_service
 from app.services.cookie_crypto import safe_decrypt_cookie
 from app.services.r18 import detect_r18
 from app.services.auto_categorize import classify_category_names
+from app.services.book_title import normalized_title_sql
 from app.services.source_interval import apply_source_interval, source_sync_interval
 from app.services.book_kind import (
     KIND_COMIC,
@@ -473,14 +474,24 @@ class SyncService:
         return cleaned
 
     async def _find_same_title_books(self, book: Book) -> list[Book]:
-        """Find other source books with the same normalized title."""
+        """Find other source books with the same normalized title.
+
+        The title comparison runs in the database: this helper is called at the
+        end of *every* global book sync, and doing the normalisation in Python
+        meant loading the whole ``books`` table (with its eager tag/category
+        loads) each time -- ~10 s per call on a 24k-book library, which also
+        showed up as the crawler pinning a CPU core.
+        """
         normalized = self._normalize_title_for_match(book.title)
+        if not normalized:
+            return []
         rows = await self.db.scalars(
             select(Book)
             .options(selectinload(Book.tags))
             .where(
                 Book.id != book.id,
                 Book.source_id.is_not(None),
+                normalized_title_sql(Book.title) == normalized,
             )
         )
         return [
