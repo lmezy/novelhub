@@ -18,6 +18,12 @@ from app.schemas.admin import (
     UserR18Update,
 )
 from app.services.auth import get_current_user, require_admin, require_super_admin
+from app.services.ai_client import AIError, LLMClient
+from app.services.ai_config import (
+    MASKED_KEY,
+    get_ai_config,
+    set_ai_config,
+)
 from app.services.proxy_config import get_proxy_config, ProxyConfig, set_proxy_config
 from app.services.security import hash_password
 from app.services.settings import (
@@ -276,4 +282,112 @@ async def admin_update_proxy(
     )
     set_proxy_config(cfg)
     return payload
+
+
+# ---------------------------------------------------------------------------
+# AI provider settings
+#
+# Stored in app_settings (see app.services.ai_config) so the model/key can be
+# changed without rebuilding the container.  The API key is encrypted at rest
+# and never returned; the UI only learns whether a key is stored and a masked
+# hint.
+# ---------------------------------------------------------------------------
+
+
+class AIConfigUpdate(BaseModel):
+    enabled: bool | None = None
+    provider: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    model: str | None = None
+    temperature: float | None = None
+    max_tokens: int | None = None
+    timeout: float | None = None
+    use_proxy: bool | None = None
+    proxy_url: str | None = None
+    context_chars: int | None = None
+    rag_enabled: bool | None = None
+    rag_top_k: int | None = None
+    embedding_provider: str | None = None
+    embedding_base_url: str | None = None
+    embedding_api_key: str | None = None
+    embedding_model: str | None = None
+
+
+def _config_payload(payload: BaseModel) -> dict:
+    values = payload.model_dump(exclude_unset=True)
+    # ``None`` means "not sent"; the mask means "unchanged".
+    for key in ("api_key", "embedding_api_key"):
+        if values.get(key) == MASKED_KEY:
+            values.pop(key)
+    return values
+
+
+@router.get("/ai")
+async def admin_get_ai(db: AsyncSession = Depends(get_db),
+                       current_user: User = Depends(require_admin)):
+    """Current AI configuration (never includes the API key)."""
+    cfg = await get_ai_config(db)
+    payload = cfg.public_dict()
+    proxy = get_proxy_config()
+    payload["crawler_proxy"] = {
+        "enabled": proxy.enabled,
+        "url": proxy.https_proxy or proxy.http_proxy or "",
+    }
+    return payload
+
+
+@router.put("/ai")
+async def admin_update_ai(payload: AIConfigUpdate,
+                          db: AsyncSession = Depends(get_db),
+                          current_user: User = Depends(require_admin)):
+    """Update AI settings; empty strings clear a field."""
+    if payload.temperature is not None and not 0 <= payload.temperature <= 2:
+        raise HTTPException(status_code=422, detail="temperature 必须在 0 到 2 之间")
+    if payload.max_tokens is not None and not 1 <= payload.max_tokens <= 100000:
+        raise HTTPException(status_code=422, detail="max_tokens 必须在 1 到 100000 之间")
+    if payload.timeout is not None and not 5 <= payload.timeout <= 900:
+        raise HTTPException(status_code=422, detail="timeout 必须在 5 到 900 秒之间")
+    if payload.rag_top_k is not None and not 1 <= payload.rag_top_k <= 20:
+        raise HTTPException(status_code=422, detail="rag_top_k 必须在 1 到 20 之间")
+    if payload.context_chars is not None and not 2000 <= payload.context_chars <= 200000:
+        raise HTTPException(status_code=422, detail="context_chars 必须在 2000 到 200000 之间")
+
+    cfg = await set_ai_config(db, _config_payload(payload))
+    return cfg.public_dict()
+
+
+@router.post("/ai/test")
+async def admin_test_ai(test_embeddings: bool = True,
+                        db: AsyncSession = Depends(get_db),
+                        current_user: User = Depends(require_admin)):
+    """Round-trip a tiny completion (and an embedding) through the provider."""
+    cfg = await get_ai_config(db)
+    client = LLMClient(cfg)
+    results: dict = {}
+    try:
+        results["chat"] = await client.test_connection()
+    except AIError as exc:
+        results["chat"] = {"ok": False, "error": str(exc), "status": exc.status}
+    except Exception as exc:  # pragma: no cover - defensive
+        results["chat"] = {"ok": False, "error": str(exc) or type(exc).__name__}
+
+    if test_embeddings:
+        if not cfg.embeddings_supported:
+            results["embeddings"] = {
+                "ok": False,
+                "error": "当前配置没有可用的 Embedding 服务/模型（RAG 语义检索会不可用）。",
+            }
+        else:
+            try:
+                results["embeddings"] = await client.test_embeddings()
+            except AIError as exc:
+                results["embeddings"] = {"ok": False, "error": str(exc)}
+            except Exception as exc:  # pragma: no cover - defensive
+                results["embeddings"] = {"ok": False, "error": str(exc) or type(exc).__name__}
+
+    results["ok"] = bool(results.get("chat", {}).get("ok"))
+    if "embeddings" in results:
+        results["ok"] = results["ok"] and bool(results["embeddings"].get("ok"))
+    return results
 

@@ -14,6 +14,10 @@ PostgreSQL、Storage 抽象、Meilisearch、Celery 定时任务、插件框架�
 以及 **Source Engine（书源规则引擎）**。当前阶段是**验收、调试、稳定性修复**，
 不是新建架构。
 
+AI 消费端已补齐（配置在 `app_settings.ai_*`，服务在 `backend/app/services/ai_config.py`、
+`ai_client.py`、`ai.py`、`rag.py`，界面在 **设置 → AI** 与阅读器侧栏），
+使用与排错见 [ai-assistant.md](ai-assistant.md)。
+
 ## 2. 架构与模块职责
 
 ```

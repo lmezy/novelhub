@@ -6,6 +6,7 @@ import { useAuthStore } from "../stores/auth"
 import { useI18nStore } from "../stores/i18n"
 import { api } from "../api/client"
 import AIChat from "../components/AIChat.vue"
+import AISelectionToolbar from "../components/AISelectionToolbar.vue"
 import {
   DEFAULT_TAP_ACTIONS,
   TAP_ACTIONS,
@@ -42,6 +43,24 @@ const showFontMenu = ref(false)
 const isDark = ref(localStorage.getItem("novelhub_dark") === "true")
 const showToc = ref(false)
 const showAI = ref(false)
+// Text container the selected-passage AI toolbar attaches to (desktop article
+// or the mobile scroll article; the paged mobile layout is column-based).
+const desktopTextRef = ref<HTMLElement | null>(null)
+const mobileTextRef = ref<HTMLElement | null>(null)
+const aiChatRef = ref<InstanceType<typeof AIChat> | null>(null)
+const aiSelectionContainer = computed(() =>
+  isMobileLayout.value ? mobileTextRef.value : desktopTextRef.value,
+)
+
+function askAIAbout(text: string) {
+  if (!text) return
+  showAI.value = true
+  nextTick(() => aiChatRef.value?.ask(text))
+}
+
+function openAISettings() {
+  router.push({ path: "/admin", query: { tab: "ai" } })
+}
 const chapterSyncing = ref(false)
 const alternates = ref<any[]>([])
 const showSourceMenu = ref(false)
@@ -924,7 +943,7 @@ onUnmounted(() => {
           @click="handleTap"
           @load.capture="onMobileScrollContentLoad"
         >
-          <article class="scroll-page-content" :style="readerFontStyle">
+          <article ref="mobileTextRef" class="scroll-page-content" :style="readerFontStyle">
             <h1 class="page-title">
               {{ chapter.title || i18n.t('reader_chapter_fallback', { n: chapter.chapter_number }) }}
             </h1>
@@ -1209,6 +1228,7 @@ onUnmounted(() => {
 
         <article
           v-else-if="chapter"
+          ref="desktopTextRef"
           class="reader-content prose"
           :class="{ 'hide-content-images': !showContentImages }"
           :style="readerFontStyle"
@@ -1311,7 +1331,7 @@ onUnmounted(() => {
         @click.self="showAI = false"
       >
         <div
-          class="w-80 max-w-[92vw] h-full shadow-xl flex flex-col"
+          class="w-96 max-w-[92vw] h-full shadow-xl flex flex-col"
           :class="isDark ? 'bg-gray-900' : 'bg-surface'"
         >
           <div class="flex items-center justify-between px-4 py-2 border-b" :class="isDark ? 'border-gray-800' : 'border-border'">
@@ -1319,12 +1339,24 @@ onUnmounted(() => {
             <button @click="showAI = false" class="text-muted text-lg">&times;</button>
           </div>
           <div class="flex-1 overflow-hidden">
-            <AIChat :bookId="bookId" />
+            <AIChat
+              ref="aiChatRef"
+              :bookId="bookId"
+              :chapter-number="chapter?.chapter_number ?? null"
+              @open-settings="openAISettings"
+            />
           </div>
         </div>
         <div class="flex-1" @click="showAI = false" />
       </div>
     </Teleport>
+
+    <AISelectionToolbar
+      :book-id="bookId"
+      :chapter-number="chapter?.chapter_number ?? null"
+      :container="aiSelectionContainer"
+      @ask="askAIAbout"
+    />
   </div>
 </template>
 

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue"
-import { useRouter } from "vue-router"
+import { useRoute, useRouter } from "vue-router"
 import { api } from "../api/client"
 import { useI18nStore } from "../stores/i18n"
 import { useCrawlStore } from "../stores/crawl"
@@ -17,6 +17,7 @@ const i18n = useI18nStore()
 const crawlStore = useCrawlStore()
 const auth = useAuthStore()
 const router = useRouter()
+const route = useRoute()
 
 interface Source {
   id: string
@@ -39,7 +40,7 @@ interface CookieItem {
   expired_at: string | null
 }
 
-const tab = ref<"sources" | "cookies" | "sync" | "logs" | "tokens" | "index" | "status" | "yuedu" | "add" | "creds" | "users" | "approvals" | "proxy" | "prefs">("yuedu")
+const tab = ref<"sources" | "cookies" | "sync" | "logs" | "tokens" | "index" | "status" | "yuedu" | "add" | "creds" | "users" | "approvals" | "proxy" | "ai" | "prefs">("yuedu")
 
 const availableTabs = computed(() => {
   const common = ["yuedu", "sources", "sync", "logs", "tokens", "prefs"] as const
@@ -52,6 +53,7 @@ const availableTabs = computed(() => {
     "index",
     "status",
     "proxy",
+    "ai",
   ] as const
 })
 
@@ -546,6 +548,138 @@ async function saveProxyConfig() {
     alert(e instanceof Error ? e.message : i18n.t('admin_proxy_save_failed'))
   } finally {
     proxySaving.value = false
+  }
+}
+
+// ---------------------------------------------------------------------------
+// AI provider settings + RAG index maintenance
+// ---------------------------------------------------------------------------
+const aiConfig = ref<any>(null)
+const aiForm = ref<Record<string, any>>({})
+const aiLoading = ref(false)
+const aiSaving = ref(false)
+const aiError = ref("")
+const aiSaved = ref(false)
+const aiTesting = ref(false)
+const aiTestResult = ref<any>(null)
+const aiApiKeyInput = ref("")
+const aiEmbeddingKeyInput = ref("")
+
+const aiIndexBookId = ref("")
+const aiIndexBusy = ref(false)
+const aiIndexError = ref("")
+const aiIndexResult = ref<any>(null)
+const aiIndexedBooks = ref<any[]>([])
+const aiIndexedLoading = ref(false)
+
+async function loadAIConfig() {
+  aiLoading.value = true
+  aiError.value = ""
+  try {
+    const res = await api.get<any>("/admin/ai")
+    aiConfig.value = res
+    aiForm.value = {
+      enabled: res.enabled,
+      provider: res.provider,
+      base_url: res.base_url || "",
+      model: res.model || "",
+      temperature: res.temperature,
+      max_tokens: res.max_tokens,
+      timeout: res.timeout,
+      use_proxy: res.use_proxy,
+      proxy_url: res.proxy_url || "",
+      context_chars: res.context_chars,
+      rag_enabled: res.rag_enabled,
+      rag_top_k: res.rag_top_k,
+      embedding_provider: res.embedding_provider || "",
+      embedding_base_url: res.embedding_base_url || "",
+      embedding_model: res.embedding_model || "",
+    }
+    aiApiKeyInput.value = ""
+    aiEmbeddingKeyInput.value = ""
+  } catch (e) {
+    aiError.value = e instanceof Error ? e.message : i18n.t('admin_failed')
+  } finally {
+    aiLoading.value = false
+  }
+}
+
+function applyProviderPreset(name: string) {
+  const preset = (aiConfig.value?.providers || []).find((p: any) => p.value === name)
+  if (!preset) return
+  aiForm.value.base_url = preset.base_url || ""
+  aiForm.value.model = preset.model || ""
+  aiForm.value.embedding_model = ""
+}
+
+async function saveAIConfig() {
+  aiSaving.value = true
+  aiError.value = ""
+  aiSaved.value = false
+  try {
+    const body: any = { ...aiForm.value }
+    if (aiApiKeyInput.value) body.api_key = aiApiKeyInput.value
+    if (aiEmbeddingKeyInput.value) body.embedding_api_key = aiEmbeddingKeyInput.value
+    const res = await api.put<any>("/admin/ai", body)
+    aiConfig.value = { ...aiConfig.value, ...res }
+    aiApiKeyInput.value = ""
+    aiEmbeddingKeyInput.value = ""
+    aiSaved.value = true
+    window.setTimeout(() => (aiSaved.value = false), 2000)
+  } catch (e) {
+    aiError.value = e instanceof Error ? e.message : i18n.t('admin_ai_save_failed')
+  } finally {
+    aiSaving.value = false
+  }
+}
+
+async function testAIConfig() {
+  aiTesting.value = true
+  aiTestResult.value = null
+  aiError.value = ""
+  try {
+    aiTestResult.value = await api.post<any>("/admin/ai/test", {})
+  } catch (e) {
+    aiError.value = e instanceof Error ? e.message : i18n.t('admin_ai_test_failed')
+  } finally {
+    aiTesting.value = false
+  }
+}
+
+async function loadIndexedBooks() {
+  aiIndexedLoading.value = true
+  try {
+    aiIndexedBooks.value = await api.get<any[]>("/rag/index?limit=50")
+  } catch {
+    aiIndexedBooks.value = []
+  } finally {
+    aiIndexedLoading.value = false
+  }
+}
+
+async function indexBookForRAG() {
+  const id = aiIndexBookId.value.trim()
+  if (!id) return
+  aiIndexBusy.value = true
+  aiIndexError.value = ""
+  aiIndexResult.value = null
+  try {
+    aiIndexResult.value = await api.post<any>("/rag/index/" + encodeURIComponent(id))
+    await loadIndexedBooks()
+  } catch (e) {
+    aiIndexError.value = e instanceof Error ? e.message : i18n.t('admin_ai_index_failed')
+  } finally {
+    aiIndexBusy.value = false
+  }
+}
+
+async function deleteRAGIndex(bookId: string) {
+  if (!confirm(i18n.t('admin_ai_index_delete_confirm'))) return
+  try {
+    await api.delete("/rag/index/" + encodeURIComponent(bookId))
+    await loadIndexedBooks()
+  } catch (e) {
+    aiIndexError.value = e instanceof Error ? e.message : i18n.t('admin_ai_index_failed')
   }
 }
 
@@ -1338,6 +1472,12 @@ async function reviewChange(id: string, action: string) {
 }
 
 onMounted(async () => {
+  // Deep link: the reader's "open AI settings" button navigates to
+  // /admin?tab=ai so the user lands on the right panel.
+  const requested = route.query.tab
+  if (typeof requested === "string" && (availableTabs.value as readonly string[]).includes(requested)) {
+    tab.value = requested as typeof tab.value
+  }
   await loadSources()
   await loadPrefs()
   accountForm.value.nickname = auth.user?.nickname || ""
@@ -1351,6 +1491,8 @@ onMounted(async () => {
     await loadApprovals()
     await loadLocalRoots()
     loadProxyConfig()
+    await loadAIConfig()
+    await loadIndexedBooks()
   }
   await loadTokens()
   await loadLogs()
@@ -2488,6 +2630,225 @@ onUnmounted(() => {
           <button @click="saveProxyConfig" :disabled="proxySaving" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">
             {{ proxySaving ? i18n.t('admin_saving') : i18n.t('admin_save') }}
           </button>
+        </div>
+      </section>
+
+      <section v-if="tab === 'ai'" class="space-y-6">
+        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
+          <div class="flex items-center justify-between mb-1">
+            <h2 class="text-sm font-semibold">{{ i18n.t('admin_ai_title') }}</h2>
+            <span
+              class="text-[11px] px-2 py-0.5 rounded"
+              :class="aiConfig?.configured
+                ? 'bg-green-500/10 text-green-600 dark:text-green-400'
+                : 'bg-amber-500/10 text-amber-600 dark:text-amber-400'"
+            >{{ aiConfig?.configured ? i18n.t('admin_ai_ready') : i18n.t('admin_ai_not_ready') }}</span>
+          </div>
+          <p class="text-xs text-muted dark:text-gray-400 mb-4">{{ i18n.t('admin_ai_hint') }}</p>
+
+          <p v-if="aiLoading" class="text-xs text-muted">{{ i18n.t('admin_loading') }}</p>
+          <p v-if="aiError" class="text-xs text-red-500 mb-3 break-words">{{ aiError }}</p>
+
+          <template v-if="!aiLoading && aiConfig">
+            <div class="flex items-center justify-between mb-4">
+              <span class="text-sm">{{ i18n.t('admin_ai_enable') }}</span>
+              <button @click="aiForm.enabled = !aiForm.enabled" :class="aiForm.enabled ? 'bg-green-500' : 'bg-gray-300 dark:bg-gray-600'" class="relative w-11 h-6 rounded-full transition-colors duration-200">
+                <span :class="aiForm.enabled ? 'translate-x-5' : 'translate-x-0.5'" class="absolute top-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform duration-200"></span>
+              </button>
+            </div>
+
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+              <label class="block">
+                <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_provider') }}</span>
+                <select
+                  v-model="aiForm.provider"
+                  @change="applyProviderPreset(aiForm.provider)"
+                  class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
+                >
+                  <option v-for="p in aiConfig.providers" :key="p.value" :value="p.value">{{ p.label }}</option>
+                </select>
+              </label>
+              <label class="block">
+                <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_model') }}</span>
+                <input v-model="aiForm.model" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+              </label>
+            </div>
+
+            <div class="mb-3">
+              <label class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_base_url') }}</label>
+              <input v-model="aiForm.base_url" :placeholder="aiConfig.effective_base_url" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+              <span class="block text-[11px] text-muted mt-1">{{ i18n.t('admin_ai_base_url_hint') }}</span>
+            </div>
+
+            <div class="mb-3">
+              <label class="block text-xs text-muted dark:text-gray-400 mb-1">
+                {{ i18n.t('admin_ai_api_key') }}
+                <span v-if="aiConfig.api_key_hint" class="text-green-600 dark:text-green-400">
+                  {{ i18n.t('admin_ai_key_saved', { hint: aiConfig.api_key_hint }) }}
+                </span>
+              </label>
+              <input
+                v-model="aiApiKeyInput"
+                type="password"
+                autocomplete="new-password"
+                :placeholder="aiConfig.api_key_set ? i18n.t('admin_ai_key_keep') : 'sk-...'"
+                class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
+              />
+              <span class="block text-[11px] text-muted mt-1">{{ i18n.t('admin_ai_key_hint') }}</span>
+            </div>
+
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3">
+              <label class="block">
+                <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_temperature') }}</span>
+                <input v-model.number="aiForm.temperature" type="number" step="0.1" min="0" max="2" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+              </label>
+              <label class="block">
+                <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_max_tokens') }}</span>
+                <input v-model.number="aiForm.max_tokens" type="number" min="1" max="100000" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+              </label>
+              <label class="block">
+                <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_timeout') }}</span>
+                <input v-model.number="aiForm.timeout" type="number" min="5" max="900" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+              </label>
+              <label class="block">
+                <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_context_chars') }}</span>
+                <input v-model.number="aiForm.context_chars" type="number" min="2000" max="200000" step="1000" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+              </label>
+            </div>
+
+            <div class="flex items-center justify-between mb-3 p-3 rounded border border-border dark:border-gray-700">
+              <div>
+                <span class="text-sm block">{{ i18n.t('admin_ai_use_proxy') }}</span>
+                <span class="text-[11px] text-muted dark:text-gray-400">
+                  {{ i18n.t('admin_ai_use_proxy_hint') }}
+                  <template v-if="aiConfig.crawler_proxy?.url">{{ i18n.t('admin_ai_proxy_available', { url: aiConfig.crawler_proxy.url }) }}</template>
+                </span>
+              </div>
+              <button @click="aiForm.use_proxy = !aiForm.use_proxy" :class="aiForm.use_proxy ? 'bg-green-500' : 'bg-gray-300 dark:bg-gray-600'" class="relative w-11 h-6 rounded-full transition-colors duration-200 shrink-0">
+                <span :class="aiForm.use_proxy ? 'translate-x-5' : 'translate-x-0.5'" class="absolute top-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform duration-200"></span>
+              </button>
+            </div>
+            <div v-if="aiForm.use_proxy" class="mb-3">
+              <label class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_proxy_url') }}</label>
+              <input v-model="aiForm.proxy_url" :placeholder="aiConfig.crawler_proxy?.url || 'http://127.0.0.1:7890'" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            </div>
+
+            <div class="flex flex-wrap gap-2 items-center">
+              <button @click="saveAIConfig" :disabled="aiSaving" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">
+                {{ aiSaving ? i18n.t('admin_saving') : i18n.t('admin_save') }}
+              </button>
+              <button @click="testAIConfig" :disabled="aiTesting" class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm hover:bg-accent/10 disabled:opacity-50">
+                {{ aiTesting ? i18n.t('admin_ai_testing') : i18n.t('admin_ai_test') }}
+              </button>
+              <span v-if="aiSaved" class="text-xs text-green-600 dark:text-green-400">{{ i18n.t('admin_ai_saved') }}</span>
+            </div>
+
+            <div v-if="aiTestResult" class="mt-4 space-y-2 text-xs">
+              <div class="p-3 rounded border" :class="aiTestResult.chat?.ok ? 'border-green-500/40 bg-green-500/5' : 'border-red-500/40 bg-red-500/5'">
+                <p class="font-medium mb-1">{{ i18n.t('admin_ai_test_chat') }}</p>
+                <p v-if="aiTestResult.chat?.ok" class="text-muted dark:text-gray-400 break-words">
+                  {{ i18n.t('admin_ai_test_ok', {
+                    model: aiTestResult.chat.model,
+                    ms: aiTestResult.chat.latency_ms,
+                  }) }}
+                  <br />{{ i18n.t('admin_ai_test_endpoint', { url: aiTestResult.chat.endpoint }) }}
+                  <span v-if="aiTestResult.chat.proxy"><br />{{ i18n.t('admin_ai_test_proxy', { url: aiTestResult.chat.proxy }) }}</span>
+                  <span v-else><br />{{ i18n.t('admin_ai_test_direct') }}</span>
+                </p>
+                <p v-else class="text-red-500 break-words">{{ aiTestResult.chat?.error }}</p>
+              </div>
+              <div v-if="aiTestResult.embeddings" class="p-3 rounded border" :class="aiTestResult.embeddings.ok ? 'border-green-500/40 bg-green-500/5' : 'border-amber-500/40 bg-amber-500/5'">
+                <p class="font-medium mb-1">{{ i18n.t('admin_ai_test_embeddings') }}</p>
+                <p v-if="aiTestResult.embeddings.ok" class="text-muted dark:text-gray-400 break-words">
+                  {{ i18n.t('admin_ai_test_embedding_ok', {
+                    model: aiTestResult.embeddings.model,
+                    dim: aiTestResult.embeddings.dimension,
+                  }) }}
+                </p>
+                <p v-else class="text-amber-600 dark:text-amber-400 break-words">{{ aiTestResult.embeddings.error }}</p>
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
+          <h2 class="text-sm font-semibold mb-1">{{ i18n.t('admin_ai_embedding_title') }}</h2>
+          <p class="text-xs text-muted dark:text-gray-400 mb-4">{{ i18n.t('admin_ai_embedding_hint') }}</p>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+            <label class="block">
+              <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_embedding_provider') }}</span>
+              <select v-model="aiForm.embedding_provider" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800">
+                <option value="">{{ i18n.t('admin_ai_embedding_same') }}</option>
+                <option v-for="p in (aiConfig?.providers || []).filter((p: any) => p.embeddings)" :key="p.value" :value="p.value">{{ p.label }}</option>
+              </select>
+            </label>
+            <label class="block">
+              <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_embedding_model') }}</span>
+              <input v-model="aiForm.embedding_model" :placeholder="aiConfig?.effective_embedding_model" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            </label>
+          </div>
+          <div class="mb-3">
+            <label class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_embedding_base_url') }}</label>
+            <input v-model="aiForm.embedding_base_url" :placeholder="aiConfig?.effective_embedding_base_url" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+          </div>
+          <div class="mb-3">
+            <label class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_embedding_key') }}</label>
+            <input v-model="aiEmbeddingKeyInput" type="password" autocomplete="new-password" :placeholder="aiConfig?.embedding_api_key_set ? i18n.t('admin_ai_key_keep') : i18n.t('admin_ai_embedding_key_same')" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+          </div>
+
+          <div class="flex items-center justify-between mb-3">
+            <div>
+              <span class="text-sm block">{{ i18n.t('admin_ai_rag_enable') }}</span>
+              <span class="text-[11px] text-muted dark:text-gray-400">{{ i18n.t('admin_ai_rag_hint') }}</span>
+            </div>
+            <button @click="aiForm.rag_enabled = !aiForm.rag_enabled" :class="aiForm.rag_enabled ? 'bg-green-500' : 'bg-gray-300 dark:bg-gray-600'" class="relative w-11 h-6 rounded-full transition-colors duration-200 shrink-0">
+              <span :class="aiForm.rag_enabled ? 'translate-x-5' : 'translate-x-0.5'" class="absolute top-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform duration-200"></span>
+            </button>
+          </div>
+          <div class="mb-3 max-w-[10rem]">
+            <label class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_rag_top_k') }}</label>
+            <input v-model.number="aiForm.rag_top_k" type="number" min="1" max="20" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+          </div>
+
+          <button @click="saveAIConfig" :disabled="aiSaving" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">
+            {{ aiSaving ? i18n.t('admin_saving') : i18n.t('admin_save') }}
+          </button>
+        </div>
+
+        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
+          <h2 class="text-sm font-semibold mb-1">{{ i18n.t('admin_ai_index_title') }}</h2>
+          <p class="text-xs text-muted dark:text-gray-400 mb-4">{{ i18n.t('admin_ai_index_hint') }}</p>
+
+          <div class="flex gap-2 mb-3">
+            <input v-model="aiIndexBookId" :placeholder="i18n.t('admin_ai_index_placeholder')" class="flex-1 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            <button @click="indexBookForRAG" :disabled="aiIndexBusy || !aiIndexBookId.trim()" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50 shrink-0">
+              {{ aiIndexBusy ? i18n.t('admin_ai_index_running') : i18n.t('admin_ai_index_run') }}
+            </button>
+          </div>
+          <p v-if="aiIndexError" class="text-xs text-red-500 mb-3 break-words">{{ aiIndexError }}</p>
+          <p v-if="aiIndexResult" class="text-xs text-muted dark:text-gray-400 mb-3">
+            {{ i18n.t('admin_ai_index_done', {
+              chapters: aiIndexResult.indexed_chapters ?? aiIndexResult.chapters ?? 0,
+              chunks: aiIndexResult.chunks ?? 0,
+              model: aiIndexResult.model || '',
+            }) }}
+            <span v-if="aiIndexResult.skipped">{{ i18n.t('admin_ai_index_skipped') }}</span>
+          </p>
+
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_ai_index_list') }}</span>
+            <button @click="loadIndexedBooks" class="text-[11px] text-accent hover:opacity-70">{{ i18n.t('admin_ai_index_refresh') }}</button>
+          </div>
+          <p v-if="aiIndexedLoading" class="text-xs text-muted">{{ i18n.t('admin_loading') }}</p>
+          <p v-else-if="!aiIndexedBooks.length" class="text-xs text-muted">{{ i18n.t('admin_ai_index_empty') }}</p>
+          <div v-else class="space-y-1.5 max-h-64 overflow-y-auto">
+            <div v-for="entry in aiIndexedBooks" :key="entry.book_id" class="flex items-center gap-3 text-xs p-2 rounded border border-border dark:border-gray-700">
+              <span class="flex-1 truncate">{{ entry.title || entry.book_id }}</span>
+              <span class="text-muted shrink-0">{{ i18n.t('admin_ai_index_entry', { chunks: entry.chunks, chapters: entry.chapters }) }}</span>
+              <button @click="deleteRAGIndex(entry.book_id)" class="text-red-400 hover:text-red-600 shrink-0">{{ i18n.t('admin_ai_index_delete') }}</button>
+            </div>
+          </div>
         </div>
       </section>
     </main>

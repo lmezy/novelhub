@@ -41,15 +41,17 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 
 ---
 
-## 2. 当前状态（2026-09-12）
+## 2. 当前状态（2026-09-17）
 
-- 后端全量测试 **467 passed**：`cd backend && python -m pytest -q`
+- 后端全量测试 **560 passed**：`cd backend && python -m pytest -q`
 - Source Engine 闭环已完成并可用：导入书源 → 搜索 → 目录 → 正文 → Storage/DB/搜索 →
   网页阅读。当前工作重心是**同步稳定性与线上排错**，不是新增架构能力。
+- **AI 功能已补齐**（第 18 节）：后端配置/上下文/流式/划词/RAG + 前端 AI 设置页与阅读器
+  AI 面板。使用说明见 [ai-assistant.md](ai-assistant.md)。
 - 并发模型：**一个书源一个 worker**（`SYNC_WORKER_CONCURRENCY=0` 默认不限），书源之间
   不再排队；同一书源同时只跑一个任务。
 - 线上仍跑着旧镜像；本地改动要 `docker compose build backend crawler` +
-  `docker compose up -d backend crawler` 才生效。
+  `docker compose up -d backend crawler` 才生效（AI 还涉及 `frontend`）。
 - 待用户处理（代码修不了，属站点侧防护，见第 4 节）：SiS文學網 / 御宅屋 /
   第一版主（Cloudflare 挑战）、菠萝猫（GoEdge 验证码）、搬山人（浏览器也被挑战）
   需浏览器过验证后导入 Cookie；UAA 书源依赖完整 Legado JS 运行时，建议换源。
@@ -101,6 +103,10 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 | 日志刷 `Failed to fetch content image …`（ClosedResourceError / ConnectError / 404） | 图片下载不重试 anyio 流错误、代理失败后只试直连、`404` 也重试 3 次 | 见第 15 节 |
 | 日志刷 `Future exception was never retrieved` / `Task exception was never retrieved` | cookie 健康检查的 `asyncio.wait_for` 超时把进行中的 `page.goto` 取消掉，Playwright 自己的导航 future 没人读 | 见第 17 节 |
 | 没配 Cookie 的书源被报「书源已配置 Cookie 但仍被站点拦截」 | `_captcha_hint` 读的 `_cookie` 混进了站点自己 `Set-Cookie` 的会话 cookie（御宅屋的 `fontsize`） | 见第 17 节 |
+| AI 每次调用都慢 2 秒多 | `httpx.AsyncClient()` 每次重建 TLS 上下文，解析 certifi 证书包（本机 2.45s）；`LLMClient` 每次请求都新建客户端 | 见第 18 节（`ai_client.default_ssl_context()` 模块级缓存） |
+| `claude` provider 永远 401/404 | 用 OpenAI 的 `/chat/completions` + `Bearer` 调 Anthropic | 见第 18 节（`/v1/messages` + `x-api-key`） |
+| AI 回答总是从第 1 章说起 / 摘要只覆盖前 30 章 | 上下文固定取「书的前 N 章」，与阅读位置无关 | 见第 18 节（`AIService.build_context`） |
+| 阅读器 AI 回答半天不出字 | nginx 默认 `proxy_buffering`，SSE 被整体缓冲 | 见第 18 节（响应头 + nginx `proxy_buffering off`） |
 
 ---
 
@@ -122,6 +128,11 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
    线上镜像不会自动跟随本地代码。
 4. **失效书籍**：源站已删除的书（如爱丽丝书屋 54334）重试也无法修好，只会在
    `crawl_tasks.error` 里给出明确原因；需要时在管理端删除该书。
+5. **AI 配置**：线上 backend 目前没有任何 AI 配置（连 `AI_*` 环境变量都没有）。
+   部署第 18 节的改动后，用管理员账号进入 **设置 → AI** 填服务地址、模型与 API Key，
+   点「测试连接」确认；国内直连 OpenAI/Anthropic 需要打开「使用代理」
+   （留空即复用设置 → 代理里的 mihomo 地址）。RAG 还需要单独配一个向量服务。
+   详见 [ai-assistant.md](ai-assistant.md)。
 
 ---
 
@@ -721,3 +732,73 @@ Playwright `Page.goto` 超时都属站点/代理侧，代码按设计重试；�
 与 Playwright 都能拿到 14KB 正常页面（标题 `【无限道淫棍路】（25-26）_万淫之首…`），当时是连续同步
 两天的站点侧限速，代码按设计中止任务。本节只保证「超时/取消不再产生无意义的 ERROR」和「拦截文案
 不再指向错误的排查方向」。改动要 `docker compose build backend crawler` + `up -d` 后才在线上生效。
+
+## 18. 2026-09-17：AI 功能补齐（配置、上下文、流式、划词、RAG）
+
+**背景**：项目一直「预留了 ai 接口」但从未真正可用。线上 `novelhub-backend` 容器里
+**没有任何 `AI_*` 环境变量**；前端只有阅读器侧栏一个纯聊天面板，`summary/person/timeline/rag`
+接口完全没有 UI 入口。
+
+**根因**（读代码得出，未改线上）：
+
+1. 配置只有环境变量，改模型/换 Key 都要重建容器；`RAGService` 还**硬编码** `AI_BASE_URL`
+   默认 `https://api.openai.com/v1`，非 OpenAI 的 provider 会把文本 POST 到 OpenAI。
+2. `claude` provider 用 OpenAI 的 `/chat/completions` + `Authorization: Bearer` 发请求，
+   Anthropic 是 `/v1/messages` + `x-api-key`，**这条分支从来不可能成功**。
+3. 上下文永远取「书的前 N 章」（`context_chapters=5` 就是第 1-5 章），跟读者当前读到哪章无关；
+   `tokens_used`、`chapters_covered` 恒为 0 占位值；摘要只读前 30 章就截断。
+4. AI 请求**完全不使用项目已有的代理配置**（`proxy_config.json` → mihomo），国内网络下
+   OpenAI/Anthropic 必然连不上，而报错是一句 `str(exc)`。
+5. 人物/时间线的 `json.loads` 一旦失败（模型习惯加 ```` ```json ```` 围栏）就丢掉整个回答，
+   只留下一行 `Parsing failed`。
+6. `httpx.AsyncClient()` **每次请求重建 TLS 上下文**：本机实测 2.45s/次
+   （`ssl.create_default_context()` 只有 16ms，开销在解析 certifi 证书包）。
+7. SSE 没有任何网关侧准备：nginx 默认会 `proxy_buffering`，整段回答会被缓冲到结束才吐给浏览器。
+
+**改动**：
+
+| 文件 | 改动 |
+|---|---|
+| `backend/app/services/ai_config.py`（新） | DB 级 AI 配置（`app_settings.ai_*`）+ 10 个 provider 预设（kind/默认 base_url/模型/向量模型/是否需要 Key）；`resolve_ai_config()` 纯函数（stored 覆盖 env）；API Key 用 `enc:` 前缀 AES-GCM 加密入库，回给前端只有掩码；`FIELD_TO_KEY` 让调用方用字段名、存储用 `ai_*` |
+| `backend/app/services/ai_client.py`（新） | `LLMClient`：OpenAI 兼容 + Anthropic 两套协议（endpoint 归一化、system 提取、同角色消息合并）、429/5xx 退避重试、流式（OpenAI `data:` 帧 / Anthropic `content_block_delta`）、embedding 分批、`AIError` 把 401/404/429/超时/连接失败翻译成可执行的排查提示；代理走 `proxy_config`；**TLS 上下文模块级缓存** |
+| `backend/app/services/ai.py`（重写） | `AIService` 配置改为 DB 读取；上下文按**阅读位置**取窗口（`build_context`，无位置时回退书首并说明）；RAG 命中优先并带章节出处；摘要改 **map-reduce**（分批 map + 合并 reduce，超上限等距抽样）；人物/时间线**等距抽样整本书** + `parse_json_list` 容忍围栏/散文；`transform` / `stream_transform` 支持划词 5 种操作；真实 token 统计 |
+| `backend/app/services/rag.py`（重写） | 向量化改走 `LLMClient`（同一 provider/代理/Key 体系，可与对话模型不同）；**先查库再决定是否向量化**（未建索引的书不再白花一次 embedding 调用）；`index_status` / `list_indexed_books` / 分批 flush / `force` 与 `max_chunks`；检索用 numpy 矩阵（保留纯 Python 兜底） |
+| `backend/app/api/routes/ai.py` | 新增 `GET /ai/status`、`POST /ai/chat/stream`、`POST /ai/transform`、`POST /ai/transform/stream`；`chat` 支持 `chapter_number`/`mode`/`history`；`summary` 支持 `max_chapters`/`style`；SSE 响应带 `X-Accel-Buffering: no` |
+| `backend/app/api/routes/rag.py` | 新增 `GET /rag/status/{id}`、`GET /rag/index`（已索引书籍）；`POST /rag/index/{id}` 支持 `force`/章节范围/`max_chunks` |
+| `backend/app/api/routes/admin.py` | 新增 `GET/PUT /admin/ai`（校验数值范围、掩码表示不修改 Key）与 `POST /admin/ai/test`（对话 + 向量双探测） |
+| `frontend/src/api/stream.ts`（新） | `fetch` + 手写 SSE 帧解析（`EventSource` 不能带 Authorization 和 JSON body） |
+| `frontend/src/components/AIChat.vue`（重写） | 四个标签页（问答/摘要/人物/时间线）、流式输出与停止、章节出处标签、上下文来源说明、未配置时给原因和「去设置 AI」按钮 |
+| `frontend/src/components/AISelectionToolbar.vue`（新） | 划词浮层工具条（解释/翻译/润色/续写/问 AI）+ 流式结果卡片 + 复制 + 翻译目标语言切换并重新生成 |
+| `frontend/src/pages/ReaderPage.vue` | 接入划词组件（桌面正文 / 手机滚动正文容器）、AI 侧栏传当前章节、`问 AI` 预填提问、点设置跳 `/admin?tab=ai`；侧栏宽度 80→96 |
+| `frontend/src/pages/AdminPage.vue` | 新增 **AI** 标签页：provider 预设联动、Key 掩码状态、代理开关（默认复用爬虫代理）、温度/token/超时/上下文上限、向量服务独立配置、**测试连接**结果卡片、RAG 索引管理与已索引列表；支持 `?tab=ai` 深链 |
+| `frontend/src/stores/i18n.ts` | 新增 60+ 中英词条（`ai_*` / `admin_ai_*` / `admin_tab_ai`） |
+| `nginx/default.conf`、`nginx/nginx.conf` | `/api` 增加 `proxy_buffering off` + `proxy_cache off`（并给 `nginx.conf` 补 3600s 读写超时），否则 SSE 会被整体缓冲 |
+
+**验证**：
+
+- `cd backend && python -m pytest -q` → **560 passed**（新增 72 项）。
+  - `tests/test_ai_service.py`：配置解析（env 兜底/stored 覆盖/无 Key 的本地 provider/掩码回显/
+    加密往返）、OpenAI 与 Anthropic 请求体、401/5xx/代理错误的文案、SSE 解析（两套协议）、
+    embedding 分批与顺序、窗口上下文落在当前章附近、history 截断、摘要 map-reduce 与抽样、
+    JSON 围栏/散文解析、划词校验、RAG 排序/未索引不调向量化、TLS 上下文只建一次。
+  - `tests/test_ai_client_live.py`：对**真实本地 HTTP 服务**验证非流式回答、SSE 逐段送达
+    （`stream: true` 真的上了线）、embedding、Anthropic 用 `x-api-key` 与 `/v1/messages`、
+    开启代理后请求不再直达目标，以及 `AIService` 真的把「读者所在章节的正文」写进了请求体。
+  - `tests/test_ai_api.py`：`/ai/status` 的可用性与原因、chat 透传阅读位置与出处、
+    provider 失败返回可读 502、`/ai/chat/stream` 与 `/ai/transform/stream` 的 SSE 帧、
+    `/admin/ai` 保存时 Key 被加密且不回显、掩码不覆盖已存 Key、数值范围 422、RAG 状态 404/502。
+- 前端 `npm run typecheck`（vue-tsc）无错误、`npm run build` 成功。
+- 性能：TLS 上下文缓存后，本机 5 项真实 socket 测试从 16s 降到 3.7s；
+  实测 `httpx.AsyncClient()` 构造 2.45s → 0.002s。
+
+**未做/已知**：
+
+- **本次只改本地代码，没有部署**（用户要求）。线上要生效需要
+  `docker compose build backend frontend` + `up -d`（以及 `nginx` 配置如果用的是仓库里那份）。
+- 线上 backend 至今没有 AI 配置：部署后必须去 **设置 → AI** 填服务地址与 Key，
+  否则阅读器侧栏只会显示「AI 还没有配置好」及其原因。
+- RAG 建索引是**同步请求**，大书耗时较长（网关超时已放到 3600s）；没有做后台任务化。
+- 对话历史不落库，刷新页面即丢失；RAG 索引没有按正文 hash 做增量失效，
+  章节内容变了要手动 `force=true` 重建。
+- 向量检索是进程内余弦计算（numpy），单本上限 2000 片段；书特别大时需要调 `max_chunks`
+  或后续换成 pgvector。

@@ -16,6 +16,7 @@
 | 文档 | 内容 |
 |---|---|
 | [cookie-guide.md](cookie-guide.md) | Cookie 获取/导入、哪些站点必须用 Cookie |
+| [ai-assistant.md](ai-assistant.md) | AI 配置（设置 → AI）、问答/摘要/人物/时间线、划词、RAG 索引与排错 |
 | [source-search.md](source-search.md) | 书源搜索 → 入库闭环与 API |
 | [r18-access.md](r18-access.md) | R18 书源标记、书籍分级、可见性规则 |
 | [crawl-queue.md](crawl-queue.md) | 爬取队列：暂停 / 继续 / 取消 / 置顶 |
@@ -67,6 +68,8 @@
 - 同步某本书报 `[Errno 36] File name too long` → [full-site-sync.md](full-site-sync.md)
   “个别书报 [Errno 36] File name too long”
 - 想让小说和漫画分页显示 / 漫画书被算成小说 → [codex-handoff.md](codex-handoff.md) 第 16 节
+- AI 侧栏提示未配置 / 回答总从第 1 章说起 / 回答不出字（流式被缓冲）→
+  [ai-assistant.md](ai-assistant.md) “排错”
 - 想连服务器看真实任务与日志 → [codex-handoff.md](codex-handoff.md) 第 1、5 节
 
 ## 文档维护约定

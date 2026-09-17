@@ -173,7 +173,8 @@ curl -X POST http://localhost:8088/api/sync/book \
 
 ### 9. 阅读
 
-桌面端阅读器支持字号、字体、主题、目录、AI 侧栏和进度保存。
+桌面端阅读器支持字号、字体、主题、目录、AI 侧栏和进度保存；
+选中文字会浮出 AI 工具条（解释 / 翻译 / 润色 / 续写 / 问 AI）。
 
 手机端会自动进入分页阅读模式：
 
@@ -186,7 +187,66 @@ curl -X POST http://localhost:8088/api/sync/book \
 ### 10. 搜索与 AI
 
 - 搜索页支持书籍、章节全文搜索；
-- 配置 AI 后，阅读器侧栏可使用 AI 问答、章节摘要和 RAG 语义检索。
+- 阅读器侧栏的 **AI 助手**有四个标签页：**问答 / 摘要 / 人物 / 时间线**；
+- 选中正文任意一段会浮出工具条：**解释 / 翻译 / 润色 / 续写 / 问 AI**，结果流式显示，
+  翻译目标语言可切换；
+- 配置向量模型后可以给整本书建 **RAG 索引**：跨章节提问会先做语义检索，回答里带上章节出处。
+
+#### 配置（设置 → AI，管理员）
+
+不用改环境变量、不用重建容器：
+
+1. 选 **提供方**（OpenAI / DeepSeek / 通义千问 / Kimi / 智谱 / SiliconFlow / Ollama / Claude / 自定义）；
+2. 填 **Base URL** 与 **模型**（留空用提供方默认值）；
+3. 填 **API Key**（加密入库，页面只显示掩码；本地 Ollama 可以留空）；
+4. 国内网络访问 OpenAI / Anthropic 时打开 **使用代理**，可复用爬虫代理
+   （设置 → 代理里配置的 mihomo 地址），也可以单独填一个；
+5. 点 **测试连接**，会分别探测对话接口与向量接口，并显示实际请求地址、是否走代理、耗时。
+
+字段说明：
+
+| 字段 | 作用 |
+|---|---|
+| `Temperature` / `最大输出 token` / `超时` | 生成参数 |
+| `上下文上限（字符）` | 每次问答送给模型的原文上限 |
+| `向量提供方 / 向量模型 / 向量接口地址 / 向量 API Key` | RAG 用的 embedding 服务，可与对话模型不同 |
+| `问答时使用语义检索` / `检索片段数` | 是否用 RAG 检索、检索几个片段 |
+
+环境变量仍然可用（`AI_PROVIDER` / `AI_API_KEY` / `AI_BASE_URL` / `AI_MODEL` /
+`AI_EMBEDDING_MODEL` / `AI_USE_PROXY` …），只有在后台没有填写对应字段时才作为兜底。
+
+#### 问答的上下文怎么取
+
+- 阅读器提问时会带上**当前章节**，默认取前后各若干章（`context_chapters`）；
+- 如果请求了语义检索（`mode=rag`）或该书已建索引，会优先用 RAG 命中片段，
+  并在回答下方标出「第 N 章」出处；
+- 没有阅读位置时（例如从别处调用接口）回退到书首若干章，并在回答里说明。
+
+#### RAG 索引
+
+**设置 → AI → RAG 索引管理**里输入书籍 ID 建索引；列表里可以查看每本书的片段数并删除。
+
+```bash
+# 建索引（管理员）；force=true 强制重建，max_chunks 限制片段数
+curl -X POST "http://localhost:8088/api/rag/index/<BOOK_ID>?force=true" \
+  -H "Authorization: Bearer $TOKEN"
+# 索引状态（普通用户，需可见该书）
+curl "http://localhost:8088/api/rag/status/<BOOK_ID>" -H "Authorization: Bearer $TOKEN"
+# 语义检索
+curl -X POST "http://localhost:8088/api/rag/search" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"book_id":"<BOOK_ID>","query":"主角第一次见到谁","top_k":6}'
+```
+
+章节多的大书建索引会调用很多次向量接口，耗时较长；受 `max_chunks`（默认 2000 片段）保护。
+
+#### 流式接口
+
+- `POST /api/ai/chat/stream`：问答，SSE 事件 `sources` / `delta` / `done` / `error`；
+- `POST /api/ai/transform/stream`：划词操作，事件 `start` / `delta` / `done` / `error`。
+
+响应头带 `X-Accel-Buffering: no`，仓库里的 nginx 配置同时关掉了 `/api` 的
+`proxy_buffering`，否则网关会把整个流缓冲到结束才吐给浏览器。
 
 ### 11. 小说与漫画分页
 
@@ -226,7 +286,7 @@ curl -X POST "http://localhost:8088/api/books/reclassify?scan_content=true&force
 | Service | Port | Notes |
 |---------|------|-------|
 | Nginx gateway | 8088 | Unified entry |
-| AI (optional) | -- | Configure via AI_PROVIDER env |
+| AI (optional) | -- | Configure in 设置 → AI (or `AI_*` env) |
 | Backend API | 8000 | FastAPI |
 | Frontend | 5173 | Vue 3 + Vite |
 | PostgreSQL | 5432 | Database |
