@@ -236,6 +236,49 @@ def test_chapter_concurrency_uses_env_override():
         assert SyncService._chapter_concurrency({"concurrentRate": "2000"}) == 9
 
 
+def test_chapter_concurrency_serialises_a_throttled_source():
+    """A configured 拉取间隔 already lets one request through at a time."""
+    # Without a note the source's 3/1000 window allows three at once ...
+    assert SyncService._chapter_concurrency({"concurrentRate": "3/1000"}) == 3
+    # ... but a per-source interval must not park nine tasks on the limiter.
+    assert SyncService._chapter_concurrency({"concurrentRate": "3/1000"}, 60) == 1
+    # 0 means "explicitly unthrottled", so the source's own rate still applies.
+    assert SyncService._chapter_concurrency({"concurrentRate": "3/1000"}, 0) == 3
+
+
+def test_source_plugin_applies_the_configured_interval():
+    db = _mock_db()
+    service = SyncService(db)
+    plugin = SimpleNamespace(set_request_interval_seconds=MagicMock())
+    source = SimpleNamespace(
+        id="yuedu_abc",
+        plugin_name="yuedu",
+        config={"bookSourceUrl": "https://example.com"},
+        sync_interval_seconds=60,
+    )
+
+    with patch("app.services.sync.get_plugin", return_value=plugin) as getter:
+        assert service._source_plugin(source) is plugin
+
+    getter.assert_called_once_with("yuedu", config=source.config)
+    plugin.set_request_interval_seconds.assert_called_once_with(60)
+
+
+def test_source_plugin_still_works_without_the_interval_column():
+    """Plugins/rows without a request-interval hook must not break a sync."""
+    db = _mock_db()
+    service = SyncService(db)
+    plugin = SimpleNamespace()
+    source = SimpleNamespace(
+        id="local_1",
+        plugin_name="local_markdown",
+        config=None,
+    )
+
+    with patch("app.services.sync.get_plugin", return_value=plugin):
+        assert service._source_plugin(source) is plugin
+
+
 def test_strip_content_images_removes_html_and_markdown_images():
     content = (
         '开头 <img src="/api/chapters/c1/images/a.jpg" alt="a"> 中间 '

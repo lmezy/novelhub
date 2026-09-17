@@ -1,4 +1,6 @@
-﻿from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+from app.services.source_interval import MAX_SYNC_INTERVAL_SECONDS
 
 
 class SourceCreate(BaseModel):
@@ -10,6 +12,13 @@ class SourceCreate(BaseModel):
     is_r18: bool = False
     config: dict | None = None
     scope: str = "personal"
+    #: One upstream request per N seconds; ``None`` keeps the source's own
+    #: ``concurrentRate``, ``0`` disables throttling for this source.
+    sync_interval_seconds: int | None = Field(
+        default=None,
+        ge=0,
+        le=MAX_SYNC_INTERVAL_SECONDS,
+    )
 
 
 class SourceUpdate(BaseModel):
@@ -20,6 +29,11 @@ class SourceUpdate(BaseModel):
     is_r18: bool | None = None
     config: dict | None = None
     scope: str | None = None
+    sync_interval_seconds: int | None = Field(
+        default=None,
+        ge=0,
+        le=MAX_SYNC_INTERVAL_SECONDS,
+    )
 
 
 class SourceOut(BaseModel):
@@ -34,6 +48,7 @@ class SourceOut(BaseModel):
     submitter_id: str | None = None
     submitter_username: str | None = None
     show_contributor: bool = True
+    sync_interval_seconds: int | None = None
 
     class Config:
         from_attributes = True

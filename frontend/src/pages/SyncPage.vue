@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue"
+import { computed, onMounted, ref, watch } from "vue"
 import { api } from "../api/client"
 import { useAuthStore } from "../stores/auth"
 import { useCrawlStore } from "../stores/crawl"
@@ -29,6 +29,14 @@ const activeTask = computed(() => crawlStore.activeTask)
 const enabledSources = computed(() => sources.value.filter((s: any) => s.enabled))
 const syncableSources = computed(() =>
   enabledSources.value.filter((s: any) => auth.isAdmin || s.owner_id === auth.user?.id)
+)
+// Sources whose 拉取间隔 is configured: the sync below will pace itself at that
+// interval, which for a full-site task can mean hours, so say so up front.
+const throttledSources = computed(() =>
+  selectedSourceIds.value.filter((id) => {
+    const source = sources.value.find((s: any) => s.id === id)
+    return (source?.sync_interval_seconds || 0) > 0
+  })
 )
 
 const activeProgress = computed(() => {
@@ -106,7 +114,94 @@ async function loadTasks() {
 async function selectTask(task: any) {
   if (!task) return
   await crawlStore.setTask(task)
+  await loadDiagnosis(task.id)
 }
+
+// ---------------------------------------------------------------------------
+// AI diagnosis of a failed task (admin only)
+//
+// The AI explains the failure and may propose book-source changes; nothing is
+// written until the proposal is approved in 设置 → 审批.
+// ---------------------------------------------------------------------------
+const diagnosis = ref<any>(null)
+const diagnosisLoading = ref(false)
+const diagnosisError = ref("")
+const diagnosisProposing = ref(false)
+const diagnosisNotice = ref("")
+
+const canDiagnose = computed(() => auth.isAdmin)
+const diagnosisWorthwhile = computed(() => {
+  const task = activeTask.value
+  if (!task) return false
+  if (task.status === "failed") return true
+  if (task.status !== "completed_with_errors") return false
+  return Number(task.result?.books_failed || 0) > 0
+    || Number(task.result?.chapters_failed || 0) > 0
+})
+
+async function loadDiagnosis(taskId: string) {
+  diagnosis.value = null
+  diagnosisError.value = ""
+  diagnosisNotice.value = ""
+  if (!auth.isAdmin || !taskId) return
+  try {
+    diagnosis.value = await api.get<any>("/ai/diagnose/" + taskId)
+  } catch {
+    // 404 simply means "not analysed yet".
+    diagnosis.value = null
+  }
+}
+
+async function runDiagnosis() {
+  const task = activeTask.value
+  if (!task) return
+  diagnosisLoading.value = true
+  diagnosisError.value = ""
+  diagnosisNotice.value = ""
+  try {
+    diagnosis.value = await api.post<any>(
+      "/ai/diagnose/" + task.id, { force: Boolean(diagnosis.value) },
+    )
+  } catch (e) {
+    diagnosisError.value = e instanceof Error ? e.message : i18n.t('sync_ai_failed')
+  } finally {
+    diagnosisLoading.value = false
+  }
+}
+
+async function proposeSourceChange() {
+  const task = activeTask.value
+  if (!task) return
+  diagnosisProposing.value = true
+  diagnosisError.value = ""
+  try {
+    const res = await api.post<any>("/ai/diagnose/" + task.id + "/propose")
+    diagnosisNotice.value = res.message || i18n.t('sync_ai_proposed')
+    if (diagnosis.value) diagnosis.value.change_id = res.change_id
+  } catch (e) {
+    diagnosisError.value = e instanceof Error ? e.message : i18n.t('sync_ai_propose_failed')
+  } finally {
+    diagnosisProposing.value = false
+  }
+}
+
+function classificationLabel(value?: string) {
+  const known = ["site_side", "cookie", "rate_limit", "proxy", "config",
+                 "removed_books", "unknown"]
+  return known.includes(String(value)) ? i18n.t('sync_ai_class_' + value) : (value || "")
+}
+
+function classificationClass(value?: string) {
+  if (value === "config" || value === "rate_limit") return "bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-300"
+  if (value === "site_side" || value === "cookie" || value === "proxy") return "bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300"
+  return "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300"
+}
+
+// The store keeps polling the active task, so reload the diagnosis whenever the
+// selected task changes (including the first render after a page load).
+watch(() => activeTask.value?.id, (id) => {
+  if (id) void loadDiagnosis(id)
+})
 
 function selectAllSources() {
   selectedSourceIds.value = syncableSources.value.map((s: any) => s.id)
@@ -301,6 +396,10 @@ onMounted(async () => {
             <span class="min-w-0">
               <span class="block text-sm font-medium truncate">{{ s.name }}</span>
               <span class="block text-xs text-muted dark:text-gray-400 truncate">{{ s.id }}</span>
+              <span
+                v-if="s.sync_interval_seconds != null && s.sync_interval_seconds > 0"
+                class="block text-xs text-amber-600 dark:text-amber-400 truncate"
+              >{{ i18n.t('admin_sync_interval_badge', { seconds: s.sync_interval_seconds }) }}</span>
             </span>
           </label>
           <p v-if="syncableSources.length === 0" class="col-span-full text-sm text-muted dark:text-gray-400 py-4 text-center">{{ i18n.t('sync_no_sources') }}</p>
@@ -324,6 +423,7 @@ onMounted(async () => {
           </button>
         </div>
         <p class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('sync_max_pages_hint') }}</p>
+        <p v-if="throttledSources.length" class="text-xs text-amber-600 dark:text-amber-400 mb-3">{{ i18n.t('sync_interval_hint', { count: throttledSources.length }) }}</p>
         <div v-if="bookshelfResults.length" class="mt-3 space-y-1 text-xs">
           <p
             v-for="r in bookshelfResults"
@@ -417,6 +517,87 @@ onMounted(async () => {
             chapters: activeTask.result.chapters_created,
           }) }}
         </p>
+
+        <!-- AI diagnosis: explains the failure, proposes (never applies) changes -->
+        <div v-if="canDiagnose && (diagnosisWorthwhile || diagnosis)" class="mt-4 pt-4 border-t border-border dark:border-gray-700">
+          <div class="flex items-center justify-between gap-2 mb-2">
+            <h3 class="text-sm font-semibold">{{ i18n.t('sync_ai_title') }}</h3>
+            <button
+              @click="runDiagnosis"
+              :disabled="diagnosisLoading"
+              class="px-3 py-1.5 text-xs rounded border border-accent text-accent hover:bg-accent/10 disabled:opacity-50 shrink-0"
+            >{{ diagnosisLoading
+                 ? i18n.t('sync_ai_running')
+                 : (diagnosis ? i18n.t('sync_ai_rerun') : i18n.t('sync_ai_run')) }}</button>
+          </div>
+          <p class="text-[11px] text-muted dark:text-gray-400 mb-2">{{ i18n.t('sync_ai_hint') }}</p>
+
+          <p v-if="diagnosisError" class="text-xs text-red-500 break-words">{{ diagnosisError }}</p>
+          <p v-else-if="diagnosisNotice" class="text-xs text-green-600 dark:text-green-400">{{ diagnosisNotice }}</p>
+
+          <div v-if="diagnosis" class="space-y-3">
+            <div class="flex flex-wrap items-center gap-2">
+              <span class="text-[11px] px-2 py-0.5 rounded-full" :class="classificationClass(diagnosis.classification)">
+                {{ classificationLabel(diagnosis.classification) }}
+              </span>
+              <span class="text-[11px] text-muted dark:text-gray-400">
+                {{ i18n.t('sync_ai_confidence', { level: diagnosis.confidence || '?' }) }}
+                · {{ diagnosis.model }}
+              </span>
+            </div>
+
+            <p class="text-sm text-ink whitespace-pre-wrap break-words">{{ diagnosis.summary }}</p>
+
+            <div v-if="diagnosis.reasoning?.length">
+              <p class="text-[11px] font-medium text-muted dark:text-gray-400 mb-1">{{ i18n.t('sync_ai_reasoning') }}</p>
+              <ul class="list-disc pl-4 space-y-0.5">
+                <li v-for="(line, i) in diagnosis.reasoning" :key="i" class="text-xs text-ink break-words">{{ line }}</li>
+              </ul>
+            </div>
+
+            <div v-if="diagnosis.next_steps?.length">
+              <p class="text-[11px] font-medium text-muted dark:text-gray-400 mb-1">{{ i18n.t('sync_ai_next') }}</p>
+              <ol class="list-decimal pl-4 space-y-0.5">
+                <li v-for="(line, i) in diagnosis.next_steps" :key="i" class="text-xs text-ink break-words">{{ line }}</li>
+              </ol>
+            </div>
+
+            <div v-if="diagnosis.proposed_changes?.length">
+              <p class="text-[11px] font-medium text-muted dark:text-gray-400 mb-1">
+                {{ i18n.t('sync_ai_proposals', { n: diagnosis.proposed_changes.length }) }}
+              </p>
+              <div class="space-y-2">
+                <div
+                  v-for="(change, i) in diagnosis.proposed_changes"
+                  :key="i"
+                  class="p-2 rounded border border-border dark:border-gray-700 text-xs"
+                >
+                  <div class="flex items-center gap-2 mb-1">
+                    <code class="text-accent break-all">{{ change.path }}</code>
+                    <span class="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800">{{ change.risk }}</span>
+                    <span
+                      v-if="change.mismatch"
+                      class="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-300"
+                    >{{ i18n.t('sync_ai_stale') }}</span>
+                  </div>
+                  <p class="text-muted dark:text-gray-400 break-words">{{ i18n.t('sync_ai_current') }}<code class="break-all">{{ change.current || '—' }}</code></p>
+                  <p class="text-muted dark:text-gray-400 break-words">{{ i18n.t('sync_ai_suggest') }}<code class="break-all">{{ change.new_text ?? change.new }}</code></p>
+                  <p v-if="change.reason" class="mt-1 text-muted dark:text-gray-400 break-words">{{ change.reason }}</p>
+                </div>
+              </div>
+              <div class="flex flex-wrap items-center gap-2 mt-2">
+                <button
+                  v-if="!diagnosis.change_id"
+                  @click="proposeSourceChange"
+                  :disabled="diagnosisProposing"
+                  class="px-3 py-1.5 text-xs rounded bg-accent text-white font-medium hover:opacity-90 disabled:opacity-50"
+                >{{ diagnosisProposing ? i18n.t('sync_ai_proposing') : i18n.t('sync_ai_propose') }}</button>
+                <span v-else class="text-xs text-green-600 dark:text-green-400">{{ i18n.t('sync_ai_proposed') }}</span>
+              </div>
+            </div>
+            <p v-else class="text-[11px] text-muted dark:text-gray-400">{{ i18n.t('sync_ai_no_change') }}</p>
+          </div>
+        </div>
       </section>
 
       <section class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">

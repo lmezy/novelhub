@@ -1,10 +1,10 @@
-from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.clock import naive_now
 from app.core.config import settings
 from app.core.database import get_db
 from app.models import Invite, User
@@ -69,7 +69,7 @@ async def register(
 ):
     if not payload.invite_code:
         raise HTTPException(status_code=400, detail="Invite code is required")
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = naive_now()
     invite = await db.scalar(
         select(Invite).where(Invite.code == payload.invite_code)
     )

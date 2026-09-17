@@ -8,18 +8,15 @@ a specific source to the front without waiting for every earlier task.
 import asyncio
 import os
 from typing import Any
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
 from loguru import logger
 from sqlalchemy import select, update
 
+from app.core.clock import naive_now
 from app.core.config import settings, sync_source_concurrency
 from app.core.database import SessionLocal
 from app.models import CrawlTask
-
-
-def _naive_utcnow() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # Failures that are worth retrying on their own: the proxy/upstream was
@@ -210,7 +207,7 @@ async def _next_pending_tasks(
         query = select(CrawlTask.id, CrawlTask.source).where(
             CrawlTask.status == "pending",
             (CrawlTask.resume_at.is_(None))
-            | (CrawlTask.resume_at <= _naive_utcnow()),
+            | (CrawlTask.resume_at <= naive_now()),
         )
         if exclude_sources:
             query = query.where(CrawlTask.source.notin_(exclude_sources))
@@ -247,7 +244,7 @@ async def run_crawl_task_async(task_id: str) -> dict:
             return {"status": "skipped", "reason": task_obj.status}
 
         task_obj.status = "running"
-        task_obj.started_at = _naive_utcnow()
+        task_obj.started_at = naive_now()
         task_obj.error = None
         task_obj.resume_at = None
         await db.commit()
@@ -353,7 +350,7 @@ async def run_crawl_task_async(task_id: str) -> dict:
             if task_obj.status == "cancelled":
                 await _apply_task_state(
                     task_obj, db, task_id,
-                    {"status": "cancelled", "finished_at": _naive_utcnow()},
+                    {"status": "cancelled", "finished_at": naive_now()},
                 )
                 raise TaskCancelled("Task cancelled")
             # Preserve every page result when a task is resumed in batches.
@@ -381,7 +378,7 @@ async def run_crawl_task_async(task_id: str) -> dict:
                         "next_page": result.get("next_page", start_page),
                     },
                     "finished_at": None,
-                    "resume_at": _naive_utcnow() + timedelta(
+                    "resume_at": naive_now() + timedelta(
                         milliseconds=int(
                             getattr(settings, "SYNC_BATCH_INTERVAL_MS", 5000) or 0
                         )
@@ -410,7 +407,7 @@ async def run_crawl_task_async(task_id: str) -> dict:
                     "chapters_failed": merged.get("chapters_failed", 0),
                     "done": True,
                 },
-                "finished_at": _naive_utcnow(),
+                "finished_at": naive_now(),
             })
             return result
         except SyncPaused:
@@ -422,7 +419,7 @@ async def run_crawl_task_async(task_id: str) -> dict:
             await _apply_task_state(task_obj, db, task_id, {
                 "status": "cancelled",
                 "error": _describe_error(exc),
-                "finished_at": _naive_utcnow(),
+                "finished_at": naive_now(),
             })
             raise
         except Exception as exc:
@@ -445,7 +442,7 @@ async def run_crawl_task_async(task_id: str) -> dict:
                 await _apply_task_state(task_obj, db, task_id, {
                     "status": "pending",
                     "finished_at": None,
-                    "resume_at": _naive_utcnow() + timedelta(seconds=delay),
+                    "resume_at": naive_now() + timedelta(seconds=delay),
                     "progress": {**progress_state, "auto_retries": retries + 1},
                     "result": _carry_result_counters(previous_result, progress_state),
                     "error": message,
@@ -467,12 +464,41 @@ async def run_crawl_task_async(task_id: str) -> dict:
             await _apply_task_state(task_obj, db, task_id, {
                 "status": "failed",
                 "error": _describe_error(exc),
-                "finished_at": _naive_utcnow(),
+                "finished_at": naive_now(),
                 "progress": dict(progress_state),
                 "result": _carry_result_counters(previous_result, progress_state),
             })
             logger.opt(exception=exc).error("Crawl task {} failed", task_id)
             raise
+
+
+#: In-flight background AI diagnoses of finished tasks.  Kept in a set so the
+#: event loop cannot garbage-collect them mid-flight.
+_diagnosis_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_auto_diagnosis(task_id: str) -> None:
+    """Ask the AI to explain a freshly failed task, without blocking the queue.
+
+    ``auto_diagnose_task`` re-checks everything itself (feature enabled, AI
+    configured, task really failed, not analysed before) and never raises, so
+    this hook cannot break a worker.
+    """
+    from app.services.ai_diagnosis import auto_diagnose_task
+
+    async def _run() -> None:
+        try:
+            await auto_diagnose_task(task_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Auto diagnosis for {} skipped: {}", task_id, exc)
+
+    try:
+        task = asyncio.create_task(_run())
+    except RuntimeError:  # pragma: no cover - no running loop
+        logger.debug("Auto diagnosis for {} skipped: no event loop", task_id)
+        return
+    _diagnosis_tasks.add(task)
+    task.add_done_callback(_diagnosis_tasks.discard)
 
 
 async def _worker_loop() -> None:
@@ -500,6 +526,9 @@ async def _worker_loop() -> None:
             logger.error("Crawl task {} stopped: {}", task_id, exc)
         finally:
             running_sources.discard(source)
+            # Explain what just failed, if the feature is on.  Fire-and-forget:
+            # a slow model call must never hold up the queue for this source.
+            _spawn_auto_diagnosis(task_id)
 
     def _free_slots() -> int:
         if limit <= 0:

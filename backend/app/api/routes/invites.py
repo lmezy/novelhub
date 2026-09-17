@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.clock import naive_now
 from app.core.database import get_db
 from app.models import Invite, User
 from app.services.auth import get_current_user
@@ -26,13 +27,9 @@ class InviteOut(BaseModel):
         from_attributes = True
 
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
-
-
 async def _cleanup_expired(db: AsyncSession) -> None:
     await db.execute(
-        delete(Invite).where(Invite.expires_at <= _utcnow())
+        delete(Invite).where(Invite.expires_at <= naive_now())
     )
     await db.commit()
 
@@ -52,7 +49,7 @@ async def create_invite(
         id=str(uuid4()),
         code=code,
         created_by=user.id,
-        expires_at=_utcnow() + timedelta(days=1),
+        expires_at=naive_now() + timedelta(days=1),
     )
     db.add(invite)
     await db.commit()

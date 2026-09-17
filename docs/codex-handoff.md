@@ -41,19 +41,22 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 
 ---
 
-## 2. 当前状态（2026-09-17）
+## 2. 当前状态（2026-09-18）
 
-- 后端全量测试 **569 passed**：`cd backend && python -m pytest -q`
+- 后端全量测试 **631 passed**：`cd backend && python -m pytest -q`
 - Source Engine 闭环已完成并可用：导入书源 → 搜索 → 目录 → 正文 → Storage/DB/搜索 →
   网页阅读。当前工作重心是**同步稳定性与线上排错**，不是新增架构能力。
 - **AI 功能已补齐**（第 18 节）：后端配置/上下文/流式/划词/RAG + 前端 AI 设置页与阅读器
   AI 面板。使用说明见 [ai-assistant.md](ai-assistant.md)。
 - 并发模型：**一个书源一个 worker**（`SYNC_WORKER_CONCURRENCY=0` 默认不限），书源之间
   不再排队；同一书源同时只跑一个任务。
+- **每书源可配「同步间隔」**（第 21 节）：`sources.sync_interval_seconds`，
+  设置 → 书源 → 编辑里填「秒/请求」，不填沿用书源 `concurrentRate`。给搬山人这类有拉取
+  间隔限制的站点用。
 - 线上仍跑着旧镜像；本地改动要 `docker compose build backend crawler` +
-  `docker compose up -d backend crawler` 才生效（AI 还涉及 `frontend`）。
+  `docker compose up -d backend crawler` 才生效（AI/前端改动还要加 `frontend`）。
 - 待用户处理（代码修不了，属站点侧防护，见第 4 节）：SiS文學網 / 御宅屋 /
-  第一版主（Cloudflare 挑战）、菠萝猫（GoEdge 验证码）、搬山人（浏览器也被挑战）
+  第一版主（Cloudflare 挑战）、菠萝猫（GoEdge 验证码）、搬山人（限速，可配同步间隔缓解）
   需浏览器过验证后导入 Cookie；UAA 书源依赖完整 Legado JS 运行时，建议换源。
 
 ---
@@ -841,3 +844,131 @@ but you passed DeepSeek-V4.1-Flash."}}`
 
 **给用户的处置**：把「模型」改成 `deepseek-flash`（或 `deepseek-v4-pro`）→ 保存 → 重新
 「测试连接」；以后模型名再变，直接点「拉取模型」按服务端返回的列表选。
+
+## 20. 2026-09-17：同步报错时让 AI 分析（诊断 + 补丁提案走审批，AI 绝不直接改配置）
+
+**需求**：用户问「AI 能在书源同步报错的时候，针对报错进行配置上的修改吗」。确认后的范围是
+**只诊断 + 生成补丁提案走人工审批**，触发方式是**手动按钮 + 任务失败自动跑一次（可关）**。
+
+**设计约束（重要，改这块前先读）**：
+
+1. `docs/NovelHub-AI-Development-Context.md` 的红线写着「AI/RAG 只做消费端，不参与爬取/解析/下载」
+   「不为单站点写死逻辑」「不绕过验证码/WAF/登录限制」。所以**任何 AI 产出的配置改动都必须经
+   管理员批准**，且不允许出现绕过验证码/伪造身份之类的建议。
+2. 线上失败绝大多数是**站点侧**（Cloudflare 挑战、520/502、代理抖动、站点限速、源站删书 ——
+   见第 11/13/14/15/17 节）。对这类失败去「改配置」不但没用，还会**静默把好源改坏**。
+   因此服务端有一道硬校验：分类不是配置类问题时，**强制丢弃**模型给出的规则修改建议。
+
+**改动**：
+
+| 文件 | 改动 |
+|---|---|
+| `backend/app/models/sync_diagnosis.py`（新）+ `alembic/versions/0033_sync_diagnoses.py`（新） | `sync_diagnoses` 表：一行一个任务（`uq_sync_diagnoses_task`），存分类/置信度/结论/`payload`（判断依据、建议下一步、建议修改、证据快照）/模型/token/`change_id`；`task_id`、`source_id` 外键级联 |
+| `backend/app/services/ai_diagnosis.py`（新） | 采集证据（任务报错 + 逐书/逐章失败按错误文本分组带样本 + 该书源最近 5 次任务 + 书源规则 JSON，规则按 key 分块渲染、单条过长截断但**每个 key 都可见**）；`sanitize_diagnosis()` 校验并**丢弃非配置类的规则建议**、限制条数/长度/风险取值；`describe_changes()` 给每条建议附上**真实当前值**并标记「模型记错了」（引用被截断的值不算不一致）；`build_patch()` 把 `config.a.b` 展开成嵌套补丁；`diagnose_task()` / `auto_diagnose_task()`（后者自开 session、自查开关与状态、不抛异常） |
+| `backend/app/services/source_patch.py`（新） | `apply_source_patch()`：`config` 深度合并（不清掉其它规则）+ 仅允许 `name/url/plugin_name/enabled/is_r18` 五列、布尔可转换、非法/超大/不可序列化的补丁直接拒 |
+| `backend/app/api/routes/ai.py` | 新增 `GET /ai/diagnose/{task_id}`、`POST /ai/diagnose/{task_id}`（`force` 重跑）、`POST /ai/diagnose/{task_id}/propose`（生成待审批 `SourceChange`，重复调用幂等）。三个都是**管理员权限**（回答里会引用书源规则原文） |
+| `backend/app/api/routes/source_changes.py` | 新增 `update` 动作与审批落地：管理员直接生效，普通用户进 pending；`approve` 调 `apply_source_patch`，`reject` 什么都不写 |
+| `backend/app/services/crawl_runner.py` | 任务跑完后 `_spawn_auto_diagnosis(task_id)`：`asyncio.create_task` 后台跑（慢模型绝不阻塞队列，引用放 `_diagnosis_tasks` 防 GC），内部自查开关/状态/是否已分析过，永不抛异常 |
+| `backend/app/services/ai_config.py`、`ai.py` | 新增设置 `ai_auto_diagnose`（默认开，可用 `AI_AUTO_DIAGNOSE` 覆盖）；`not_configured_reason()` 抽到 ai_config 供诊断复用 |
+| `frontend/src/pages/SyncPage.vue` | 选中任务后加载/展示诊断：分类徽章、置信度、结论、判断依据、建议下一步、建议修改（字段/当前值/建议值/理由/风险/「与当前值不一致」标记）、「提交为待审批提案」；仅管理员可见 |
+| `frontend/src/pages/AdminPage.vue` | AI 设置新增「同步失败后自动 AI 分析」开关；**审批面板渲染 `update` 提案的完整 diff** 与「来自 AI 分析」标记 |
+| `frontend/src/stores/i18n.ts`、`docs/ai-assistant.md`、`README.md` | 新词条 20+；`ai-assistant.md` 新增「同步报错诊断」一节（能改什么、不能改什么、接口、怎么读结论） |
+
+**验证**：
+
+- `cd backend && python -m pytest -q` → **612 passed**（新增 43 项）。
+  - 安全回归（重点）：`site_side`/`proxy` 分类下模型硬塞的规则建议被**丢弃并计数**；
+    诊断全程 `sources.config` **字节级不变**（测试里对 config 做深拷贝前后比对）；
+    补丁只能改白名单字段与 `config` 合并（其它规则保留、`owner_id` 之类不落库）；
+    非 JSON 回答、不可序列化/超大补丁、未知任务都按预期拒绝；
+    `auto_diagnose_task` 在功能关闭/任务成功/已分析/AI 报错/内部异常时都**返回 None 且不抛**。
+  - 迁移链断言更新到 `0033_sync_diagnoses`。
+- 前端 `npm run typecheck`、`npm run build` 通过；i18n 中英各 863 键、无单边键
+  （顺带修掉了本次编辑引入的一处 zh 词条被并行的笔误）。
+
+**未做/已知**：
+
+- 本次仍**只改本地代码**；线上生效需要 `docker compose build backend crawler frontend` +
+  `up -d`，迁移由 backend 启动时执行（新增了 `0033`，部署时注意）。
+- 自动诊断每次失败任务调用一次模型（默认开）。全站同步每天跑 12 个源、每个源几本失败
+  → 每天约十几次调用，觉得吵或费 token 就在设置里关掉。
+- AI 仍然**不会**自动改书源、自动导 Cookie、自动处理验证码；第 2 层「提案 + 人工批准」
+  是这次做到的边界，再往上（自动执行白名单：重试/降速/临时禁源）这次没做。
+
+---
+
+## 21. 2026-09-18：线上同步报错排查 + 每书源「同步间隔」（拉取间隔）
+
+**需求**：①「线上容器同步报错了，排查一下」；②搬山人这类站点有「拉取间隔」限制（例如一分钟一次），
+要求**在书源页面给每个书源配一个同步间隔**，不配就用默认间隔，且**启动同步任务时读取并使用**该值。
+用户确认：间隔语义 = **每次上游请求之间**的间隔；默认（不配）= 沿用现状（源自带 `concurrentRate`
+优先，否则 `CRAWL_DELAY_MS`=1.2s/请求）。
+
+**排查过程与结论**（只读线上，未改任何线上配置/数据）：
+
+```bash
+# 任务态与报错（psql 端口是 15432，不是 5432）
+docker exec novelhub-postgres psql -U novelhub -d novelhub -p 15432 -P pager=off \
+  -c "select id,source,status,created_at,finished_at,error from crawl_tasks order by created_at desc limit 20;"
+docker logs --tail 5000 novelhub-crawler 2>&1 | grep -E "ERROR|Traceback"
+```
+
+- 容器全部健康（backend healthy）；日志里**没有任何代码崩溃**（只有一处任务失败 ERROR）。
+- 失败分类（166 个任务：failed 121 / cancelled 24 / completed 15 / running 4 / paused 4 /
+  completed_with_errors 3）全都是**站点侧**：
+  - **要撸小说 `www.yaoluku.com`**：经代理连续 3 次 **HTTP 520**（Cloudflare 回源错误），
+    直连 000（NAS 无直连能力）。→ 目录页 0 本书 → 任务经 2 次自动重试后失败。
+    **站点侧问题，改代码/配置都无效**。
+  - **搬山人 `www.banshanren.com`**：此刻代理直取首页 **200**，但同步是「连续 5 章被反爬拦截」。
+    → 站点限速，书源自带 `concurrentRate=1000`（1 秒 1 次）远快于站点真实限制。**这就是需求 ②**。
+  - **御宅屋 `yswhub.cc`**：代理直取 **403**；**爱丽丝书屋** 200；禁忌书屋/風月文學網 是 Cookie/人机验证。
+- 顺带发现一个**真 bug**：`crawl_tasks.created_at` 是 DB 的 `now()`（容器本地 CST），而
+  `started_at/finished_at/resume_at` 是 Python 的 `datetime.now(timezone.utc)`（UTC）。四个容器
+  `TZ=Asia/Shanghai`，于是同步页显示「创建 23:06 / 开始 15:37 / 结束 15:39」——**结束早于开始**，
+  时长全是负的。schema 里其它表都是 `now()`（本地），前端用 `new Date(v).toLocaleString()`
+  把无时区的 ISO 串当本地时间，所以**本地时间才是这个项目的约定**。
+
+**改动**：
+
+| 文件 | 改动 |
+|---|---|
+| `backend/app/core/clock.py`（新） | `naive_now()` = `datetime.now()`；模块 docstring 写清「DB `now()` 是本地时间 + 前端按本地时间渲染 ⇒ Python 写入也必须是本地 naive」。`crawl_runner.py`（9 处）、`api/routes/crawl.py`（5 处）、`api/routes/invites.py` + `api/routes/auth.py`（邀请码过期校验）改用它 |
+| `backend/app/models/source.py`、`alembic/versions/0034_source_sync_interval.py`（新） | `sources.sync_interval_seconds INT NULL`：`NULL`=未配置（用书源 `concurrentRate`，再退 `CRAWL_DELAY_MS`）、`0`=显式不限速、`N>0`=每 N 秒最多 1 次请求 |
+| `backend/app/services/source_interval.py`（新） | `clamp_sync_interval()`（布尔/负数/垃圾/超 3600 都归一）、`source_sync_interval(source)`、`apply_source_interval(plugin, source)`。**只对实现了 `set_request_interval_seconds` 的插件生效**：`YueduPlugin` 每次新建实例所以安全，其它插件是进程级单例，故意不实现该钩子 → 一个源的限速不会漏到下一个源 |
+| `backend/app/crawler/plugins/yuedu/__init__.py` | `set_request_interval_seconds()`；`_sleep_rate_limit()` 优先级变成 `SYNC_IGNORE_RATE_LIMIT` > **手配间隔** > `concurrentRate` > `CRAWL_DELAY_MS`（`0` 直接返回）。请求槽状态仍是**类级、按 base_url** 共享，所以跨书籍/跨任务持续生效 |
+| `backend/app/services/sync.py` | 新增 `_source_plugin(source)`，5 个建插件的地方统一走它（`sync_book`/`sync_bookshelf`/`_book_plugin`/`discover_and_sync`/`discover_and_sync_all`）——**任务启动时读源表**，所以跑到一半改配置要等下一个任务才生效；`_chapter_concurrency(config, source_interval)` 在手配了间隔时返回 1（否则 9 个章节任务全堵在限速器上） |
+| `backend/app/crawler/registry.py`、`api/routes/sources.py`（远程搜索）、`cookies.py`（测 Cookie）、`credentials.py`（自动登录） | 这些入口也按同一间隔请求：registry 按 source_id 查库时顺手下发，其余三处显式 `apply_source_interval()` |
+| `backend/app/schemas/source.py` | `sync_interval_seconds` 加进 Create/Update/Out，`ge=0, le=3600`。Update 用 `exclude_unset` 区分「没传」和「显式 null（清空）」 |
+| `backend/app/services/source_patch.py` | 加进 `PATCHABLE_COLUMNS`：`"60"`/`60` 都收，负数归 0、超限归 3600，`True`/`"soon"` 之类直接忽略并保留原值，`null`/`""` 清空 |
+| `backend/app/services/ai_diagnosis.py` | `SOURCE_FIELDS` 加该列；证据里新增「请求间隔（sync_interval_seconds）」一行（`_render_interval`：未配置/不限速/每 N 秒）；提示词补一条「连续多章多本被拦且 concurrentRate 很小 ⇒ 这是站点限速，应提高 sync_interval_seconds 而不是改解析规则」；`value_at_path`/`describe_changes` 现在也解析**源字段**（之前只解析 config，导致 `sync_interval_seconds` 的审批 diff 永远显示「缺失」） |
+| `frontend/src/pages/AdminPage.vue` | 书源表单新增「同步间隔（秒/请求）」数字输入 + 说明；列表显示 `N 秒/请求` 徽章（0 显示「不限速」）；提交前校验 0～3600 |
+| `frontend/src/pages/SyncPage.vue` | 源列表显示间隔徽章；勾选了限速源时提示「会按该间隔逐个请求，全站同步可能很久」 |
+| `frontend/src/stores/i18n.ts` | 新增 7 个键（中英各一份） |
+
+**验证**：
+
+- `cd backend && python -m pytest -q` → **631 passed**（新增 19 项）。
+  - `tests/test_source_interval.py`（新，10 项）：间隔归一化/`0`/`null`/垃圾值；**限速器本身**
+    用假 `asyncio`（只记 sleep，其余委托真模块）断言首请求不等待、第二次按 60s 等待、
+    手配 60s 压过 `concurrentRate=1000`、`0` 从不等待、`SYNC_IGNORE_RATE_LIMIT` 仍然最高优先级。
+  - `_chapter_concurrency`：`{"concurrentRate":"3/1000"}` 无间隔=3、配 60s=1、配 0=3。
+  - `_source_plugin` 把 60 下发给插件；没有 `sync_interval_seconds` 属性的老行/插件不报错。
+  - API：PUT 能设/能清空、不传字段不动原值、`-1`/`3601` 被 pydantic 拒。
+  - 补丁白名单：`"60"`→60、`999999`→3600、`-30`→0、`True`/`"soon"` 忽略且原值不变、`null` 清空。
+  - 迁移链断言更新到 `0034_source_sync_interval`。
+- 前端 `npm run typecheck`、`npm run build` 通过。
+- 时间戳修复顺带更新了 `tests/test_invites.py` 的自有时间基准（原来用 UTC）。
+
+**未做/已知**：
+
+- **仍然只改本地代码**。线上生效：`docker compose build backend crawler frontend` + `up -d`，
+  迁移 `0034` 由 backend 启动时自动执行（只加一列，向后兼容）。
+- 线上要真正解决搬山人，还得在 **设置 → 书源 → 编辑 → 同步间隔** 填 `60`（或按实测调整）。
+  代价很直接：1 本书 50 章 ≈ 50 分钟，27 本书全站同步 ≈ 20 小时以上；只配真正需要的源。
+- 要撸小说（520）**改什么都无效**，属于源站/线路问题；可换代理节点或等源站恢复。
+- 同一类时区问题**还有残留**（本次没动，属另一批）：`services/cookie_health.py`、
+  `repositories/cookie.py`、`plugins/alicesw/login.py` 把用户填的本地 `expired_at` 与 UTC `now()`
+  比较 → **Cookie 被判过期的时刻偏晚 8 小时**；`services/token_service.py`、`api/routes/source_changes.py`、
+  `services/account.py` 写的是 UTC（与自身比较一致，但前端显示早 8 小时）。要统一就照
+  `core/clock.py` 的说明一次性改完，别只改一半。
+

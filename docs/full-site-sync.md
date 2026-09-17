@@ -30,6 +30,13 @@ curl -X POST http://localhost:8088/api/crawl/tasks \
 
 ## 限速与并发
 
+- **每个书源可以单独配一个「同步间隔」**（设置 → 书源 → 编辑 → 同步间隔，单位**秒/请求**）：
+  填 `60` 就是「最多每分钟 1 次请求」，用于搬山人这类站点明确公布拉取间隔、而书源 JSON 里的
+  `concurrentRate` 写得太快的情况。留空 = 不配置，走下面的默认逻辑；填 `0` = 这个源明确不限速。
+  优先级：`SYNC_IGNORE_RATE_LIMIT` > 手配的同步间隔 > 书源 `concurrentRate` > `CRAWL_DELAY_MS`。
+  配置在**任务启动时**读取，所以改完要么等下一个任务、要么重新发起同步。
+  代价很直接：60 秒/请求意味着一本 50 章的书要 50 分钟左右，全站同步可能要几十小时——
+  只给真正需要的源配。配了间隔的源其章节并发会被压到 1（否则多个章节任务会全堵在限速器上）。
 - 请求间隔优先用书源 JSON 里的 `concurrentRate`，未配置时用 `CRAWL_DELAY_MS`（默认 1200ms），
   另叠加 200–600ms 随机抖动；长任务每 `SYNC_RATE_COOLDOWN_EVERY`（默认 300）次请求暂停
   `SYNC_RATE_COOLDOWN_SECONDS`（默认 10）秒。

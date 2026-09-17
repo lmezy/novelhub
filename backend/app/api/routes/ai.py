@@ -322,6 +322,122 @@ class AITestRequest(BaseModel):
     test_embeddings: bool = False
 
 
+# ---------------------------------------------------------------------------
+# Sync-failure diagnosis
+#
+# Admin-only: the answer quotes the book source's rules and the proposal it can
+# produce is applied through the normal approval flow, never automatically.
+# ---------------------------------------------------------------------------
+
+
+class DiagnoseRequest(BaseModel):
+    force: bool = Field(default=False, description="Re-run even if one is stored")
+
+
+@router.get("/diagnose/{task_id}")
+async def get_task_diagnosis(task_id: str,
+                             user: User = Depends(require_admin),
+                             db: AsyncSession = Depends(get_db)):
+    """The stored AI diagnosis of a sync task (404 when not analysed yet)."""
+    from app.services.ai_diagnosis import get_stored_diagnosis
+
+    stored = await get_stored_diagnosis(db, task_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="这个任务还没有 AI 诊断结果")
+    return stored
+
+
+@router.post("/diagnose/{task_id}")
+async def run_task_diagnosis(task_id: str,
+                             payload: DiagnoseRequest | None = None,
+                             user: User = Depends(require_admin),
+                             db: AsyncSession = Depends(get_db)):
+    """Explain a failed sync task; stores and returns the diagnosis."""
+    from app.services.ai_diagnosis import diagnose_task
+
+    try:
+        return await diagnose_task(
+            db, task_id, force=bool(payload and payload.force)
+        )
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/diagnose/{task_id}/propose")
+async def propose_source_change(task_id: str,
+                                user: User = Depends(require_admin),
+                                db: AsyncSession = Depends(get_db)):
+    """Turn the diagnosis' suggested changes into a pending source proposal.
+
+    The proposal is *not* applied here: it shows up in 设置 → 审批, where an
+    admin reviews the diff and approves or rejects it.
+    """
+    from uuid import uuid4
+
+    from sqlalchemy import select
+
+    from app.models import Source, SourceChange, SyncDiagnosis
+    from app.services.ai_diagnosis import PROPOSAL_ORIGIN, build_patch
+
+    row = await db.scalar(
+        select(SyncDiagnosis).where(SyncDiagnosis.task_id == task_id)
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="这个任务还没有 AI 诊断结果")
+
+    if row.change_id:
+        existing = await db.get(SourceChange, row.change_id)
+        if existing is not None and existing.status == "pending":
+            return {
+                "change_id": existing.id,
+                "status": existing.status,
+                "created": False,
+                "message": "这个诊断已经提交过提案，去「设置 → 审批」处理。",
+            }
+
+    changes = [
+        change for change in ((row.payload or {}).get("proposed_changes") or [])
+        if isinstance(change, dict) and change.get("path") and change.get("new") is not None
+    ]
+    if not changes:
+        raise HTTPException(
+            status_code=400,
+            detail="这次诊断没有可提交的配置修改建议（多半是站点侧问题，改配置解决不了）。",
+        )
+
+    source = await db.get(Source, row.source_id) if row.source_id else None
+    if source is None:
+        raise HTTPException(status_code=404, detail="书源不存在，无法生成提案")
+
+    change = SourceChange(
+        id=str(uuid4()),
+        user_id=user.id,
+        action="update",
+        source_id=row.source_id,
+        source_data={
+            "patch": build_patch(changes),
+            "diff": changes,
+            "origin": PROPOSAL_ORIGIN,
+            "diagnosis_id": row.id,
+            "task_id": task_id,
+            "classification": row.classification,
+            "summary": row.summary,
+        },
+        status="pending",
+    )
+    db.add(change)
+    row.change_id = change.id
+    await db.commit()
+
+    return {
+        "change_id": change.id,
+        "status": change.status,
+        "created": True,
+        "changes": len(changes),
+        "message": "已生成待审批提案，去「设置 → 审批」确认后才会写入书源。",
+    }
+
+
 @router.post("/test", dependencies=[Depends(require_admin)])
 async def ai_test(payload: AITestRequest | None = None,
                   db: AsyncSession = Depends(get_db)):

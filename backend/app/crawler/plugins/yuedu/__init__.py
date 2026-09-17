@@ -585,6 +585,29 @@ class YueduPlugin:
         # not depend on the shared Node runtime's mutable global cache (several
         # books may sync concurrently).
         self._chapter_image_manifest: list[dict[str, str]] = []
+        # Per-source request interval (seconds) configured in the admin UI.
+        # ``None`` means "not configured": the source's own ``concurrentRate``
+        # decides, then ``CRAWL_DELAY_MS``.  0 means "explicitly unthrottled".
+        self._request_interval_seconds: int | None = None
+
+    def set_request_interval_seconds(self, seconds: int | None) -> None:
+        """Override how often this source may issue one upstream request.
+
+        Site operators publish a 拉取间隔 ("no more than one request per N
+        seconds") that the book source JSON often understates -- 搬山人 ships
+        ``concurrentRate: 1000`` while its real limit is a minute -- so the
+        admin UI can set an explicit interval per source.  ``None`` keeps the
+        source's ``concurrentRate``.
+        """
+        if seconds is None:
+            self._request_interval_seconds = None
+            return
+        try:
+            value = int(seconds)
+        except (TypeError, ValueError):
+            self._request_interval_seconds = None
+            return
+        self._request_interval_seconds = max(0, value)
 
     @property
     def display_name(self) -> str:
@@ -4612,19 +4635,31 @@ class YueduPlugin:
         "count/window" allows count starts per window milliseconds.  Sources
         without concurrentRate fall back to CRAWL_DELAY_MS when it is
         configured, matching Legado's unthrottled behavior by default.
+
+        A per-source interval configured in the admin UI wins over both: the
+        site's real 拉取间隔 is a property of the site, not of the rule file,
+        and a book source that ships ``concurrentRate: 1000`` for a site that
+        only tolerates one request per minute gets the sync captcha-blocked.
         """
         if self._rate_limit_disabled():
             return
-        spec = self._parse_concurrent_rate()
-        if spec is None:
-            try:
-                from app.core.config import settings
-                delay_ms = int(getattr(settings, "CRAWL_DELAY_MS", 0) or 0)
-            except Exception:
-                delay_ms = 0
-            if delay_ms <= 0:
+        configured = self._request_interval_seconds
+        if configured is not None:
+            if configured <= 0:
+                # Explicitly unthrottled for this source.
                 return
-            spec = ("interval", 1, delay_ms)
+            spec = ("interval", 1, configured * 1000)
+        else:
+            spec = self._parse_concurrent_rate()
+            if spec is None:
+                try:
+                    from app.core.config import settings
+                    delay_ms = int(getattr(settings, "CRAWL_DELAY_MS", 0) or 0)
+                except Exception:
+                    delay_ms = 0
+                if delay_ms <= 0:
+                    return
+                spec = ("interval", 1, delay_ms)
         mode, count, window_ms = spec
         key = self.base_url or "default"
         lock = self.__class__._rate_locks.get(key)

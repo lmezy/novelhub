@@ -31,6 +31,7 @@ interface Source {
   submitter_id?: string | null
   submitter_username?: string | null
   show_contributor?: boolean
+  sync_interval_seconds?: number | null
 }
 
 interface CookieItem {
@@ -58,7 +59,7 @@ const availableTabs = computed(() => {
 })
 
 const sources = ref<Source[]>([])
-const sourceForm = ref({ id: "", name: "", url: "", plugin_name: "yuedu", enabled: true, is_r18: false, scope: "personal" })
+const sourceForm = ref({ id: "", name: "", url: "", plugin_name: "yuedu", enabled: true, is_r18: false, scope: "personal", sync_interval_seconds: "" })
 const sourceConfigText = ref("")
 const sourceEditingId = ref("")
 const sourceError = ref("")
@@ -206,11 +207,24 @@ async function createSource() {
       return
     }
   }
+  // 拉取间隔: how many seconds must pass between two upstream requests.
+  // Blank means "not configured" -> the source's own concurrentRate decides.
+  const intervalText = String(sourceForm.value.sync_interval_seconds ?? "").trim()
+  let syncInterval: number | null = null
+  if (intervalText !== "") {
+    const parsedInterval = Number(intervalText)
+    if (!Number.isFinite(parsedInterval) || parsedInterval < 0 || parsedInterval > 3600) {
+      sourceError.value = i18n.t('admin_sync_interval_invalid')
+      return
+    }
+    syncInterval = Math.floor(parsedInterval)
+  }
   try {
     const body: any = {
       ...sourceForm.value,
       url: sourceForm.value.url || null,
       config,
+      sync_interval_seconds: syncInterval,
     }
     if (sourceEditingId.value) {
       // Editing an existing source must use update semantics. POST-ing the
@@ -239,6 +253,7 @@ function editSource(s: Source) {
     enabled: s.enabled,
     is_r18: s.is_r18,
     scope: s.owner_id ? "personal" : "global",
+    sync_interval_seconds: s.sync_interval_seconds == null ? "" : String(s.sync_interval_seconds),
   }
   if (!auth.isAdmin && !s.owner_id) {
     sourceForm.value.scope = "personal"
@@ -260,7 +275,7 @@ function editSource(s: Source) {
 
 function resetSourceForm() {
   sourceEditingId.value = ""
-  sourceForm.value = { id: "", name: "", url: "", plugin_name: "yuedu", enabled: true, is_r18: false, scope: "personal" }
+  sourceForm.value = { id: "", name: "", url: "", plugin_name: "yuedu", enabled: true, is_r18: false, scope: "personal", sync_interval_seconds: "" }
   sourceConfigText.value = ""
 }
 
@@ -606,6 +621,7 @@ async function loadAIConfig() {
       embedding_provider: res.embedding_provider || "",
       embedding_base_url: res.embedding_base_url || "",
       embedding_model: res.embedding_model || "",
+      auto_diagnose: res.auto_diagnose !== false,
     }
     aiApiKeyInput.value = ""
     aiEmbeddingKeyInput.value = ""
@@ -1597,6 +1613,21 @@ onUnmounted(() => {
               {{ i18n.t('admin_r18_label') }}
             </label>
           </div>
+          <div class="flex flex-wrap items-center gap-4 mb-3">
+            <label class="text-xs text-muted dark:text-gray-400">
+              <span class="block mb-1">{{ i18n.t('admin_sync_interval_label') }}</span>
+              <input
+                v-model="sourceForm.sync_interval_seconds"
+                type="number"
+                min="0"
+                max="3600"
+                step="1"
+                :placeholder="i18n.t('admin_sync_interval_placeholder')"
+                class="w-32 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
+              />
+            </label>
+            <p class="text-xs text-muted dark:text-gray-400 max-w-xl leading-relaxed">{{ i18n.t('admin_sync_interval_hint') }}</p>
+          </div>
           <textarea
             v-model="sourceConfigText"
             :placeholder="i18n.t('admin_source_config_placeholder')"
@@ -1621,6 +1652,10 @@ onUnmounted(() => {
                 <span v-if="s.owner_id" class="text-xs px-1.5 py-0.5 rounded ml-2 bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300">{{ i18n.t('admin_source_personal') }}</span>
                 <span v-else class="text-xs px-1.5 py-0.5 rounded ml-2 bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300">{{ i18n.t('admin_source_global') }}</span>
                 <span v-if="s.is_r18" class="text-xs px-1.5 py-0.5 rounded ml-2 bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-300">R18</span>
+                <span
+                  v-if="s.sync_interval_seconds != null"
+                  class="text-xs px-1.5 py-0.5 rounded ml-2 bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-200"
+                >{{ s.sync_interval_seconds > 0 ? i18n.t('admin_sync_interval_badge', { seconds: s.sync_interval_seconds }) : i18n.t('admin_sync_interval_off') }}</span>
                 <span
                   v-if="sourceCookies(s.id).length"
                   class="text-xs px-1.5 py-0.5 rounded ml-2"
@@ -2630,23 +2665,43 @@ onUnmounted(() => {
         <p class="text-xs text-muted dark:text-gray-400 -mt-3 mb-3">{{ i18n.t('admin_approval_sync_hint') }}</p>
         <p v-if="approvalError" class="text-sm text-red-600 mb-3">{{ approvalError }}</p>
         <div class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900">
-          <div v-for="a in approvals" :key="a.id" class="px-4 py-3 flex items-center justify-between flex-wrap gap-2">
-            <div>
-              <span class="text-xs px-1.5 py-0.5 rounded-full mr-2" :class="a.action === 'create' ? 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300' : a.action === 'confirm_r18' ? 'bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-300' : 'bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300'">{{ a.action === 'confirm_r18' ? i18n.t('admin_approval_r18_conflict') : a.action }}</span>
-              <template v-if="a.action === 'create' && a.source_data">
-                <span class="text-sm font-medium">{{ a.source_data.name }}</span>
-                <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ a.source_data.id }} ({{ a.source_data.plugin_name }})</span>
-              </template>
-              <template v-else-if="a.source_id">
-                <span class="text-sm font-medium">{{ i18n.t('admin_delete_source', { id: a.source_id }) }}</span>
-              </template>
-              <template v-else-if="a.action === 'confirm_r18' && a.source_data">
-                <span class="text-sm font-medium">{{ i18n.t('admin_approval_r18_conflict') }}</span>
-                <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ a.source_data.title }}</span>
-              </template>
-              <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ i18n.t('admin_by_user', { id: a.submitter_username || a.user_id?.slice(0, 8) }) }}...</span>
+          <div v-for="a in approvals" :key="a.id" class="px-4 py-3 flex items-start justify-between flex-wrap gap-2">
+            <div class="min-w-0 flex-1">
+              <div class="flex items-center flex-wrap gap-2">
+                <span class="text-xs px-1.5 py-0.5 rounded-full" :class="a.action === 'create' ? 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300' : a.action === 'confirm_r18' ? 'bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-300' : a.action === 'update' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300' : 'bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300'">{{ a.action === 'confirm_r18' ? i18n.t('admin_approval_r18_conflict') : a.action === 'update' ? i18n.t('admin_approval_update') : a.action }}</span>
+                <span v-if="a.source_data?.origin === 'ai'" class="text-[10px] px-1.5 py-0.5 rounded bg-accent/10 text-accent">{{ i18n.t('admin_approval_from_ai') }}</span>
+                <template v-if="a.action === 'create' && a.source_data">
+                  <span class="text-sm font-medium">{{ a.source_data.name }}</span>
+                  <span class="text-xs text-muted dark:text-gray-400">{{ a.source_data.id }} ({{ a.source_data.plugin_name }})</span>
+                </template>
+                <template v-else-if="a.action === 'update'">
+                  <span class="text-sm font-medium">{{ i18n.t('admin_approval_update_source', { id: a.source_id }) }}</span>
+                </template>
+                <template v-else-if="a.source_id">
+                  <span class="text-sm font-medium">{{ i18n.t('admin_delete_source', { id: a.source_id }) }}</span>
+                </template>
+                <template v-else-if="a.action === 'confirm_r18' && a.source_data">
+                  <span class="text-sm font-medium">{{ i18n.t('admin_approval_r18_conflict') }}</span>
+                  <span class="text-xs text-muted dark:text-gray-400">{{ a.source_data.title }}</span>
+                </template>
+                <span class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_by_user', { id: a.submitter_username || a.user_id?.slice(0, 8) }) }}</span>
+              </div>
+
+              <div v-if="a.action === 'update' && a.source_data?.diff?.length" class="mt-2 space-y-1.5">
+                <p v-if="a.source_data.summary" class="text-xs text-muted dark:text-gray-400">{{ a.source_data.summary }}</p>
+                <div v-for="(d, i) in a.source_data.diff" :key="i" class="p-2 rounded border border-border dark:border-gray-700 text-xs">
+                  <div class="flex items-center gap-2 mb-1">
+                    <code class="text-accent break-all">{{ d.path }}</code>
+                    <span class="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800">{{ d.risk }}</span>
+                    <span v-if="d.mismatch" class="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-300">{{ i18n.t('sync_ai_stale') }}</span>
+                  </div>
+                  <p class="text-muted dark:text-gray-400 break-words">{{ i18n.t('sync_ai_current') }}<code class="break-all">{{ d.current || '—' }}</code></p>
+                  <p class="text-muted dark:text-gray-400 break-words">{{ i18n.t('sync_ai_suggest') }}<code class="break-all">{{ d.new_text ?? d.new }}</code></p>
+                  <p v-if="d.reason" class="mt-1 text-muted dark:text-gray-400 break-words">{{ d.reason }}</p>
+                </div>
+              </div>
             </div>
-            <div class="flex items-center gap-2">
+            <div class="flex items-center gap-2 shrink-0">
               <button @click="reviewChange(a.id, 'approve')" :disabled="approvalReviewing[a.id]" class="px-3 py-1 rounded bg-green-600 text-white text-xs font-medium hover:bg-green-700 disabled:opacity-50">{{ i18n.t('admin_approve') }}</button>
               <button @click="reviewChange(a.id, 'reject')" :disabled="approvalReviewing[a.id]" class="px-3 py-1 rounded bg-red-500 text-white text-xs font-medium hover:bg-red-600 disabled:opacity-50">{{ i18n.t('admin_reject') }}</button>
             </div>
@@ -2915,6 +2970,16 @@ onUnmounted(() => {
           <div class="mb-3 max-w-[10rem]">
             <label class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_rag_top_k') }}</label>
             <input v-model.number="aiForm.rag_top_k" type="number" min="1" max="20" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+          </div>
+
+          <div class="flex items-center justify-between mb-3 p-3 rounded border border-border dark:border-gray-700">
+            <div>
+              <span class="text-sm block">{{ i18n.t('admin_ai_auto_diagnose') }}</span>
+              <span class="text-[11px] text-muted dark:text-gray-400">{{ i18n.t('admin_ai_auto_diagnose_hint') }}</span>
+            </div>
+            <button @click="aiForm.auto_diagnose = !aiForm.auto_diagnose" :class="aiForm.auto_diagnose ? 'bg-green-500' : 'bg-gray-300 dark:bg-gray-600'" class="relative w-11 h-6 rounded-full transition-colors duration-200 shrink-0">
+              <span :class="aiForm.auto_diagnose ? 'translate-x-5' : 'translate-x-0.5'" class="absolute top-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform duration-200"></span>
+            </button>
           </div>
 
           <button @click="saveAIConfig" :disabled="aiSaving" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">

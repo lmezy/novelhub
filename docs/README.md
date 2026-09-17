@@ -16,7 +16,7 @@
 | 文档 | 内容 |
 |---|---|
 | [cookie-guide.md](cookie-guide.md) | Cookie 获取/导入、哪些站点必须用 Cookie |
-| [ai-assistant.md](ai-assistant.md) | AI 配置（设置 → AI）、问答/摘要/人物/时间线、划词、RAG 索引与排错 |
+| [ai-assistant.md](ai-assistant.md) | AI 配置（设置 → AI）、问答/摘要/人物/时间线、划词、RAG 索引、**同步报错诊断**与排错 |
 | [source-search.md](source-search.md) | 书源搜索 → 入库闭环与 API |
 | [r18-access.md](r18-access.md) | R18 书源标记、书籍分级、可见性规则 |
 | [crawl-queue.md](crawl-queue.md) | 爬取队列：暂停 / 继续 / 取消 / 置顶 |
@@ -72,6 +72,8 @@
   [ai-assistant.md](ai-assistant.md) “排错”
 - AI 测试连接报 400 `The supported API model names are …`（模型名不对）→
   [ai-assistant.md](ai-assistant.md) “排错” + [codex-handoff.md](codex-handoff.md) 第 19 节
+- 同步失败想让 AI 说明原因 / AI 能不能自动改书源 → [ai-assistant.md](ai-assistant.md)
+  “同步报错诊断” + [codex-handoff.md](codex-handoff.md) 第 20 节
 - 想连服务器看真实任务与日志 → [codex-handoff.md](codex-handoff.md) 第 1、5 节
 
 ## 文档维护约定

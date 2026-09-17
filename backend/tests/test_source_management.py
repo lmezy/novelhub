@@ -48,6 +48,47 @@ async def test_update_source_changes_metadata_and_book_r18():
 
 
 @pytest.mark.asyncio
+async def test_update_source_sets_and_clears_the_sync_interval():
+    source = SimpleNamespace(
+        id="src-1",
+        name="搬山人",
+        url="https://www.banshanren.com",
+        plugin_name="yuedu",
+        enabled=True,
+        is_r18=False,
+        config={"bookSourceUrl": "https://www.banshanren.com"},
+        sync_interval_seconds=None,
+    )
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=source)
+    db.commit = AsyncMock()
+    db.refresh = AsyncMock()
+    admin = SimpleNamespace(id="u1", role="admin")
+
+    await update_source("src-1", SourceUpdate(sync_interval_seconds=60), admin, db)
+    assert source.sync_interval_seconds == 60
+
+    # An explicit null clears it back to "use the source's own rate".
+    await update_source("src-1", SourceUpdate(sync_interval_seconds=None), admin, db)
+    assert source.sync_interval_seconds is None
+
+    # Omitting the field must not touch a stored value.
+    source.sync_interval_seconds = 30
+    await update_source("src-1", SourceUpdate(name="改名"), admin, db)
+    assert source.sync_interval_seconds == 30
+
+
+def test_source_interval_schema_bounds():
+    from pydantic import ValidationError
+
+    assert SourceUpdate(sync_interval_seconds=0).sync_interval_seconds == 0
+    assert SourceUpdate(sync_interval_seconds=3600).sync_interval_seconds == 3600
+    for bad in (-1, 3601):
+        with pytest.raises(ValidationError):
+            SourceUpdate(sync_interval_seconds=bad)
+
+
+@pytest.mark.asyncio
 async def test_update_source_404_when_missing():
     db = AsyncMock()
     db.get = AsyncMock(return_value=None)

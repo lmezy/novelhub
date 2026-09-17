@@ -11,6 +11,7 @@ from app.services.cookie_crypto import encrypt_cookie, decrypt_cookie
 from app.repositories.cookie import CookieRepository
 from app.schemas.cookie import CookieCreate, CookieOut, CookieUpdate
 from app.services.auth import get_current_user
+from app.services.source_interval import apply_source_interval
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +161,7 @@ async def test_cookie(
         plugin = get_plugin(source.plugin_name, config=config)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    apply_source_interval(plugin, source)
 
     if not hasattr(plugin, "fetch_bookshelf"):
         raise HTTPException(

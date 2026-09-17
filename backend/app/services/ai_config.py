@@ -45,6 +45,7 @@ AI_EMBEDDING_PROVIDER_KEY = "ai_embedding_provider"
 AI_EMBEDDING_BASE_URL_KEY = "ai_embedding_base_url"
 AI_EMBEDDING_API_KEY_KEY = "ai_embedding_api_key"
 AI_EMBEDDING_MODEL_KEY = "ai_embedding_model"
+AI_AUTO_DIAGNOSE_KEY = "ai_auto_diagnose"
 
 ALL_KEYS = (
     AI_ENABLED_KEY,
@@ -64,6 +65,7 @@ ALL_KEYS = (
     AI_EMBEDDING_BASE_URL_KEY,
     AI_EMBEDDING_API_KEY_KEY,
     AI_EMBEDDING_MODEL_KEY,
+    AI_AUTO_DIAGNOSE_KEY,
 )
 
 #: ``AIConfig`` field name -> stored setting key.  Callers (the admin route, the
@@ -86,6 +88,7 @@ FIELD_TO_KEY = {
     "embedding_base_url": AI_EMBEDDING_BASE_URL_KEY,
     "embedding_api_key": AI_EMBEDDING_API_KEY_KEY,
     "embedding_model": AI_EMBEDDING_MODEL_KEY,
+    "auto_diagnose": AI_AUTO_DIAGNOSE_KEY,
 }
 
 # -- provider presets --------------------------------------------------------
@@ -303,6 +306,10 @@ class AIConfig:
     embedding_base_url: str = ""
     embedding_api_key: str = ""
     embedding_model: str = ""
+    #: When a sync task ends in an error state, ask the model to explain it.
+    #: The answer is advice only -- nothing is ever applied without an admin
+    #: approving the proposal it may produce.
+    auto_diagnose: bool = True
 
     # -- derived ------------------------------------------------------------
 
@@ -396,6 +403,7 @@ class AIConfig:
             "effective_embedding_base_url": self.effective_embedding_base_url,
             "embedding_api_key_set": bool(self.embedding_api_key),
             "embeddings_supported": self.embeddings_supported,
+            "auto_diagnose": self.auto_diagnose,
             "providers": [
                 {
                     "value": name,
@@ -485,7 +493,23 @@ def resolve_ai_config(
         embedding_base_url=pick(AI_EMBEDDING_BASE_URL_KEY, "AI_EMBEDDING_BASE_URL"),
         embedding_api_key=embedding_api_key,
         embedding_model=pick(AI_EMBEDDING_MODEL_KEY, "AI_EMBEDDING_MODEL"),
+        auto_diagnose=_truthy(pick(AI_AUTO_DIAGNOSE_KEY, "AI_AUTO_DIAGNOSE"), True),
     )
+
+
+def not_configured_reason(cfg: AIConfig) -> str:
+    """Why :attr:`AIConfig.configured` is false, in actionable Chinese."""
+    if not cfg.enabled:
+        return ("AI 功能未启用：请在「设置 → AI」里启用并填写服务地址与 API Key。"
+                if not cfg.api_key else
+                "AI 功能已关闭：请在「设置 → AI」里打开开关。")
+    if not cfg.effective_base_url:
+        return "AI 服务地址（Base URL）为空：请在「设置 → AI」里填写。"
+    if not cfg.effective_model:
+        return "AI 模型名为空：请在「设置 → AI」里填写。"
+    if cfg.needs_key and not cfg.api_key:
+        return "AI API Key 为空：请在「设置 → AI」里填写。"
+    return "AI 未配置。"
 
 
 async def _load_raw(db: AsyncSession) -> dict[str, str]:

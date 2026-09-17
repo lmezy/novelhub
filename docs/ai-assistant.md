@@ -1,6 +1,6 @@
-# AI 助手（问答 / 摘要 / 人物 / 时间线 / 划词 / RAG）
+# AI 助手（问答 / 摘要 / 人物 / 时间线 / 划词 / RAG / 同步排错）
 
-面向使用与排错。架构与历史根因见 [codex-handoff.md](codex-handoff.md) 第 18 节。
+面向使用与排错。架构与历史根因见 [codex-handoff.md](codex-handoff.md) 第 18、20 节。
 
 ## 1. 配置（设置 → AI）
 
@@ -71,7 +71,62 @@ curl "http://localhost:8088/api/rag/index?limit=50" -H "Authorization: Bearer $T
 建索引是同步请求，会反复调用向量接口：一本几百章的书可能要一两分钟
 （网关已配 3600s 超时）。片段总数上限 2000（`max_chunks` 可调），超出会截断并在结果里标注。
 
-## 4. 接口一览
+## 4. 同步报错诊断
+
+失败的时候不用自己啃日志：**同步页 → 选中那个失败的任务 → 「AI 分析这次报错」**。
+任务以 `failed` 或 `completed_with_errors` 结束时也会自动分析一次（**设置 → AI → 同步失败后自动
+AI 分析**可以关；每个任务最多分析一次，手动「重新分析」才会重跑）。
+
+它会基于这些证据给结论：任务级报错、逐书/逐章失败明细（按错误文本分组带样本）、该书源最近几次
+任务、以及**书源规则 JSON 全文**。
+
+输出四块：
+
+| 输出 | 说明 |
+|---|---|
+| 分类 | 站点侧问题 / Cookie 问题 / 站点限速 / 代理与网络 / 书源配置问题 / 源站已删书 / 无法确定 |
+| 结论 + 判断依据 | 一到两句结论，加上从证据到结论的推理 |
+| 建议下一步 | 具体动作，例如「稍后重试」「去浏览器过验证后导入 Cookie」「检查代理」 |
+| 建议修改书源配置 | 字段路径、当前值、建议值、理由、风险等级；**只有当分类是配置类问题时才有** |
+
+### AI 能改配置吗？—— 只能提，不能改
+
+- AI **从不直接写** `sources.config`。它提出的是补丁提案，必须点「**提交为待审批提案**」，
+  然后到 **设置 → 审批** 里逐条看 diff（字段 / 当前值 / 建议值 / 理由 / 风险）后点「批准」，
+  才会真正写入书源。「拒绝」则什么都不发生。
+- 分类为**站点侧 / 代理 / 源站删书**时，服务端会**强制丢弃**模型给出的规则修改建议
+  （即使模型硬要提），因为改规则解决不了这些故障，只会把好源改坏。
+- 补丁只能落在 `config.*`（书源规则，深度合并，不会清掉其它规则）和
+  `enabled` / `url` / `name` / `plugin_name` / `is_r18` / `sync_interval_seconds`
+  这几个字段上；其它键一律忽略。
+- 明确不做：自动导入或改写 Cookie、任何绕过验证码 / WAF / 登录限制的操作、自动改解析规则。
+
+> 「站点限速」分类最常见的正确处置**不是**改规则，而是给这个书源配一个「同步间隔」
+> （设置 → 书源 → 编辑 → 同步间隔，单位秒/请求；搬山人这类站点按站点说明填 60）。
+> AI 也可以直接建议 `sync_interval_seconds` 的值，同样要你批准才生效。见
+> [codex-handoff.md](codex-handoff.md) 第 21 节。
+
+### 接口
+
+```bash
+TOKEN=<管理员 JWT>
+# 分析（force=true 重跑）
+curl -X POST "http://localhost:8088/api/ai/diagnose/<TASK_ID>" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"force":true}'
+# 读取已存结果（404 = 还没分析过）
+curl "http://localhost:8088/api/ai/diagnose/<TASK_ID>" -H "Authorization: Bearer $TOKEN"
+# 把建议转成待审批提案
+curl -X POST "http://localhost:8088/api/ai/diagnose/<TASK_ID>/propose" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+诊断接口都是管理员权限：回答里会引用书源规则原文。
+
+**怎么读结论**：如果分类是站点侧/Cookie/限速/代理，按「建议下一步」处理，不要改规则；
+如果分类是「书源配置问题」且建议里带具体字段，先看「当前值」那一栏——如果标了
+「当前值与 AI 的说法不一致」，说明模型记错了原文，以你看到的当前值为准。
+
+## 5. 接口一览
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -85,11 +140,15 @@ curl "http://localhost:8088/api/rag/index?limit=50" -H "Authorization: Bearer $T
 | POST | `/api/ai/transform/stream` | 同上，流式（`start` / `delta` / `done` / `error`） |
 | GET/PUT | `/api/admin/ai` | 读取 / 保存 AI 配置（管理员，不回显 Key） |
 | POST | `/api/admin/ai/test` | 连通性测试（管理员） |
+| POST | `/api/admin/ai/models` | 拉取服务端可用模型列表（管理员） |
+| GET | `/api/ai/diagnose/{task_id}` | 读取某次同步任务的 AI 诊断（管理员） |
+| POST | `/api/ai/diagnose/{task_id}` | 分析该任务（管理员，`force` 重跑） |
+| POST | `/api/ai/diagnose/{task_id}/propose` | 把建议转成待审批的书源修改提案（管理员） |
 
 问答请求可以带 `chapter_number`（当前章）、`mode`（`auto` / `rag` / `window`）和 `history`
 （最近 10 轮，用于追问）。
 
-## 5. 排错
+## 6. 排错
 
 | 现象 | 原因 / 处理 |
 |---|---|
@@ -103,3 +162,6 @@ curl "http://localhost:8088/api/rag/index?limit=50" -H "Authorization: Bearer $T
 | RAG 相关报「需要一个支持向量化的服务」 | 向量提供方/模型没配；DeepSeek 不提供 embedding，需另选一个向量提供方 |
 | 摘要只覆盖了一部分章节 | 超出「最多章节数」上限，结果里会标注「已等距抽样」 |
 | 回答半天不出字 | 网关是否缓冲了 SSE：响应需要 `X-Accel-Buffering: no`，nginx 的 `/api` 需要 `proxy_buffering off`（仓库配置已带） |
+| 同步页看不到「AI 分析这次报错」 | 该入口只对管理员显示；任务状态要是 `failed` 或部分失败 |
+| 诊断结果里没有「建议修改书源配置」 | 正常：AI 判定为站点侧/代理/Cookie/删书类问题，改配置解决不了（服务端也会强制丢弃这类建议） |
+| 诊断报「AI 功能未启用」 | 先去 设置 → AI 配好并「测试连接」通过 |

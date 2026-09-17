@@ -33,7 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Book, Chapter
 from app.services.ai_client import AIError, LLMClient
-from app.services.ai_config import AIConfig, get_ai_config
+from app.services.ai_config import AIConfig, get_ai_config, not_configured_reason
 from app.services.storage import BookStorage
 
 #: Characters of a single chapter kept when building a prompt.
@@ -195,22 +195,12 @@ class AIService:
     async def _client(self) -> LLMClient:
         cfg = await self.config()
         if not cfg.configured:
-            raise AIError(self._not_configured_reason(cfg))
+            raise AIError(not_configured_reason(cfg))
         return LLMClient(cfg)
 
     @staticmethod
     def _not_configured_reason(cfg: AIConfig) -> str:
-        if not cfg.enabled:
-            return ("AI 功能未启用：请在「设置 → AI」里启用并填写服务地址与 API Key。"
-                    if not cfg.api_key else
-                    "AI 功能已关闭：请在「设置 → AI」里打开开关。")
-        if not cfg.effective_base_url:
-            return "AI 服务地址（Base URL）为空：请在「设置 → AI」里填写。"
-        if not cfg.effective_model:
-            return "AI 模型名为空：请在「设置 → AI」里填写。"
-        if cfg.needs_key and not cfg.api_key:
-            return "AI API Key 为空：请在「设置 → AI」里填写。"
-        return "AI 未配置。"
+        return not_configured_reason(cfg)
 
     async def status(self) -> dict[str, Any]:
         """Configuration + index summary for the front-end."""

@@ -35,6 +35,7 @@ from app.services.search import search_service
 from app.services.cookie_crypto import safe_decrypt_cookie
 from app.services.r18 import detect_r18
 from app.services.auto_categorize import classify_category_names
+from app.services.source_interval import apply_source_interval, source_sync_interval
 from app.services.book_kind import (
     KIND_COMIC,
     is_comic_content,
@@ -260,6 +261,25 @@ class SyncService:
         self.db = db
         self.storage = storage or BookStorage()
 
+    def _source_plugin(self, source: Source):
+        """Build the plugin for a source, carrying its request interval.
+
+        The interval is a property of the site, so it is read from the source
+        row on every task start -- a sync that is already running keeps the
+        pacing it began with, and the next one picks up an edit made in the
+        admin UI in between.
+        """
+        config = source.config if source.plugin_name == "yuedu" else None
+        plugin = get_plugin(source.plugin_name, config=config)
+        seconds = apply_source_interval(plugin, source)
+        if seconds:
+            logger.debug(
+                "Source {} throttled to one request per {}s",
+                source.id,
+                seconds,
+            )
+        return plugin
+
     @staticmethod
     def _safe_text(value, fallback: str) -> str:
         text = str(value).strip() if value else ""
@@ -370,7 +390,10 @@ class SyncService:
         return any(marker in message for marker in TRANSIENT_CHAPTER_MARKERS)
 
     @staticmethod
-    def _chapter_concurrency(config: dict | None) -> int:
+    def _chapter_concurrency(
+        config: dict | None,
+        source_interval: int | None = None,
+    ) -> int:
         """Pick chapter fetch concurrency, mirroring Legado's thread model."""
         default = min(
             max(1, int(getattr(settings, "SYNC_CHAPTER_CONCURRENCY", 9))),
@@ -378,6 +401,11 @@ class SyncService:
         )
         if getattr(settings, "SYNC_IGNORE_RATE_LIMIT", False):
             return default
+        if source_interval:
+            # The configured interval already lets one request through at a
+            # time; extra chapter tasks would only park on that limiter while
+            # holding their producer slot.
+            return 1
         if not config:
             return default
         rate = str(config.get("concurrentRate", "") or "").strip()
@@ -690,7 +718,7 @@ class SyncService:
         logger.info("Starting sync for source={} url={}", source_id, url)
 
         config = source.config if source.plugin_name == 'yuedu' else None
-        plugin = get_plugin(source.plugin_name, config=config)
+        plugin = self._source_plugin(source)
         cookie_record = await self.db.scalar(
             select(Cookie).where(Cookie.source == source_id)
         )
@@ -926,7 +954,10 @@ class SyncService:
 
         await _checkpoint()
 
-        concurrency = self._chapter_concurrency(config)
+        concurrency = self._chapter_concurrency(
+            config,
+            source_sync_interval(source),
+        )
         semaphore = asyncio.Semaphore(concurrency)
         results_queue = asyncio.Queue(maxsize=concurrency * 2)
 
@@ -1492,7 +1523,7 @@ class SyncService:
             raise ValueError(f"No cookie found for source '{source_id}'")
 
         config = source.config if source.plugin_name == 'yuedu' else None
-        plugin = get_plugin(source.plugin_name, config=config)
+        plugin = self._source_plugin(source)
         cookie_data = safe_decrypt_cookie(cookie_record.cookie_data)
         plugin.set_cookie(cookie_data)
 
@@ -1671,8 +1702,7 @@ class SyncService:
             raise ValueError("Source not found")
         if not source.enabled:
             raise ValueError("Source disabled")
-        config = source.config if source.plugin_name == "yuedu" else None
-        plugin = get_plugin(source.plugin_name, config=config)
+        plugin = self._source_plugin(source)
         cookie_record = await self.db.scalar(
             select(Cookie).where(Cookie.source == book.source_id)
         )
@@ -1734,7 +1764,7 @@ class SyncService:
             raise ValueError("Source not found or disabled")
 
         config = source.config if source.plugin_name == "yuedu" else None
-        plugin = get_plugin(source.plugin_name, config=config)
+        plugin = self._source_plugin(source)
 
         cookie_record = await self.db.scalar(
             select(Cookie).where(Cookie.source == source_id)
@@ -1826,7 +1856,7 @@ class SyncService:
             raise ValueError("Source not found or disabled")
 
         config = source.config if source.plugin_name == "yuedu" else None
-        plugin = get_plugin(source.plugin_name, config=config)
+        plugin = self._source_plugin(source)
 
         cookie_record = await self.db.scalar(
             select(Cookie).where(Cookie.source == source_id)

@@ -87,6 +87,7 @@ async def _lookup_source_async(source_id: str) -> NovelSourcePlugin:
     """
     from app.core.database import LookupSessionLocal
     from app.models import Source
+    from app.services.source_interval import apply_source_interval
     from sqlalchemy import select
 
     async with LookupSessionLocal() as db:
@@ -94,5 +95,10 @@ async def _lookup_source_async(source_id: str) -> NovelSourcePlugin:
         if source is None:
             raise ValueError(f"Source not found: {source_id}")
         config = source.config if source.plugin_name == "yuedu" else None
+        plugin = _instantiate(source.plugin_name, config)
+        # Every caller that resolves a source by ID (cookie health checks,
+        # manual task retries, …) must hit the site at the configured 拉取间隔
+        # too, not just the full-site sync path.
+        apply_source_interval(plugin, source)
         logger.debug("Resolved source {} -> plugin {}", source_id, source.plugin_name)
-        return _instantiate(source.plugin_name, config)
+        return plugin

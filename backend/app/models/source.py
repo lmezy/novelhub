@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Boolean, ForeignKey, Index
+from sqlalchemy import Column, String, Boolean, Integer, ForeignKey, Index
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 
@@ -59,6 +59,17 @@ class Source(Base):
         Boolean,
         default=True,
         nullable=False,
+    )
+
+    #: Minimum gap between two upstream requests of this source, in seconds.
+    #: ``None`` keeps the source's own ``concurrentRate`` (falling back to
+    #: ``CRAWL_DELAY_MS``); ``0`` explicitly means "no throttle".  Sites like
+    #: 搬山人 answer with a captcha when polled faster than their 拉取间隔, and
+    #: the value a source ships with is often wrong, so it is overridable per
+    #: source from the admin UI instead of being hardcoded per site.
+    sync_interval_seconds = Column(
+        Integer,
+        nullable=True,
     )
 
     __table_args__ = (

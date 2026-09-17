@@ -1,4 +1,3 @@
-from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -6,6 +5,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.clock import naive_now
 from app.core.database import get_db
 from app.models import Cookie, CrawlTask, Source, User
 from app.repositories.crawl_task import CrawlTaskRepository
@@ -211,7 +211,7 @@ async def cancel_task(
         raise HTTPException(status_code=400, detail=f"Cannot cancel task in status: {task.status}")
     task.status = "cancelled"
     task.resume_at = None
-    task.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    task.finished_at = naive_now()
     await db.commit()
     return {"task_id": task.id, "status": task.status}
 
@@ -250,7 +250,7 @@ async def retry_task(
     task.status = "running"
     task.error = None
     task.resume_at = None
-    task.started_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    task.started_at = naive_now()
     task.finished_at = None
     await db.commit()
 
@@ -266,18 +266,18 @@ async def retry_task(
             result = await svc.sync_bookshelf(task.source)
         task.status = "completed"
         task.result = result
-        task.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        task.finished_at = naive_now()
         await db.commit()
         return {"task_id": task_id, "status": "completed", "result": result}
     except ValueError as exc:
         task.status = "failed"
         task.error = str(exc)
-        task.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        task.finished_at = naive_now()
         await db.commit()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         task.status = "failed"
         task.error = str(exc)
-        task.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        task.finished_at = naive_now()
         await db.commit()
         raise HTTPException(status_code=500, detail=f"Retry failed: {str(exc)[:300]}") from exc

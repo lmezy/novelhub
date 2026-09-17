@@ -1,4 +1,4 @@
-﻿from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -19,6 +19,7 @@ from app.schemas.source import (
 from app.services.auth import get_current_user, require_admin
 from app.services.book_cleanup import delete_books
 from app.services.search import search_service
+from app.services.source_interval import apply_source_interval
 from app.services.visibility import can_view_all_ages, can_view_r18
 
 
@@ -195,6 +196,7 @@ async def search_remote_books(
 
     config = source.config if source.plugin_name == "yuedu" else None
     plugin = get_plugin(source.plugin_name, config=config)
+    apply_source_interval(plugin, source)
     if not hasattr(plugin, "search_books"):
         raise HTTPException(
             status_code=400,

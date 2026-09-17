@@ -13,6 +13,7 @@ from app.models import Source, Cookie, User
 from app.models.source_credential import SourceCredential
 from app.services.cookie_crypto import encrypt_cookie, decrypt_cookie
 from app.services.auth import get_current_user
+from app.services.source_interval import apply_source_interval
 
 router = APIRouter(
     prefix="/credentials",
@@ -127,6 +128,7 @@ async def trigger_auto_login(
         plugin = get_plugin(source.plugin_name, config=config)
     except ValueError:
         raise HTTPException(status_code=400, detail=f"Unknown plugin: {source.plugin_name}")
+    apply_source_interval(plugin, source)
 
     password = decrypt_cookie(cred.password_encrypted)
     cookie_str = await plugin.auto_login(cred.username, password)

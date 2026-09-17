@@ -46,7 +46,10 @@ async def call(method, path, db, *, user=None, json=None, admin=True):
     app.dependency_overrides[get_db] = lambda: db
     app.dependency_overrides[get_current_user] = lambda: (user or fake_user())
     if admin:
-        app.dependency_overrides[require_admin] = lambda: None
+        # Routes that take ``user: User = Depends(require_admin)`` validate the
+        # dependency's return value, so the override must return a user object
+        # (``lambda: None`` would fail validation with a 500).
+        app.dependency_overrides[require_admin] = lambda: (user or fake_user())
     try:
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -391,6 +394,149 @@ async def test_admin_test_ai_offers_the_model_names_from_the_error():
     assert resp.status_code == 200
     assert body["available_models"] == ["deepseek-flash", "deepseek-v4-pro"]
     assert body["current_model"] == "DeepSeek-V4.1-Flash"
+
+
+# ---------------------------------------------------------------------------
+# sync-failure diagnosis
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_diagnosis_of_an_unanalysed_task_is_404():
+    with patch("app.services.ai_diagnosis.get_stored_diagnosis",
+               AsyncMock(return_value=None)):
+        resp = await call("GET", "/api/ai/diagnose/t1", fake_db())
+
+    assert resp.status_code == 404
+    assert "诊断" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_diagnosis_route_returns_the_stored_analysis():
+    stored = {
+        "id": "d1", "task_id": "t1", "status": "ok",
+        "classification": "site_side", "confidence": "high",
+        "summary": "站点反爬", "reasoning": ["证据"], "next_steps": ["导 Cookie"],
+        "proposed_changes": [], "counts": {}, "problem_groups": [],
+    }
+    with patch("app.services.ai_diagnosis.get_stored_diagnosis",
+               AsyncMock(return_value=stored)):
+        resp = await call("GET", "/api/ai/diagnose/t1", fake_db())
+
+    assert resp.status_code == 200
+    assert resp.json()["classification"] == "site_side"
+
+
+@pytest.mark.asyncio
+async def test_diagnosis_route_runs_the_analysis():
+    db = fake_db()
+    runner = AsyncMock(return_value={"task_id": "t1", "classification": "proxy",
+                                     "summary": "代理抖动", "proposed_changes": []})
+    with patch("app.services.ai_diagnosis.diagnose_task", runner):
+        resp = await call("POST", "/api/ai/diagnose/t1", db, json={"force": True})
+
+    assert resp.status_code == 200
+    assert resp.json()["classification"] == "proxy"
+    assert runner.await_args.kwargs["force"] is True
+
+
+@pytest.mark.asyncio
+async def test_diagnosis_route_reports_an_unconfigured_provider():
+    db = fake_db()
+    with patch("app.services.ai_diagnosis.diagnose_task",
+               AsyncMock(side_effect=AIError("AI 功能未启用：请在「设置 → AI」里启用。"))):
+        resp = await call("POST", "/api/ai/diagnose/t1", db, json={})
+
+    assert resp.status_code == 502
+    assert "设置" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_propose_turns_a_diagnosis_into_a_pending_change():
+    from app.models import Source, SyncDiagnosis
+
+    changes = [{
+        "path": "config.ruleToc.chapterList", "old": "old", "current": "old",
+        "new": "li a", "reason": "命中页脚", "risk": "low", "mismatch": False,
+    }]
+    row = SimpleNamespace(
+        id="d1", task_id="t1", source_id="yuedu_abc", status="ok",
+        classification="config", confidence="high", summary="目录规则问题",
+        payload={"proposed_changes": changes}, change_id=None,
+    )
+    source = SimpleNamespace(id="yuedu_abc")
+
+    db = fake_db()
+    db.scalar = AsyncMock(return_value=row)
+    db.get = AsyncMock(side_effect=lambda model, key: (
+        source if model is Source else None
+    ))
+
+    resp = await call("POST", "/api/ai/diagnose/t1/propose", db)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["created"] is True
+    assert body["changes"] == 1
+    created = db.add.call_args_list[0].args[0]
+    assert created.action == "update"
+    assert created.status == "pending"
+    assert created.source_data["origin"] == "ai"
+    assert created.source_data["patch"]["config"]["ruleToc"]["chapterList"] == "li a"
+    # The diagnosis now points at the proposal so the UI can link them.
+    assert row.change_id == created.id
+
+
+@pytest.mark.asyncio
+async def test_propose_refuses_when_there_is_nothing_to_change():
+    row = SimpleNamespace(
+        id="d1", task_id="t1", source_id="yuedu_abc", status="ok",
+        classification="site_side", confidence="high", summary="站点反爬",
+        payload={"proposed_changes": []}, change_id=None,
+    )
+    db = fake_db()
+    db.scalar = AsyncMock(return_value=row)
+
+    resp = await call("POST", "/api/ai/diagnose/t1/propose", db)
+
+    assert resp.status_code == 400
+    assert "站点侧" in resp.json()["detail"]
+    db.add.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_propose_is_idempotent_while_the_change_is_pending():
+    from app.models import SourceChange
+
+    row = SimpleNamespace(
+        id="d1", task_id="t1", source_id="yuedu_abc", status="ok",
+        classification="config", payload={"proposed_changes": [{"path": "config.x",
+                                                                "new": "1"}]},
+        change_id="ch1",
+    )
+    existing = SimpleNamespace(id="ch1", status="pending")
+    db = fake_db()
+    db.scalar = AsyncMock(return_value=row)
+    db.get = AsyncMock(return_value=existing
+                       if True else None)
+
+    resp = await call("POST", "/api/ai/diagnose/t1/propose", db)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["created"] is False
+    assert body["change_id"] == "ch1"
+    db.add.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_propose_of_an_unknown_task_is_404():
+    db = fake_db()
+    db.scalar = AsyncMock(return_value=None)
+
+    resp = await call("POST", "/api/ai/diagnose/t1/propose", db)
+
+    assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------

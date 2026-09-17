@@ -2,6 +2,7 @@ from uuid import uuid4
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
+from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -11,9 +12,14 @@ from app.models import Book, CrawlTask, Source, SourceChange, User
 from app.schemas.source_change import SourceChangeCreate, SourceChangeOut, SourceChangeReview
 from app.services.auth import get_current_user, require_admin
 from app.services.search import search_service
+from app.services.source_patch import apply_source_patch
 from app.services.task_queue import enqueue_crawl_all
 
 router = APIRouter(prefix="/source-changes", tags=["source-changes"])
+
+#: Actions the API accepts.  ``update`` carries a field patch for an existing
+#: source and is what an AI diagnosis proposal uses.
+ACTIONS = ("create", "delete", "update")
 
 
 async def _enqueue_global_sync(
@@ -55,8 +61,13 @@ async def create_change(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    if payload.action not in ("create", "delete"):
-        raise HTTPException(status_code=400, detail="Action must be 'create' or 'delete'")
+    if payload.action not in ACTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Action must be one of: create, delete, update",
+        )
+    if payload.action == "update" and not payload.source_id:
+        raise HTTPException(status_code=400, detail="update requires source_id")
 
     if user.role in ("admin", "super_admin"):
         if payload.action == "create" and payload.source_data:
@@ -74,6 +85,12 @@ async def create_change(
             if source:
                 await db.delete(source)
                 await db.commit()
+        elif payload.action == "update" and payload.source_id:
+            source = await db.get(Source, payload.source_id)
+            if source is None:
+                raise HTTPException(status_code=404, detail="Source not found")
+            apply_source_patch(source, (payload.source_data or {}).get("patch"))
+            await db.commit()
         change = SourceChange(
             id=str(uuid4()),
             user_id=user.id,
@@ -132,6 +149,15 @@ async def review_change(
             source = await db.get(Source, change.source_id)
             if source:
                 await db.delete(source)
+        elif change.action == "update" and change.source_id:
+            source = await db.get(Source, change.source_id)
+            if source is None:
+                raise HTTPException(status_code=404, detail="Source not found")
+            applied = apply_source_patch(source, (change.source_data or {}).get("patch"))
+            logger.info(
+                "Applied source update proposal {} to {}: {}",
+                change.id, change.source_id, applied,
+            )
         elif change.action == "confirm_r18" and change.source_data:
             for book_id in change.source_data.get("book_ids") or []:
                 book = await db.scalar(

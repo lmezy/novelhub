@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,8 +11,9 @@ from app.api.routes.admin import list_users
 from app.schemas.user import UserCreate
 
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+def _now() -> datetime:
+    # Invite expiry follows the DB convention: naive *local* wall clock.
+    return datetime.now()
 
 
 @pytest.mark.asyncio
@@ -30,8 +31,8 @@ async def test_create_invite_generates_one_time_code():
 
     assert invite.code == "ABC123"
     assert invite.created_by == "u1"
-    assert invite.expires_at > _utcnow()
-    assert invite.expires_at <= _utcnow() + timedelta(days=1)
+    assert invite.expires_at > _now()
+    assert invite.expires_at <= _now() + timedelta(days=1)
 
 
 @pytest.mark.asyncio
@@ -84,7 +85,7 @@ async def test_register_consumes_one_time_invite():
         id="inv-1",
         code="ABC123",
         created_by="u1",
-        expires_at=_utcnow() + timedelta(hours=12),
+        expires_at=_now() + timedelta(hours=12),
         used_by=None,
     )
     db = AsyncMock()
