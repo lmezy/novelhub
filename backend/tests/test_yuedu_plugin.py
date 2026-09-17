@@ -3161,6 +3161,140 @@ def test_blocked_page_error_tells_the_truth_about_a_configured_cookie():
     assert "anti-bot" in with_cookie
 
 
+def test_blocked_page_error_ignores_session_cookies_the_site_sets():
+    """A source with no user Cookie must not be told its Cookie expired.
+
+    御宅屋 (yswhub.cc) hands out a ``fontsize`` preference cookie as soon as a
+    page renders; ``_capture_cookie_jar``/``_capture_playwright_cookies`` fold
+    it into ``_cookie``, and the hint read that as "you configured a Cookie and
+    it went stale" -- sending the user to re-import a Cookie they never had.
+    """
+    plugin = YueduPlugin({"bookSourceUrl": "https://yswhub.cc"})
+    plugin._capture_playwright_cookies([{"name": "fontsize", "value": "16px"}])
+    assert plugin._cookie == "fontsize=16px"
+
+    message = str(plugin._blocked_page_error("https://yswhub.cc/read/1/2.html"))
+    assert "把 Cookie 导入书源" in message
+    assert "已配置 Cookie" not in message
+
+    # An actual user Cookie still flips the hint to the stale-Cookie wording.
+    plugin.set_cookie("fontsize=16px; cf_clearance=old")
+    assert "已配置 Cookie" in str(
+        plugin._blocked_page_error("https://yswhub.cc/read/1/2.html")
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_playwright_fetch_settles_the_navigation():
+    """A caller timeout must not cancel ``page.goto`` while it is in flight.
+
+    Cancelling an in-flight navigation leaves Playwright's own navigation
+    future with nobody to read its error, which asyncio then reports as
+    "Future exception was never retrieved" at ERROR level -- the 2am cookie
+    health check (``COOKIE_CHECK_ITEM_TIMEOUT``) produced three of those per
+    run.  The render is shielded instead, and closing the browser settles it.
+    """
+
+    class FakePage:
+        def __init__(self):
+            self.goto_started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.goto_cancelled = False
+
+        async def goto(self, url, **kwargs):
+            self.goto_started.set()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.goto_cancelled = True
+                raise
+            # What Chromium answers once the browser goes away underneath it.
+            raise RuntimeError("Target page, context or browser has been closed")
+
+    class FakeContext:
+        def __init__(self, page):
+            self.page = page
+
+        async def add_init_script(self, script):
+            return None
+
+        async def new_page(self):
+            return self.page
+
+        async def add_cookies(self, cookies):
+            return None
+
+        async def cookies(self):
+            return []
+
+        async def close(self):
+            return None
+
+    class FakeBrowser:
+        def __init__(self, page):
+            self.page = page
+            self.closed = False
+            self.context = FakeContext(page)
+
+        async def new_context(self, **kwargs):
+            return self.context
+
+        async def close(self):
+            self.closed = True
+            # Closing aborts whatever navigation is still running.
+            self.page.release.set()
+
+    class FakeChromium:
+        def __init__(self, browser):
+            self.browser = browser
+
+        async def launch(self, **kwargs):
+            return self.browser
+
+    class FakePlaywrightManager:
+        """Stands in for ``playwright.async_api.async_playwright``."""
+
+        def __init__(self, browser):
+            self.browser = browser
+
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            return SimpleNamespace(chromium=FakeChromium(self.browser))
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+    page = FakePage()
+    browser = FakeBrowser(page)
+    plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
+
+    loop = asyncio.get_running_loop()
+    unhandled = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, ctx: unhandled.append(ctx))
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                plugin._fetch_with_playwright(
+                    FakePlaywrightManager(browser),
+                    "https://example.com/book/1",
+                    "",
+                    None,
+                ),
+                timeout=0.05,
+            )
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert page.goto_started.is_set()
+    assert page.goto_cancelled is False, "the in-flight navigation was cancelled"
+    assert browser.closed is True, "the browser must be closed to settle the render"
+    assert [ctx.get("message") for ctx in unhandled] == []
+
+
 @pytest.mark.asyncio
 async def test_wait_for_challenge_waits_until_content_ready():
     plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})

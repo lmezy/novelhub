@@ -560,6 +560,13 @@ class YueduPlugin:
             self.engine = YueduRuleEngine(self.config)
         self.base_url: str = self.config.get("bookSourceUrl", "")
         self._cookie: str = ""
+        # The cookie the user configured (a stored shelf cookie, via
+        # ``set_cookie``), as opposed to session cookies the *site* hands out in
+        # ``Set-Cookie`` and which ``_capture_cookie_jar`` folds into
+        # ``_cookie``.  Only the former makes the "your Cookie expired" hint
+        # true: a bare ``fontsize`` preference cookie was enough to tell the
+        # user to re-import a Cookie the source never had.
+        self._configured_cookie: str = ""
         self._client_lock = asyncio.Lock()
         # Pagination templates learned from a catalog page.  Sources such as
         # 風月文學網 h528 list categories without a ``{{page}}`` placeholder,
@@ -2448,6 +2455,7 @@ class YueduPlugin:
         3. Parse the first successful response
         """
         self._cookie = cookie
+        self._configured_cookie = cookie
         bookshelf_url = self.config.get("bookshelf_url", "")
 
         if bookshelf_url:
@@ -3952,6 +3960,7 @@ class YueduPlugin:
     def set_cookie(self, cookie: str) -> None:
         """Set cookie for authenticated requests."""
         self._cookie = cookie
+        self._configured_cookie = cookie
 
     async def auto_login(self, username: str, password: str) -> str | None:
         """Attempt auto-login using the source loginUrl mechanism.
@@ -4094,114 +4103,165 @@ class YueduPlugin:
     ) -> str:
         """Render ``url`` in Chromium and return the (webJs-processed) HTML."""
         async with async_playwright() as pw:
-            launch_kwargs: dict[str, Any] = {
-                "headless": True,
-                "args": [
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-blink-features=AutomationControlled",
-                ],
-            }
+            browser = await self._launch_chromium(pw)
+            # The render runs as a task that is never cancelled.  A caller that
+            # stops waiting -- the cookie health check's per-item timeout, a
+            # paused/cancelled crawl task -- used to cancel ``page.goto`` in
+            # flight, which orphans Playwright's own navigation future: nothing
+            # reads its error, so asyncio reports "Future exception was never
+            # retrieved" at ERROR level (three of those per 2am health check).
+            # Closing the browser settles the render, and awaiting it here
+            # retrieves its error instead of leaking it.
+            render = asyncio.ensure_future(
+                self._render_page(browser, url, web_js, request_headers)
+            )
             try:
-                from app.services.proxy_config import get_playwright_proxy
-                proxy = get_playwright_proxy()
-                if proxy:
-                    launch_kwargs["proxy"] = proxy
+                return await asyncio.shield(render)
+            except BaseException:
+                await self._close_browser(browser)
+                try:
+                    await render
+                except BaseException:
+                    pass
+                raise
+
+    async def _launch_chromium(self, pw: Any) -> Any:
+        """Launch a browser, preferring the full Chromium build.
+
+        Cloudflare/WAF fingerprint checks pass far more often against the full
+        browser (new headless) than against the lightweight headless shell; if
+        it is not available, fall back to Playwright's default launch.
+        """
+        launch_kwargs: dict[str, Any] = {
+            "headless": True,
+            "args": [
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        }
+        try:
+            from app.services.proxy_config import get_playwright_proxy
+            proxy = get_playwright_proxy()
+            if proxy:
+                launch_kwargs["proxy"] = proxy
+        except Exception:
+            pass
+        try:
+            return await pw.chromium.launch(
+                **launch_kwargs,
+                channel="chromium",
+            )
+        except Exception:
+            return await pw.chromium.launch(**launch_kwargs)
+
+    async def _close_browser(self, browser: Any) -> None:
+        """Close a browser, tolerating one that is already gone.
+
+        Closing twice happens on the cancellation path (the settling close plus
+        the render's own teardown), and the close itself may be interrupted
+        while the caller cancels us; neither may mask the error being raised.
+        """
+        try:
+            await browser.close()
+        except BaseException:
+            pass
+
+    async def _render_page(
+        self,
+        browser: Any,
+        url: str,
+        web_js: str,
+        request_headers: dict[str, str] | None,
+    ) -> str:
+        """Render ``url`` in ``browser`` and return the (webJs-processed) HTML."""
+        context = None
+        try:
+            headers = dict(request_headers or self._build_headers())
+            user_agent = headers.pop("User-Agent", None)
+            # Cookie is installed through the browser cookie jar below.
+            cookie_header = self._merge_cookie_strings(
+                headers.pop("Cookie", ""),
+                self._cookie,
+            )
+            headers.pop("Connection", None)
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 720},
+                locale="zh-CN",
+                **({"user_agent": user_agent} if user_agent else {}),
+                extra_http_headers=headers,
+            )
+            # Mask common automation fingerprints so challenge pages
+            # do not immediately classify the browser as a headless bot.
+            try:
+                await context.add_init_script(
+                    "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                    "window.chrome=window.chrome||{runtime:{}};"
+                    "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});"
+                    "Object.defineProperty(navigator,'languages',{get:()=>['zh-CN','zh','en']});"
+                )
             except Exception:
                 pass
-            # Prefer the full Chromium build (new headless) over the
-            # lightweight headless shell: Cloudflare/WAF fingerprint checks
-            # pass far more often against a full browser.  If it is not
-            # available, fall back to Playwright's default launch.
-            try:
-                browser = await pw.chromium.launch(
-                    **launch_kwargs,
-                    channel="chromium",
+            page = await context.new_page()
+
+            # Apply cookies if set
+            if cookie_header:
+                await context.add_cookies(
+                    self._parse_cookies_for_playwright(cookie_header)
                 )
-            except Exception:
-                browser = await pw.chromium.launch(**launch_kwargs)
-            try:
-                headers = dict(request_headers or self._build_headers())
-                user_agent = headers.pop("User-Agent", None)
-                # Cookie is installed through the browser cookie jar below.
-                cookie_header = self._merge_cookie_strings(
-                    headers.pop("Cookie", ""),
-                    self._cookie,
+
+            # WAF-protected sites often keep analytics sockets open forever;
+            # waiting for networkidle turns a usable page into a timeout.
+            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            # Cloudflare / WAF challenge pages ("Just a moment…") return
+            # before the JS challenge has solved itself.  Wait for the
+            # real page (and the resolved session cookies) before running
+            # any webJs or parsing the content.
+            rendered = await self._wait_for_challenge(
+                context,
+                page,
+                url,
+                timeout=25.0,
+            )
+            if not rendered:
+                raise RuntimeError(
+                    "Site returned an empty browser page (网站返回了空白页): "
+                    + url
                 )
-                headers.pop("Connection", None)
-                context = await browser.new_context(
-                    viewport={"width": 1280, "height": 720},
-                    locale="zh-CN",
-                    **({"user_agent": user_agent} if user_agent else {}),
-                    extra_http_headers=headers,
-                )
-                # Mask common automation fingerprints so challenge pages
-                # do not immediately classify the browser as a headless bot.
+            if self._is_blocked_page(rendered):
+                # Even after waiting the challenge never cleared; surface
+                # a clear hint instead of parsing the WAF gate as content.
+                raise self._blocked_page_error(url)
+            self._capture_playwright_cookies(await context.cookies())
+
+            # Legado webJs may mutate the DOM or return the rendered
+            # HTML directly. Preserve both forms instead of discarding
+            # the script result.
+            if web_js:
                 try:
-                    await context.add_init_script(
-                        "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-                        "window.chrome=window.chrome||{runtime:{}};"
-                        "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});"
-                        "Object.defineProperty(navigator,'languages',{get:()=>['zh-CN','zh','en']});"
+                    html = await page.evaluate(
+                        f"(function(){{ var result=document.documentElement.outerHTML; "
+                        f"var value=(function(){{ {web_js} }})(); "
+                        f"return (typeof value === 'string' && value.trim()) "
+                        f"? value : document.documentElement.outerHTML; }})()"
                     )
+                except Exception as e:
+                    logger.warning(f"webJs execution error: {e}")
+                    html = rendered
+            else:
+                html = rendered
+
+            if self._is_blocked_page(html):
+                raise self._blocked_page_error(url)
+
+            return html
+        finally:
+            if context is not None:
+                try:
+                    await context.close()
                 except Exception:
                     pass
-                page = await context.new_page()
-
-                # Apply cookies if set
-                if cookie_header:
-                    await context.add_cookies(
-                        self._parse_cookies_for_playwright(cookie_header)
-                    )
-
-                # WAF-protected sites often keep analytics sockets open forever;
-                # waiting for networkidle turns a usable page into a timeout.
-                await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                # Cloudflare / WAF challenge pages ("Just a moment…") return
-                # before the JS challenge has solved itself.  Wait for the
-                # real page (and the resolved session cookies) before running
-                # any webJs or parsing the content.
-                rendered = await self._wait_for_challenge(
-                    context,
-                    page,
-                    url,
-                    timeout=25.0,
-                )
-                if not rendered:
-                    raise RuntimeError(
-                        "Site returned an empty browser page (网站返回了空白页): "
-                        + url
-                    )
-                if self._is_blocked_page(rendered):
-                    # Even after waiting the challenge never cleared; surface
-                    # a clear hint instead of parsing the WAF gate as content.
-                    raise self._blocked_page_error(url)
-                self._capture_playwright_cookies(await context.cookies())
-
-                # Legado webJs may mutate the DOM or return the rendered
-                # HTML directly. Preserve both forms instead of discarding
-                # the script result.
-                if web_js:
-                    try:
-                        html = await page.evaluate(
-                            f"(function(){{ var result=document.documentElement.outerHTML; "
-                            f"var value=(function(){{ {web_js} }})(); "
-                            f"return (typeof value === 'string' && value.trim()) "
-                            f"? value : document.documentElement.outerHTML; }})()"
-                        )
-                    except Exception as e:
-                        logger.warning(f"webJs execution error: {e}")
-                        html = rendered
-                else:
-                    html = rendered
-
-                if self._is_blocked_page(html):
-                    raise self._blocked_page_error(url)
-
-                await context.close()
-                return html
-            finally:
-                await browser.close()
+            await self._close_browser(browser)
 
     def _parse_cookies_for_playwright(
         self,
@@ -4939,8 +4999,13 @@ class YueduPlugin:
         with it and still came back as a gate, so the Cookie is stale or bound
         to another IP/User-Agent (Cloudflare's ``cf_clearance`` is tied to both
         the address that solved the challenge and the browser's UA).
+
+        This looks at ``_configured_cookie`` rather than ``_cookie``: the latter
+        also holds session cookies the site itself sets, so a source with no
+        user Cookie at all (御宅屋 hands out a ``fontsize`` preference cookie)
+        was reported as "your Cookie expired".
         """
-        if self._cookie:
+        if self._configured_cookie:
             return (
                 "书源已配置 Cookie 但仍被站点拦截：Cookie 可能已过期，或与当前出口 "
                 "IP / User-Agent 不匹配。请在与 NovelHub 相同的代理节点下用浏览器重新"

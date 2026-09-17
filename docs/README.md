@@ -60,6 +60,10 @@
   “正常页面被判成验证码页：小说正文里出现了“已被限制 / 身份验证”这类词”
 - 日志刷 `Failed to fetch content image …`、章节缺图 → [full-site-sync.md](full-site-sync.md)
   “日志刷 `Failed to fetch content image …`，章节里图片缺失”
+- 日志刷 `Future exception was never retrieved` / `Task exception was never retrieved` →
+  [full-site-sync.md](full-site-sync.md) “日志刷 `Future exception was never retrieved`…”
+- 没配 Cookie 的书源却提示「书源已配置 Cookie 但仍被站点拦截」→
+  [full-site-sync.md](full-site-sync.md) “没配 Cookie 的书源却提示…”
 - 同步某本书报 `[Errno 36] File name too long` → [full-site-sync.md](full-site-sync.md)
   “个别书报 [Errno 36] File name too long”
 - 想让小说和漫画分页显示 / 漫画书被算成小说 → [codex-handoff.md](codex-handoff.md) 第 16 节

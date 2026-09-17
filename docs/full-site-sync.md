@@ -185,6 +185,36 @@ Admin → 代理里填的是别的主机地址，容器访问不到。crawler/ba
   的括号配对规则切分，XPath 风格选择器翻译成等价 CSS（`li[1]` 等索引仍按 Legado 语义），
   且**书源声明了 `bookUrlPattern` 时才用它过滤**，否则以书源自己的 `bookList` 为准。
 
+### 日志刷 `Future exception was never retrieved` / `Task exception was never retrieved`
+
+这类 ERROR 出在浏览器收尾环节，不是书源或 Cookie 坏了，也不影响已经同步下来的书：
+
+- `Future exception was never retrieved` + `TargetClosedError('Target page, context or browser
+  has been closed')`：每天 2 点的 cookie 健康检查给每一项设了 `COOKIE_CHECK_ITEM_TIMEOUT`
+  （默认 60s）上限，而浏览器路径单次最坏要 `goto` 45s + 挑战等待 25s，超时就会取消正在进行的
+  `page.goto`，Playwright 自己的导航 future 于是无人读取，被回收时由 asyncio 打成 ERROR
+  （一次检查会连出好几条，间隔正好 60 秒）。
+- `Task exception was never retrieved` + `InvalidStateError: invalid state`（`PipeTransport.run`）
+  同源：Playwright 传输层在关闭竞态里收尾。
+
+2026-09-17 修：浏览器渲染改成不可取消的任务，调用方超时/取消时先关掉浏览器让渲染收尾、把它的
+异常读掉，然后才重抛取消。升级后这几行会消失；真正的失败仍会以书/章级的 `Failed to sync …` 出现。
+
+### 没配 Cookie 的书源却提示「书源已配置 Cookie 但仍被站点拦截」
+
+`Cookie 可能已过期` 这句只应在**你确实导入过 Cookie** 时出现。旧版看的是内部的 cookie 串，而
+站点自己用 `Set-Cookie` 下发的会话 cookie（御宅屋的 `fontsize=16px` 之类）也会写进同一个字段，
+于是没配 Cookie 的书源被报成「Cookie 过期」，把人引去重新导入一个根本不存在的 Cookie。
+
+2026-09-17 修：只有走「设置 → 书源 → Cookie / 账号」导入的 Cookie 才算「已配置」。现在看到
+
+- 「请在浏览器中访问该网站通过验证后，把 Cookie 导入书源再同步」＝ 该源确实没配 Cookie；
+- 「书源已配置 Cookie 但仍被站点拦截」＝ 配了但站点仍然拦（Cookie 过期，或与当前出口 IP / UA
+  不匹配）。
+
+两条都是**真实拦截**，服务端不绕过。同一次修复还确认了御宅屋 09-17 12:10 的中止属真实限速
+（稍后同一 URL 用浏览器与普通 HTTP 都能拿到正常页面），隔一段时间再同步即可。
+
 ### 正常页面被判成“限流/反爬”，整本书同步中止
 
 2026-09-13 修：弱标记（`限流`、`访问异常`、`访问频繁`、`请求频繁`）以前只要在**整页任意位置**

@@ -99,6 +99,8 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 | 風月文學網任务每次都报“验证码/人机验证”失败，浏览器里页面正常 | 正文里“我的手**已被限制**在厚实手套中”命中强标记 `已被限制`（整页裸子串） | 见第 15 节 |
 | 禁忌书屋任务报“验证码/人机验证”，浏览器正常 | 正文“经过严格的**身份验证**”+ 同段“无**人机**”：`身份验证` 是上下文标记、`人机` 是确认词，而 `人机`⊂`无人机` | 见第 15 节 |
 | 日志刷 `Failed to fetch content image …`（ClosedResourceError / ConnectError / 404） | 图片下载不重试 anyio 流错误、代理失败后只试直连、`404` 也重试 3 次 | 见第 15 节 |
+| 日志刷 `Future exception was never retrieved` / `Task exception was never retrieved` | cookie 健康检查的 `asyncio.wait_for` 超时把进行中的 `page.goto` 取消掉，Playwright 自己的导航 future 没人读 | 见第 17 节 |
+| 没配 Cookie 的书源被报「书源已配置 Cookie 但仍被站点拦截」 | `_captcha_hint` 读的 `_cookie` 混进了站点自己 `Set-Cookie` 的会话 cookie（御宅屋的 `fontsize`） | 见第 17 节 |
 
 ---
 
@@ -671,3 +673,51 @@ Playwright `Page.goto` 超时都属站点/代理侧，代码按设计重试；�
 全库结果；旧书由迁移回填，剩下判错的（图源自报 text、目录被解析成图集）用「设置 → 索引 →
 小说 / 漫画识别 → 重新识别」或 `POST /api/books/reclassify?scan_content=true&source_id=<书源>` 重算。改动要
 `docker compose build backend crawler frontend` + `up -d` 后在线上生效（迁移由 backend 启动时自动执行）。
+
+## 17. 2026-09-17：cookie 健康检查的超时掐断 Playwright 导航，日志刷 ERROR；御宅屋被误报「Cookie 已过期」
+
+**现象**（线上 `novelhub-crawler` 日志，用户报「同步书源时 crawler 里有报错」）：
+
+1. 24 小时内 8 条 ERROR，其中 4 条是浏览器收尾噪声：
+   - 02:04:19、02:05:15、02:06:18 —— 每天 2 点的 cookie 健康检查，两两间隔 56s / 63s（≈
+     `COOKIE_CHECK_ITEM_TIMEOUT` 默认 60s）：`Future exception was never retrieved` +
+     `TargetClosedError('Target page, context or browser has been closed')`；
+   - 12:10:10 —— 御宅屋任务收尾时：`Task exception was never retrieved` +
+     `PipeTransport.run → InvalidStateError: invalid state`。
+2. 御宅屋（`yuedu_123bca8ecb6a`）12:10 的失败信息是
+   `Site returned an anti-bot/captcha page (…书源已配置 Cookie 但仍被站点拦截：Cookie 可能已过期…)`，
+   可这个**书源根本没配过 Cookie** —— 用户会去找一个不存在的 Cookie 重新导入。
+
+**根因**（都在线上容器里复现）：
+
+1. **超时会在导航途中取消 `page.goto`**：cookie 健康检查用
+   `asyncio.wait_for(_check_one(cookie), timeout=COOKIE_CHECK_ITEM_TIMEOUT)`，而浏览器路径单次最坏要
+   `goto` 45s + 挑战等待 25s = 70s，超时必然落在导航中间。取消 `page.goto` 会把 Playwright
+   自己的导航 future 丢下没人读，GC 时 asyncio 就用 ERROR 打出「Future exception was never
+   retrieved」。线上容器实测：部署版插件 + `wait_for(..., 2.5)` 取消同一本书 → **1 条**未取回异常。
+2. **`_captcha_hint` 读的是 `self._cookie`**，而该字段同时被 `_capture_cookie_jar` /
+   `_capture_playwright_cookies` 写入站点自己 `Set-Cookie` 的会话 cookie。御宅屋渲染一页就下发
+   `fontsize=16px`，于是「没配 Cookie」被说成「配了 Cookie 但过期了」。
+
+**改动**：
+
+| 文件 | 改动 |
+|---|---|
+| `backend/app/crawler/plugins/yuedu/__init__.py` | `_fetch_with_playwright` 拆成 `_launch_chromium` + `_render_page`：渲染跑在 `asyncio.ensure_future` 里并以 `asyncio.shield` 等待，调用方超时/取消时**不取消导航**，改为关掉浏览器让渲染收尾、再 `await` 它取回异常，最后重抛 `CancelledError`；新增 `_close_browser`（关两次或在取消中被中断都不遮住真正的错误）；`_render_page` 用 `finally` 保证 context 先于 browser 关闭 |
+| 同上 | 新增 `_configured_cookie`（由 `set_cookie` / `fetch_bookshelf` 写入），`_captcha_hint` 改用它判断「有没有配 Cookie」 |
+| `backend/tests/test_yuedu_plugin.py` | 新增 2 项回归：`test_blocked_page_error_ignores_session_cookies_the_site_sets`、`test_cancelled_playwright_fetch_settles_the_navigation` |
+
+**验证**：
+
+- `cd backend && python -m pytest -q` → **488 passed**。两项新测试在**改动前**都会失败
+  （`the in-flight navigation was cancelled`），确认它们真能复现问题。
+- 线上影子回归（改动后的 `__init__.py` 送到容器 `/tmp/shadow_yuedu_plugin.py`，用 importlib
+  单独加载；不动线上镜像、代码与数据库）：同一本书、同样 `wait_for(2.5)` 取消 ——
+  部署版 `Future exception was never retrieved` **1 条**，改动后 **0 条**；
+  只带站点会话 cookie（`fontsize=16px`）时改动后提示「把 Cookie 导入书源」，
+  `set_cookie` 后才变成「已配置 Cookie 但仍被拦截」。
+
+**未做/已知**：御宅屋 12:10 那 5 章被判拦截是**真实拦截**，不是误判 —— 同一 URL 现在用 httpx
+与 Playwright 都能拿到 14KB 正常页面（标题 `【无限道淫棍路】（25-26）_万淫之首…`），当时是连续同步
+两天的站点侧限速，代码按设计中止任务。本节只保证「超时/取消不再产生无意义的 ERROR」和「拦截文案
+不再指向错误的排查方向」。改动要 `docker compose build backend crawler` + `up -d` 后才在线上生效。
