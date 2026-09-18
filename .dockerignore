@@ -4,6 +4,12 @@
 **/*.pyc
 **/.venv
 **/venv
+# 本地密钥文件绝不进镜像：crawler/scheduler 的 context 是仓库根目录，会
+# COPY backend/（其中就有 backend/.env）。运行时的变量由 compose 的 env_file 提供。
+.env
+**/.env
+.env.*
+**/.env.*
 frontend
 nginx
 docs
