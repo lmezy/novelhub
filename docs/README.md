@@ -87,6 +87,10 @@
   + [codex-handoff.md](codex-handoff.md) 第 26 节
 - **搜索/发现结果被过滤成 0 本，只入库一个首页链接；书页报 `no usable metadata`** →
   [codex-handoff.md](codex-handoff.md) 第 26 节
+- **AI 分析说「书源未配置 Cookie」，但书源页显示「已保存 Cookie」** →
+  [codex-handoff.md](codex-handoff.md) 第 27 节 + [ai-assistant.md](ai-assistant.md) “排错”
+- **搜索结果和搜索词没关系（搜「铃铛」出「铃木」）** → [codex-handoff.md](codex-handoff.md) 第 28 节
+- **高级搜索（多条件）怎么填都是 0 条** → [codex-handoff.md](codex-handoff.md) 第 28 节
 - AI 侧栏提示未配置 / 回答总从第 1 章说起 / 回答不出字（流式被缓冲）→
   [ai-assistant.md](ai-assistant.md) “排错”
 - AI 测试连接报 400 `The supported API model names are …`（模型名不对）→

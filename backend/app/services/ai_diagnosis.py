@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Iterable
 from uuid import uuid4
 
@@ -29,9 +30,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import SessionLocal
-from app.models import CrawlTask, Source, SyncDiagnosis
+from app.models import Cookie, CrawlTask, Source, SourceCredential, SyncDiagnosis
 from app.services.ai_client import AIError, LLMClient
 from app.services.ai_config import AIConfig, get_ai_config, not_configured_reason
+from app.services.cookie_crypto import decrypt_cookie
 from app.services.source_interval import source_sync_interval
 
 #: Failure classes the model must choose from.
@@ -92,6 +94,11 @@ B. **书源配置问题**：某条规则写法与本站页面结构不符（选�
 - Cookie 类站点报拦截：需要在浏览器里过验证后重新导入 Cookie，**不能**靠改规则解决。
 - 连续多章/多本被拦（验证码、403、520）且书源自带的 concurrentRate 很小：这是**站点限速**，
   正确的处置是提高 sync_interval_seconds（每个请求之间的秒数），而不是改解析规则。
+- 「书源有没有 Cookie」**只看证据里的「登录状态」一节**：Legado 书源规则 JSON 的 `header` 里
+  几乎永远不会出现 cookie 字段（Cookie 是独立存在 cookies 表里的），所以**不要**因为规则里看不到
+  Cookie 就断言“书源未配置 Cookie”。反过来，那一节写「已保存 Cookie」时也不能说“没配 Cookie”：
+  页面仍被拦/403/要求登录时，结论应是 Cookie **可能已过期**，处置是在浏览器里重新登录后重新导入。
+  只有那一节明确写「没有保存 Cookie」时，才允许把失败归因为缺少 Cookie。
 
 **红线（违反即视为无效回答）**：
 1. 不得建议绕过验证码 / WAF / 登录限制，也不得建议伪造身份或抓取受限内容；
@@ -121,6 +128,109 @@ B. **书源配置问题**：某条规则写法与本站页面结构不符（选�
 def _trim(text: Any, limit: int) -> str:
     value = str(text or "")
     return value if len(value) <= limit else value[:limit] + "…（已截断）"
+
+
+def _iso(value: Any) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def _is_cookie_name(name: str) -> bool:
+    """RFC 6265 token check, so a failed decrypt cannot masquerade as a name.
+
+    A ``COOKIE_SECRET`` that differs between containers makes the stored value
+    undecryptable and the raw base64 blob would otherwise be printed as if it
+    were a cookie name.
+    """
+    if not name or len(name) > 40 or " " in name:
+        return False
+    return all(ch.isalnum() or ch in "!#$%&'*+-.^_`|~" for ch in name)
+
+
+def cookie_names(cookie_header: str, *, limit: int = 15) -> list[str]:
+    """The **names** in a Cookie header, never the values.
+
+    The diagnosis prompt goes to an external model, so the user's session cookie
+    must not travel with it.  The names alone are what the model needs: a
+    ``cf_clearance`` in the list means the browser challenge was solved, and a
+    bare ``fontsize`` preference cookie is not a login at all.
+    """
+    names: list[str] = []
+    for part in str(cookie_header or "").split(";"):
+        if "=" not in part:
+            # Every Cookie header pair is ``name=value``; a bare blob (a stored
+            # value that failed to decrypt) must not pass as a name.
+            continue
+        name = part.split("=", 1)[0].strip()
+        if not _is_cookie_name(name) or name in names:
+            continue
+        names.append(name)
+        if len(names) >= limit:
+            break
+    return names
+
+
+def _cookie_plaintext(stored: str) -> tuple[str, bool]:
+    """``(plaintext, decrypted)`` for one stored Cookie row.
+
+    Legacy rows hold an unencrypted Cookie header.  The caller decides what a
+    failed decrypt means: names found anyway → fine; no names at all → the
+    ``COOKIE_SECRET`` of this process does not match the one that stored it.
+    """
+    try:
+        return decrypt_cookie(stored), True
+    except Exception:
+        return str(stored or ""), False
+
+
+async def collect_login_state(db: AsyncSession, source_id: str | None) -> dict[str, Any]:
+    """Whether the source has a stored Cookie and/or auto-login credential.
+
+    The model used to be blind to this.  It only saw the book-source rule JSON,
+    whose ``header`` holds a UA and nothing else, and concluded "书源未配置
+    Cookie" even for a source whose Cookie had been imported a minute earlier --
+    then told the user to go export and re-import the Cookie that was already
+    stored (``sync_diagnoses`` on the live instance shows exactly that).
+    """
+    state: dict[str, Any] = {
+        "configured": False,
+        "count": 0,
+        "names": [],
+        "decrypted": False,
+        "created_at": None,
+        "expired_at": None,
+        "expired": False,
+        "credentials_saved": False,
+    }
+    if not source_id:
+        return state
+
+    rows = list(await db.scalars(select(Cookie).where(Cookie.source == source_id)))
+    if rows:
+        newest = max(
+            rows,
+            key=lambda row: getattr(row, "created_at", None)
+            or datetime.min.replace(tzinfo=None),
+        )
+        plaintext, decrypted = _cookie_plaintext(newest.cookie_data or "")
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        state.update({
+            "configured": True,
+            "count": len(rows),
+            "names": cookie_names(plaintext),
+            "decrypted": decrypted,
+            "created_at": _iso(getattr(newest, "created_at", None)),
+            "expired_at": _iso(getattr(newest, "expired_at", None)),
+            "expired": bool(
+                getattr(newest, "expired_at", None)
+                and newest.expired_at < now
+            ),
+        })
+
+    credential = await db.scalar(
+        select(SourceCredential).where(SourceCredential.source == source_id)
+    )
+    state["credentials_saved"] = credential is not None
+    return state
 
 
 @dataclass
@@ -196,6 +306,7 @@ async def collect_evidence(db: AsyncSession, task: CrawlTask) -> Evidence:
         "enabled": bool(getattr(source, "enabled", True)),
         "sync_interval_seconds": source_sync_interval(source),
         "config": dict(getattr(source, "config", None) or {}),
+        "cookies": await collect_login_state(db, task.source),
     }
 
     recent: list[dict[str, Any]] = []
@@ -234,6 +345,11 @@ async def collect_evidence(db: AsyncSession, task: CrawlTask) -> Evidence:
             "error": _trim(task.error, 2000),
             "exclude_tags": list(task.exclude_tags or []),
             "exclude_categories": list(task.exclude_categories or []),
+            # The timestamps let the model line the task up against the Cookie's
+            # save time instead of guessing whether a Cookie existed back then.
+            "created_at": _iso(getattr(task, "created_at", None)),
+            "started_at": _iso(getattr(task, "started_at", None)),
+            "finished_at": _iso(getattr(task, "finished_at", None)),
         },
         source=source_info,
         problem_groups=group_failures(result.get("details")),
@@ -279,6 +395,51 @@ def _render_interval(seconds: Any) -> str:
     return f"每 {value} 秒最多 1 次请求（{value} 秒/请求）"
 
 
+def render_login_state(source: dict[str, Any] | None) -> list[str]:
+    """The ``## 登录状态`` block: Cookie presence, names only."""
+    state = (source or {}).get("cookies")
+    if not isinstance(state, dict):
+        return ["- Cookie 状态：证据未提供"]
+    if not state.get("configured"):
+        lines = ["- **没有保存 Cookie**：cookies 表里没有该书源的记录。"]
+    else:
+        names = "、".join(state.get("names") or [])
+        if names:
+            head = (
+                f"- **已保存 Cookie**（cookies 表 {state.get('count', 0)} 条）："
+                f"最新一条包含 {names}（只列名字，值加密存储、不发送给模型）"
+            )
+        elif not state.get("decrypted"):
+            head = (
+                f"- **已保存 Cookie**（cookies 表 {state.get('count', 0)} 条），"
+                "但值解密失败（保存时的 COOKIE_SECRET 与当前进程不一致）——"
+                "依然算「已配置」，不要改口说没有 Cookie。"
+            )
+        else:
+            head = (
+                f"- **已保存 Cookie**（cookies 表 {state.get('count', 0)} 条），内容为空。"
+            )
+        lines = [
+            head,
+            "- Cookie 保存时间：{}；过期时间：{}{}".format(
+                state.get("created_at") or "未知",
+                state.get("expired_at") or "未设置",
+                "（**已过期**）" if state.get("expired") else "",
+            ),
+        ]
+    lines.append(
+        "- 已保存自动登录凭据（Cookie 过期时可自动刷新）"
+        if state.get("credentials_saved")
+        else "- 没有保存自动登录凭据"
+    )
+    lines.append(
+        "- 口径：以本节为准。规则 JSON 的 header 里看不到 cookie 字段**不代表**没配置 Cookie；"
+        "「已保存 Cookie」也不代表它仍然有效——被拦/403/要登录时应说 Cookie 可能已过期，"
+        "而不是说「书源未配置 Cookie」。"
+    )
+    return lines
+
+
 def render_evidence(evidence: Evidence, config_budget: int = DEFAULT_CONFIG_BUDGET) -> str:
     task = evidence.task
     counts = evidence.counts
@@ -289,11 +450,16 @@ def render_evidence(evidence: Evidence, config_budget: int = DEFAULT_CONFIG_BUDG
         f"站点：{evidence.source.get('url')}",
         f"请求间隔（sync_interval_seconds）：{_render_interval(evidence.source.get('sync_interval_seconds'))}",
         f"模式：{task.get('mode')} 状态：{task.get('status')} 页数上限：{task.get('max_pages')}",
+        f"任务时间：创建 {task.get('created_at') or '未知'} / 开始 {task.get('started_at') or '未知'}"
+        f" / 结束 {task.get('finished_at') or '未知'}",
         f"计数：找到 {counts['books_found']}，成功 {counts['books_synced']}，"
         f"失败 {counts['books_failed']}，新增章节 {counts['chapters_created']}，"
         f"章节失败 {counts['chapters_failed']}，已翻页 {counts['pages_checked']}",
         f"任务级报错：{task.get('error') or '(无)'}",
     ]
+
+    lines.append("\n## 登录状态（Cookie）")
+    lines.extend(render_login_state(evidence.source))
 
     lines.append("\n## 失败内容分组（按出现次数排序）")
     if evidence.problem_groups:
@@ -739,6 +905,8 @@ __all__ = [
     "build_messages",
     "build_patch",
     "collect_evidence",
+    "collect_login_state",
+    "cookie_names",
     "describe_changes",
     "diagnose_task",
     "get_stored_diagnosis",
@@ -746,6 +914,7 @@ __all__ = [
     "normalize_change_path",
     "render_config",
     "render_evidence",
+    "render_login_state",
     "sanitize_diagnosis",
     "serialize_diagnosis",
     "task_deserves_diagnosis",

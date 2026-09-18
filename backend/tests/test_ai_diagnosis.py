@@ -6,12 +6,13 @@ model itself classified as site-side.
 """
 
 import json
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.models import CrawlTask, Source
+from app.models import Cookie, CrawlTask, Source, SourceCredential
 from app.services.ai_client import LLMResult
 from app.services.ai_config import AIConfig
 from app.services.ai_diagnosis import (
@@ -19,24 +20,37 @@ from app.services.ai_diagnosis import (
     build_messages,
     build_patch,
     collect_evidence,
+    cookie_names,
     describe_changes,
     diagnose_task,
     group_failures,
     normalize_change_path,
     render_config,
     render_evidence,
+    render_login_state,
     sanitize_diagnosis,
     task_deserves_diagnosis,
     value_at_path,
 )
 
 
+def _query_entity(query):
+    """Which model a ``select(...)`` targets (so the fake can route by model)."""
+    try:
+        return query.column_descriptions[0].get("entity")
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
 class FakeDB:
-    def __init__(self, *, task=None, source=None, scalar_value=None, scalars_values=None):
+    def __init__(self, *, task=None, source=None, scalar_value=None, scalars_values=None,
+                 cookie_rows=None, credential=None):
         self.task = task
         self.source = source
         self.scalar_value = scalar_value
         self.scalars_values = list(scalars_values or [])
+        self.cookie_rows = list(cookie_rows or [])
+        self.credential = credential
         self.added: list = []
         self.commits = 0
 
@@ -48,9 +62,16 @@ class FakeDB:
         return None
 
     async def scalars(self, query):
+        if _query_entity(query) is Cookie:
+            return list(self.cookie_rows)
         return list(self.scalars_values)
 
     async def scalar(self, query):
+        entity = _query_entity(query)
+        if entity is Cookie:
+            return self.cookie_rows[0] if self.cookie_rows else None
+        if entity is SourceCredential:
+            return self.credential
         return self.scalar_value
 
     def add(self, obj):
@@ -248,6 +269,160 @@ async def test_collect_evidence_reads_task_source_and_history():
     assert evidence.source["name"] == "示例书源"
     assert evidence.counts["books_failed"] == 10
     assert evidence.recent_tasks[0]["id"] == "t0"
+
+
+def make_cookie_row(**overrides):
+    values = {
+        "id": "c1",
+        "source": "yuedu_abc",
+        "cookie_data": "ss_userid=283; cf_clearance=abc123; fontsize=16px",
+        "expired_at": None,
+        "created_at": datetime(2026, 9, 18, 21, 39, 29),
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_cookie_names_lists_names_but_never_values():
+    names = cookie_names("ss_userid=283; cf_clearance=abc123; fontsize=16px")
+
+    assert names == ["ss_userid", "cf_clearance", "fontsize"]
+    assert all("283" not in name and "abc123" not in name for name in names)
+
+
+def test_cookie_names_ignores_a_undecryptable_blob():
+    """A COOKIE_SECRET mismatch hands back raw base64; that is not a name."""
+    blob = "pJ3r9F0kQ2xhbW9uZHNhZGRhc2Rhc2Rhc2Rhc2Rhc2Rhc2Rhc2Q="
+
+    assert cookie_names(blob) == []
+
+
+@pytest.mark.asyncio
+async def test_collect_evidence_flags_a_cookie_it_cannot_decrypt():
+    db = FakeDB(
+        task=make_task(),
+        source=make_source(),
+        cookie_rows=[make_cookie_row(cookie_data="pJ3r9F0kQ2xhbW9uZHNhZGRh")],
+    )
+
+    state = (await collect_evidence(db, db.task)).source["cookies"]
+
+    assert state["configured"] is True
+    assert state["decrypted"] is False
+    assert state["names"] == []
+    assert "已保存 Cookie" in "\n".join(render_login_state({"cookies": state}))
+
+
+@pytest.mark.asyncio
+async def test_collect_evidence_reports_the_stored_cookie():
+    """The model used to be told nothing about a Cookie that does exist.
+
+    ``sync_diagnoses`` on the live instance holds an answer that says
+    「书源未配置 Cookie，header 中只有 UA」 for 中文成人文学网-短篇(简体) -- a source
+    whose Cookie had been saved one minute earlier.  The rules JSON never
+    mentions cookies, so the evidence has to carry the login state itself.
+    """
+    db = FakeDB(
+        task=make_task(),
+        source=make_source(),
+        cookie_rows=[make_cookie_row(source="yuedu_abc")],
+    )
+
+    evidence = await collect_evidence(db, db.task)
+
+    state = evidence.source["cookies"]
+    assert state["configured"] is True
+    assert state["count"] == 1
+    assert state["names"] == ["ss_userid", "cf_clearance", "fontsize"]
+    assert state["created_at"] == "2026-09-18T21:39:29"
+    assert state["credentials_saved"] is False
+    # The prompt must never carry the cookie's value.
+    assert "283" not in json.dumps(evidence.as_dict(), ensure_ascii=False)
+    assert "abc123" not in json.dumps(evidence.as_dict(), ensure_ascii=False)
+
+
+@pytest.mark.asyncio
+async def test_collect_evidence_marks_an_expired_cookie_and_saved_credentials():
+    db = FakeDB(
+        task=make_task(),
+        source=make_source(),
+        cookie_rows=[make_cookie_row(expired_at=datetime(2020, 1, 1))],
+        credential=SimpleNamespace(username="u"),
+    )
+
+    state = (await collect_evidence(db, db.task)).source["cookies"]
+
+    assert state["expired"] is True
+    assert state["credentials_saved"] is True
+
+
+@pytest.mark.asyncio
+async def test_collect_evidence_without_a_cookie_says_so():
+    db = FakeDB(task=make_task(), source=make_source())
+
+    state = (await collect_evidence(db, db.task)).source["cookies"]
+
+    assert state["configured"] is False
+    assert state["count"] == 0
+    assert state["names"] == []
+
+
+def test_render_evidence_tells_the_model_a_cookie_is_configured():
+    evidence = SimpleNamespace(
+        task=make_task().__dict__,
+        source={
+            "name": "中文成人文学网", "id": "yuedu_c4a", "plugin_name": "yuedu",
+            "enabled": True, "url": "https://blog.xbookcn.net",
+            "config": make_source().config,
+            "cookies": {"configured": True, "count": 1,
+                        "names": ["ss_userid", "cf_clearance"],
+                        "created_at": "2026-09-18T21:39:29", "expired_at": None,
+                        "expired": False, "credentials_saved": False},
+        },
+        problem_groups=[], recent_tasks=[],
+        counts={"books_found": 0, "books_synced": 0, "books_failed": 0,
+                "chapters_created": 0, "chapters_failed": 0, "pages_checked": 0},
+    )
+
+    text = render_evidence(evidence)
+
+    assert "## 登录状态（Cookie）" in text
+    assert "已保存 Cookie" in text
+    assert "cf_clearance" in text
+    assert "没有保存 Cookie" not in text
+    # The prompt has to say out loud that the rules JSON is not the source of
+    # truth for cookies, otherwise the model repeats the wrong conclusion.
+    assert "不代表" in text
+
+
+def test_render_login_state_says_no_cookie_only_when_the_store_is_empty():
+    lines = render_login_state({
+        "cookies": {"configured": False, "count": 0, "names": [],
+                    "credentials_saved": False},
+    })
+
+    assert "没有保存 Cookie" in lines[0]
+    assert "没有保存自动登录凭据" in lines[1]
+
+
+def test_render_login_state_without_evidence_is_not_a_claim():
+    assert render_login_state({}) == ["- Cookie 状态：证据未提供"]
+
+
+def test_system_prompt_forbids_cookie_claims_from_the_rule_json():
+    messages = build_messages(SimpleNamespace(
+        task=make_task().__dict__,
+        source={"name": "s", "id": "i", "plugin_name": "yuedu", "enabled": True,
+                "url": "u", "config": make_source().config},
+        problem_groups=[], recent_tasks=[],
+        counts={"books_found": 0, "books_synced": 0, "books_failed": 0,
+                "chapters_created": 0, "chapters_failed": 0, "pages_checked": 0},
+    ))
+
+    prompt = messages[0]["content"]
+
+    assert "登录状态" in prompt
+    assert "**不要**因为规则里看不到" in prompt
 
 
 def test_build_messages_embeds_the_rules():

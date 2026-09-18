@@ -27,13 +27,14 @@ class SearchService:
     # (measured on the live 115k-chapter index), while 300 is ~29 MB and stays
     # under a second.  300 candidates is still eight pages of 40 results.
     CONTENT_CANDIDATE_LIMIT = 300
-    # Single-condition *exact* searches score in Python (see
+    # Single-condition searches score the engine's candidates in Python (see
     # ``_single_condition_search``) because Meilisearch cannot express a Chinese
-    # substring match: charabia splits 白骨精 into 白/骨/精, ``matchingStrategy:
-    # "last"`` only requires the last fragment (so 穿成白骨肿么破 matches on 破!)
-    # and ``"all"``/phrase queries return 0 hits for perfectly good terms such as
-    # 剑来.  The scan only retrieves ``id`` + the searched field, which is 0.02-0.7 s
-    # for 10 000 documents, and the ordered result is cached for repeat pages.
+    # substring match: charabia splits 白骨精 into 白/骨/精 and
+    # ``matchingStrategy: "last"`` only requires the last fragment, so 穿成白骨肿么破
+    # matches on 破, ``matchingStrategy: "all"`` returns 0 hits for 剑来 (which has
+    # 113 real ones) and phrase queries are no better.  The scan only retrieves
+    # ``id`` + the searched field, which is 0.02-0.7 s for 10 000 documents, and
+    # the ordered result is cached for repeat pages.
     METADATA_CANDIDATE_LIMIT = 10_000
     # How long a scored single-condition result stays usable for paging.  Books
     # and chapters keep flowing in while a user pages, so this is deliberately
@@ -337,6 +338,27 @@ class SearchService:
             return self.client.index(self.INDEX_CHAPTERS).search(query, options)
 
     @staticmethod
+    def _longest_run(needle: str, haystack: str) -> int:
+        """Length of the longest contiguous piece of ``needle`` present in text.
+
+        Only used to order fuzzy hits: a title holding 「铃铛」 as one piece beats
+        one where 铃 and 铛 sit far apart.  Queries come from a search box, so the
+        O(n·m) walk is bounded by a handful of characters and stops as soon as a
+        start position cannot beat the best run found so far.
+        """
+        if not needle or not haystack:
+            return 0
+        best = 0
+        for start in range(len(needle)):
+            if len(needle) - start <= best:
+                break
+            end = start
+            while end < len(needle) and needle[start:end + 1] in haystack:
+                end += 1
+            best = max(best, end - start)
+        return best
+
+    @staticmethod
     def _condition_score(
         value: str,
         text: str,
@@ -345,8 +367,14 @@ class SearchService:
     ) -> int:
         """Score one field condition. Exact requires the whole string to appear.
 
-        Fuzzy counts how many distinct characters from the query appear in the
-        field, so 白骨精 ranks above 白龙精 (2/3 chars) and 白毛鼠 (1/3 chars).
+        Fuzzy requires **every character** of the query to appear (any order, gaps
+        allowed) and then ranks the survivors: whole string first, then the
+        longest contiguous piece, then the engine's own ranking.  Partial matches
+        are *not* results: Meilisearch's CJK analysis is per-character, so
+        ``matchingStrategy: "last"`` only needs the last character, and 铃铛 came
+        back with 19 hits of which exactly one contained 铃铛 (the rest had just
+        铃 -- 铃木/铃雨/聖誕鈴聲 -- or just 铛).  Users read that as "结果和搜索内容
+        没有关系", which is what it is.
         """
         if isinstance(text, (list, tuple)):
             text = " ".join(str(item) for item in text)
@@ -359,11 +387,16 @@ class SearchService:
             return 1_000_000 + tie if needle in haystack else 0
 
         chars = list(dict.fromkeys(ch for ch in value if not ch.isspace()))
+        if not chars:
+            return 0
         matched = sum(1 for ch in chars if ch.lower() in haystack)
-        if matched == 0:
+        if matched < len(chars):
             return 0
         full_bonus = 1000 if needle in haystack else 0
-        return matched * 10_000 + full_bonus + tie
+        # Capped below ``full_bonus`` so an exact hit always outranks a scattered
+        # one, however long the query is.
+        run_bonus = min(SearchService._longest_run(needle, haystack), 99) * 10
+        return matched * 10_000 + full_bonus + run_bonus + tie
 
     def _search_field(
         self,
@@ -371,11 +404,13 @@ class SearchService:
         attr: str,
         value: str,
         filters: str | None,
+        limit: int | None = None,
     ) -> dict:
         options = {
-            "limit": (
-                self.CONTENT_CANDIDATE_LIMIT if attr == "content"
-                else self.CANDIDATE_LIMIT
+            "limit": int(
+                limit
+                or (self.CONTENT_CANDIDATE_LIMIT if attr == "content"
+                    else self.CANDIDATE_LIMIT)
             ),
             "offset": 0,
             "attributesToSearchOn": [attr],
@@ -394,6 +429,29 @@ class SearchService:
             options.pop("attributesToSearchOn", None)
             return self.client.index(index_name).search(value, options)
 
+    def _candidate_window(self, index_name: str, attr: str) -> int:
+        """How many candidates one condition may pull into the Python scorer.
+
+        This is a *correctness* knob, not just a speed one.  Every condition is
+        scored in Python, so whatever falls outside the window is invisible to it:
+        ``category = 言情`` alone matches 1 847 books, so with the old flat
+        1 000-candidate window ``title ~ 晴晴的 AND category = 言情`` returned 0
+        although the book carries both -- and every other AND/OR condition whose
+        partner ranked below the cut behaved the same way ("多条件搜索全是 0 条").
+
+        The books index answers a 10 000-document window in 0.1-0.3 s (measured
+        on the live 24k-book index), so book-side conditions simply score every
+        match.  The chapters index is two orders of magnitude slower at that
+        width (47-250 s measured on the live 115k-chapter index), so chapter-side
+        conditions keep the small window, and ``content`` keeps the smallest one
+        because its candidates have to carry the body (``_retrieve_attrs``).
+        """
+        if attr == "content":
+            return self.CONTENT_CANDIDATE_LIMIT
+        if index_name == self.INDEX_BOOKS:
+            return self.METADATA_CANDIDATE_LIMIT
+        return self.CANDIDATE_LIMIT
+
     def _search_all_with_filter(self, index_name: str, filters: str | None) -> dict:
         options = {
             "limit": self.CANDIDATE_LIMIT,
@@ -411,8 +469,12 @@ class SearchService:
         value: str,
         mode: str,
         filters: str | None,
+        limit: int | None = None,
     ) -> dict[str, tuple[int, dict]]:
-        result = self._search_field(index_name, attr, value, filters)
+        result = self._search_field(
+            index_name, attr, value, filters,
+            limit if limit is not None else self._candidate_window(index_name, attr),
+        )
         candidates: dict[str, tuple[int, dict]] = {}
         for hit in result.get("hits", []):
             text = hit.get(attr) or ""
@@ -696,7 +758,7 @@ class SearchService:
             ],
         }
 
-    # ---- single-condition search: deep paging without a candidate window ----
+    # ---- single-condition search: one scan, then cached deep pages ----
 
     @staticmethod
     def _scope_index(scope: str) -> str:
@@ -713,55 +775,6 @@ class SearchService:
             return self.CHAPTER_FIELD_ATTRS[field]
         return self.CHAPTER_BOOK_FIELD_ATTRS.get(field)
 
-    def _engine_page(
-        self,
-        index_name: str,
-        value: str,
-        attr: str,
-        filters: str | None,
-        offset: int,
-        limit: int,
-    ) -> dict:
-        """One page straight out of Meilisearch: matching + ranking + paging.
-
-        ``page``/``hitsPerPage`` is Meilisearch's finite-pagination mode and is
-        what makes hundreds of pages possible: the response carries the exact
-        ``totalHits``/``totalPages`` and the engine can jump to page 250 without
-        touching pages 1-249 (measured 0.007 s on the live index, versus 40-110 s
-        for the old "pull every candidate into Python" page).
-        """
-        remainder = offset % limit if limit else 0
-        page = offset // limit + 1 if limit else 1
-        hits_per_page = limit + remainder
-        options = {
-            "page": page,
-            "hitsPerPage": hits_per_page,
-            "attributesToSearchOn": [attr],
-            # Display attributes only; ``content`` is cropped below so a
-            # chapter page never ships a whole 100 KB body per result.
-            "attributesToRetrieve": self._retrieve_attrs(index_name, ""),
-            "showRankingScore": True,
-        }
-        if index_name == self.INDEX_CHAPTERS:
-            options["attributesToCrop"] = ["content"]
-            options["cropLength"] = self.SNIPPET_CROP_WORDS
-        if filters:
-            options["filter"] = filters
-        result = self.client.index(index_name).search(value, options)
-        hits = result.get("hits", []) or []
-        if remainder:
-            hits = hits[remainder:]
-        return {
-            "hits": hits,
-            "total": int(
-                result.get("totalHits")
-                or result.get("estimatedTotalHits")
-                or len(hits)
-            ),
-            "offset": offset,
-            "limit": limit,
-        }
-
     def _scan_condition(
         self,
         index_name: str,
@@ -769,6 +782,7 @@ class SearchService:
         value: str,
         filters: str | None,
         window: int,
+        mode: str = "exact",
     ) -> list[tuple[int, str]]:
         """Rank the engine's candidates with the shared Python scorer.
 
@@ -798,7 +812,7 @@ class SearchService:
             score = self._condition_score(
                 value,
                 hit.get(attr) or "",
-                "exact",
+                mode,
                 hit.get("_rankingScore", 0),
             )
             if score > 0:
@@ -895,45 +909,33 @@ class SearchService:
     ) -> dict | None:
         """Deep-pageable search for one condition, or ``None`` to use the window.
 
-        * ``fuzzy`` -- Meilisearch matches, ranks and pages (its relevance is at
-          least as good as the old character-coverage score, and the candidate
-          set is the same one the scorer saw).
-        * ``exact`` -- Meilisearch can only tokenize, so the substring test stays
-          in Python; the engine still drives the scan and the ranked ids are
-          cached, which is what makes pages 2..N cheap.
+        Both modes scan the engine's candidates once, score them in Python, cache
+        the ranking and hydrate only the page that is returned:
+
+        * ``exact`` -- the bare substring test Meilisearch cannot express;
+        * ``fuzzy`` -- every character of the query must appear.  This used to be
+          handed straight to the engine, but Meilisearch's CJK matching is
+          per-character, so the noise the user sees (铃铛 -> 铃木/铃雨) *is* its
+          answer.  Scoring here keeps the gate and the honest ``total``.
         """
         index_name = self._scope_index(scope)
         attr = self._field_attr(index_name, cond["field"])
         if not attr:
             return None
 
-        if cond["mode"] == "fuzzy":
-            page = self._engine_page(
-                index_name, cond["value"], attr, filters, offset, limit,
-            )
-            hits = [
-                self._serialize_engine_hit(hit, cond["field"], scope)
-                for hit in page["hits"]
-            ]
-            return {
-                "hits": hits,
-                "total": page["total"],
-                "offset": offset,
-                "limit": limit,
-                "engine_paged": True,
-            }
-
         window = (
             self.CONTENT_CANDIDATE_LIMIT if attr == "content"
             else self.METADATA_CANDIDATE_LIMIT
         )
         cache_key = "|".join((
-            index_name, attr, cond["value"], filters or "", str(window),
+            index_name, attr, cond["value"], filters or "",
+            cond.get("mode") or "exact", str(window),
         ))
         ranked = self._page_cache_get(cache_key)
         if ranked is None:
             ranked = self._scan_condition(
                 index_name, attr, cond["value"], filters, window,
+                cond.get("mode") or "exact",
             )
             self._page_cache_put(cache_key, ranked)
 
@@ -952,7 +954,6 @@ class SearchService:
             "total": len(ranked),
             "offset": offset,
             "limit": limit,
-            "engine_paged": True,
         }
 
     def _page_cache_get(self, key: str) -> list[tuple[int, str]] | None:

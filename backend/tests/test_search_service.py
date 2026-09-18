@@ -364,13 +364,31 @@ def test_condition_score_exact_requires_substring():
     assert SearchService._condition_score("白骨精", "白龙精", "exact") == 0
 
 
-def test_condition_score_fuzzy_ranks_by_matched_chars():
-    full = SearchService._condition_score("白骨精", "三打白骨精", "fuzzy")
-    two = SearchService._condition_score("白骨精", "白龙精", "fuzzy")
-    one = SearchService._condition_score("白骨精", "白毛鼠", "fuzzy")
+def test_condition_score_fuzzy_requires_every_character():
+    """Fuzzy means "all characters present", not "one of them".
 
-    assert full > two > one > 0
-    assert SearchService._condition_score("白骨精", "毛鼠", "fuzzy") == 0
+    Meilisearch's CJK analysis is per-character, so 铃铛 came back with 19 hits
+    of which exactly one contained 铃铛: the rest had merely 铃 (铃木/铃雨/
+    聖誕鈴聲) or merely 铛, which users correctly read as unrelated results.
+    """
+    assert SearchService._condition_score("铃铛", "【小铃铛】（1-12）", "fuzzy") > 0
+    assert SearchService._condition_score("铃铛", "【日娱猎手】铃木爱理", "fuzzy") == 0
+    assert SearchService._condition_score("铃铛", "铛的一声", "fuzzy") == 0
+    assert SearchService._condition_score("铃铛", "聖誕鈴聲", "fuzzy") == 0
+    assert SearchService._condition_score("铃铛", "毛鼠", "fuzzy") == 0
+
+
+def test_condition_score_fuzzy_prefers_the_whole_string_then_a_long_run():
+    contiguous = SearchService._condition_score("白骨精", "第1章 三打白骨精", "fuzzy")
+    long_run = SearchService._condition_score("白骨精", "白骨X精", "fuzzy")
+    scattered = SearchService._condition_score("白骨精", "白X骨X精", "fuzzy")
+
+    # Same coverage, so the whole-string bonus decides, then the longest
+    # contiguous piece (「白骨」 beats 白…骨…精).
+    assert contiguous > long_run > scattered > 0
+    assert SearchService._longest_run("白骨精", "白骨X精") == 2
+    assert SearchService._longest_run("白骨精", "白X骨X精") == 1
+    assert SearchService._longest_run("白骨精", "毛鼠") == 0
 
 
 def test_advanced_search_books_scope_and_requires_all_conditions():
@@ -526,57 +544,60 @@ def test_advanced_search_content_scope_all_returns_chapters_only():
     assert result["hits"][0]["book_title"] == "1983"
 
 
-def test_advanced_search_chapters_fuzzy_is_engine_paged():
-    """A single fuzzy condition is answered by Meilisearch itself.
+def test_advanced_search_fuzzy_single_condition_is_scored_not_engine_paged():
+    """A single fuzzy condition must be filtered, not handed straight back.
 
-    That is what makes hundreds of pages possible: the engine jumps to the page
-    instead of the old "pull the whole candidate window into Python and re-sort
-    it on every click" (40-110 s per page on the live index).
+    The engine answers 铃铛 with every title holding 铃 *or* 铛 (per-character CJK
+    matching), so its hits -- and its ``totalHits`` -- are not the result set.
     """
     service, _, chapters_index = _service_with_indexes()
-    chapters_index.search.return_value = {
-        "hits": [
-            {"id": "c1", "book_id": "b1", "title": "三打白骨精", "book_title": "西游记"},
-            {"id": "c2", "book_id": "b2", "title": "白龙精", "book_title": "另一本书"},
-        ],
-        "totalHits": 2500,
-        "totalPages": 63,
-    }
+    chapters_index.search.side_effect = [
+        {"hits": [
+            {"id": "c1", "book_id": "b1", "title": "小铃铛", "book_title": "西游记"},
+            {"id": "c2", "book_id": "b2", "title": "铃木爱理", "book_title": "另一本书"},
+            {"id": "c3", "book_id": "b3", "title": "铛的一声", "book_title": "再一本书"},
+        ], "estimatedTotalHits": 19},
+        {"hits": [
+            {"id": "c1", "book_id": "b1", "title": "小铃铛", "book_title": "西游记",
+             "content": "…"},
+        ]},
+    ]
 
     result = service.advanced_search(
-        [{"field": "chapter_title", "mode": "fuzzy", "value": "白骨精"}],
+        [{"field": "chapter_title", "mode": "fuzzy", "value": "铃铛"}],
         match="or",
         scope="chapters",
-        offset=80,
-        limit=40,
     )
 
-    options = chapters_index.search.call_args.args[1]
-    assert options["page"] == 3
-    assert options["hitsPerPage"] == 40
-    assert options["attributesToSearchOn"] == ["title"]
-    # Names come from the engine, not from a Python-side count of scored hits.
-    assert result["total"] == 2500
-    assert result["engine_paged"] is True
-    assert [hit["title"] for hit in result["hits"]] == ["三打白骨精", "白龙精"]
+    assert result["total"] == 1
+    assert [hit["title"] for hit in result["hits"]] == ["小铃铛"]
     assert result["hits"][0]["type"] == "chapter"
 
 
-def test_engine_paged_deep_page_does_not_scan_candidates():
+def test_deep_page_of_a_single_condition_reuses_the_scanned_ranking():
     service, books_index, _ = _service_with_indexes()
-    books_index.search.return_value = {"hits": [], "totalHits": 10000}
+    scan_hits = [
+        {"id": f"b{i}", "title": "小铃铛", "_rankingScore": (500 - i) / 500}
+        for i in range(500)
+    ]
+    books_index.search.side_effect = lambda query, options: (
+        {"hits": [{"id": "b250", "title": "小铃铛"}]}
+        if options.get("filter") else {"hits": scan_hits}
+    )
 
-    service.advanced_search(
-        [{"field": "title", "mode": "fuzzy", "value": "白"}],
+    result = service.advanced_search(
+        [{"field": "title", "mode": "fuzzy", "value": "铃铛"}],
         scope="books",
-        offset=9960,
+        offset=250,
         limit=40,
     )
 
-    options = books_index.search.call_args.args[1]
-    assert options["page"] == 250
-    # One query for the page -- no candidate window, no scoring pass.
-    assert "limit" not in options
+    scans = [call for call in books_index.search.call_args_list
+             if not call.args[1].get("filter")]
+    assert len(scans) == 1, "page 7 must come from the cached ranking"
+    assert scans[0].args[1]["limit"] == SearchService.METADATA_CANDIDATE_LIMIT
+    assert result["total"] == 500
+    assert result["hits"][0]["id"] == "b250"
 
 
 def test_advanced_search_multi_condition_fuzzy_ranks_in_python():
@@ -599,13 +620,78 @@ def test_advanced_search_multi_condition_fuzzy_ranks_in_python():
         scope="chapters",
     )
 
-    assert result.get("engine_paged") is None
     assert result["total"] == 3
-    assert [hit["title"] for hit in result["hits"]] == [
-        "三打白骨精",
-        "白龙精",
-        "白毛鼠",
+    # 白龙精/白毛鼠 survive only through the second condition: neither carries
+    # all of 白骨精.
+    assert result["hits"][0]["title"] == "三打白骨精"
+    assert {hit["title"] for hit in result["hits"]} == {"三打白骨精", "白龙精", "白毛鼠"}
+
+
+def test_multi_condition_book_window_covers_every_match():
+    """The books window is a correctness knob, not a speed one.
+
+    ``category = 言情`` matches 1 847 books on the live index, so the old flat
+    1 000-candidate window made ``title ~ X AND category = 言情`` return 0 for
+    books that carry both -- and every OR/AND whose partner ranked below the cut
+    behaved the same way ("多条件搜索全是 0 条").
+    """
+    service, books_index, chapters_index = _service_with_indexes()
+    assert service._candidate_window("books", "category_names") == \
+        SearchService.METADATA_CANDIDATE_LIMIT
+    assert service._candidate_window("books", "title") == \
+        SearchService.METADATA_CANDIDATE_LIMIT
+    # Chapters are two orders of magnitude slower at that width, and ``content``
+    # candidates have to carry the body.
+    assert service._candidate_window("chapters", "book_title") == \
+        SearchService.CANDIDATE_LIMIT
+    assert service._candidate_window("chapters", "content") == \
+        SearchService.CONTENT_CANDIDATE_LIMIT
+
+    books_index.search.return_value = {"hits": []}
+    chapters_index.search.return_value = {"hits": []}
+
+    service.advanced_search(
+        [
+            {"field": "title", "mode": "exact", "value": "晴晴的"},
+            {"field": "category", "mode": "exact", "value": "言情"},
+        ],
+        match="and",
+        scope="all",
+    )
+
+    windows = [
+        call.args[1]["limit"] for call in books_index.search.call_args_list
     ]
+    assert windows == [SearchService.METADATA_CANDIDATE_LIMIT,
+                       SearchService.METADATA_CANDIDATE_LIMIT]
+
+
+def test_multi_condition_and_keeps_a_book_the_wide_window_reaches():
+    service, books_index, chapters_index = _service_with_indexes()
+    # "晴晴的乖巧日记" ranks 1 500th for 言情: outside the old 1 000 window.
+    ranked_after_cut = [
+        {"id": f"other-{i}", "title": f"别的书{i}", "author": "x",
+         "tags": [], "category_names": ["言情"], "is_r18": False}
+        for i in range(1200)
+    ]
+    target = {"id": "target", "title": "晴晴的乖巧日记", "author": "哈基米",
+              "tags": [], "category_names": ["言情"], "is_r18": False}
+    books_index.search.side_effect = lambda query, options: {
+        "hits": [target] if "晴晴" in str(query) else ranked_after_cut + [target]
+    }
+    chapters_index.search.return_value = {"hits": []}
+
+    result = service.advanced_search(
+        [
+            {"field": "title", "mode": "exact", "value": "晴晴的"},
+            {"field": "category", "mode": "exact", "value": "言情"},
+        ],
+        match="and",
+        scope="all",
+    )
+
+    assert result["total"] == 1
+    assert result["hits"][0]["title"] == "晴晴的乖巧日记"
 
 
 def test_advanced_search_or_returns_any_matching_book():

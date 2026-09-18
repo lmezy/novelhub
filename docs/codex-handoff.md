@@ -43,7 +43,7 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 
 ## 2. 当前状态（2026-09-18）
 
-- 后端全量测试 **641 passed**：`cd backend && python -m pytest -q`
+- 后端全量测试 **690 passed**：`cd backend && python -m pytest -q`
 - Source Engine 闭环已完成并可用：导入书源 → 搜索 → 目录 → 正文 → Storage/DB/搜索 →
   网页阅读。当前工作重心是**同步稳定性与线上排错**，不是新增架构能力。
 - **AI 功能已补齐**（第 18 节）：后端配置/上下文/流式/划词/RAG + 前端 AI 设置页与阅读器
@@ -118,6 +118,9 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 | `exploreUrl` 是 `<js>` 但站点正常，仍报「发现规则是 Legado JS 脚本，当前环境无法执行」 | shim 缺 `java.connect`（书源 `try/catch` 把 TypeError 变成字符串，日志里看不到 JS 报错） | 见第 26 节（`java.connect`/`getBody`/`selectFirst`/`equals`） |
 | 日志刷 `JsRuntime eval error: Object of type Tag is not JSON serializable` | 纯 JS 字段规则的输入是 bs4 `Tag`，`json.dumps` 在脚本运行前就抛错 | 见第 26 节（`json_safe()`） |
 | 搜索结果被全部过滤、只剩首页链接；书页无 `<title>` 导致 `no usable metadata` | host-only 的 `bookUrlPattern`（只有 scheme+host）当过滤器用；`{{book.name}}` 没有 book 上下文 | 见第 26 节（`_book_url_pattern()`/`_extract_labelled_title()`） |
+| AI 诊断说「书源未配置 Cookie」，但设置 → 书源明明显示「已保存 Cookie」 | 诊断证据只带任务报错 + 规则 JSON，**完全没带 cookies 表的状态**；书源 `header` 里本来就不会有 cookie 字段 | 见第 27 节（`collect_login_state()` + 提示词口径） |
+| 搜索「铃铛」返回一堆只有「铃」或只有「铛」的结果 | Meilisearch 的 CJK 匹配是**逐字**的，`matchingStrategy: last` 只要求最后一个字命中；模糊模式把引擎结果原样返回 | 见第 28 节（`_condition_score` 模糊改为「每个字都要出现」） |
+| 高级搜索（多条件）怎么填都是 0 条 | 多条件路径每个条件只取 1000 条候选（`CANDIDATE_LIMIT`），`category=言情` 一类条件命中 1847 本，交集被截断后恒为空 | 见第 28 节（`_candidate_window()`：books 元数据 10000） |
 
 ---
 
@@ -1144,6 +1147,10 @@ crawler 长期 100% CPU。
 
 ## 24. 2026-09-18：为什么别人几百页还快 —— 单条件搜索改成引擎原生深分页
 
+> 本节里的「模糊模式交给引擎（相关度排序 + 原生分页）」**已被第 28 节取代**：
+> 引擎的中文匹配是逐字的，`铃铛` 会把 `铃木`/`铃雨` 一起返回。第 28 节改成
+> 「引擎只提供候选，打分/门槛留在 Python」，精确与模糊都走「扫一次 + 缓存 + 深分页」。
+
 **现象/需求**：用户问「为什么其他小说网站能有几百页，而且速度还那么快」。第 23 节修完之后
 搜索已经是亚秒级，但**页数**仍是自造的：单查询最多 25 页（`content` 8 页）。
 
@@ -1376,3 +1383,135 @@ crawler 长期 100% CPU。
   形状判定回落到路径启发式（`/xs_ls/…` 这类短路径不会被当成书页，也不影响
   `ruleToc` 命中即权威的既有策略）。
 - Icu 的相册式漫画正文是图片，阅读器渲染属于前端既有能力，未在本轮验证。
+
+## 27. 2026-09-18：AI 说「书源未配置 Cookie」，可书源页明明写着「已保存 Cookie」
+
+**现象**：用户在「阅读书源导入」页导入书源时**同时填了 Cookie**（设置 → 书源里那条书源确实显示
+已保存 Cookie），但对该书源失败任务点「AI 分析这次报错」，结论里写着
+「书源未配置 Cookie，header 中只有 UA」，`next_steps` 还让用户「去浏览器导出 Cookie 再导入」——
+用户已经导过了。问：别的书源是不是也有这个问题？
+
+**排查（只读线上数据库）**：
+
+1. `cookies` 表里 `yuedu_c4a94f9ce7ce`（中文成人文学网-短篇(简体)）**有一条**记录，
+   `created_at = 21:39:29`；那次任务 `started_at = 21:39:41`、诊断存于 `21:40:20`。
+   也就是说：任务运行时 Cookie 就在库里，诊断时也在库里。
+2. `sync_diagnoses` 里那条诊断的 `reasoning` 第 5 条原文是「书源未配置 Cookie，header 中只有 UA，
+   没有任何可用于通过站点验证的凭据」——**是模型猜的**。
+3. 根因不在书源、也不在导入流程：`import_yuedu_sources` 会把 `payload.cookie` 加密写进 `cookies` 表
+   （`yuedu.py` 第 970-985 行），这条链路是好的。问题在
+   `ai_diagnosis.collect_evidence()` 交给模型的证据里**只有任务报错、逐书失败明细、书源规则 JSON**，
+   完全没有 `cookies` 表的状态；而 Legado 书源 JSON 的 `header` 里本来就不会出现 cookie 字段
+   （Cookie 是独立存在的），于是模型看着规则里「没有 cookie」就断言「没配置 Cookie」。
+4. **是系统性问题**：线上 16 个书源**全部**有 Cookie 记录（各 1 条，均未过期），
+   而这段证据代码与书源无关 —— 任何书源都可能被这样误判。9 条已存诊断里有 1 条明确写了
+   「未配置 Cookie」（就是上面那条），其余只是碰巧没往 Cookie 上归因。
+
+**改动**：
+
+| 文件 | 改动 |
+|---|---|
+| `backend/app/services/ai_diagnosis.py` | 新增 `collect_login_state()`（读 `cookies` 表 + `source_credentials`，给出「有没有 / 几条 / 名字 / 保存时间 / 过期时间 / 是否已过期 / 有没有自动登录凭据」）、`cookie_names()`（**只取名字，绝不带值**）、`_cookie_plaintext()`（解密失败时区分「旧版明文」与「密文解不开」）、`render_login_state()`；`collect_evidence()` 把结果挂到 `evidence.source["cookies"]`，并给任务补上 `created_at/started_at/finished_at`；`render_evidence()` 增加 `## 登录状态（Cookie）` 一节；`SYSTEM_DIAGNOSE` 增加口径：「书源有没有 Cookie 只看这一节，`header` 里看不到不代表没配；已保存 ≠ 仍有效，被拦时说可能已过期，而不是说没配」 |
+| `backend/tests/test_ai_diagnosis.py` | FakeDB 按查询的模型路由（Cookie / SourceCredential / 其他），新增 7 项：只列名字不带值、base64 密文不当成名字、证据里带 Cookie、已过期与已存凭据、没有 Cookie 时如实说、渲染出「已保存 Cookie」且不出现「没有保存 Cookie」、系统提示词的口径 |
+
+**验证**：
+
+- `cd backend && python -m pytest -q` → **690 passed**。
+- 线上影子回归（把改后的 `ai_diagnosis.py` 放进 backend 容器 `/tmp` 导入，
+  **只读数据库、不调 AI、不写任何行**），对**真实那条任务**重新收集证据：
+
+| 检查 | 结果 |
+|---|---|
+| `collect_login_state("yuedu_c4a94f9ce7ce")` | `configured=True, count=1, names=[_gid, cf_clearance, _gat_gtag_UA_99929_1, _ga_JKNXPWV2R8, _ga], decrypted=True` |
+| 渲染出的证据 | `## 登录状态（Cookie）` → 「**已保存 Cookie**（cookies 表 1 条）…」（含 `cf_clearance`） |
+| 证据全文 | 不再出现「没有保存 Cookie」；且 `ss_userid=`/`cf_clearance=` 等**值一律不出现在证据里** |
+
+**未做/已知**：
+
+- **只改本地代码**。线上生效要 `docker compose build backend crawler` + `up -d`（无新迁移）。
+- 已经存在的那条错误诊断**不会自愈**（诊断按任务缓存，一个任务只自动分析一次）：
+  在同步页对该任务点「重新分析」才会按新证据重跑。
+- Cookie 的**值**永远不进提示词（会发给外部模型服务），只给名字：像 `cf_clearance` 这种名字已经
+  足够判断「浏览器验证过了」，而 `fontsize` 这类站点自己发的偏好 cookie 不会被误当作登录态。
+- 如果 backend 与 crawler 的 `COOKIE_SECRET` 不一致，证据会写「值解密失败」并**仍然算已配置**，
+  不会退回成「没有 Cookie」——这种情况该去查两个容器的环境变量，不是改书源。
+- **已知缺口（本轮未改）**：非管理员用「全局」scope 导入书源时走审批流
+  （`_submit_global_approvals` → source_changes），而保存 Cookie 的那段代码在它 `return` 之后，
+  所以**这一步填的 Cookie 会被丢掉**，审批通过后书源是「没有 Cookie」的状态。
+  Cookie 是按 source_id 存的、没有 owner 列，把某个用户的会话 Cookie 先写进一条待审批的
+  全局书源里（或审批时自动带上）属于权限问题，不适合顺手改：目前请在**审批通过之后**再导入一次
+  Cookie（或在「设置 → 书源」里给那条书源单独保存）。个人 scope 导入不受影响。
+
+## 28. 2026-09-18：搜索结果和搜索词没关系 / 多条件搜索全是 0 条
+
+**现象**：① 搜索「铃铛」时结果里混进只带「铃」或只带「铛」的书，甚至看着两个都不占；
+② 高级搜索（多条件）怎么填都是 0 条。
+
+**排查（只读线上索引，`novelhub-search`）**：
+
+1. 直接把前端的查询发给引擎（`attributesToSearchOn: ["title"]`，就是代码里的参数）：
+
+| 查询 | 引擎返回 |
+|---|---|
+| `铃铛` | `estimatedTotalHits=19`，逐条看：**只有 1 条**（《【小铃铛】（1-12）》，命中长度 2）真的含「铃铛」；其余 10 条只含「铃」（铃木/铃雨/铃铃铃二世…）、8 条连简体「铃」都没有（`鈴木`/`晶鈴`/`聖誕鈴聲`，繁体字形被引擎归一成「铃」） |
+| `白骨精` | 404-407 条，第一名是《穿成白骨肿么破》（命中位置是第 7 个字「破」） |
+| `剑来` + `matchingStrategy: "all"` | **0 条**（而真含「剑来」的有 100+ 条） |
+
+   即：charabia 把中文切成**单字**，默认 `matchingStrategy: "last"` 只要求最后一个片段命中，
+   `"all"` 又会把 `剑来` 这种词整条判死 —— 换 strategy 解决不了。
+   （第 24 节据此把「模糊」交给了引擎，代价就是这次报的噪声。）
+2. 多条件（0 条）的根因是**候选窗口截断**，不是 AND 逻辑写错：
+   `_collect_condition` 每个条件只取 `CANDIDATE_LIMIT=1000` 条候选再在 Python 里打分，
+   而 `category_names = 言情` 一个条件就命中 **1847** 本；
+   《晴晴的乖巧日记》确实同时满足「书名含 晴晴的」和「分类=言情」，但它排在 1000 名之外
+   → 交集恒为空。实测：`title=晴晴的 AND category=言情` = **0**（`title + author` 这类
+   命中数小的组合反而正常，所以看起来「有时好有时坏」）。
+3. 顺带量了窗口代价（线上真实索引，只读）：
+
+| 查询 | 1000 条窗口 | 10000 条窗口 |
+|---|---|---|
+| books / `category_names=言情`（含全部显示字段） | 0.09 s / 0.9 MB | **0.10 s / 1.7 MB**（1847 条全覆盖） |
+| books / `title=的` | 0.09 s | 0.32 s |
+| chapters / `book_title=的` | 36 s | **249 s**（太贵，不能放） |
+| chapters / `content=的` | 17 s | 105 s / 118 MB |
+
+**改动**（`backend/app/services/search.py`，其余文件不动）：
+
+| 位置 | 改动 |
+|---|---|
+| `_condition_score(..., "fuzzy")` | **每个字都必须出现**才算命中（可乱序、可不连续），再按「整串命中 > 最长连续片段 > 引擎排序分」排；少一个字就是 0。精确模式不变（连续子串） |
+| `_longest_run()`（新） | 查询在字段里最长连续片段长度，只用于模糊排序 |
+| `_scan_condition(..., mode=)` | 打分模式由调用方传入，模糊同样在扫描时过滤 |
+| `_single_condition_search()` | 单条件**精确与模糊都走**「扫一次候选 → Python 打分 → 缓存排名 → 按 id 补水」；删掉 `_engine_page()`（引擎分页的 `totalHits` 对中文本来就是错的：`铃铛`=19 实测只有 1 条） |
+| `_candidate_window(index_name, attr)`（新）+ `_search_field(..., limit=)`/`_collect_condition(..., limit=)` | 多条件的候选窗口按索引区分：books 元数据 10000（0.1-0.3 s，覆盖全部命中）、chapters 仍 1000（太贵）、`content` 仍 300（候选要带正文） |
+| `backend/tests/test_search_service.py` | 改写 3 项（模糊按字门槛、深分页复用缓存、多条件模糊排序），新增 4 项：模糊单条件必须过滤而不是原样返回、深分页只扫一次、各索引的窗口取值、多条件 AND 保住排在 1000 名之外的合法书 |
+
+**验证**：
+
+- `cd backend && python -m pytest -q` → **690 passed**。
+- 线上影子回归（把改后的 `search.py` 放进 backend 容器 `/tmp` 导入，只读真实索引）：
+
+| 查询 | 改动前 | 改动后 |
+|---|---|---|
+| `title` 模糊 `铃铛` | 19 条（1 条真的） | **1 条**《【小铃铛】（1-12）》，且每条标题都含「铃铛」 |
+| `title` 模糊 `白骨精` | 406 条（第一名《穿成白骨肿么破》） | **0 条**（实测：407 条候选里**没有**任何标题同时含 白/骨/精，0 是实话） |
+| `title` 模糊 `剑来` | 113 条噪声（`matchingStrategy=all` 时 0 条） | **8 条**，全部是《剑归来》系列 |
+| `title` 精确 `铃铛` | 1 条 | 1 条（未变） |
+| `title=晴晴的 AND category=言情` | **0 条** | **1 条**《晴晴的乖巧日记》 |
+| `title+category` / `author+category` / `category+tags` / `title+tags` / `title+author` | 前三组 0 条 | 全部 1 条 |
+| 第二次同一查询 | — | 0.00 s（命中进程内排名缓存） |
+
+**未做/已知**：
+
+- **只改本地代码**。线上生效要 `docker compose build backend crawler` + `up -d`（无新迁移）。
+  `SearchResult` 响应模型没有 `engine_paged` 字段，前端不受影响；前端**不需要重新构建**。
+- 「模糊」现在是**所有字都要出现**（乱序/可断开），所以字符写错的查询（`白骨精` vs `白骨睛`）
+  会返回 0，而不是像以前那样返回一堆含单个字的噪声；这也是用户要的「结果必须和搜索词有关」。
+  想放宽就用更少的字。
+- 单条件深分页仍受扫描窗口限制：元数据 10000 条（= 250 页 ×40，和 Meilisearch 的
+  `maxTotalHits` 一致），`content` 300 条（= 8 页）。原因见上表的耗时：chapters 索引在
+  10000 条宽度上要几十秒到几分钟，不能为了页数把搜索拖死。
+- `content` 搜索**本来就慢**（精确模式一直如此，线上实测一次 10-22 s，窗口越小越省），
+  现在模糊模式也走同一条路 —— 相关性换来的代价，正文检索建议用更具体的短语。
+- 多条件的候选窗口仍是「有上限的候选集」：books 上超过 10000 条的极端条件（如 `title=的`
+  命中 10000+）依然会截断，只是截断线从 1000 提到 10000。
