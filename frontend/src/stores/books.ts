@@ -33,6 +33,9 @@ export interface Chapter {
   source_chapter_id: string | null
   title: string | null
   created_at: string
+  // Content digest; the chunk cache is keyed on it so a re-synced chapter can
+  // never be served from a stale, shorter cache entry.
+  hash?: string | null
 }
 
 export interface ChapterContent extends Chapter {
@@ -42,6 +45,12 @@ export interface ChapterContent extends Chapter {
 export interface ChapterContentChunk extends ChapterContent {
   offset: number
   next_offset: number | null
+  total_length: number
+}
+
+export interface ChapterContentMeta {
+  id: string
+  hash: string | null
   total_length: number
 }
 
@@ -168,14 +177,29 @@ export const useBooksStore = defineStore("books", () => {
     return loaded
   }
 
+  async function fetchChapterContentMeta(
+    chapterId: string,
+  ): Promise<ChapterContentMeta> {
+    return api.get<ChapterContentMeta>(`/chapters/${chapterId}/content/meta`)
+  }
+
   async function fetchChapterChunk(
     chapterId: string,
     offset = 0,
     limit = 200_000,
+    version?: string | null,
+    refresh = false,
   ): Promise<ChapterContentChunk> {
-    const key = `chunk:${chapterId}:${offset}:${limit}`
-    const persistent = await readCachedChapter(key) as ChapterContentChunk | null
-    if (persistent) return persistent
+    // ``version`` is the content digest (or the length, for chapters written
+    // before digests existed).  The old cache key was the offset alone, so a
+    // chapter that was re-synced and grew kept answering from the old, shorter
+    // cached chunk whose ``next_offset`` was null -- the reader then showed a
+    // fraction of the chapter forever and could never fetch the rest.
+    const key = `chunk:${chapterId}:${version || "v0"}:${offset}:${limit}`
+    if (!refresh) {
+      const persistent = await readCachedChapter(key) as ChapterContentChunk | null
+      if (persistent) return persistent
+    }
     const loaded = await api.get<ChapterContentChunk>(
       `/chapters/${chapterId}/content?offset=${offset}&limit=${limit}`,
     )
@@ -220,5 +244,5 @@ export const useBooksStore = defineStore("books", () => {
     return next
   }
 
-  return { books, loading, error, fetchBooks, fetchBook, fetchChapters, fetchChapter, fetchChapterChunk, prefetchChapter, invalidateChapter, fetchFavorites, toggleFavorite }
+  return { books, loading, error, fetchBooks, fetchBook, fetchChapters, fetchChapter, fetchChapterChunk, fetchChapterContentMeta, prefetchChapter, invalidateChapter, fetchFavorites, toggleFavorite }
 })

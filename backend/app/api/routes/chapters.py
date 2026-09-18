@@ -52,6 +52,34 @@ async def get_chapter(chapter_id: str, user: User = Depends(get_current_user), d
     )
 
 
+@router.get("/chapters/{chapter_id}/content/meta")
+async def get_chapter_content_meta(
+    chapter_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Length and digest of a chapter body, without sending the body.
+
+    The reader needs both before it can decide whether its cached chunks are
+    still valid and how much of a very long chapter is left to load; sending
+    the first 200 000 characters just to learn the length would be wasteful.
+    """
+    chapter = await db.get(Chapter, chapter_id)
+    if chapter is None:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+    book = await db.get(Book, chapter.book_id)
+    if not ensure_book_visible(user, book):
+        raise HTTPException(status_code=404, detail="Chapter not found")
+    total = 0
+    try:
+        total = len(BookStorage().read_chapter(chapter.content_path) or "")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Chapter content not found")
+    except OSError:
+        total = 0
+    return {"id": chapter.id, "hash": chapter.hash, "total_length": total}
+
+
 @router.get("/chapters/{chapter_id}/content")
 async def get_chapter_content_chunk(
     chapter_id: str,
@@ -94,6 +122,7 @@ async def get_chapter_content_chunk(
         "chapter_number": chapter.chapter_number,
         "source_chapter_id": chapter.source_chapter_id,
         "content_path": chapter.content_path,
+        "hash": chapter.hash,
         "content": content[start:end],
         "offset": start,
         "next_offset": end if end < total else None,

@@ -7,6 +7,9 @@ class ChapterOut(BaseModel):
     chapter_number: int
     source_chapter_id: str | None = None
     content_path: str
+    # Content digest: the reader keys its client-side chunk cache on it, so a
+    # re-synced (changed) chapter never serves a stale, shorter body.
+    hash: str | None = None
 
     class Config:
         from_attributes = True

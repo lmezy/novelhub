@@ -1212,6 +1212,78 @@ crawler 长期 100% CPU。
 - 单条件精确结果缓存 120 秒且只存在进程内：backend 多 worker 时各自一份，同步中的新章节
   最多 2 分钟后才可能出现在该查询的后续页里（第 1 页永远是新的）。
 
+## 25. 2026-09-18：一章几十万字只读到一部分，后面的内容取不到
+
+**现象**：用户报「书库里有的书一章有几十万字，点进去阅读只有一部分、没有加载完全，
+后面的部分也获取不到」。
+
+**排查（只读线上；用真实浏览器跑线上阅读器）**：
+
+1. 后端分块接口本身是对的。在 backend 容器里用管理员 token 直接调
+   `GET /api/chapters/{id}/content?offset=&limit=`：317,503 字的章节分成
+   199,999 + 117,504 两块，第二块 `next_offset: null`，拼起来与文件完全一致。
+   库里 153 个章节文件 >300 KB，最大 1.38 MB（约 46 万汉字）。
+2. 用 Playwright 跑线上阅读器（1280×900）：打开 317k 字的章节，首屏 200,023 字，
+   滚到底部后第二块自动追加 → 317,527 字，**桌面滚动这条路径是通的**。
+3. 换成手机（390×844，翻页模式）：把进度停在末尾再点一下翻页，第二块确实加载
+   （317,495 字）——但**紧接着页面被整体重载**（`/src/main.ts`、`/@vite/client`
+   重新请求，NAV 事件指向同一 URL），正文立刻退回 199,991 字，而且**没有任何新请求**
+   （offset=0 那块来自 IndexedDB 缓存）。之后 494 页要从头再翻一遍。
+4. 不点任何东西等 165 秒：不会自发重载 → 重载与交互有关，不是环境抖动。
+
+**根因**（三条，都是「长章节的剩余内容没有可靠的取回路径」）：
+
+1. **只有隐形的滚动触发点**：`onScroll` / `onMobileScroll` 在距底部 900px 内才
+   `loadNextContentChunk()`，一次只加载一块；桌面页脚在正文只有一半时显示
+   `reader_end`「结束」（实测：正文 200,023 / 317,527 字，页脚写着「结束」）。
+2. **重载/重新挂载会丢掉已追加的内容**：追加只在内存里，`loadChapter` 从 offset 0
+   重新开始；因为 offset=0 的块能从 IndexedDB 直接命中，连请求都不发，看起来就像
+   「内容自己缩水了」。手机上任何一次刷新/切后台/进程回收都会回到第 1 页。
+3. **分块缓存键只有 offset**（`chunk:{id}:{offset}:{limit}`）：章节被重新同步变长后，
+   旧缓存里的 `next_offset: null` 会让阅读器**永久**认为已经到底，除非清站点数据。
+   `invalidateChapter` 只在管理端从阅读器手动「重同步本章」时才调用。
+
+**改动**：
+
+| 文件 | 改动 |
+|---|---|
+| `backend/app/schemas/chapter.py` | `ChapterOut.hash`（章节列表就带上内容摘要） |
+| `backend/app/api/routes/chapters.py` | 新增 `GET /chapters/{id}/content/meta`（只回 `hash` + `total_length`，不传正文）；分块响应也带 `hash` |
+| `frontend/src/stores/books.ts` | `Chapter.hash`、`ChapterContentChunk.hash`、`ChapterContentMeta`、`fetchChapterContentMeta()`；`fetchChapterChunk(id, offset, limit, version, refresh)` —— 缓存键改成 `chunk:{id}:{version}:{offset}:{limit}`，`version` 是内容摘要（老数据用 `len{总长}`），`refresh` 用于摘要未知时强制跳过缓存 |
+| `frontend/src/pages/ReaderPage.vue` | 先取 meta 拿摘要/总长 → 再取第一块；首屏渲染后**后台自动续传**剩余块（`scheduleContentAutoLoad`，上限 8 块）；新增 `contentHasMore` / `contentRemaining` / `contentChunkError`，桌面与手机（翻页/滚动两种模式）都给出「已加载 X / Y 字」+「继续加载剩余 N 字」按钮，失败可重试（不再 `catch {}` 静默）；页脚在还有未加载内容时不再显示「结束」；滚动触发点改走自动续传 |
+| `frontend/public/sw.js` | 导航请求网络优先（缓存只作离线回退）、`/assets/*` 缓存优先、**不拦截 `/api/*`**，并加 `activate` 清理旧缓存 —— 原来对所有请求 cache-first 且永不更新 |
+
+**验证**：
+
+- `cd backend && python -m pytest -q` → **663 passed**（新增 `tests/test_chapter_chunks.py` 3 项：
+  分块必须首尾相接拼回全文且最后一块 `next_offset: null`、分块带 `hash`、meta 只回长度与摘要）。
+- 前端 `npm run typecheck`、`npm run build` 通过。
+- **端到端验证**（本地起 `vite` 把 `/api` 代理到线上 NAS，用本机 Playwright 跑**改动后的前端**
+  读真实 317,503 字章节；没有改线上任何东西）：
+
+| 场景 | 修复前 | 修复后 |
+|---|---|---|
+| 桌面打开（完全不滚动） | 200,023 字 | **317,527 字**（约 3s 内后台补齐） |
+| 桌面刷新页面 | 退回 200,023 字 | **317,527 字** |
+| 手机翻页模式 | 200k，需手动翻到第 318 页才补 | **312,720 字**，加载中显示「继续加载剩余 117504 字」，补完后提示消失 |
+| 请求序列 | `offset=0`（+ 触发后 `offset=199999`） | `content/meta` → `offset=0` → `offset=199999`（自动） |
+| 第二次进入同一章 | — | 0 个 content 请求（全部命中缓存） |
+
+  另外确认 IndexedDB 里的键是 `chunk:{chapterId}:{version}:{offset}:{limit}` 形式。
+  本次验证针对的线上 backend 还是旧镜像（没有 `/content/meta`），所以走的正是**降级分支**，
+  说明「旧后端 + 新前端」也能正常工作。
+
+**未做/已知**：
+
+- 只改本地代码。线上生效要 `docker compose build backend frontend` + `up -d`
+  （本次**没有** crawler 改动、没有新迁移）。
+- 后台自动续传上限 8 块（160 万字符）；更长的章节仍需要点按钮，避免无限占带宽。
+- 分块边界按段落（`content.rfind("\n", …)`）取整，所以块大小会在
+  10 万–20 万字符之间浮动，属预期。
+- `sw.js` 变更后浏览器要等旧 SW 被替换（新 SW `skipWaiting` + `clients.claim`，
+  刷新一次即可生效）；旧缓存会在 `activate` 里删掉。
+
+
 
 
 

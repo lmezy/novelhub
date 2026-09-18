@@ -78,6 +78,20 @@ const pendingRestorePercent = ref<number | null>(null)
 const nextContentOffset = ref<number | null>(null)
 const contentChunkLoading = ref(false)
 const contentTotalLength = ref(0)
+const contentChunkError = ref("")
+// A single chapter can hold hundreds of thousands of characters (some books
+// are one chapter), so the body arrives in chunks.  Loading the rest used to
+// depend on one invisible trigger -- scrolling to within 900 px of the bottom
+// -- and a reload dropped everything that had been appended, which left the
+// reader showing only the first chunk with no way forward.  Now the first
+// chunk paints, the remainder is fetched in the background, and there is an
+// explicit control whenever anything is still missing.
+const CHUNK_LIMIT = 200_000
+const AUTO_LOAD_MAX_CHUNKS = 8
+// Identifies the stored body the loaded chunks belong to (content digest, or
+// the length for chapters written before digests existed).
+const contentVersion = ref("")
+let contentAutoLoadTimer: ReturnType<typeof setTimeout> | undefined
 interface BookmarkItem {
   id: string
   book_id: string
@@ -247,7 +261,7 @@ function currentPosition(): number {
 function onScroll() {
   desktopProgress.value = desktopScrollPercent()
   if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 900) {
-    void loadNextContentChunk()
+    scheduleContentAutoLoad()
   }
   clearTimeout(scrollTimer)
   scrollTimer = setTimeout(() => {
@@ -351,7 +365,7 @@ function onMobileScroll() {
   updateMobileScrollProgress()
   const el = scrollViewport.value
   if (el && el.scrollTop + el.clientHeight >= el.scrollHeight - 900) {
-    void loadNextContentChunk()
+    scheduleContentAutoLoad()
   }
   clearTimeout(progressTimer)
   progressTimer = setTimeout(() => savePosition(mobileScrollProgress.value), 800)
@@ -727,21 +741,74 @@ async function loadNextContentChunk(): Promise<boolean> {
   const offset = nextContentOffset.value
   if (offset === null || contentChunkLoading.value || !chapter.value) return false
   contentChunkLoading.value = true
+  contentChunkError.value = ""
   try {
-    const chunk = await store.fetchChapterChunk(chapter.value.id, offset)
+    const chunk = await store.fetchChapterChunk(
+      chapter.value.id,
+      offset,
+      CHUNK_LIMIT,
+      contentVersion.value,
+    )
     if (!chapter.value || chapter.value.id !== chunk.id) return false
+    // Guard against a duplicate append when two callers raced.
+    if (chunk.offset < (chapter.value.content?.length || 0)) {
+      nextContentOffset.value = chunk.next_offset
+      contentTotalLength.value = chunk.total_length
+      return false
+    }
     chapter.value = {
       ...chapter.value,
       content: chapter.value.content + chunk.content,
+      hash: chunk.hash ?? chapter.value.hash,
     }
     nextContentOffset.value = chunk.next_offset
     contentTotalLength.value = chunk.total_length
     if (isMobileLayout.value) await refreshMobileLayout()
     return true
-  } catch {
+  } catch (e) {
+    // Swallowing this silently is what made a long chapter look truncated with
+    // no explanation; show it and offer a retry instead.
+    contentChunkError.value = e instanceof Error ? e.message : i18n.t("reader_chunk_failed")
     return false
   } finally {
     contentChunkLoading.value = false
+  }
+}
+
+const contentLoadedLength = computed(() => chapter.value?.content?.length || 0)
+const contentHasMore = computed(() => nextContentOffset.value !== null)
+const contentRemaining = computed(() =>
+  Math.max(0, contentTotalLength.value - contentLoadedLength.value),
+)
+
+/**
+ * Keep pulling the remaining chunks in the background until the chapter is
+ * complete (or the bound is hit), so reading never runs into a cliff that the
+ * user has to discover by scrolling.
+ */
+function scheduleContentAutoLoad() {
+  clearTimeout(contentAutoLoadTimer)
+  contentAutoLoadTimer = setTimeout(async () => {
+    let loaded = 0
+    while (
+      nextContentOffset.value !== null &&
+      !contentChunkError.value &&
+      loaded < AUTO_LOAD_MAX_CHUNKS
+    ) {
+      const ok = await loadNextContentChunk()
+      if (!ok) break
+      loaded += 1
+    }
+  }, 400)
+}
+
+async function loadRemainingContent() {
+  contentChunkError.value = ""
+  let guard = 0
+  while (nextContentOffset.value !== null && guard < 200) {
+    const ok = await loadNextContentChunk()
+    if (!ok) break
+    guard += 1
   }
 }
 
@@ -756,12 +823,30 @@ async function loadChapter(id: string) {
   pendingRestorePercent.value = null
   nextContentOffset.value = null
   contentTotalLength.value = 0
+  contentChunkError.value = ""
+  clearTimeout(contentAutoLoadTimer)
   try {
-    const loaded = await store.fetchChapterChunk(id, 0)
+    // Length first (a few hundred bytes), so the reader knows from the start
+    // whether this is a partial view and whether its cached chunks still match
+    // the stored body.
+    let version = ""
+    try {
+      const meta = await store.fetchChapterContentMeta(id)
+      version = meta.hash || (meta.total_length ? `len${meta.total_length}` : "")
+      contentTotalLength.value = meta.total_length
+    } catch {
+      // Backend without the meta endpoint: the digest is unknown until the
+      // first chunk arrives, so that request must not be served from cache.
+    }
     if (seq !== chapterLoadSeq) return
+    const loaded = await store.fetchChapterChunk(id, 0, CHUNK_LIMIT, version, !version)
+    if (seq !== chapterLoadSeq) return
+    contentVersion.value = version
+      || loaded.hash
+      || (loaded.total_length ? `len${loaded.total_length}` : "")
     chapter.value = loaded
     nextContentOffset.value = loaded.next_offset
-    contentTotalLength.value = loaded.total_length
+    contentTotalLength.value = loaded.total_length || contentTotalLength.value
     readLocation.value = { book_id: bookId.value, chapter_id: id }
     loading.value = false
     // Warm the next chapter while the reader lays out the current one.
@@ -781,6 +866,8 @@ async function loadChapter(id: string) {
       if (seq !== chapterLoadSeq) return
       applyRestoredPosition()
     }
+    // Only now start prefetching the rest of a long chapter.
+    if (nextContentOffset.value !== null) scheduleContentAutoLoad()
   } catch (e) {
     if (seq !== chapterLoadSeq) return
     error.value = e instanceof Error ? e.message : i18n.t('reader_failed_load_chapter')
@@ -894,6 +981,7 @@ onUnmounted(() => {
   document.documentElement.classList.remove("reader-locked")
   clearTimeout(scrollTimer)
   clearTimeout(resizeTimer)
+  clearTimeout(contentAutoLoadTimer)
   window.removeEventListener("pagehide", flushPageProgressKeepalive)
   flushPageProgress()
 })
@@ -938,6 +1026,14 @@ onUnmounted(() => {
             </article>
           </div>
           <div class="page-meta">{{ currentPage + 1 }} / {{ pageCount }}</div>
+          <button
+            v-if="contentHasMore || contentChunkError"
+            @click.stop="loadRemainingContent"
+            :disabled="contentChunkLoading"
+            class="page-chunk-hint"
+          >{{ contentChunkError
+              ? i18n.t('reader_chunk_retry')
+              : i18n.t('reader_chunk_load_rest', { n: contentRemaining }) }}</button>
         </div>
 
         <div
@@ -957,6 +1053,13 @@ onUnmounted(() => {
               :class="{ 'hide-content-images': !showContentImages }"
               v-html="chapterBodyHtml"
             />
+            <div
+              v-if="contentHasMore || contentChunkError"
+              class="page-chunk-hint page-chunk-hint-scroll"
+              @click.stop="loadRemainingContent"
+            >{{ contentChunkError
+                ? i18n.t('reader_chunk_retry')
+                : i18n.t('reader_chunk_load_rest', { n: contentRemaining }) }}</div>
           </article>
           <div class="scroll-page-meta">{{ mobileScrollProgress }}%</div>
         </div>
@@ -1245,6 +1348,28 @@ onUnmounted(() => {
           <div v-html="chapterBodyHtml" />
         </article>
 
+        <div
+          v-if="chapter && (contentHasMore || contentChunkError)"
+          class="mt-8 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 px-4 py-3 text-center text-sm"
+        >
+          <p v-if="contentChunkError" class="text-red-600 dark:text-red-400">
+            {{ contentChunkError }}
+          </p>
+          <p v-else class="text-muted dark:text-gray-400">
+            {{ i18n.t('reader_chunk_partial', {
+              loaded: contentLoadedLength,
+              total: contentTotalLength,
+            }) }}
+          </p>
+          <button
+            @click="loadRemainingContent"
+            :disabled="contentChunkLoading"
+            class="mt-2 rounded bg-accent px-4 py-2 text-xs text-white disabled:opacity-50"
+          >{{ contentChunkLoading
+              ? i18n.t('reader_chunk_loading')
+              : i18n.t('reader_chunk_load_rest', { n: contentRemaining }) }}</button>
+        </div>
+
         <nav
           v-if="chapter"
           class="flex items-center justify-between mt-12 pt-6 border-t"
@@ -1256,11 +1381,17 @@ onUnmounted(() => {
             class="text-sm hover:opacity-70 transition-opacity"
           >&larr; {{ prevChapter.title || i18n.t('reader_ch_short', { n: prevChapter.chapter_number }) }}</button>
           <span v-else class="text-sm text-muted">{{ i18n.t('reader_start') }}</span>
+          <!-- The end of a chapter is only the end once every chunk is loaded:
+               saying "已经到结尾" while content was still missing is what made a
+               long chapter look truncated with no way to fetch the rest. -->
           <button
             v-if="nextChapter"
             @click="openChapter(nextChapter.id)"
             class="text-sm hover:opacity-70 transition-opacity"
           >{{ nextChapter.title || i18n.t('reader_ch_short', { n: nextChapter.chapter_number }) }} &rarr;</button>
+          <span v-else-if="contentHasMore" class="text-sm text-muted">
+            {{ i18n.t('reader_chunk_more_above') }}
+          </span>
           <span v-else class="text-sm text-muted">{{ i18n.t('reader_end') }}</span>
         </nav>
       </main>
@@ -1474,6 +1605,36 @@ onUnmounted(() => {
   font-size: 12px;
   opacity: 0.45;
   pointer-events: none;
+}
+
+/* Long chapters arrive in chunks; this is the visible way to pull the rest
+   (the background prefetch normally finishes first and hides it again). */
+.page-chunk-hint {
+  position: absolute;
+  left: 50%;
+  bottom: max(30px, calc(env(safe-area-inset-bottom) + 26px));
+  transform: translateX(-50%);
+  z-index: 6;
+  padding: 7px 14px;
+  border-radius: 999px;
+  border: 1px solid rgba(128, 128, 128, 0.35);
+  background: rgba(128, 128, 128, 0.16);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.page-chunk-hint[disabled] {
+  opacity: 0.5;
+}
+
+.page-chunk-hint-scroll {
+  position: sticky;
+  bottom: max(12px, env(safe-area-inset-bottom));
+  left: auto;
+  transform: none;
+  width: max-content;
+  margin: 16px auto 0;
 }
 
 .scroll-page-surface {

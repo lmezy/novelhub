@@ -74,6 +74,9 @@
 - **搜索翻页/搜索本身要等几十秒** → [codex-handoff.md](codex-handoff.md) 第 23 节
 - **搜索结果只有几十页（想要几百页）/ 为什么别人翻页那么快** →
   [codex-handoff.md](codex-handoff.md) 第 24 节
+- **一章几十万字只读到一部分 / 后面读不到 / 刷新后回到开头** →
+  [codex-handoff.md](codex-handoff.md) 第 25 节 + [reading-performance.md](reading-performance.md)
+  “超长章节（一章几十万字）怎么读”
 - **crawler 日志大量 `Chapter returned empty content`** → [full-site-sync.md](full-site-sync.md)
   “日志大量 `Chapter returned empty content`（同一批书）”
 - AI 侧栏提示未配置 / 回答总从第 1 章说起 / 回答不出字（流式被缓冲）→
