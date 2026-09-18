@@ -73,7 +73,7 @@
   （搜索索引缺 `kind` 字段；首次启动会自动回填）
 - **搜索翻页/搜索本身要等几十秒** → [codex-handoff.md](codex-handoff.md) 第 23 节
 - **搜索结果只有几十页（想要几百页）/ 为什么别人翻页那么快** →
-  [codex-handoff.md](codex-handoff.md) 第 24 节
+  [codex-handoff.md](codex-handoff.md) 第 24 节 + 第 28 节「检索到底搜了多少库」
 - **一章几十万字只读到一部分 / 后面读不到 / 刷新后回到开头** →
   [codex-handoff.md](codex-handoff.md) 第 25 节 + [reading-performance.md](reading-performance.md)
   “超长章节（一章几十万字）怎么读”
@@ -91,6 +91,8 @@
   [codex-handoff.md](codex-handoff.md) 第 27 节 + [ai-assistant.md](ai-assistant.md) “排错”
 - **搜索结果和搜索词没关系（搜「铃铛」出「铃木」）** → [codex-handoff.md](codex-handoff.md) 第 28 节
 - **高级搜索（多条件）怎么填都是 0 条** → [codex-handoff.md](codex-handoff.md) 第 28 节
+- **问「检索是不是全库检索」/ 结果为什么会少** → [codex-handoff.md](codex-handoff.md) 第 28 节
+  「检索到底搜了多少库」
 - AI 侧栏提示未配置 / 回答总从第 1 章说起 / 回答不出字（流式被缓冲）→
   [ai-assistant.md](ai-assistant.md) “排错”
 - AI 测试连接报 400 `The supported API model names are …`（模型名不对）→
@@ -105,8 +107,11 @@
 
 - **每次线上定位/修复**：在 [codex-handoff.md](codex-handoff.md) **文末追加一节**，
   只写「现象 → 根因 → 改动文件 → 验证」；不要粘长日志、逐条命令输出或历史测试次数。
+- **沉淀过的小节要持续压缩**：现象一句、根因要点、改动落点（文件/函数）、一条仍然有效的提醒；
+  细节去读代码。2026-09-19 做过一次（143KB → 66KB，1540 → 780 行），别让它再涨回去。
 - **可复用的排查结论**：写进 [full-site-sync.md](full-site-sync.md) 的排错清单
   （面向“用户看到什么报错该怎么办”）。
 - **架构或需求变化**：更新 [NovelHub-AI-Development-Context.md](NovelHub-AI-Development-Context.md)，
   并在本索引补入口。
 - 正文用中文、Markdown、相对路径链接；命令统一用 `docker compose`。
+- 提交前确认没把 `.env`、`*.pyc`、`.pytest_cache/` 带进去（`.gitignore` 已覆盖）。
