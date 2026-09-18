@@ -184,6 +184,128 @@ async def test_sync_book_kinds_with_no_changed_books_touches_nothing():
     assert client.index.return_value.search.call_count == 0
 
 
+def _exact_service(hits, hydrated):
+    """Service whose books index answers the scan and the hydration query."""
+    service, books_index, _ = _service_with_indexes()
+
+    def fake_search(query, options):
+        if options.get("filter"):
+            return {"hits": hydrated}
+        return {"hits": hits}
+
+    books_index.search.side_effect = fake_search
+    return service, books_index
+
+
+def test_exact_single_condition_scans_once_then_serves_pages_from_cache():
+    scan_hits = [
+        {"id": "b1", "title": "三打白骨精", "_rankingScore": 0.9},
+        {"id": "b2", "title": "三打白骨精 续", "_rankingScore": 0.5},
+        {"id": "b3", "title": "白龙精", "_rankingScore": 0.9},
+    ]
+    service, books_index = _exact_service(
+        scan_hits,
+        [{"id": "b1", "title": "三打白骨精", "author": "吴承恩", "tags": [], "category_names": []}],
+    )
+    conds = [{"field": "title", "mode": "exact", "value": "白骨精"}]
+
+    first = service.advanced_search(conds, scope="books", offset=0, limit=1)
+    scans_after_first = sum(
+        1 for call in books_index.search.call_args_list if not call.args[1].get("filter")
+    )
+    second = service.advanced_search(conds, scope="books", offset=1, limit=1)
+    scans_after_second = sum(
+        1 for call in books_index.search.call_args_list if not call.args[1].get("filter")
+    )
+
+    # Only the substring matches are kept: 白龙精 is dropped although the engine
+    # returned it (Meilisearch only tokenizes; it cannot do a substring test).
+    assert first["total"] == 2
+    assert second["total"] == 2
+    assert scans_after_first == 1
+    assert scans_after_second == 1, "page 2 must be served from the cached ranking"
+    assert first["hits"][0]["title"] == "三打白骨精"
+    assert first["hits"][0]["author"] == "吴承恩"
+
+
+def test_exact_page_is_hydrated_by_id():
+    service, books_index = _exact_service(
+        [{"id": "b1", "title": "三打白骨精"}],
+        [{"id": "b1", "title": "三打白骨精", "author": "吴承恩", "tags": ["仙侠"], "category_names": []}],
+    )
+
+    result = service.advanced_search(
+        [{"field": "title", "mode": "exact", "value": "白骨精"}],
+        scope="books",
+    )
+
+    hydrate_options = books_index.search.call_args.args[1]
+    assert hydrate_options["filter"] == 'id IN ["b1"]'
+    assert result["hits"][0]["author"] == "吴承恩"
+
+
+def test_exact_content_search_uses_the_small_window():
+    service, _, chapters_index = _service_with_indexes()
+    chapters_index.search.return_value = {"hits": []}
+
+    service.advanced_search(
+        [{"field": "content", "mode": "exact", "value": "笔没墨水"}],
+        scope="chapters",
+    )
+
+    scan_options = chapters_index.search.call_args.args[1]
+    assert scan_options["limit"] == SearchService.CONTENT_CANDIDATE_LIMIT
+
+
+def test_exact_metadata_search_uses_the_wide_window():
+    service, books_index, _ = _service_with_indexes()
+    books_index.search.return_value = {"hits": []}
+
+    service.advanced_search(
+        [{"field": "title", "mode": "exact", "value": "白骨精"}],
+        scope="books",
+    )
+
+    scan_options = books_index.search.call_args.args[1]
+    assert scan_options["limit"] == SearchService.METADATA_CANDIDATE_LIMIT
+
+
+def test_page_cache_expires():
+    service, _ = _make_service()
+    service._page_cache_put("k", [(1, "a")])
+    assert service._page_cache_get("k") == [(1, "a")]
+
+    expires_at, ranked = service._page_cache["k"]
+    service._page_cache["k"] = (expires_at - service.PAGE_CACHE_TTL_SECONDS * 2, ranked)
+
+    assert service._page_cache_get("k") is None
+
+
+def test_hydration_failure_keeps_the_search_result():
+    """``id`` becomes filterable asynchronously; a racing search must not 500."""
+    service, books_index, _ = _service_with_indexes()
+
+    response = requests.Response()
+    response.status_code = 400
+    response.encoding = "utf-8"
+    response._content = b'{"message":"Attribute `id` is not filterable."}'
+
+    def fake_search(query, options):
+        if options.get("filter"):
+            raise MeilisearchApiError("not filterable", response)
+        return {"hits": [{"id": "b1", "title": "三打白骨精"}]}
+
+    books_index.search.side_effect = fake_search
+
+    result = service.advanced_search(
+        [{"field": "title", "mode": "exact", "value": "白骨精"}],
+        scope="books",
+    )
+
+    assert result["total"] == 1
+    assert result["hits"][0]["id"] == "b1"
+
+
 def test_chapter_buffer_flushes_in_batches():
     service, client = _make_service()
     index = client.index.return_value
@@ -404,43 +526,80 @@ def test_advanced_search_content_scope_all_returns_chapters_only():
     assert result["hits"][0]["book_title"] == "1983"
 
 
-def test_advanced_search_chapters_fuzzy_rank():
+def test_advanced_search_chapters_fuzzy_is_engine_paged():
+    """A single fuzzy condition is answered by Meilisearch itself.
+
+    That is what makes hundreds of pages possible: the engine jumps to the page
+    instead of the old "pull the whole candidate window into Python and re-sort
+    it on every click" (40-110 s per page on the live index).
+    """
     service, _, chapters_index = _service_with_indexes()
     chapters_index.search.return_value = {
         "hits": [
-            {
-                "id": "c-full",
-                "book_id": "b1",
-                "title": "三打白骨精",
-                "book_title": "西游记",
-                "content": "",
-                "is_r18": False,
-            },
-            {
-                "id": "c-two",
-                "book_id": "b2",
-                "title": "白龙精",
-                "book_title": "另一本书",
-                "content": "",
-                "is_r18": False,
-            },
-            {
-                "id": "c-one",
-                "book_id": "b3",
-                "title": "白毛鼠",
-                "book_title": "再一本书",
-                "content": "",
-                "is_r18": False,
-            },
-        ]
+            {"id": "c1", "book_id": "b1", "title": "三打白骨精", "book_title": "西游记"},
+            {"id": "c2", "book_id": "b2", "title": "白龙精", "book_title": "另一本书"},
+        ],
+        "totalHits": 2500,
+        "totalPages": 63,
     }
 
     result = service.advanced_search(
         [{"field": "chapter_title", "mode": "fuzzy", "value": "白骨精"}],
         match="or",
         scope="chapters",
+        offset=80,
+        limit=40,
     )
 
+    options = chapters_index.search.call_args.args[1]
+    assert options["page"] == 3
+    assert options["hitsPerPage"] == 40
+    assert options["attributesToSearchOn"] == ["title"]
+    # Names come from the engine, not from a Python-side count of scored hits.
+    assert result["total"] == 2500
+    assert result["engine_paged"] is True
+    assert [hit["title"] for hit in result["hits"]] == ["三打白骨精", "白龙精"]
+    assert result["hits"][0]["type"] == "chapter"
+
+
+def test_engine_paged_deep_page_does_not_scan_candidates():
+    service, books_index, _ = _service_with_indexes()
+    books_index.search.return_value = {"hits": [], "totalHits": 10000}
+
+    service.advanced_search(
+        [{"field": "title", "mode": "fuzzy", "value": "白"}],
+        scope="books",
+        offset=9960,
+        limit=40,
+    )
+
+    options = books_index.search.call_args.args[1]
+    assert options["page"] == 250
+    # One query for the page -- no candidate window, no scoring pass.
+    assert "limit" not in options
+
+
+def test_advanced_search_multi_condition_fuzzy_ranks_in_python():
+    """Two conditions still need the candidate window and the shared scorer."""
+    service, _, chapters_index = _service_with_indexes()
+    chapters_index.search.return_value = {
+        "hits": [
+            {"id": "c-full", "book_id": "b1", "title": "三打白骨精", "book_title": "西游记", "content": ""},
+            {"id": "c-two", "book_id": "b2", "title": "白龙精", "book_title": "另一本书", "content": ""},
+            {"id": "c-one", "book_id": "b3", "title": "白毛鼠", "book_title": "再一本书", "content": ""},
+        ]
+    }
+
+    result = service.advanced_search(
+        [
+            {"field": "chapter_title", "mode": "fuzzy", "value": "白骨精"},
+            {"field": "chapter_title", "mode": "fuzzy", "value": "白"},
+        ],
+        match="or",
+        scope="chapters",
+    )
+
+    assert result.get("engine_paged") is None
     assert result["total"] == 3
     assert [hit["title"] for hit in result["hits"]] == [
         "三打白骨精",

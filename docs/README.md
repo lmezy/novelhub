@@ -72,6 +72,8 @@
 - **小说页/漫画页搜索时两类结果混在一起** → [codex-handoff.md](codex-handoff.md) 第 23 节
   （搜索索引缺 `kind` 字段；首次启动会自动回填）
 - **搜索翻页/搜索本身要等几十秒** → [codex-handoff.md](codex-handoff.md) 第 23 节
+- **搜索结果只有几十页（想要几百页）/ 为什么别人翻页那么快** →
+  [codex-handoff.md](codex-handoff.md) 第 24 节
 - **crawler 日志大量 `Chapter returned empty content`** → [full-site-sync.md](full-site-sync.md)
   “日志大量 `Chapter returned empty content`（同一批书）”
 - AI 侧栏提示未配置 / 回答总从第 1 章说起 / 回答不出字（流式被缓冲）→

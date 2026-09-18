@@ -1,4 +1,6 @@
+import json
 import re
+import time
 
 import meilisearch
 from loguru import logger
@@ -25,6 +27,23 @@ class SearchService:
     # (measured on the live 115k-chapter index), while 300 is ~29 MB and stays
     # under a second.  300 candidates is still eight pages of 40 results.
     CONTENT_CANDIDATE_LIMIT = 300
+    # Single-condition *exact* searches score in Python (see
+    # ``_single_condition_search``) because Meilisearch cannot express a Chinese
+    # substring match: charabia splits 白骨精 into 白/骨/精, ``matchingStrategy:
+    # "last"`` only requires the last fragment (so 穿成白骨肿么破 matches on 破!)
+    # and ``"all"``/phrase queries return 0 hits for perfectly good terms such as
+    # 剑来.  The scan only retrieves ``id`` + the searched field, which is 0.02-0.7 s
+    # for 10 000 documents, and the ordered result is cached for repeat pages.
+    METADATA_CANDIDATE_LIMIT = 10_000
+    # How long a scored single-condition result stays usable for paging.  Books
+    # and chapters keep flowing in while a user pages, so this is deliberately
+    # short; the cost of a miss is one scan.
+    PAGE_CACHE_TTL_SECONDS = 120
+    # One entry is at most ~10 000 ``(score, id)`` pairs (~1.5 MB), so 16 keeps
+    # the worst case around 24 MB per process.
+    PAGE_CACHE_MAX_ENTRIES = 16
+    # Words returned around the match when a chapter body is used as a snippet.
+    SNIPPET_CROP_WORDS = 60
     CONTENT_INDEX_LIMIT = 100_000
     DESCRIPTION_INDEX_LIMIT = 2000
 
@@ -95,12 +114,23 @@ class SearchService:
         "tags",
         "category_names",
     ]
-    FILTERABLE_ATTRIBUTES = ["source_id", "book_id", "author_id", "is_r18", "tags", "kind"]
+    FILTERABLE_ATTRIBUTES = [
+        # ``id`` is filterable so a single page can be hydrated back from a
+        # cached ranked id list (``filter: id IN [...]``).
+        "id",
+        "source_id",
+        "book_id",
+        "author_id",
+        "is_r18",
+        "tags",
+        "kind",
+    ]
 
     def __init__(self):
         self.client = meilisearch.Client(settings.MEILI_HOST, settings.MEILI_KEY)
         self._chapter_buffer: list[dict] = []
         self._ensured: set[str] = set()
+        self._page_cache: dict[str, tuple[float, list[tuple[int, str]]]] = {}
 
     def _ensure_index(self, name: str, primary_key: str = "id") -> None:
         if name in self._ensured:
@@ -666,6 +696,290 @@ class SearchService:
             ],
         }
 
+    # ---- single-condition search: deep paging without a candidate window ----
+
+    @staticmethod
+    def _scope_index(scope: str) -> str:
+        return (
+            SearchService.INDEX_BOOKS if scope == "books"
+            else SearchService.INDEX_CHAPTERS
+        )
+
+    def _field_attr(self, index_name: str, field: str) -> str | None:
+        """Which indexed attribute a condition field maps to for one index."""
+        if index_name == self.INDEX_BOOKS:
+            return self.BOOK_FIELD_ATTRS.get(field)
+        if field in self.CHAPTER_FIELD_ATTRS:
+            return self.CHAPTER_FIELD_ATTRS[field]
+        return self.CHAPTER_BOOK_FIELD_ATTRS.get(field)
+
+    def _engine_page(
+        self,
+        index_name: str,
+        value: str,
+        attr: str,
+        filters: str | None,
+        offset: int,
+        limit: int,
+    ) -> dict:
+        """One page straight out of Meilisearch: matching + ranking + paging.
+
+        ``page``/``hitsPerPage`` is Meilisearch's finite-pagination mode and is
+        what makes hundreds of pages possible: the response carries the exact
+        ``totalHits``/``totalPages`` and the engine can jump to page 250 without
+        touching pages 1-249 (measured 0.007 s on the live index, versus 40-110 s
+        for the old "pull every candidate into Python" page).
+        """
+        remainder = offset % limit if limit else 0
+        page = offset // limit + 1 if limit else 1
+        hits_per_page = limit + remainder
+        options = {
+            "page": page,
+            "hitsPerPage": hits_per_page,
+            "attributesToSearchOn": [attr],
+            # Display attributes only; ``content`` is cropped below so a
+            # chapter page never ships a whole 100 KB body per result.
+            "attributesToRetrieve": self._retrieve_attrs(index_name, ""),
+            "showRankingScore": True,
+        }
+        if index_name == self.INDEX_CHAPTERS:
+            options["attributesToCrop"] = ["content"]
+            options["cropLength"] = self.SNIPPET_CROP_WORDS
+        if filters:
+            options["filter"] = filters
+        result = self.client.index(index_name).search(value, options)
+        hits = result.get("hits", []) or []
+        if remainder:
+            hits = hits[remainder:]
+        return {
+            "hits": hits,
+            "total": int(
+                result.get("totalHits")
+                or result.get("estimatedTotalHits")
+                or len(hits)
+            ),
+            "offset": offset,
+            "limit": limit,
+        }
+
+    def _scan_condition(
+        self,
+        index_name: str,
+        attr: str,
+        value: str,
+        filters: str | None,
+        window: int,
+    ) -> list[tuple[int, str]]:
+        """Rank the engine's candidates with the shared Python scorer.
+
+        Only ``id``, the searched field and the cheapest display fields are
+        retrieved, so a 10 000 document window costs 0.02-0.7 s instead of the
+        96 MB / 18 s that pulling every chapter body used to cost.  The result is
+        a ranked ``(score, id)`` list -- tiny enough to cache, which is what
+        makes pages 2..N cheap.
+        """
+        retrieve = ["id", attr]
+        if index_name == self.INDEX_BOOKS:
+            retrieve.append("author")
+        else:
+            retrieve.extend(["book_id", "book_title"])
+        options = {
+            "limit": window,
+            "offset": 0,
+            "attributesToSearchOn": [attr],
+            "attributesToRetrieve": list(dict.fromkeys(retrieve)),
+            "showRankingScore": True,
+        }
+        if filters:
+            options["filter"] = filters
+        result = self.client.index(index_name).search(value, options)
+        scored: list[tuple[int, str]] = []
+        for hit in result.get("hits", []) or []:
+            score = self._condition_score(
+                value,
+                hit.get(attr) or "",
+                "exact",
+                hit.get("_rankingScore", 0),
+            )
+            if score > 0:
+                scored.append((score, str(hit.get("id"))))
+        scored.sort(key=lambda row: (-row[0], row[1]))
+        return scored
+
+    def _hydrate(self, index_name: str, ids: list[str]) -> dict[str, dict]:
+        """Fetch the full documents for the ids of one page.
+
+        The ranked list only carries ``(score, id)``, so the page that is
+        actually returned gets its display fields (and a cropped body) from one
+        small filtered query.  This needs ``id`` in the index's filterable
+        attributes, which ``_ensure_index`` sets; Meilisearch applies settings
+        asynchronously, so a query racing the very first startup may still be
+        rejected -- the caller then falls back to the scanned fields instead of
+        failing the whole search.
+        """
+        if not ids:
+            return {}
+        quoted = ", ".join(json.dumps(str(doc_id)) for doc_id in ids)
+        options = {
+            "limit": len(ids),
+            "filter": f"id IN [{quoted}]",
+            "attributesToRetrieve": self._retrieve_attrs(index_name, ""),
+        }
+        if index_name == self.INDEX_CHAPTERS:
+            options["attributesToCrop"] = ["content"]
+            options["cropLength"] = self.SNIPPET_CROP_WORDS
+        try:
+            result = self.client.index(index_name).search("", options)
+        except meilisearch.errors.MeilisearchApiError as exc:
+            logger.warning("Search page hydration failed: {}", exc)
+            return {}
+        return {str(hit.get("id")): hit for hit in result.get("hits", []) or []}
+
+    @staticmethod
+    def _cropped_content(hit: dict) -> str:
+        formatted = hit.get("_formatted") or {}
+        return str(formatted.get("content") or "")
+
+    def _serialize_engine_hit(
+        self,
+        hit: dict,
+        field: str,
+        scope: str,
+    ) -> dict:
+        score = int(max(0.0, min(float(hit.get("_rankingScore") or 0.0), 1.0)) * 1000)
+        if scope == "books":
+            description = hit.get("description") or ""
+            return {
+                "type": "book",
+                "id": str(hit.get("id") or ""),
+                "book_id": str(hit.get("id") or ""),
+                "title": hit.get("title") or "",
+                "author": hit.get("author") or "",
+                "description": description[: self.DESCRIPTION_INDEX_LIMIT],
+                "tags": hit.get("tags") or [],
+                "category_names": hit.get("category_names") or [],
+                "status": hit.get("status") or "",
+                "is_r18": bool(hit.get("is_r18", False)),
+                "score": score,
+                "matched_fields": [field],
+                "snippet": (
+                    self._snippet(description, []) if field == "description" else ""
+                ),
+                "matched_chapter": None,
+            }
+        content = self._cropped_content(hit)
+        return {
+            "type": "chapter",
+            "id": str(hit.get("id") or ""),
+            "chapter_id": str(hit.get("id") or ""),
+            "book_id": str(hit.get("book_id") or ""),
+            "title": hit.get("title") or "",
+            "book_title": hit.get("book_title") or "",
+            "author": hit.get("book_author") or "",
+            "category_names": hit.get("category_names") or [],
+            "chapter_number": hit.get("chapter_number"),
+            "content": content[:500],
+            "snippet": content,
+            "score": score,
+            "matched_fields": [field],
+        }
+
+    def _single_condition_search(
+        self,
+        cond: dict,
+        *,
+        scope: str,
+        filters: str | None,
+        offset: int,
+        limit: int,
+    ) -> dict | None:
+        """Deep-pageable search for one condition, or ``None`` to use the window.
+
+        * ``fuzzy`` -- Meilisearch matches, ranks and pages (its relevance is at
+          least as good as the old character-coverage score, and the candidate
+          set is the same one the scorer saw).
+        * ``exact`` -- Meilisearch can only tokenize, so the substring test stays
+          in Python; the engine still drives the scan and the ranked ids are
+          cached, which is what makes pages 2..N cheap.
+        """
+        index_name = self._scope_index(scope)
+        attr = self._field_attr(index_name, cond["field"])
+        if not attr:
+            return None
+
+        if cond["mode"] == "fuzzy":
+            page = self._engine_page(
+                index_name, cond["value"], attr, filters, offset, limit,
+            )
+            hits = [
+                self._serialize_engine_hit(hit, cond["field"], scope)
+                for hit in page["hits"]
+            ]
+            return {
+                "hits": hits,
+                "total": page["total"],
+                "offset": offset,
+                "limit": limit,
+                "engine_paged": True,
+            }
+
+        window = (
+            self.CONTENT_CANDIDATE_LIMIT if attr == "content"
+            else self.METADATA_CANDIDATE_LIMIT
+        )
+        cache_key = "|".join((
+            index_name, attr, cond["value"], filters or "", str(window),
+        ))
+        ranked = self._page_cache_get(cache_key)
+        if ranked is None:
+            ranked = self._scan_condition(
+                index_name, attr, cond["value"], filters, window,
+            )
+            self._page_cache_put(cache_key, ranked)
+
+        page_rows = ranked[offset : offset + limit]
+        docs = self._hydrate(index_name, [row[1] for row in page_rows])
+        hits = []
+        for _score, doc_id in page_rows:
+            hit = docs.get(doc_id)
+            if hit is None:
+                # Hydration unavailable (settings task still applying): keep the
+                # row with the little we know rather than dropping the result.
+                hit = {"id": doc_id}
+            hits.append(self._serialize_engine_hit(hit, cond["field"], scope))
+        return {
+            "hits": hits,
+            "total": len(ranked),
+            "offset": offset,
+            "limit": limit,
+            "engine_paged": True,
+        }
+
+    def _page_cache_get(self, key: str) -> list[tuple[int, str]] | None:
+        entry = self._page_cache.get(key)
+        if entry is None:
+            return None
+        expires_at, ranked = entry
+        if expires_at < time.monotonic():
+            self._page_cache.pop(key, None)
+            return None
+        return ranked
+
+    def _page_cache_put(self, key: str, ranked: list[tuple[int, str]]) -> None:
+        now = time.monotonic()
+        for stale in [
+            cache_key
+            for cache_key, (expires_at, _) in self._page_cache.items()
+            if expires_at < now
+        ]:
+            self._page_cache.pop(stale, None)
+        self._page_cache[key] = (now + self.PAGE_CACHE_TTL_SECONDS, ranked)
+        while len(self._page_cache) > self.PAGE_CACHE_MAX_ENTRIES:
+            oldest = min(
+                self._page_cache.items(), key=lambda item: item[1][0],
+            )[0]
+            self._page_cache.pop(oldest, None)
+
     def advanced_search(
         self,
         conditions: list[dict],
@@ -746,6 +1060,21 @@ class SearchService:
         filters = self._combined_filter(
             allow_r18, allow_all_ages, tag, source_id, kind,
         )
+        # A single condition is the overwhelmingly common case (the quick search
+        # box) and the only one that can be answered with deep paging.  Two or
+        # more conditions span fields/AND-OR combinations that Meilisearch cannot
+        # express as one query, so they keep the bounded candidate window below.
+        if len(active) == 1 and effective_scope in ("books", "chapters"):
+            single = self._single_condition_search(
+                active[0],
+                scope=effective_scope,
+                filters=filters,
+                offset=offset,
+                limit=limit,
+            )
+            if single is not None:
+                return single
+
         book_cond_maps: dict[int, dict[str, tuple[int, dict]]] = {}
         chapter_cond_maps: dict[int, dict[str, tuple[int, dict]]] = {}
         has_chapter_fields = any(
