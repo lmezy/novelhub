@@ -245,6 +245,10 @@ NAV_PATH_SEGMENTS = (
     "booklist",
 )
 
+# ``bookUrlPattern`` values that only name the site ("https://host:port/"):
+# they match every URL on that host, so they cannot filter book links (Icu).
+_HOST_ONLY_URL_PATTERN = re.compile(r"^https?://[^/?#]+/?$", re.I)
+
 TOC_NOISE_TITLES = {
     "首页",
     "原创",
@@ -1533,6 +1537,9 @@ class YueduPlugin:
                 break
 
         if not title:
+            title = self._extract_labelled_title(soup)
+
+        if not title:
             title_tag = soup.find("title")
             if title_tag:
                 title = title_tag.get_text(" ", strip=True)
@@ -1794,6 +1801,54 @@ class YueduPlugin:
                 title = candidates[0]
         title = re.sub(r"\s+", " ", title).strip()
         return title
+
+    @staticmethod
+    def _extract_labelled_title(soup: BeautifulSoup) -> str:
+        """Extract a title the page explicitly labels as the work's name.
+
+        Some sites ship no ``<title>`` at all and describe the book only as
+        ``书名：X`` inside the detail card (Icu / hq555.icu does exactly that).
+        Its ``ruleBookInfo.name`` is ``{{book.name}}`` -- Legado resolves that
+        against the book object the search result carried, which NovelHub does
+        not have when it opens a URL -- so without this the book had no name and
+        ``sync_book`` rejected it ("no usable metadata") although every chapter
+        parsed fine.
+        """
+        for meta in soup.select(
+            "meta[property='og:novel:book_name'], "
+            "meta[name='og:novel:book_name'], "
+            "meta[property='og:novel:name']"
+        ):
+            content = (meta.get("content") or "").strip()
+            if content:
+                return content
+
+        for script in soup.select("script[type='application/ld+json']"):
+            try:
+                data = json.loads(script.get_text(strip=True))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            name = data.get("name") if isinstance(data, dict) else None
+            if name:
+                return str(name).strip()
+
+        label = (
+            r"(?:书\s*名|書\s*名|小说名|小說名|漫画名|漫畫名|作品名|book\s*name)"
+        )
+        for node in soup.find_all(string=True):
+            if node.parent is not None and node.parent.name in ("script", "style"):
+                continue
+            text = str(node).strip()
+            if not text or len(text) > 80:
+                continue
+            match = re.search(
+                label + r"\s*[:：]\s*([^\n<]{1,60})",
+                text,
+                re.IGNORECASE,
+            )
+            if match:
+                return match.group(1).strip()
+        return ""
 
     @staticmethod
     def _extract_labelled_author(soup: BeautifulSoup) -> str:
@@ -2784,14 +2839,36 @@ class YueduPlugin:
 
         return _extension(candidate.path) == _extension(book.path)
 
+    def _book_url_pattern(self) -> str:
+        """The source's ``bookUrlPattern`` when it can actually discriminate.
+
+        A pattern that only names the site (``https://host:port``) matches
+        every URL on that host, so it can never tell a book page from a chapter
+        or a category page.  Used as a *filter* it drops everything (our
+        "the match must reach the end of the path" rule leaves the whole path
+        unmatched), and taken literally it would call every chapter a book.
+        Icu (hq555.icu) ships exactly such a pattern; Legado itself only uses
+        ``bookUrlPattern`` to recognise links a user opens, so the honest
+        answer is to treat it as "no pattern" and let the source's own
+        ``bookList`` / ``chapterList`` rule stay in charge -- the same policy
+        already used for sources that declare no pattern at all.
+        """
+        pattern = str(self.config.get("bookUrlPattern", "") or "").strip()
+        if not pattern:
+            return ""
+        if _HOST_ONLY_URL_PATTERN.match(pattern):
+            return ""
+        return pattern
+
     def _is_book_url(self, url: str, require_pattern: bool = False) -> bool:
         """Check whether a URL points to a book detail page.
 
-        When the source defines `bookUrlPattern`, discovery uses it strictly
-        for the same host so category/chapter links are not mistaken for books.
+        When the source defines a discriminating `bookUrlPattern`, discovery
+        uses it strictly for the same host so category/chapter links are not
+        mistaken for books.
         """
         url = self._strip_url_options_suffix(url)
-        pattern = self.config.get("bookUrlPattern", "")
+        pattern = self._book_url_pattern()
         if pattern and pattern.strip():
             try:
                 # ``bookUrlPattern`` must only match a *book detail* URL, not a
@@ -2904,7 +2981,7 @@ class YueduPlugin:
 
         # A book detail page is not a chapter, even if it sits under /book/.
         if self._is_book_url(abs_url, require_pattern=True):
-            if self.config.get("bookUrlPattern", "").strip():
+            if self._book_url_pattern():
                 # The source told us exactly what a book URL looks like.
                 return False
             # Without a pattern the heuristic cannot tell a book page from a
@@ -3693,15 +3770,14 @@ class YueduPlugin:
                 for item in usable_items
             ]
             # The source's own ``bookList`` rule already decided which links are
-            # books, so without a ``bookUrlPattern`` the URL only has to be a
-            # usable detail link on this site -- Legado accepts such rules as
-            # written.  Running our path heuristic on top dropped whole sites
-            # whose detail URLs are not in the ``/novel/123`` shape (绅士漫画:
-            # ``/photos-index-aid-354422.html``), even though the rule matched
-            # them correctly, which surfaced as "同步 0 本书".
-            declared_pattern = str(
-                self.config.get("bookUrlPattern", "") or ""
-            ).strip()
+            # books, so without a discriminating ``bookUrlPattern`` the URL only
+            # has to be a usable detail link on this site -- Legado accepts such
+            # rules as written.  Running our path heuristic on top dropped whole
+            # sites whose detail URLs are not in the ``/novel/123`` shape
+            # (绅士漫画: ``/photos-index-aid-354422.html``, Icu: ``/xs_ls/39898``),
+            # even though the rule matched them correctly, which surfaced as
+            # "同步 0 本书".
+            declared_pattern = self._book_url_pattern()
             filtered_items = []
             for item in normalized_items:
                 book_url = self._make_absolute(
@@ -3765,9 +3841,7 @@ class YueduPlugin:
         items = await self.fetch_explore(url=url, page=page)
         link_base = self._make_absolute(url, self.base_url) if url else self.base_url
         books: list[RemoteShelfBook] = []
-        declared_pattern = str(
-            self.config.get("bookUrlPattern", "") or ""
-        ).strip()
+        declared_pattern = self._book_url_pattern()
         for item in items:
             book_url = self._explore_item_url(item)
             if not book_url:
@@ -3864,6 +3938,9 @@ class YueduPlugin:
         seen: set[str] = set()
         results: list[dict[str, Any]] = []
         link_base = self._make_absolute(page_url, self.base_url) if page_url else self.base_url
+        # Same policy as discovery: the source's ``bookList`` rule is the
+        # authority, and a host-only ``bookUrlPattern`` cannot filter anything.
+        declared_pattern = self._book_url_pattern()
 
         for item in items:
             if not isinstance(item, dict):
@@ -3875,7 +3952,10 @@ class YueduPlugin:
             full_url = self._make_absolute(book_url, link_base)
             if not full_url.startswith(("http://", "https://")):
                 continue
-            if not self._is_book_url(full_url, require_pattern=True):
+            if declared_pattern and not self._is_book_url(
+                full_url,
+                require_pattern=True,
+            ):
                 continue
             key = full_url.rstrip("/")
             if key in seen:

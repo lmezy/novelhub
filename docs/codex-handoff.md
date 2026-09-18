@@ -114,6 +114,10 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 | `claude` provider 永远 401/404 | 用 OpenAI 的 `/chat/completions` + `Bearer` 调 Anthropic | 见第 18 节（`/v1/messages` + `x-api-key`） |
 | AI 回答总是从第 1 章说起 / 摘要只覆盖前 30 章 | 上下文固定取「书的前 N 章」，与阅读位置无关 | 见第 18 节（`AIService.build_context`） |
 | 阅读器 AI 回答半天不出字 | nginx 默认 `proxy_buffering`，SSE 被整体缓冲 | 见第 18 节（响应头 + nginx `proxy_buffering off`） |
+| 分类页「明明有书」却报 `returned no books`、任务以 `书源未返回可同步的书籍` 失败 | `bookList`/`chapterList` 里的 `\|\|`/`&&` 组合规则没按 Legado 切分，整条丢给 soupsieve 抛 `Invalid character '\|'` 后被吞 | 见第 26 节（`_get_elements_from_root`） |
+| `exploreUrl` 是 `<js>` 但站点正常，仍报「发现规则是 Legado JS 脚本，当前环境无法执行」 | shim 缺 `java.connect`（书源 `try/catch` 把 TypeError 变成字符串，日志里看不到 JS 报错） | 见第 26 节（`java.connect`/`getBody`/`selectFirst`/`equals`） |
+| 日志刷 `JsRuntime eval error: Object of type Tag is not JSON serializable` | 纯 JS 字段规则的输入是 bs4 `Tag`，`json.dumps` 在脚本运行前就抛错 | 见第 26 节（`json_safe()`） |
+| 搜索结果被全部过滤、只剩首页链接；书页无 `<title>` 导致 `no usable metadata` | host-only 的 `bookUrlPattern`（只有 scheme+host）当过滤器用；`{{book.name}}` 没有 book 上下文 | 见第 26 节（`_book_url_pattern()`/`_extract_labelled_title()`） |
 
 ---
 
@@ -1283,7 +1287,92 @@ crawler 长期 100% CPU。
 - `sw.js` 变更后浏览器要等旧 SW 被替换（新 SW `skipWaiting` + `clients.claim`，
   刷新一次即可生效）；旧缓存会在 `activate` 里删掉。
 
+---
 
+## 26. 2026-09-18：crawler 两个任务失败的真根因（`||` 组合列表规则、shim 缺 java.connect）
 
+**现象**（`docker logs novelhub-crawler --since 72h`：4 条 ERROR + 117 条 WARNING；用户报
+「crawler 容器后台报错」）：
 
+1. `中文成人文学网-短篇(简体)`（`yuedu_c4a94f9ce7ce`，blog.xbookcn.net）的 `discover_all` 任务
+   失败：`书源未返回可同步的书籍`。任务里 21 个分类页各有一条
+   `Explore kind … returned no books on page 1: … [bytes=61193 title='精选作品-短篇成人情色小说'
+   text='…猎美陷阱 姐姐的屁股…']` ——**页面有书，解析出 0 本**。
+2. `Icu`（`yuedu_963f7dd31df3`，hq555.icu）的 `discover_all` 任务失败：
+   `该书源的发现规则是 Legado JS 脚本（<js>/@js:），当前环境无法执行` —— 而该站点此刻用
+   proxy 直取 `/so` 是 **200 / 81 KB**，页面里 `layui-tab-item-title` 5 个、没有验证码页面。
+3. 其余 WARNING 全是站点/代理侧（h528 502、cool18 404/删帖、banshanren 人机验证、
+   `img5.wnimg2.cfd` 图片连接失败、mihomo 抖动 `Configured proxy … retrying direct`），与本轮无关。
 
+**根因**（都在线上容器里用真实页面复现，未改线上代码/数据）：
+
+1. **列表规则里的 `&&`/`||`/`%%` 从未被切分**：Legado 的
+   `AnalyzeByJSoup.getElements` 先 `RuleAnalyzer.splitRule("&&","||","%%")` 再逐段选择
+   （`||` = 取第一段有结果的，`&&` = 拼接，`%%` = 交错）。我们的 `_get_elements` 把整条
+   规则丢给 soupsieve：`h3 a||.post-title a||article h3 a` → `SelectorSyntaxError: Invalid
+   character '|'`，而 `_legado_before_elements` 的 `except` 把它吞掉返回**空**，于是
+   bookList/chapterList 组合规则一律 0 元素。xbookcn 的 `ruleExplore`/`ruleSearch` 都是
+   这条 `||` 规则；Icu 的 `ruleSearch.bookList` 是
+   `.layui-tab-item-novelContainer[-1]@…&&.layui-tab-item-novelContainer[-2]@…`。
+2. **shim 缺 `java.connect`**：Icu 的 `exploreUrl` 是 `<js>`，第一句就是
+   `java.connect(baseUrl + "/so").getBody()`。shim 里只有 `org.jsoup.Jsoup.connect`，
+   `java.connect` 是 undefined → TypeError 被书源自己的 `try/catch` 接住并 `return "" + e`
+   （所以日志里**没有** JS 报错），结果是非 JSON 字符串 → `_parse_explore_js` 返回 `[]` →
+   落到「发现规则是 JS 脚本」的错误文案。同一个脚本还用到 `Element.selectFirst` 与
+   `Element.equals`（shim 都没有）。
+3. **纯 JS 字段规则的输入是 bs4 `Tag`**：`_eval_js_impl` 里 `json.dumps(input_value)` 对
+   `Tag` 抛 `Object of type Tag is not JSON serializable`（容器日志里刷了 24 条
+   `JsRuntime eval error`），脚本还没跑就失败 —— Icu 的 `ruleSearch.kind`
+   （`<js>java.getString("a@href")…</js>`）就是这样丢掉 kind 的。绅士漫画的 kind 之所以没踩到，
+   是因为它的规则前半段是 CSS，传给 JS 的已经是字符串。
+4. **host-only 的 `bookUrlPattern` 把结果全过滤掉**：Icu 声明
+   `bookUrlPattern = "https://ztopaq7zrz.hq555.icu:1678"`（只有 scheme+host）。
+   `_is_book_url` 的「匹配必须走到路径结尾」规则对它永远不成立（余下整条路径），
+   `require_pattern` 分支又对同 host 直接返回 False → 24 条搜索结果全被丢弃，
+   只剩通用兜底扫出来的首页链接（书名 `首頁`）。
+5. **书页没有 `<title>`**：Icu 的书页只有 `<p>书&nbsp;&nbsp;名：风流穿越</p>` 和封面
+   `<img alt>`，而书源 `ruleBookInfo.name = "{{book.name}}"`（Legado 用搜索结果带的 book
+   对象解析，NovelHub 按 URL 打开时没有这个对象）→ 书名空 → `sync_book` 直接判
+   `Book page returned no usable metadata` 失败（章节其实解析出 20 条）。
+
+**改动**：
+
+| 文件 | 改动 |
+|---|---|
+| `backend/app/crawler/plugins/yuedu/rule_engine.py` | 新增 `_get_elements_from_root`：`_get_elements` 先按 `_RuleAnalyzer.split_rule(*SEPARATORS)` 切分再逐段链式选择，`\|\|`/`\|` 取首个非空、`%%` 交错、`&&` 拼接（与 Legado `AnalyzeByJSoup.getElements` 一致）；括号不平衡时退化为单段求值 |
+| `backend/app/crawler/plugins/yuedu/jsoup_shim.js` | 新增 `java.connect(url[, headerJson])`（按 Legado 语义**立即**发请求并返回响应对象，带上源 `header`：`__nhSourceHeaders`）、`__nhResponse.getBody()`、`__nhEl.selectFirst`/`__nhElements.selectFirst`、`__nhEl.equals` |
+| `backend/app/crawler/plugins/yuedu/js_runtime.py` | 新增 `json_safe()`：把非 JSON 可序列化的输入（bs4 `Tag` 等）转成字符串（元素 → 外层 HTML），`_eval_js_impl` 的 `input_value`/`context` 与 `_eval_js_with_context_impl` 都改用它 —— 元素变成 HTML 正好是 `src`/`java.getString` 的根 |
+| `backend/app/crawler/plugins/yuedu/__init__.py` | 新增 `_book_url_pattern()`：只有 scheme+host 的 `bookUrlPattern` 视为「无法区分书页」（返回 `""`），`_is_book_url`、`_is_chapter_url`、`_explore_items_from_html`、`discover_books`、`_normalize_search_items` 统一改用它，书源自己的 `bookList` 重新成为权威；新增 `_extract_labelled_title()`（`og:novel:book_name`/ld+json/正文 `书名：X`），`_parse_book_generic` 在没有 `<title>` 时用它取名 |
+| `backend/tests/test_rule_engine_legado.py` | 新增 6 项：`\|\|` 取首个匹配/回退、`&&` 拼接、`%%` 交错、括号内分隔符不被切开、chapterList 回退、`java.connect().getBody()`、`selectFirst`/`equals` |
+| `backend/tests/test_yuedu_plugin.py` | 新增 6 项：xbookcn 式 `\|\|` 探页发现书籍、Icu 式 `&&` 搜索、纯 JS 字段规则读列表项元素、Icu 式 exploreUrl JS 产出分类（stub `__nhCurlRaw`）、host-only `bookUrlPattern` 不过滤/不吞章节、无 `<title>` 时用「书名：」取名 |
+
+**验证**：
+
+- 9 项新测试在**改动前全部失败**（先 `git checkout` 还原两个源文件跑一遍确认，再恢复改动）。
+- `cd backend && python -m pytest -q` → **677 passed**（改动前 663）。
+- 线上影子回归（把改后的 4 个文件写进容器 `/tmp/shadow_backend`，**没有改线上镜像/代码/数据**；
+  探针只读站点与数据库）：
+
+| 探针 | 部署版 | 改动后 |
+|---|---|---|
+| xbookcn `discover_books` 精选作品 / 现代情色 | 0 / 0 本 | **20 / 20 本**（《猎美陷阱》《姐姐的屁股》…） |
+| Icu `get_explore_kinds()` | 0 个（`discover_books` 抛「发现规则是 JS 脚本」） | **55 个分类**（风流/阿宾/爸爸…） |
+| Icu `discover_books(风流)` | — | **24 本**真实书籍（`/xs_ls/39898` …） |
+| Icu `fetch_book` + 首章正文 | — | 书名 **风流穿越**、20 章、正文 **5112 字符** |
+| 绅士漫画 wn09 `discover_books(page=1)`（回归） | 399 本 | **399 本** |
+| 御宅屋 `fetch_book`/正文（回归） | 50 章 | **50 章**，正文可取 |
+
+  验证用的 `/tmp/shadow_backend`、`/tmp/nhdbg` 已删除；线上容器 4 个文件的 md5 与开始前一致。
+
+**未做/已知**：
+
+- **只改本地代码**。线上生效要 `docker compose build backend crawler` + `up -d`（无新迁移）。
+  部署后 xbookcn、Icu 这两个书源需要重发一次全站同步（旧任务里的失败记录不会自己重跑）。
+- Legado 组合规则的 `%%`（交错）现在按 Legado 语义实现，但线上书源里暂无实际用例。
+- 依赖完整 Android 运行时的书源（UAA 的 `Reload(...)`/`java.importScript`）仍然跑不了，
+  错误文案不变：[full-site-sync.md](full-site-sync.md)「书源发现规则是 `<js>` 脚本」一节已更新，
+  区分「shim 能跑」与「真需要 Legado」。
+- Icu 的 `bookUrlPattern` 是 host-only，`_is_book_url` 现在按「无模式」处理：同源的书页/章节
+  形状判定回落到路径启发式（`/xs_ls/…` 这类短路径不会被当成书页，也不影响
+  `ruleToc` 命中即权威的既有策略）。
+- Icu 的相册式漫画正文是图片，阅读器渲染属于前端既有能力，未在本轮验证。

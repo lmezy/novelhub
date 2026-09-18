@@ -79,6 +79,14 @@
   “超长章节（一章几十万字）怎么读”
 - **crawler 日志大量 `Chapter returned empty content`** → [full-site-sync.md](full-site-sync.md)
   “日志大量 `Chapter returned empty content`（同一批书）”
+- **分类页「明明有书」却报 0 本 / 任务报「书源未返回可同步的书籍」** →
+  [full-site-sync.md](full-site-sync.md) “分类页明明有书，却报 `returned no books`” +
+  [codex-handoff.md](codex-handoff.md) 第 26 节
+- **书源 `exploreUrl` 是 `<js>`，报「发现规则是 Legado JS 脚本，当前环境无法执行」** →
+  [full-site-sync.md](full-site-sync.md) “书源发现规则是 `<js>` / `@js:` 脚本，同步报无法执行”
+  + [codex-handoff.md](codex-handoff.md) 第 26 节
+- **搜索/发现结果被过滤成 0 本，只入库一个首页链接；书页报 `no usable metadata`** →
+  [codex-handoff.md](codex-handoff.md) 第 26 节
 - AI 侧栏提示未配置 / 回答总从第 1 章说起 / 回答不出字（流式被缓冲）→
   [ai-assistant.md](ai-assistant.md) “排错”
 - AI 测试连接报 400 `The supported API model names are …`（模型名不对）→

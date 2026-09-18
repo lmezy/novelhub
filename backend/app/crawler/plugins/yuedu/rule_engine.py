@@ -631,12 +631,69 @@ class YueduRuleEngine:
         if root is None:
             return []
 
-        elements: list[Tag] = [root]
-        for segment in self._split_element_steps(rule):
-            elements = self._select_elements_chain(elements, segment)
+        elements = self._get_elements_from_root(root, rule)
         if reverse:
             elements.reverse()
         return elements
+
+    def _get_elements_from_root(
+        self,
+        root: BeautifulSoup | Tag,
+        rule: str,
+    ) -> list[Tag]:
+        """Select elements for one list rule, honouring ``&&``/``||``/``%%``.
+
+        Legado's ``AnalyzeByJSoup.getElements`` splits the rule with
+        ``RuleAnalyzer.splitRule("&&", "||", "%%")`` *before* selecting and
+        combines the per-fragment element lists:
+
+        * ``||`` -- first fragment that selects anything wins (fallback);
+        * ``%%`` -- interleave the fragments element by element;
+        * ``&&`` / no separator -- concatenate all fragments.
+
+        Handing the combined rule straight to soupsieve instead made every
+        ``bookList`` / ``chapterList`` that uses a fallback parse to **zero**
+        elements: ``h3 a||.post-title a`` raised
+        ``SelectorSyntaxError: Invalid character '|'`` and the caller's
+        ``except`` swallowed it.  中文成人文学网 (blog.xbookcn.net) discovered no
+        books at all because of it, and Icu's search rule
+        (``.novelContainer[-1]@…&&.novelContainer[-2]@…``) never matched.
+        """
+        analyzer = _RuleAnalyzer(rule)
+        try:
+            fragments = analyzer.split_rule(*self.SEPARATORS)
+            elements_type = analyzer.elements_type
+        except RuleUnbalancedError:
+            logger.debug(
+                "Unbalanced list rule, evaluating as a single fragment: {}",
+                rule[:160],
+            )
+            fragments = [rule]
+            elements_type = ""
+
+        groups: list[list[Tag]] = []
+        for fragment in fragments:
+            fragment = fragment.strip()
+            if not fragment:
+                continue
+            selected: list[Tag] = [root]
+            for segment in self._split_element_steps(fragment):
+                selected = self._select_elements_chain(selected, segment)
+            groups.append(selected)
+            if selected and elements_type in ("||", "|"):
+                break
+
+        if not groups:
+            return []
+        if elements_type == "%%":
+            combined: list[Tag] = []
+            longest = max(len(group) for group in groups)
+            for index in range(longest):
+                for group in groups:
+                    if index < len(group):
+                        combined.append(group[index])
+            return combined
+        return [element for group in groups for element in group]
 
     @staticmethod
     def _split_element_steps(rule: str) -> list[str]:

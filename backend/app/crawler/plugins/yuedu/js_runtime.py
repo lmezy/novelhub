@@ -34,6 +34,32 @@ try:
 except Exception:
     _JSOUP_SHIM = ""
 
+
+def json_safe(value: Any) -> Any:
+    """Return a JSON-serializable stand-in for a rule input value.
+
+    Book-source JS rules are evaluated against the current list item, which in
+    this codebase is a bs4 ``Tag`` (Legado hands the script a jsoup Element).
+    ``json.dumps(Tag)`` raises "Object of type Tag is not JSON serializable",
+    and ``_eval_js_impl`` did that before the script ran -- so **every** pure-JS
+    field rule on a list item silently failed, not just the ones that need the
+    element.  Icu's ``ruleSearch.kind`` (``<js>java.getString("a@href")…</js>``)
+    was one of them: the item element is the Java rule's root, so turning the
+    element into its outer HTML both fixes the serialization and gives
+    ``src`` / ``java.getString`` the node the rule expects.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    try:
+        json.dumps(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return value
+
 # JS wrapper template that receives code + data, executes, and returns result
 _EVAL_WRAPPER = r"""
 function __codex_eval__() {
@@ -291,20 +317,17 @@ class JsRuntime:
                 # Wrap the user code: inject input as 'result' and execute.
                 # Legado rules communicate through the ``result`` variable,
                 # so append a return unless the script returns explicitly.
-                input_json = json.dumps(input_value)
+                input_json = json.dumps(json_safe(input_value))
                 user_code = js_code.strip()
                 context_js = ""
                 if context:
+                    safe_context = json_safe(context)
                     # Inject every context key as a JS variable so rules can
                     # reference baseUrl / bookUrl / url / key / page / chapter
                     # directly, and seed the shim stores (Get/Put and source.*).
-                    for key, value in context.items():
-                        if isinstance(value, (dict, list, bool, int, float)) or value is None:
-                            encoded = json.dumps(value, ensure_ascii=False)
-                        else:
-                            encoded = json.dumps(str(value), ensure_ascii=False)
-                        context_js += f"var {key}={encoded};"
-                    ctx_json = json.dumps(context, ensure_ascii=False)
+                    for key, value in safe_context.items():
+                        context_js += f"var {key}={json.dumps(value, ensure_ascii=False)};"
+                    ctx_json = json.dumps(safe_context, ensure_ascii=False)
                     context_js += (
                         "if(globalThis.__nhSetVars){globalThis.__nhSetVars(" + 
                         ctx_json + ");}"
@@ -454,18 +477,19 @@ class JsRuntime:
                     return None
 
             try:
+                safe_context = json_safe(context)
                 var_decls = []
-                for key, value in context.items():
+                for key, value in safe_context.items():
                     var_decls.append(f"var {key}={json.dumps(value)};")
                 var_block = " ".join(var_decls)
-                ctx_json = json.dumps(context, ensure_ascii=False)
+                ctx_json = json.dumps(safe_context, ensure_ascii=False)
                 seed_js = (
                     "if(globalThis.__nhSetVars){globalThis.__nhSetVars(" + 
                     ctx_json + ");}"
                     "if(globalThis.__nhSetSourceConfig){globalThis.__nhSetSourceConfig(" + 
                     ctx_json + ");}"
                 )
-                result_json = json.dumps(context)
+                result_json = json.dumps(safe_context)
                 snippet = (
                     f'(function(){{'
                     f'{var_block}'

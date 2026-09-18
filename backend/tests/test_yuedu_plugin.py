@@ -4159,3 +4159,358 @@ async def test_fetch_book_still_scans_book_page_when_toc_url_is_a_guess():
         "https://example.com/novel/123/2.html",
     ]
 
+
+XBOOKCN_LABEL_HTML = """
+<html><head><title>精选作品-短篇成人情色小说</title></head><body>
+  <div class='post'>
+    <h3 class='post-title entry-title' itemprop='name'>
+      <a href='https://blog.xbookcn.net/2022/02/blog-post.html'>猎美陷阱</a>
+    </h3>
+    <div class='post-header'>2022/02</div>
+  </div>
+  <div class='post'>
+    <h3 class='post-title entry-title' itemprop='name'>
+      <a href='https://blog.xbookcn.net/2022/01/blog-post_24.html'>姐姐的屁股</a>
+    </h3>
+  </div>
+</body></html>
+"""
+
+XBOOKCN_EXPLORE_RULE = "h3 a||.post-title a||article h3 a"
+
+
+def test_explore_book_list_with_or_fallback_discovers_books():
+    """中文成人文学网 (blog.xbookcn.net) lost every book to a ``||`` rule.
+
+    Its ``ruleExplore.bookList`` / ``ruleSearch.bookList`` are
+    ``h3 a||.post-title a||article h3 a``; passing that whole string to
+    soupsieve raised ``SelectorSyntaxError: Invalid character '|'``, the
+    ``except`` swallowed it and all 22 discover categories reported
+    "returned no books", so the task ended with "书源未返回可同步的书籍".
+    """
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://blog.xbookcn.net",
+        "ruleExplore": {
+            "bookList": XBOOKCN_EXPLORE_RULE,
+            "name": "text",
+            "bookUrl": "href",
+        },
+    })
+
+    items = plugin._explore_items_from_html(
+        XBOOKCN_LABEL_HTML,
+        "https://blog.xbookcn.net/search/label/%E7%B2%BE%E9%80%89%E4%BD%9C%E5%93%81",
+    )
+
+    assert [item["name"] for item in items] == ["猎美陷阱", "姐姐的屁股"]
+    assert items[0]["bookUrl"] == "https://blog.xbookcn.net/2022/02/blog-post.html"
+
+
+def test_search_book_list_with_and_separator_concatenates_containers():
+    """Icu's ``ruleSearch.bookList`` joins two containers with ``&&``.
+
+    ``.layui-tab-item-novelContainer[-1]@…&&.layui-tab-item-novelContainer[-2]@…``
+    used to be handed to soupsieve whole; ``&&`` is not valid CSS, the error was
+    swallowed and search always returned nothing for this source.
+    """
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://icu.example.com",
+        "ruleSearch": {
+            "bookList": ".layui-tab-item-novelContainer[-1]@.novel-grid@.novel-grid-item"
+                        "&&.layui-tab-item-novelContainer[-2]@.novel-grid@.novel-grid-item",
+            "name": "p@text",
+            "bookUrl": "a@href",
+        },
+    })
+    html = (
+        "<html><body>"
+        "<div class='layui-tab-item-novelContainer'><div class='novel-grid'>"
+        "<div class='novel-grid-item'><a href='/xs/1'><p>小说一</p></a></div>"
+        "</div></div>"
+        "<div class='layui-tab-item-novelContainer'><div class='novel-grid'>"
+        "<div class='novel-grid-item'><a href='/comic/2'><p>漫画二</p></a></div>"
+        "</div></div>"
+        "</body></html>"
+    )
+
+    results = plugin.engine.parse_search_results(html)
+
+    # ``[-1]`` is the last container and ``[-2]`` the one before it, and the
+    # ``&&`` concatenation keeps both groups in rule order.
+    assert [item["name"] for item in results] == ["漫画二", "小说一"]
+
+
+def test_js_field_rule_reads_the_list_item_element():
+    """Icu's ``ruleSearch.kind`` is a pure ``<js>`` rule on the result card.
+
+    ``json.dumps(Tag)`` raised "Object of type Tag is not JSON serializable"
+    before the script ran, so every pure-JS field rule evaluated against a list
+    item failed and its field came back empty.  The item element is the Java
+    rule's root, so the JS input has to become the element's HTML.
+    """
+    import shutil as _shutil
+
+    if _shutil.which("node") is None:
+        pytest.skip("Node.js not available")
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://icu.example.com",
+        "ruleSearch": {
+            "bookList": ".layui-tab-item-novelContainer[-1]@.novel-grid@.novel-grid-item"
+                        "&&.layui-tab-item-novelContainer[-2]@.novel-grid@.novel-grid-item",
+            "name": "p@text",
+            "bookUrl": "a@href",
+            "kind": (
+                "<js>\nvar href = java.getString(\"a@href\");\n"
+                "if (href && href.indexOf('/xs') === 0) { result = '小说'; }\n"
+                "else if (href && href.indexOf('/comic') === 0) { result = '漫画'; }\n"
+                "else { result = '视频'; }\nresult;\n</js>"
+            ),
+        },
+    })
+    html = (
+        "<html><body>"
+        "<div class='layui-tab-item-novelContainer'><div class='novel-grid'>"
+        "<div class='novel-grid-item'><a href='/xs/1'><p>小说一</p></a></div>"
+        "</div></div>"
+        "<div class='layui-tab-item-novelContainer'><div class='novel-grid'>"
+        "<div class='novel-grid-item'><a href='/comic/2'><p>漫画二</p></a></div>"
+        "</div></div>"
+        "</body></html>"
+    )
+
+    results = plugin.engine.parse_search_results(html)
+
+    by_name = {item["name"]: item for item in results}
+    assert by_name["小说一"]["kind"] == "小说"
+    assert by_name["漫画二"]["kind"] == "漫画"
+
+
+ICU_EXPLORE_JS = """
+<js>
+java.longToast("多刷新两次");
+(function() {
+    try {
+        var baseUrl = "https://icu.example.com";
+        var html = java.connect(baseUrl + "/so").getBody();
+        if (html.match(/easy_slider_html/) || html.match(/安全验证/)) {
+            java.startBrowserAwait(baseUrl, '人机验证');
+            html = java.connect(baseUrl + "/so").getBody();
+        };
+        if (!html) return '';
+        var doc = org.jsoup.Jsoup.parse(html);
+        var titles = doc.select('.layui-tab-item-title');
+        if (titles.size() < 4) { return ''; }
+        var results = [];
+        results.push({"title": "小说", "url": ""});
+        var fictionTitle = titles.get(1);
+        var comicTitle = titles.get(2);
+        var endTitle = titles.get(3);
+        var currentElement = fictionTitle.nextElementSibling();
+        while (currentElement && !currentElement.equals(comicTitle)) {
+            if (currentElement.hasClass('layui-tab-item-tagContainer')) {
+                var links = currentElement.select('a');
+                for (var i = 0; i < links.size(); i++) {
+                    var link = links.get(i);
+                    var span = link.selectFirst('span.layui-tab-item-tagContainer-tag');
+                    var name = span ? span.text().trim() : link.text().trim();
+                    var href = link.attr('href');
+                    if (name && href) {
+                        if (!href.includes("{{page}}")) { href = href + "/{{page}}"; }
+                        results.push({"title": name, "url": href});
+                    }
+                }
+            }
+            currentElement = currentElement.nextElementSibling();
+        }
+        results.push({"title": "漫画", "url": ""});
+        currentElement = comicTitle.nextElementSibling();
+        while (currentElement && !currentElement.equals(endTitle)) {
+            if (currentElement.hasClass('layui-tab-item-tagContainer')) {
+                var clinks = currentElement.select('a');
+                for (var j = 0; j < clinks.size(); j++) {
+                    var clink = clinks.get(j);
+                    var cname = clink.text().trim();
+                    var chref = clink.attr('href');
+                    if (cname && chref) {
+                        if (!chref.includes("{{page}}")) { chref = chref + "/{{page}}"; }
+                        results.push({"title": cname, "url": chref});
+                    }
+                }
+            }
+            currentElement = currentElement.nextElementSibling();
+        }
+        return JSON.stringify(results);
+    } catch (e) {
+        return "" + e;
+    }
+})();
+</js>
+"""
+
+ICU_SO_HTML = """
+<html><body>
+  <div class="layui-tab-item-title">热门搜索词</div>
+  <div class="layui-tab-item-tagContainer">
+    <a href="/so/video/口交"><span class="layui-tab-item-tagContainer-tag">口交</span></a>
+  </div>
+  <div class="layui-tab-item-title">热门搜索词</div>
+  <div class="layui-tab-item-tagContainer">
+    <a href="/so/novel/风流"><span class="layui-tab-item-tagContainer-tag">风流</span></a>
+    <a href="/so/novel/阿宾">阿宾</a>
+  </div>
+  <div class="layui-tab-item-title">热门搜索词</div>
+  <div class="layui-tab-item-tagContainer">
+    <a href="/so/comic/秘密教学">
+      <span class="layui-tab-item-tagContainer-tag">秘密教学</span>
+    </a>
+  </div>
+  <div class="layui-tab-item-title">猜你喜欢</div>
+  <div class="layui-tab-item-novelContainer"><div class="novel-grid"></div></div>
+</body></html>
+"""
+
+
+def test_icu_explore_js_builds_category_list_from_java_connect():
+    """Icu's ``exploreUrl`` fetches its category list through the JS shim.
+
+    ``java.connect(url).getBody()`` and ``Element.selectFirst``/``equals`` did
+    not exist, the source's own ``try/catch`` turned the TypeError into a plain
+    string, and the task failed with "该书源的发现规则是 Legado JS 脚本
+    （<js>/@js:），当前环境无法执行".  The site itself answers fine.
+    """
+    import shutil as _shutil
+
+    from app.crawler.plugins.yuedu.js_runtime import JsRuntime
+
+    if _shutil.which("node") is None:
+        pytest.skip("Node.js not available")
+    runtime = JsRuntime.get_instance()
+    if not runtime.start_sync():
+        pytest.skip("Node.js runtime failed to start")
+
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://icu.example.com",
+        "exploreUrl": ICU_EXPLORE_JS,
+    })
+    # Stub the shim's transport instead of hitting the network; the JS itself
+    # (java.connect / getBody / selectFirst / equals) still runs in Node.
+    # ``var`` declarations inside one eval do not survive into the next one, so
+    # the saved transport and the page body ride on ``globalThis``.
+    plugin.engine._try_eval_js(
+        "globalThis.__NH_SAVED_CURL = __nhCurlRaw;"
+        f"globalThis.__NH_TEST_HTML = {json.dumps(ICU_SO_HTML)};"
+        "__nhCurlRaw = function () { return globalThis.__NH_TEST_HTML; };"
+        "void 0;",
+        "",
+    )
+    try:
+        kinds = plugin.get_explore_kinds()
+    finally:
+        plugin.engine._try_eval_js(
+            "__nhCurlRaw = globalThis.__NH_SAVED_CURL;"
+            "delete globalThis.__NH_SAVED_CURL;"
+            "delete globalThis.__NH_TEST_HTML;"
+            "void 0;",
+            "",
+        )
+
+    # The page holds three 热门搜索词 blocks (video / novel / comic); the script
+    # walks from the novel one to the comic one and then from the comic one to
+    # 猜你喜欢, so every tag link of the novel and comic tabs becomes a category.
+    # The two ``小说`` / ``漫画`` header rows carry no URL and are dropped.
+    assert [kind["title"] for kind in kinds] == ["风流", "阿宾", "秘密教学"]
+    assert kinds[0]["url"] == "/so/novel/风流/{{page}}"
+    assert kinds[2]["url"] == "/so/comic/秘密教学/{{page}}"
+
+
+def test_host_only_book_url_pattern_does_not_filter_candidates():
+    """Icu declares ``bookUrlPattern`` as just ``https://host:port``.
+
+    Such a pattern matches every URL on the site: the end-of-path check dropped
+    every result (so discovery fell back to the generic scanner and stored the
+    homepage as a "book"), while taking it literally would call chapter pages
+    books.  A pattern that cannot discriminate must not filter anything.
+    """
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://icu.example.com",
+        "bookUrlPattern": "https://icu.example.com",
+        "ruleSearch": {
+            "bookList": ".novel-grid-item",
+            "name": "p@text",
+            "bookUrl": "a@href",
+        },
+        "ruleExplore": {},
+    })
+    html = (
+        "<html><body><div class='novel-grid'>"
+        "<div class='novel-grid-item'><a href='/xs_ls/39898'><p>风流穿越</p></a></div>"
+        "<div class='novel-grid-item'><a href='/comic_ls/10261'><p>绿帽男友</p></a></div>"
+        "</div></body></html>"
+    )
+
+    assert plugin._book_url_pattern() == ""
+    items = plugin._normalize_search_items(
+        [
+            {"name": "风流穿越", "bookUrl": "/xs_ls/39898"},
+            {"name": "绿帽男友", "bookUrl": "/comic_ls/10261"},
+        ],
+        "https://icu.example.com/so/novel/x/1",
+    )
+    assert [item["name"] for item in items] == ["风流穿越", "绿帽男友"]
+    assert [item["name"] for item in plugin._explore_items_from_html(
+        html, "https://icu.example.com/so/novel/x/1",
+    )] == ["风流穿越", "绿帽男友"]
+
+
+def test_host_only_book_url_pattern_does_not_hide_chapters():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://icu.example.com",
+        "bookUrlPattern": "https://icu.example.com/",
+    })
+
+    # The path heuristic still works, and a book-shaped URL is not treated as
+    # "anything on this host is a book detail page".
+    assert plugin._is_book_url(
+        "https://icu.example.com/novel/1.html", require_pattern=True,
+    ) is True
+    assert plugin._is_book_url(
+        "https://example.com/other/1.html", require_pattern=True,
+    ) is False
+    # A chapter under a *discriminating* pattern is still rejected.
+    strict = YueduPlugin({
+        "bookSourceUrl": "https://www.alicesw.com",
+        "bookUrlPattern": r"https?://www\.alicesw\.com/novel/\d+\.html",
+    })
+    assert strict._book_url_pattern() == r"https?://www\.alicesw\.com/novel/\d+\.html"
+    assert strict._is_book_url(
+        "https://www.alicesw.com/novel/1.html", require_pattern=True,
+    ) is True
+    assert strict._is_book_url(
+        "https://www.alicesw.com/novel/1/2.html", require_pattern=True,
+    ) is False
+
+
+def test_labelled_book_name_is_used_when_the_page_has_no_title():
+    """Icu's book page has no ``<title>``; it labels the book 书名：X.
+
+    The source's ``ruleBookInfo.name`` is ``{{book.name}}`` (a Legado book
+    object NovelHub does not have when it opens a URL), so the book stayed
+    nameless and ``sync_book`` rejected it with "no usable metadata" even
+    though all chapters parsed.
+    """
+    plugin = YueduPlugin({"bookSourceUrl": "https://icu.example.com"})
+    html = (
+        '<html><body><div class="detail-box"><div class="imgbox">'
+        '<img alt="风流穿越" src="/a.js"></div><div class="info"><div class="top">'
+        '<div class="fix"><p>书&nbsp;&nbsp;名：风流穿越</p>'
+        '<p class="xs-show">类&nbsp;&nbsp;别：武侠</p></div></div></div></div>'
+        "</body></html>"
+    )
+
+    info = plugin._parse_book_generic(html, "https://icu.example.com/xs_ls/39898")
+
+    assert info["title"] == "风流穿越"
+    # A random "别：x" label must not be mistaken for the book name.
+    assert plugin._extract_labelled_title(
+        BeautifulSoup("<html><body><p>别：x</p></body></html>", "lxml")
+    ) == ""

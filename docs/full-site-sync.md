@@ -348,10 +348,43 @@ XPath，而服务端 JS 环境旧版只支持 CSS，取到空串后 `split(...)[
 
 ### 书源发现规则是 `<js>` / `@js:` 脚本，同步报无法执行
 
-例如 UAA 小说的 `exploreUrl` 是 `eval(String(Reload('https://…/xxx.js')))`，依赖完整
-Legado Android 运行时（`source`、`cache`、`java.importScript`）和登录 token，
-NovelHub 的 Node shim 跑不了这类脚本：请在 Legado 里搜索后走书源搜索/手动链接同步，
-或在 yckceo 书源库换一个实现。
+先确认是不是**这一版才修好的两类**（2026-09-18，[codex-handoff.md](codex-handoff.md) 第 26 节）：
+
+- 书源 `exploreUrl` 的脚本用 `java.connect(url).getBody()` 取页面再解析出分类列表
+  （典型：Icu / hq555.icu）。以前 shim 里没有 `java.connect`，脚本抛错的异常又被书源自己的
+  `try/catch` 吞掉，于是任务报「发现规则是 Legado JS 脚本，当前环境无法执行」——现在能跑。
+- 书源的 `bookList` 里带 `||` / `&&` 组合（例如 `h3 a||.post-title a`、
+  `.容器[-1]@…&&.容器[-2]@…`）。以前组合规则一律解析出 0 本，日志里是
+  `Explore kind … returned no books on page 1: … [bytes=61193 title='…']`；现在按 Legado
+  语义切分，`||` 取第一个有结果的、`&&` 拼接。
+
+剩下的才是真的跑不了：例如 UAA 小说的 `exploreUrl` 是
+`eval(String(Reload('https://…/xxx.js')))`，依赖完整 Legado Android 运行时（`source`、`cache`、
+`java.importScript`）和登录 token，NovelHub 的 Node shim 跑不了这类脚本：请在 Legado 里搜索后
+走书源搜索/手动链接同步，或在 yckceo 书源库换一个实现。
+
+### 分类页明明有书，却报 `returned no books` / 任务报“书源未返回可同步的书籍”
+
+先看日志里那条警告的 `bytes=` 和 `title=`：如果页面有几十 KB、标题就是分类名、`text=` 里还能看到
+书名（如 `精选作品-短篇成人情色小说 … 猎美陷阱 姐姐的屁股`），说明**页面正常、是解析规则没命中**，
+不是站点/代理问题。
+
+2026-09-18 修：`bookList` / `chapterList` 里的 Legado 组合规则（`||` 取第一个有结果的、
+`&&` 拼接、`%%` 交错）以前没有切分，整条字符串被当成一个 CSS 选择器（`h3 a||.post-title a`
+直接抛 `Invalid character '|'`），异常被吞掉后返回 0 个元素，于是每个分类页都是 0 本、任务以
+`书源未返回可同步的书籍` 收尾。现在与 Legado 的 `AnalyzeByJSoup.getElements` 一致。
+部署后**重发一次全站同步**即可，已入库的书不受影响。
+
+若日志里的 `bytes=` 很小（几 KB 的 5xx/验证码页）或 `text=` 是错误页文字，那仍是站点/代理问题，
+按上面的“任务报…但书源本身正常”处理。
+
+### 搜索/发现结果里有真书，但入库的只有一个首页链接
+
+书源声明了**只有域名**的 `bookUrlPattern`（如 Icu 的 `https://host:1678`）时，旧逻辑既拿它
+过滤（要求匹配走到路径结尾，于是全部丢掉），又因为同域名直接判 False，最后只剩通用兜底扫到的
+首页链接（书名常常是「首頁」）。2026-09-18 起这类无法区分书页的模式视为“未声明”，以书源自己的
+`bookList` 为准。同一版还让没有 `<title>` 的书页从正文 `书名：X` 取名（否则整本书会因
+`Book page returned no usable metadata` 失败）。
 
 ### 爱丽丝书屋（alicesw.com）域名解析异常
 

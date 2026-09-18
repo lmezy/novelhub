@@ -471,6 +471,127 @@ def test_java_get_reads_the_value_written_by_java_put():
     assert value == "001"
 
 
+LIST_SEPARATOR_HTML = """
+<html><body>
+  <h3 class='post-title entry-title' itemprop='name'>
+    <a href='/2022/02/a.html'>猎美陷阱</a>
+  </h3>
+  <h3 class='post-title entry-title' itemprop='name'>
+    <a href='/2022/01/b.html'>姐姐的屁股</a>
+  </h3>
+  <div class='fallback-only'><a href='/2021/12/c.html'>欲梦迷蝶</a></div>
+</body></html>
+"""
+
+
+def test_list_rule_or_fallback_uses_the_first_matching_selector():
+    """中文成人文学网's ``bookList`` is ``h3 a||.post-title a||article h3 a``.
+
+    The whole rule used to be handed to soupsieve, which raised
+    ``SelectorSyntaxError: Invalid character '|'``; the swallowed error made
+    every discover category parse 0 books and the full-site task fail with
+    "书源未返回可同步的书籍".
+    """
+    engine = _engine()
+
+    items = engine._get_elements(LIST_SEPARATOR_HTML, "h3 a||.post-title a||article h3 a")
+
+    assert len(items) == 2
+    assert items[0].get_text(strip=True) == "猎美陷阱"
+    # The ``||`` chain stops at the first fragment that matched, exactly like
+    # Legado's ``AnalyzeByJSoup.getElements`` (``if (el.size > 0) break``).
+    assert engine._get_elements(
+        LIST_SEPARATOR_HTML, ".missing a||.fallback-only a",
+    )[0].get_text(strip=True) == "欲梦迷蝶"
+
+
+def test_list_rule_and_concatenates_fragments():
+    """Icu's ``bookList`` joins two containers with ``&&``."""
+    engine = _engine()
+
+    items = engine._get_elements(LIST_SEPARATOR_HTML, "h3 a&&.fallback-only a")
+
+    assert [el.get_text(strip=True) for el in items] == ["猎美陷阱", "姐姐的屁股", "欲梦迷蝶"]
+
+
+def test_list_rule_percent_interleaves_fragments():
+    engine = _engine()
+
+    items = engine._get_elements(LIST_SEPARATOR_HTML, "h3 a%%.fallback-only a")
+
+    assert [el.get_text(strip=True) for el in items] == ["猎美陷阱", "欲梦迷蝶", "姐姐的屁股"]
+
+
+def test_list_rule_separator_inside_brackets_is_kept_whole():
+    engine = _engine()
+    html = '<html><body><a href="x||y">A</a><a href="z">B</a></body></html>'
+
+    items = engine._get_elements(html, "a[href*='x||y']")
+
+    assert [el.get_text(strip=True) for el in items] == ["A"]
+
+
+def test_chapter_list_rule_with_fallback_produces_chapters():
+    engine = YueduRuleEngine({
+        "bookSourceUrl": "https://example.com",
+        "ruleToc": {
+            "chapterList": ".missing a||.fallback-only a",
+            "chapterName": "text",
+            "chapterUrl": "href",
+        },
+    })
+    engine.set_page_url("https://example.com/book/1/")
+
+    chapters = engine.parse_toc(LIST_SEPARATOR_HTML)
+
+    assert len(chapters) == 1
+    assert chapters[0]["chapterUrl"] == "/2021/12/c.html"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_java_connect_returns_a_response_with_get_body():
+    """Icu's exploreUrl does ``java.connect(url).getBody()``.
+
+    ``java.connect`` did not exist in the shim, so the call threw inside the
+    source's own ``try/catch``; the category list came back as an error string
+    and discovery ended with "发现规则是 Legado JS 脚本，当前环境无法执行".
+    """
+    engine = _engine()
+
+    value = engine._try_eval_js(
+        "var __saved = __nhCurlRaw;"
+        "__nhCurlRaw = function (url, method, body, headers) {"
+        "  return 'BODY:' + url + ':' + (headers && headers['User-Agent']);"
+        "};"
+        "var out;"
+        "try {"
+        "  globalThis.__nhSetSourceConfig({header: '{\"User-Agent\":\"UA-1\"}'});"
+        "  out = java.connect('https://example.com/so').getBody();"
+        "} finally { __nhCurlRaw = __saved; }"
+        "out;",
+        "",
+    )
+
+    assert value == "BODY:https://example.com/so:UA-1"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_jsoup_select_first_and_equals_are_available():
+    engine = _engine()
+
+    value = engine._try_eval_js(
+        "var doc = org.jsoup.Jsoup.parse("
+        "'<div class=\"box\"><span class=\"t\">A</span><span>B</span></div>');"
+        "var box = doc.selectFirst('.box');"
+        "var spans = box.select('span');"
+        "spans.get(0).equals(spans.get(0)) + '|' + spans.get(0).equals(spans.get(1))"
+        " + '|' + box.selectFirst('.t').text();",
+        "",
+    )
+
+    assert value == "true|false|A"
+
+
 @pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
 def test_java_get_string_supports_attribute_and_regex_transform():
     engine = _engine()

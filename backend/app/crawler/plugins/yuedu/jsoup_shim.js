@@ -190,6 +190,13 @@ function __nhElements(arr) {
     }
     return __nhElements(out);
   };
+  els.selectFirst = function (css) {
+    for (var i = 0; i < els.length; i++) {
+      var found = els[i].selectFirst(css);
+      if (found) return found;
+    }
+    return null;
+  };
   els.remove = function () { for (var i = els.length - 1; i >= 0; i--) els[i].remove(); return els; };
   els.addClass = function (c) { for (var i = 0; i < els.length; i++) els[i].addClass(c); return els; };
   els.removeClass = function (c) { for (var i = 0; i < els.length; i++) els[i].removeClass(c); return els; };
@@ -362,6 +369,13 @@ __nhEl.prototype.select = function (css) {
     walk(self);
   }
   return __nhElements(out);
+};
+// jsoup ``Element.selectFirst`` / ``Elements.selectFirst``: return the first
+// match or null.  Icu's exploreUrl script guards with ``if (span)``, so a
+// missing method made the whole category list come back as an error string.
+__nhEl.prototype.selectFirst = function (css) {
+  var els = this.select(css);
+  return els.length ? els[0] : null;
 };
 function __nhCompoundMatch(el, parts) {
   var right = parts[parts.length - 1];
@@ -546,6 +560,14 @@ __nhEl.prototype.removeClass = function (c) {
 __nhEl.prototype.hasClass = function (c) {
   return (' ' + (this.attrs['class'] || '') + ' ').indexOf(' ' + c + ' ') >= 0;
 };
+// jsoup ``Node.equals``.  Scripts walk siblings with
+// ``while (el && !el.equals(stopEl))`` (Icu's exploreUrl), which threw
+// "equals is not a function" before.  Elements come from one shim DOM tree,
+// so identity is the faithful comparison.
+__nhEl.prototype.equals = function (other) {
+  return other === this;
+};
+__nhEl.prototype.is = function (other) { return this.equals(other); };
 __nhEl.prototype.className = function () { return this.attrs['class'] || ''; };
 __nhEl.prototype.classNames = function () { return (this.attrs['class'] || '').split(/\s+/).filter(Boolean); };
 __nhEl.prototype.id = function () { return this.attrs.id || ''; };
@@ -804,6 +826,26 @@ function __nhCurlRaw(url, method, body, headers, timeoutSec) {
   }
 }
 
+// Merge the source's own ``header`` rule with an optional JSON header
+// argument, the way Legado's AnalyzeUrl seeds every java.* request.
+function __nhSourceHeaders(extraJson) {
+  var headers = {};
+  function merge(raw) {
+    if (!raw) return;
+    var parsed = raw;
+    if (typeof raw === 'string') {
+      try { parsed = JSON.parse(raw); } catch (e) { return; }
+    }
+    if (!parsed || typeof parsed !== 'object') return;
+    for (var k in parsed) {
+      if (parsed[k] !== undefined && parsed[k] !== null) headers[k] = String(parsed[k]);
+    }
+  }
+  merge(__nhSourceConfig.header);
+  merge(extraJson);
+  return headers;
+}
+
 function __nhResponse(url, text, status, headers) {
   this._url = url || '';
   this._text = text == null ? '' : text;
@@ -811,6 +853,11 @@ function __nhResponse(url, text, status, headers) {
   this._headers = headers || {};
 }
 __nhResponse.prototype.body = function () { return this._text; };
+// Legado's ``java.connect(url)`` returns a StrResponse, and sources call the
+// Java-style getter ``.getBody()`` on it (Icu's exploreUrl).  Without it the
+// call threw, the source's own try/catch turned that into a plain error
+// string, and discovery silently ended with "发现规则是 Legado JS 脚本".
+__nhResponse.prototype.getBody = function () { return this._text; };
 __nhResponse.prototype.string = function () { return this._text; };
 __nhResponse.prototype.url = function () { return this._url; };
 __nhResponse.prototype.code = function () { return this._status; };
@@ -1021,6 +1068,15 @@ var java = {
   },
   post: function (url, body, headers) {
     return new __nhResponse(url, __nhCurlRaw(url, 'POST', body, headers), 200, {});
+  },
+  // ---- java.connect(url[, headerJson]): Legado performs the request and
+  // returns a StrResponse, so ``java.connect(url).getBody()`` must give the
+  // page source (Icu builds its whole explore category list that way).  The
+  // source's own ``header`` rule is applied like Legado's AnalyzeUrl does.
+  connect: function (url, header) {
+    var headers = __nhSourceHeaders(header);
+    var text = __nhCurlRaw(url, 'GET', null, headers, 40);
+    return new __nhResponse(String(url), text == null ? '' : text, 200, {});
   },
   // ---- java.ajax: accepts "url,{json options}" (Legado) or an object ----
   ajax: function (opts) {
