@@ -39,6 +39,9 @@ class AdvancedSearchRequest(BaseModel):
     scope: Literal["all", "books", "chapters"] = "all"
     tag: str | None = None
     source_id: str | None = None
+    # ``/novels`` and ``/comics`` search their own half of the library; the
+    # index used to ignore the distinction and returned both kinds together.
+    kind: Literal["novel", "comic"] | None = None
     offset: int = Field(default=0, ge=0)
     limit: int = Field(default=20, ge=1, le=100)
 
@@ -91,6 +94,7 @@ async def search(
     q: str = Query(default="", description="Search query"),
     scope: str = Query("books", pattern="^(books|chapters)$"),
     tag: str | None = Query(default=None, description="Book tag name"),
+    kind: str | None = Query(default=None, description="novel | comic"),
     offset: int = 0,
     limit: int = 20,
 ):
@@ -104,6 +108,7 @@ async def search(
             allow_r18=allow_r18,
             allow_all_ages=allow_all_ages,
             tag=tag,
+            kind=kind,
         )
     else:
         result = search_service.search_chapters(
@@ -113,6 +118,7 @@ async def search(
             allow_r18=allow_r18,
             allow_all_ages=allow_all_ages,
             tag=tag,
+            kind=kind,
         )
 
     hits = await _filter_visible_hits(user, db, result["hits"])
@@ -142,6 +148,7 @@ async def advanced_search(
         scope=payload.scope,
         tag=payload.tag,
         source_id=payload.source_id,
+        kind=payload.kind,
         offset=payload.offset,
         limit=payload.limit,
         allow_r18=allow_r18,
@@ -167,5 +174,18 @@ async def rebuild_index(user: User = Depends(get_current_user)):
     try:
         result = await search_service.rebuild_index()
         return {"status": "ok", **result}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/index/kinds")
+async def sync_index_kinds(user: User = Depends(get_current_user)):
+    """Copy ``books.kind`` into the books index (novel/comic search filter).
+
+    Runs automatically on startup when the index still lacks the field; this
+    endpoint is the manual escape hatch after a re-classification.
+    """
+    try:
+        return {"status": "ok", **await search_service.sync_book_kinds(force=True)}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc

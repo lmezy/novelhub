@@ -4,6 +4,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
+import asyncio
 from uuid import uuid4
 
 from loguru import logger
@@ -78,6 +79,18 @@ async def ensure_search_indexes():
         search_service.ensure_indexes()
     except Exception as exc:
         logger.warning("Search index initialization failed: {}", exc)
+        return
+
+    # ``books.kind`` decides whether a search stays on /novels or /comics, and
+    # the index predates the field.  Backfill it in the background so startup is
+    # not blocked; the probe inside makes this a no-op on later restarts.
+    async def _backfill_kinds() -> None:
+        try:
+            await search_service.sync_book_kinds()
+        except Exception as exc:  # pragma: no cover - startup best effort
+            logger.warning("Search kind backfill failed: {}", exc)
+
+    asyncio.create_task(_backfill_kinds())
 
 
 @app.get("/")

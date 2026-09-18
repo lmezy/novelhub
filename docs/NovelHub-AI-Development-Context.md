@@ -54,7 +54,9 @@ Scheduler 容器：Celery Beat（定时同步、cookie 健康检查）
 - Book 的 `kind`（`novel`/`comic`）是**派生字段**：由书源类型、书籍标签/分类、章节正文形态
    判定（`backend/app/services/book_kind.py`），用于把小说和漫画分到不同页面；同步时自动更新，
    老数据靠 Alembic 回填 + `POST /api/books/reclassify` 重算。前端 `/novels`、`/comics` 共用
-   `BooksPage.vue`，只按 `kind` 过滤。
+   `BooksPage.vue`，只按 `kind` 过滤。该字段同时写进 Meilisearch 的 `books`/`chapters` 文档并
+   作为可过滤属性，**搜索也按它分开**（`/search/advanced` 的 `kind` 参数）；老索引由 backend
+   启动时的 `SearchService.sync_book_kinds()` 自动回填。
 - 正文以 Markdown 落 Storage：`storage/books/{author}/{title}/000001.md` + `metadata.json`。
 - 更新必须是增量：拉目录 → 按章节 URL/Hash 比对 → 只下载新增 → 更新索引；
   支持断点恢复与失败重试。

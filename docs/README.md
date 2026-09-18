@@ -69,6 +69,11 @@
 - 同步某本书报 `[Errno 36] File name too long` → [full-site-sync.md](full-site-sync.md)
   “个别书报 [Errno 36] File name too long”
 - 想让小说和漫画分页显示 / 漫画书被算成小说 → [codex-handoff.md](codex-handoff.md) 第 16 节
+- **小说页/漫画页搜索时两类结果混在一起** → [codex-handoff.md](codex-handoff.md) 第 23 节
+  （搜索索引缺 `kind` 字段；首次启动会自动回填）
+- **搜索翻页/搜索本身要等几十秒** → [codex-handoff.md](codex-handoff.md) 第 23 节
+- **crawler 日志大量 `Chapter returned empty content`** → [full-site-sync.md](full-site-sync.md)
+  “日志大量 `Chapter returned empty content`（同一批书）”
 - AI 侧栏提示未配置 / 回答总从第 1 章说起 / 回答不出字（流式被缓冲）→
   [ai-assistant.md](ai-assistant.md) “排错”
 - AI 测试连接报 400 `The supported API model names are …`（模型名不对）→

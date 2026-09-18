@@ -310,14 +310,25 @@ async def reclassify_book_kinds_endpoint(
 
     The migration backfills the obvious cases; this endpoint is the escape
     hatch for galleries whose source does not declare an image type and for
-    re-checking a source after its rules changed.
+    re-checking a source after its rules changed.  The books whose kind moved
+    are pushed into the search index as well, otherwise a re-classified comic
+    would keep showing up in novel search results.
     """
-    return await reclassify_book_kinds(
+    result = await reclassify_book_kinds(
         db,
         scan_content=scan_content,
         source_id=source_id,
         force=force,
     )
+    changed = result.pop("changed_book_ids", [])
+    try:
+        # Only the books whose kind actually moved need touching in the index.
+        result["index"] = await search_service.sync_book_kinds(book_ids=changed)
+    except Exception as exc:
+        # The DB side already succeeded; report the index problem instead of
+        # failing the whole request.
+        result["index"] = {"error": str(exc)}
+    return result
 
 
 @router.post("/batch-delete", dependencies=[Depends(require_admin)])
@@ -731,6 +742,7 @@ async def convert_book_to_r18(
         "is_r18": book.is_r18,
         "tags": list(book.tag_names),
         "category_names": list(book.category_names),
+        "kind": normalize_kind(getattr(book, "kind", None)),
     })
     favorite = await db.scalar(
         select(BookFavorite).where(

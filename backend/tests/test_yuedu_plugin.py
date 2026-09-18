@@ -9,6 +9,7 @@ import re
 import time
 from bs4 import BeautifulSoup
 
+from app.crawler.base import EmptyTocError
 from app.crawler.plugins.yuedu import YueduPlugin
 from app.crawler.plugins.yuedu.rule_engine import YueduRuleEngine
 from app.services.proxy_config import ProxyConfig
@@ -4060,3 +4061,101 @@ async def test_fetch_explore_probes_pagination_when_task_resumes_mid_catalog():
         plugin._explore_page_templates["https://example.com/novel/category/cat"]
         == "https://example.com/novel/category/cat?page={page}"
     )
+
+
+YSWHUB_SOURCE = {
+    "bookSourceUrl": "https://yswhub.cc",
+    "bookSourceType": 0,
+    "ruleBookInfo": {
+        "name": "h1@text",
+        "tocUrl": "a.btn[href*='/indexlist/']@href",
+    },
+    "ruleToc": {
+        "chapterList": "ul#jsList1 li.two a",
+        "chapterName": "@text",
+        "chapterUrl": "@href",
+    },
+    "concurrentRate": "0",
+}
+
+
+@pytest.mark.asyncio
+async def test_fetch_book_does_not_invent_chapters_from_book_page_recommendations():
+    """御宅屋 (yswhub.cc) book pages only link to *other* books.
+
+    Its ``ruleBookInfo.tocUrl`` points at ``/indexlist/<id>/``; when that page
+    came back with an empty chapter list (the site renders it with JavaScript)
+    the generic scanner fell back to the book detail page and turned the
+    "相关推荐" links into chapters.  Every one of those was a book page, so the
+    sync then logged ``Chapter returned empty content`` 601 times in 15 hours.
+    A declared TOC page is authoritative -- never invent a table of contents
+    from the book detail page.
+    """
+    plugin = YueduPlugin(YSWHUB_SOURCE)
+    book_html = (
+        "<html><body><h1>青家妹子缺点银子</h1>"
+        "<a class='btn' href='/indexlist/104039/'>目录</a>"
+        "<div class='chapterList otherChapterList'><h3>相关推荐</h3><ul>"
+        "<li><a href='/read/103645.html'>快穿之欲罢不能(gl)</a></li>"
+        "<li><a href='/read/103544.html'>小三是个哭包</a></li>"
+        "</ul></div></body></html>"
+    )
+    toc_html = (
+        "<html><body><ul class='list_li' id='jsList1'></ul>"
+        "<select id='indexselect'></select></body></html>"
+    )
+    requested: list[str] = []
+
+    async def fake_get(url):
+        requested.append(url)
+        if url == "https://yswhub.cc/read/104039.html":
+            return book_html
+        if url == "https://yswhub.cc/indexlist/104039/":
+            return toc_html
+        raise AssertionError(f"unexpected url: {url}")
+
+    with patch.object(plugin, "_get", fake_get):
+        with pytest.raises(EmptyTocError):
+            await plugin.fetch_book("https://yswhub.cc/read/104039.html")
+
+    assert requested == [
+        "https://yswhub.cc/read/104039.html",
+        "https://yswhub.cc/indexlist/104039/",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_book_still_scans_book_page_when_toc_url_is_a_guess():
+    """Without an explicit ``ruleBookInfo.tocUrl`` the old fallback stays.
+
+    ``_find_toc_url`` only guesses; when the guess leads nowhere the chapter
+    list may legitimately live on the book page itself, so it must still be
+    scanned.
+    """
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "ruleBookInfo": {"name": "h1@text"},
+        "ruleToc": {"chapterList": "ul#missing li", "chapterUrl": "a@href"},
+        "concurrentRate": "0",
+    })
+    book_html = (
+        "<html><body><h1>Book One</h1>"
+        "<a href='/other/chapters/123/1.html'>查看所有章节</a>"
+        "<div class='list'><a href='/novel/123/1.html'>Chapter 1</a>"
+        "<a href='/novel/123/2.html'>Chapter 2</a></div></body></html>"
+    )
+    empty_toc = "<html><body><p>no chapter list here</p></body></html>"
+
+    async def fake_get(url):
+        if url == "https://example.com/novel/123.html":
+            return book_html
+        return empty_toc
+
+    with patch.object(plugin, "_get", fake_get):
+        book = await plugin.fetch_book("https://example.com/novel/123.html")
+
+    assert [c.url for c in book.chapters] == [
+        "https://example.com/novel/123/1.html",
+        "https://example.com/novel/123/2.html",
+    ]
+

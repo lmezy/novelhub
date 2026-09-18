@@ -116,8 +116,12 @@ const remoteTotal = ref(0)
 const remoteSearching = ref(false)
 const syncingUrl = ref("")
 
-const SEARCH_CACHE_KEY = "novelhub:books-search-cache"
 const ADVANCED_CACHE_KEY = "novelhub:advanced-search-cache"
+// Local search results are paged 40 at a time and every page used to be a fresh
+// ``/search/advanced`` call.  Keeping the pages that were already fetched makes
+// "next page" / going back instant instead of re-running the query.
+const SEARCH_PAGES_KEY = "novelhub:books-search-pages"
+const SEARCH_PAGES_MAX = 12
 const isAdvancedRoute = computed(() => String(route.query.advanced || "") === "1")
 
 function readSessionCache<T>(key: string): T | null {
@@ -131,6 +135,28 @@ function readSessionCache<T>(key: string): T | null {
 
 function writeSessionCache(key: string, value: unknown) {
   try { sessionStorage.setItem(key, JSON.stringify(value)) } catch { /* storage is optional */ }
+}
+
+interface CachedPage { hits: SearchHit[]; total: number }
+type PageCache = Record<string, CachedPage>
+
+function readPageCache(): PageCache {
+  const all = readSessionCache<PageCache>(SEARCH_PAGES_KEY)
+  return all && typeof all === "object" ? all : {}
+}
+
+function readCachedPage(key: string): CachedPage | null {
+  return readPageCache()[key] || null
+}
+
+function writeCachedPage(key: string, page: CachedPage) {
+  const all = readPageCache()
+  all[key] = page
+  const keys = Object.keys(all)
+  if (keys.length > SEARCH_PAGES_MAX) {
+    for (const stale of keys.slice(0, keys.length - SEARCH_PAGES_MAX)) delete all[stale]
+  }
+  writeSessionCache(SEARCH_PAGES_KEY, all)
 }
 
 const activeCategory = computed(() => String(route.query.category || ""))
@@ -203,9 +229,10 @@ async function loadSearch() {
   const field = (String(route.query.field || "title") as SearchField)
   searchQuery.value = q
   searchField.value = searchFields.some((item) => item.value === field) ? field : "title"
-  const cacheKey = `${q}|${searchField.value}|${currentOffset.value}`
-  const cached = readSessionCache<{ key: string; hits: SearchHit[]; total: number }>(SEARCH_CACHE_KEY)
-  if (cached?.key === cacheKey) {
+  // ``kind`` is part of the key: /novels and /comics must not share a page.
+  const cacheKey = `${bookKind.value}|${q}|${searchField.value}|${currentOffset.value}`
+  const cached = readCachedPage(cacheKey)
+  if (cached) {
     results.value = cached.hits
     searchTotal.value = cached.total
     return
@@ -214,12 +241,13 @@ async function loadSearch() {
     conditions: [{ field: searchField.value, mode: fuzzyFields.includes(searchField.value) ? "fuzzy" : "exact", value: q }],
     match: "and",
     scope: "all",
+    ...(bookKind.value ? { kind: bookKind.value } : {}),
     offset: currentOffset.value,
     limit: 40,
   })
   results.value = response.hits
   searchTotal.value = response.total
-  writeSessionCache(SEARCH_CACHE_KEY, { key: cacheKey, hits: response.hits, total: response.total })
+  writeCachedPage(cacheKey, { hits: response.hits, total: response.total })
 }
 
 async function loadCurrentView() {
@@ -232,13 +260,16 @@ async function loadCurrentView() {
   try {
     if (isSearching.value) await loadSearch()
     else if (isAdvancedRoute.value) {
-      const cached = readSessionCache<{ conditions: Condition[]; match: "and" | "or"; results: SearchHit[]; total: number; offset: number }>(ADVANCED_CACHE_KEY)
-      if (cached) {
+      const cached = readSessionCache<{ conditions: Condition[]; match: "and" | "or"; kind?: string; results: SearchHit[]; total: number; offset: number }>(ADVANCED_CACHE_KEY)
+      // A cache filled on /novels must not leak into /comics.
+      if (cached && (cached.kind || "") === bookKind.value) {
         conditions.value = cached.conditions
         match.value = cached.match
         advancedResults.value = cached.results
         advancedTotal.value = cached.total
         advancedActive.value = true
+      } else {
+        advancedActive.value = false
       }
     } else if (isBrowsing.value) await loadBrowse()
     else await loadHome()
@@ -375,6 +406,15 @@ async function runAdvancedSearch(offset = 0) {
     advancedError.value = i18n.t("search_condition_placeholder")
     return
   }
+  const cacheKey = `adv|${bookKind.value}|${match.value}|${JSON.stringify(conds)}|${offset}`
+  const cachedPage = readCachedPage(cacheKey)
+  if (cachedPage) {
+    advancedResults.value = cachedPage.hits
+    advancedTotal.value = cachedPage.total
+    advancedActive.value = true
+    await router.replace({ path: listPath.value, query: { advanced: "1", offset: String(offset) } })
+    return
+  }
   advancedSearching.value = true
   advancedError.value = ""
   try {
@@ -382,13 +422,15 @@ async function runAdvancedSearch(offset = 0) {
       conditions: conds,
       match: match.value,
       scope: "all",
+      ...(bookKind.value ? { kind: bookKind.value } : {}),
       offset,
       limit: 40,
     })
     advancedResults.value = res.hits
     advancedTotal.value = res.total
     advancedActive.value = true
-    writeSessionCache(ADVANCED_CACHE_KEY, { conditions: conditions.value, match: match.value, results: res.hits, total: res.total, offset })
+    writeCachedPage(cacheKey, { hits: res.hits, total: res.total })
+    writeSessionCache(ADVANCED_CACHE_KEY, { conditions: conditions.value, match: match.value, kind: bookKind.value, results: res.hits, total: res.total, offset })
     await router.replace({ path: listPath.value, query: { advanced: "1", offset: String(offset) } })
   } catch (e) {
     advancedError.value = e instanceof Error ? e.message : i18n.t("search_failed")

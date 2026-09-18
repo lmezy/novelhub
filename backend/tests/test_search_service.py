@@ -1,5 +1,6 @@
 from unittest.mock import MagicMock, patch
 
+import pytest
 import requests
 from meilisearch.errors import MeilisearchApiError
 
@@ -72,7 +73,115 @@ def test_search_books_restricts_attributes():
 
 
 def test_candidate_limit_is_bounded_for_fast_advanced_search():
-    assert SearchService.CANDIDATE_LIMIT == 5000
+    """The candidate window decides how long every page click takes.
+
+    At 5000 a single search on the live index took 40-110 s (~66 s cold), and
+    the candidate fetch also dragged each chapter's full 100 KB body along
+    (313 MB per request).  Keep it small; the retrieval attributes keep the
+    payload small too.
+    """
+    assert SearchService.CANDIDATE_LIMIT == 1000
+    assert "content" not in SearchService.CHAPTER_RETRIEVE_ATTRS
+    assert "content" not in SearchService.BOOK_RETRIEVE_ATTRS
+
+
+def test_content_search_uses_a_smaller_candidate_window():
+    """``content`` is the one field whose candidates must carry the text.
+
+    1000 chapters is ~96 MB of JSON and took 18-25 s on every request against
+    the live index; 300 keeps it under a second.
+    """
+    assert SearchService.CONTENT_CANDIDATE_LIMIT < SearchService.CANDIDATE_LIMIT
+    service, client = _make_service()
+    index = client.index.return_value
+    index.search.return_value = {"hits": []}
+
+    service._search_field(SearchService.INDEX_CHAPTERS, "content", "白", None)
+    assert index.search.call_args.args[1]["limit"] == SearchService.CONTENT_CANDIDATE_LIMIT
+
+    service._search_field(SearchService.INDEX_CHAPTERS, "title", "白", None)
+    assert index.search.call_args.args[1]["limit"] == SearchService.CANDIDATE_LIMIT
+
+
+def test_search_field_does_not_retrieve_unrequested_content():
+    service, client = _make_service()
+    index = client.index.return_value
+    index.search.return_value = {"hits": []}
+
+    service._search_field(SearchService.INDEX_CHAPTERS, "title", "白骨精", None)
+
+    options = index.search.call_args.args[1]
+    assert "content" not in options["attributesToRetrieve"]
+    assert "book_id" in options["attributesToRetrieve"]
+
+
+def test_search_field_retrieves_content_when_it_is_the_searched_field():
+    service, client = _make_service()
+    index = client.index.return_value
+    index.search.return_value = {"hits": []}
+
+    service._search_field(SearchService.INDEX_CHAPTERS, "content", "白骨精", None)
+
+    options = index.search.call_args.args[1]
+    assert "content" in options["attributesToRetrieve"]
+
+
+def test_advanced_search_applies_kind_filter():
+    service, books_index, _ = _service_with_indexes()
+    books_index.search.return_value = {"hits": []}
+
+    service.advanced_search(
+        [{"field": "title", "mode": "exact", "value": "西游记"}],
+        scope="books",
+        kind="comic",
+    )
+
+    options = books_index.search.call_args.args[1]
+    assert options["filter"] == 'kind = "comic"'
+
+
+def test_kind_filter_ignores_unknown_values():
+    assert SearchService._kind_filter("") is None
+    assert SearchService._kind_filter("all") is None
+    assert SearchService._kind_filter(None) is None
+    assert SearchService._kind_filter("novel") == 'kind = "novel"'
+
+
+def test_index_book_always_carries_a_kind():
+    service, client = _make_service()
+    index = client.index.return_value
+
+    service.index_book({"id": "b1", "title": "无名"})
+
+    assert index.add_documents.call_args.args[0][0]["kind"] == "novel"
+
+    service.index_book({"id": "b2", "title": "图集", "kind": "comic"})
+
+    assert index.add_documents.call_args.args[0][0]["kind"] == "comic"
+
+
+def test_index_missing_kind_probes_with_a_exists_filter():
+    service, client = _make_service()
+    index = client.index.return_value
+    index.search.return_value = {"hits": [{"id": "b1"}]}
+
+    assert service.index_missing_kind(SearchService.INDEX_BOOKS) is True
+
+    options = index.search.call_args.args[1]
+    assert options["filter"] == "kind NOT EXISTS"
+    assert options["limit"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_book_kinds_with_no_changed_books_touches_nothing():
+    """A re-classification that changed nothing must not re-index the library."""
+    service, client = _make_service()
+
+    result = await service.sync_book_kinds(book_ids=[])
+
+    assert result == {"books": 0, "chapters": 0, "skipped": True}
+    assert client.index.return_value.update_documents.call_count == 0
+    assert client.index.return_value.search.call_count == 0
 
 
 def test_chapter_buffer_flushes_in_batches():

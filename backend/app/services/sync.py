@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from loguru import logger
 
+from app.crawler.base import EmptyTocError
 from app.crawler.registry import get_plugin
 from app.core.config import settings, sync_thread_count
 from app.core.database import SessionLocal
@@ -588,6 +589,7 @@ class SyncService:
                     "is_r18": b.is_r18,
                     "tags": list(b.tag_names),
                     "category_names": list(b.category_names),
+                    "kind": normalize_kind(getattr(b, "kind", None)),
                 })
             except Exception:
                 continue
@@ -905,6 +907,7 @@ class SyncService:
             "is_r18": book.is_r18,
             "tags": index_tags,
             "category_names": book_category_names,
+            "kind": book_kind,
         })
 
         if is_new:
@@ -1117,6 +1120,7 @@ class SyncService:
                         "tags": index_tags,
                         "category_names": book_category_names,
                         "is_r18": book_is_r18,
+                        "kind": book_kind,
                     })
 
                     emit(
@@ -1689,6 +1693,7 @@ class SyncService:
             "tags": index_tags,
             "category_names": book_category_names,
             "is_r18": book_is_r18,
+            "kind": normalize_kind(getattr(book, "kind", None)),
         })
         emit(
             EventType.CHAPTER_UPDATED,
@@ -1959,6 +1964,37 @@ class SyncService:
                 if isinstance(outcome, BaseException):
                     if self._is_upstream_blocked(outcome):
                         raise outcome
+                    if isinstance(outcome, EmptyTocError):
+                        # The source's own TOC rule no longer matches the site
+                        # (or the book genuinely has no chapters there).
+                        # Retrying cannot fix a stale rule, and counting it as a
+                        # failure aborted the whole task after
+                        # ``SYNC_MAX_CONSECUTIVE_FAILURES`` books -- 御宅屋 has
+                        # ~5% such books, so a full-site run died every time.
+                        # Skip and keep going instead.
+                        await self.db.rollback()
+                        books_filtered += 1
+                        consecutive_failures = 0
+                        consecutive_transient_failures = 0
+                        message = describe_error(outcome)
+                        logger.warning(
+                            "Skipped book {} ({}): {}",
+                            sb.title,
+                            sb.url,
+                            message,
+                        )
+                        details.append({
+                            "title": sb.title,
+                            "author": sb.author,
+                            "url": sb.url,
+                            "synced": False,
+                            "filtered": True,
+                            "filter_type": "目录",
+                            "filter_value": message,
+                        })
+                        if progress_cb is not None:
+                            await progress_cb(pages_checked, books_found, books_synced, books_failed)
+                        return
                     await self.db.rollback()
                     books_failed += 1
                     if self._is_transient_book_fetch(outcome):

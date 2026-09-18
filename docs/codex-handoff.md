@@ -1054,4 +1054,88 @@ crawler 长期 100% CPU。
 - `GET /api/books/home` 0.86s（首页并发聚合多个书源 browse）与章节目录一次返回全部章节
   （2484 章 675 KB）本次未动。
 
+## 23. 2026-09-18：crawler 刷 601 条空章节报错；小说/漫画搜索混出；搜索翻页要等几十秒
+
+用户报三件事：①crawler 容器后台报错；②在小说页/漫画页搜索，两类结果一起冒出来；
+③搜索翻页要等很久。
+
+**排查（只读线上，未改任何线上代码/数据/配置）**：把 `docker logs novelhub-crawler --since 72h`
+（约 19 MB）导出后按错误签名分组：
+
+| 条数 | 签名 |
+|---|---|
+| **601** | `Failed to sync chapter … : Chapter returned empty content`，**全部来自 yswhub.cc（御宅屋）** |
+| 86 | `Configured proxy http://127.0.0.1:27890 request failed (…); retrying direct`（mihomo 节点抖动，属预期） |
+| 8/7/3/3 | `ConnectError` / `pop from an empty deque` / `ConnectTimeout` |
+| 5 | 任务级失败（yaoluku 520/502、cool18/h528 验证码） |
+
+搜索侧在 backend 容器里直接对 Meilisearch 计时（115,155 章 / 31,895 本）：
+
+| 操作 | 实测 |
+|---|---|
+| 章节候选 `limit=5000`（旧值）取 `content` | **37.8s，313 MB** |
+| `advanced_search(title)`（旧） | 2.9s（缓存热）/ 冷启动 66s |
+| `advanced_search(content)`（旧） | **110.5s** |
+
+**根因 1（crawler）**：御宅屋的 `ruleBookInfo.tocUrl` 指向 `/indexlist/<id>/`，该页的
+`<ul id="jsList1">` 现在由 JavaScript 填充（真实浏览器渲染后**也是空的**，说明这些书在源站
+本来就没有章节）。`ruleToc` 因此解析出 0 条，代码随后**退回扫描书籍详情页**——而书籍页上
+唯一的 `/read/*.html` 链接是「相关推荐 / 作者其他作品」，于是一本书被造出 8 个「章节」，
+每个都是一本书的详情页，取正文时必然 `Chapter returned empty content`。约 75 本 × 8 条
+≈ 601 条。这些书此前还会被算作**同步失败**，累积到 `SYNC_MAX_CONSECUTIVE_FAILURES`(10)
+就会中止整个全站任务。
+
+**根因 2（搜索混出）**：`books.kind`（第 16 节）只落在 Postgres 里。Meilisearch 的
+`books`/`chapters` 文档没有 `kind` 字段，也不在 `FILTERABLE_ATTRIBUTES` 里，
+`/search/advanced` 的请求体更没有任何 kind 参数——`/novels`、`/comics` 共用同一个
+全库查询，所以两类结果一起出现（第 16 节「未做/已知」里记过，这次补上）。
+
+**根因 3（翻页慢）**：`_search_field` 没设 `attributesToRetrieve`，一次候选抓取会把
+**每个候选章节的完整正文**（单章上限 10 万字）一起拉回来；而 `CANDIDATE_LIMIT=5000`
+意味着**每点一次下一页**都重跑一遍这个查询并重新在 Python 里排序。`content` 字段尤其致命：
+1000 个候选 ≈ 96 MB JSON、18–25 秒（每次请求都如此）。
+
+**改动**：
+
+| 文件 | 改动 |
+|---|---|
+| `backend/app/crawler/base.py` | 新增 `EmptyTocError`：书源声明的目录页没有解析出任何章节 |
+| `backend/app/crawler/plugins/yuedu/__init__.py` | `fetch_book` 记下 `toc_url` 是否来自 `ruleBookInfo.tocUrl`；当它指向**独立目录页**且该页规则/通用扫描都没解析出章节时抛 `EmptyTocError`，不再退回扫描书籍详情页（`_find_toc_url` 猜出来的 URL 不适用这条，仍保留旧回退） |
+| `backend/app/services/sync.py` | `discover_and_sync_all` 把 `EmptyTocError` 记为**跳过**（`books_filtered` + `details[].filter_type="目录"`），既不中止任务也不刷章节错误；不再进入「连续失败」计数 |
+| `backend/app/services/search.py` | 新增 `BOOK_RETRIEVE_ATTRS`/`CHAPTER_RETRIEVE_ATTRS`（**不含 `content`**）并传给每次候选查询；`CANDIDATE_LIMIT` 5000 → **1000**，`content` 字段单独用 `CONTENT_CANDIDATE_LIMIT = 300`；`kind` 进 `FILTERABLE_ATTRIBUTES`；`_kind_filter()` + `search_books/search_chapters/advanced_search(kind=…)`；`index_book()` 保证文档带 `kind`；新增 `index_missing_kind()` / `sync_book_kinds()`（用 `update_documents` 只合并 `kind`；可按 `book_ids` 精准刷新，也可整库回填） |
+| `backend/app/services/book_kind.py` | `reclassify_books()` 返回 `changed_book_ids`，让索引只刷新真正变过的书与其章节 |
+| `backend/app/api/routes/search.py` | `AdvancedSearchRequest.kind`（`novel|comic`）、`GET /search?kind=`、`POST /search/index/kinds`（整库回填） |
+| `backend/app/api/routes/books.py`、`sources.py`、`source_changes.py`、`services/manual_import.py` | 6 处 `index_book` / `index_chapter` 文档补 `kind` |
+| `backend/app/api/routes/books.py` | `POST /books/reclassify` 结束后把**变过的**书推给索引（失败只记在 `result["index"]`，不影响重新识别本身） |
+| `backend/app/main.py` | 启动时后台跑一次 `sync_book_kinds()`（先用 `kind NOT EXISTS` 探测，正常重启是 no-op） |
+| `frontend/src/pages/BooksPage.vue` | 轻量搜索与高级搜索都带上 `kind`；缓存键含 `kind`（`/novels` 的缓存不会漏进 `/comics`）；把已取回的搜索页存进 `sessionStorage`（最多 12 页），翻页/返回不再重跑查询 |
+| `backend/tests/test_yuedu_plugin.py`、`test_sync_service.py`、`test_search_service.py`、`test_book_kind.py` | 新增 10 项回归：御宅屋式书页只出 `EmptyTocError` 且只请求书页+目录页、无 `tocUrl` 规则时仍回退扫书页、`EmptyTocError` 记为跳过不中止任务、候选窗口与取回字段（含 `content` 单独窗口）、`kind` 过滤串、`index_book` 必带 kind、`kind NOT EXISTS` 探测、无变化时不动索引、`reclassify_books` 上报 `changed_book_ids` |
+
+**验证**：
+
+- `cd backend && python -m pytest -q` → **652 passed**。前端 `npm run typecheck`、`npm run build` 通过。
+- 线上影子回归（改动后的 `yuedu/__init__.py` 单独加载进 crawler 容器 `/tmp`，**不动线上镜像/代码/数据库**）：
+  - `https://yswhub.cc/read/104039.html` → 抛 `EmptyTocError`（修复前造出 8 个假章节）；
+  - 对照组 `https://yswhub.cc/read/39108.html` → 仍然解析出 50 章，URL 正常。
+- 线上只读计时（改动后的 `search.py` 推入 backend 容器 `/tmp` 导入，读真实索引）：
+  - `title` 搜索 **0.04s**（旧 2.9–66s）；`chapter_title` 0.40s；`content` **0.25s**（旧 110.5s）；
+  - `content` 候选窗口 300 / 500 / 700 / 1000 分别约 0.65s / 1.4s / 1.2s / **18–25s**，故取 300。
+- Meilisearch 语义在**临时索引**上验证后删除（不碰生产索引）：`update_documents` 只合并
+  `kind`（`title`/`source_id` 保留）、`kind NOT EXISTS` 可用、`kind = "novel"|"comic"` 各自命中。
+
+**未做/已知**：
+
+- 只改本地代码。线上生效要 `docker compose build backend crawler frontend` + `up -d`；
+  **没有新迁移**。首次启动会在后台回填两个索引的 `kind`（约 2.4 万本书 + 11.5 万章），
+  完成后重启是 no-op；也可以手动 `POST /api/search/index/kinds`。
+  之后「设置 → 索引 → 重新识别」只会刷新 kind 真的变了的书及其章节。
+- 搜索候选窗口从 5000 收到 1000（`content` 300），也就是单个查询最多给 25 页
+  （`content` 8 页）结果、`total` 以窗口为上限——这是「翻页从几十秒降到亚秒」的代价。
+- Meilisearch 在 crawler 写入新章节后会丢弃查询缓存，当天首次搜索仍可能冷启动几秒到二十几秒，
+  与本次改动无关。
+- 御宅屋那批「源站无章节」的书现在会出现在任务的「同步书籍明细」里，标为「已过滤 / 目录」，
+  需要的话按书源更新规则或在管理端忽略；不要期望它们同步成功。
+- `SearchPage.vue`（`/search` 独立搜索页）没有 kind 上下文，仍是全库搜索；`/novels`、`/comics` 已分开。
+
+
 

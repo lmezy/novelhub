@@ -11,6 +11,7 @@ from app.core.database import get_db
 from app.models import Book, CrawlTask, Source, SourceChange, User
 from app.schemas.source_change import SourceChangeCreate, SourceChangeOut, SourceChangeReview
 from app.services.auth import get_current_user, require_admin
+from app.services.book_kind import normalize_kind
 from app.services.search import search_service
 from app.services.source_patch import apply_source_patch
 from app.services.task_queue import enqueue_crawl_all
@@ -179,6 +180,7 @@ async def review_change(
                             "is_r18": True,
                             "tags": list(book.tag_names),
                             "category_names": list(book.category_names),
+                            "kind": normalize_kind(getattr(book, "kind", None)),
                         })
                     except Exception:
                         continue
@@ -207,6 +209,7 @@ async def review_change(
                             "is_r18": bool(was_r18),
                             "tags": list(book.tag_names),
                             "category_names": list(book.category_names),
+                            "kind": normalize_kind(getattr(book, "kind", None)),
                         })
                     except Exception:
                         continue

@@ -221,6 +221,8 @@ async def test_reclassify_books_backfills_and_reads_chapters(monkeypatch):
     assert result["updated"] == 2
     assert result["scanned"] == 2
     assert result["content_comics"] == 1
+    # Only the books whose kind moved are offered to the search index refresh.
+    assert result["changed_book_ids"] == ["b2", "b3"]
     # One commit per processed chunk; the empty follow-up chunk ends the loop.
     assert session.commits == 1
 

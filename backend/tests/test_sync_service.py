@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from sqlalchemy.exc import MissingGreenlet, SQLAlchemyError
 
-from app.crawler.base import RemoteBook, RemoteChapter, RemoteShelfBook
+from app.crawler.base import EmptyTocError, RemoteBook, RemoteChapter, RemoteShelfBook
 from app.models import Book, Chapter, Cookie, Source
 from app.services.sync import SyncPaused, SyncService
 
@@ -1725,6 +1725,53 @@ async def test_discover_and_sync_all_counts_filtered_books_without_failure():
     assert result["books_filtered"] == 1
     assert result["books_synced"] == 0
     assert result["books_failed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_discover_and_sync_all_skips_empty_toc_books_instead_of_aborting():
+    """A stale source TOC must not abort a whole full-site run.
+
+    御宅屋 (yswhub.cc) has books with no chapters at all; counting each of them
+    as a failure tripped ``SYNC_MAX_CONSECUTIVE_FAILURES`` and killed the task.
+    They are reported as filtered/skipped with the reason instead.
+    """
+    db = _mock_db()
+    db.get.return_value = _source()
+    db.rollback = AsyncMock()
+
+    plugin = AsyncMock()
+    plugin.set_cookie = MagicMock()
+    plugin.discover_books.return_value = [
+        RemoteShelfBook(
+            source_book_id=f"{i}.html",
+            title=f"Book {i}",
+            author="Author",
+            url=f"https://example.com/{i}.html",
+        )
+        for i in range(4)
+    ]
+
+    fake_settings = SimpleNamespace(
+        SYNC_BOOK_CONCURRENCY=1,
+        SYNC_MAX_CONSECUTIVE_FAILURES=2,
+        SYNC_BOOK_CONTINUOUS=False,
+    )
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.settings", fake_settings),
+        patch.object(
+            SyncService,
+            "sync_book",
+            AsyncMock(side_effect=EmptyTocError("书源目录规则已失效：目录页没有章节")),
+        ),
+    ):
+        result = await SyncService(db).discover_and_sync_all("src1", max_pages=1)
+
+    assert result["books_filtered"] == 4
+    assert result["books_failed"] == 0
+    assert result["books_synced"] == 0
+    assert all(detail.get("filtered") for detail in result["details"])
+    assert all(detail.get("filter_type") == "目录" for detail in result["details"])
 
 
 @pytest.mark.asyncio

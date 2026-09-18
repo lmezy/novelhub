@@ -34,7 +34,7 @@ from urllib.parse import (
 import httpx
 from bs4 import BeautifulSoup, Tag
 
-from app.crawler.base import RemoteBook, RemoteChapter, RemoteShelfBook
+from app.crawler.base import EmptyTocError, RemoteBook, RemoteChapter, RemoteShelfBook
 from app.crawler.plugins.yuedu.js_runtime import JsRuntime, try_eval_js_pattern
 from app.crawler.plugins.yuedu.rule_engine import YueduRuleEngine
 
@@ -917,6 +917,11 @@ class YueduPlugin:
         self.engine.run_pre_update_js(toc_data)
 
         toc_url = str(info.get("tocUrl") or "").strip()
+        # Remember whether the source *itself* declared where its catalogue is.
+        # A URL guessed by ``_find_toc_url`` is only a hint, so the stricter
+        # "the catalogue page is authoritative" rule below applies to the
+        # declared one only.
+        toc_url_from_rules = bool(toc_url)
         if not toc_url:
             toc_url = self._find_toc_url(html, identity_url)
         if toc_url and not toc_url.startswith(("http://", "https://")):
@@ -1117,6 +1122,19 @@ class YueduPlugin:
                 chapter_number=1,
             )]
         if not chapters and not android_toc_rule:
+            if toc_url_from_rules and toc_url.rstrip("/") != identity_url.rstrip("/"):
+                # The source declared a dedicated catalogue page and it came
+                # back without a single chapter.  Scanning the book detail page
+                # here is wrong: its links are recommendations ("相关推荐",
+                # "作者其他作品"), which then turned into chapters that were
+                # really other books and failed one by one with "Chapter
+                # returned empty content".  Skip the book with a clear reason
+                # instead of inventing a table of contents.
+                raise EmptyTocError(
+                    "书源目录规则已失效：书源声明的目录页没有解析出任何章节"
+                    f"（{toc_url}）。该书在源站可能没有章节，或站点已把目录改成"
+                    "动态加载，请更新书源规则或改用其它书源。"
+                )
             chapters = generic["chapters"]
         if not chapters and self._has_forum_content(html):
             # Several Cool18-compatible sources use Android Jsoup in ruleToc.

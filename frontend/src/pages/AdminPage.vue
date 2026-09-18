@@ -1366,6 +1366,11 @@ async function reclassifyKinds() {
       novels: res.novels ?? 0,
       updated: res.updated ?? 0,
     })
+    // The endpoint also refreshes the search index for the books that changed;
+    // surface a failure there instead of reporting a clean success.
+    if (res.index?.error) {
+      kindError.value = i18n.t("admin_kind_index_failed", { error: res.index.error })
+    }
   } catch (e) {
     kindError.value = e instanceof Error ? e.message : i18n.t('admin_kind_failed')
   } finally {

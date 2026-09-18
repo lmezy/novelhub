@@ -18,6 +18,7 @@ from app.schemas.source import (
 )
 from app.services.auth import get_current_user, require_admin
 from app.services.book_cleanup import delete_books
+from app.services.book_kind import normalize_kind
 from app.services.search import search_service
 from app.services.source_interval import apply_source_interval
 from app.services.visibility import can_view_all_ages, can_view_r18
@@ -162,6 +163,7 @@ async def update_source(
                     "is_r18": book.is_r18,
                     "tags": list(book.tag_names),
                     "category_names": list(book.category_names),
+                    "kind": normalize_kind(getattr(book, "kind", None)),
                 })
             except Exception:
                 continue

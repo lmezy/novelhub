@@ -4,15 +4,61 @@ import meilisearch
 from loguru import logger
 
 from app.core.config import settings
+from app.services.book_kind import KIND_NOVEL, normalize_kind
 
 
 class SearchService:
     INDEX_BOOKS = "books"
     INDEX_CHAPTERS = "chapters"
     CHAPTER_BUFFER_SIZE = 100
-    CANDIDATE_LIMIT = 5000
+    # Advanced search fetches a candidate window per condition, scores it in
+    # Python and then slices the page out of it.  The window therefore decides
+    # how long *every* page click takes: at 5000 candidates a single search on
+    # the live 115k-chapter index regularly took 40-110 s (~66 s cold), because
+    # Meilisearch drops its per-query cache whenever the crawler indexes a new
+    # chapter batch.  1000 keeps the same semantics at ~0.5 s while still
+    # offering 25 pages of 40 results.
+    CANDIDATE_LIMIT = 1000
+    # ``content`` needs its own, much smaller window.  Scoring a content match
+    # requires the chapter text itself, so the candidate fetch has to carry it:
+    # 1000 chapters is ~96 MB of JSON and took 18-25 s *on every request*
+    # (measured on the live 115k-chapter index), while 300 is ~29 MB and stays
+    # under a second.  300 candidates is still eight pages of 40 results.
+    CONTENT_CANDIDATE_LIMIT = 300
     CONTENT_INDEX_LIMIT = 100_000
     DESCRIPTION_INDEX_LIMIT = 2000
+
+    # ``content`` is deliberately absent from both lists: one chapter document
+    # can carry 100 KB of text, and retrieving it for every candidate made a
+    # title search move 313 MB and take ~38 s (measured against the live index).
+    # Only a search *on* ``content`` asks for it (``_search_field`` appends the
+    # searched attribute).
+    BOOK_RETRIEVE_ATTRS = [
+        "id",
+        "title",
+        "author",
+        "description",
+        "status",
+        "source_id",
+        "author_id",
+        "is_r18",
+        "tags",
+        "category_names",
+        "kind",
+    ]
+    CHAPTER_RETRIEVE_ATTRS = [
+        "id",
+        "book_id",
+        "title",
+        "chapter_number",
+        "book_title",
+        "book_author",
+        "book_description",
+        "is_r18",
+        "tags",
+        "category_names",
+        "kind",
+    ]
 
     BOOK_FIELD_ATTRS = {
         "title": "title",
@@ -49,7 +95,7 @@ class SearchService:
         "tags",
         "category_names",
     ]
-    FILTERABLE_ATTRIBUTES = ["source_id", "book_id", "author_id", "is_r18", "tags"]
+    FILTERABLE_ATTRIBUTES = ["source_id", "book_id", "author_id", "is_r18", "tags", "kind"]
 
     def __init__(self):
         self.client = meilisearch.Client(settings.MEILI_HOST, settings.MEILI_KEY)
@@ -82,8 +128,13 @@ class SearchService:
 
     def index_book(self, book: dict) -> None:
         self._ensure_index(self.INDEX_BOOKS)
-        self.client.index(self.INDEX_BOOKS).add_documents([book])
-        logger.debug("Indexed book {}", book.get("id"))
+        doc = dict(book)
+        # Every book document must carry ``kind``: it is what keeps a search
+        # started on /novels or /comics inside its own half of the library, and
+        # a document without the field matches neither side of the filter.
+        doc["kind"] = normalize_kind(doc.get("kind"))
+        self.client.index(self.INDEX_BOOKS).add_documents([doc])
+        logger.debug("Indexed book {}", doc.get("id"))
 
     def index_chapter(self, chapter: dict) -> None:
         self._ensure_index(self.INDEX_CHAPTERS)
@@ -136,12 +187,27 @@ class SearchService:
         safe_tag = tag.replace('"', '\\"')
         return f'tags = "{safe_tag}"'
 
+    @staticmethod
+    def _kind_filter(kind: str | None) -> str | None:
+        """Restrict a search to novels or comics.
+
+        ``books.kind`` is the same derived field ``/books/browse?kind=`` uses;
+        it is indexed so ``/novels`` and ``/comics`` search their own half of
+        the library instead of mixing both (the search index used to ignore it
+        completely).
+        """
+        value = str(kind or "").strip().lower()
+        if value not in ("novel", "comic"):
+            return None
+        return f'kind = "{value}"'
+
     def _combined_filter(
         self,
         allow_r18: bool,
         allow_all_ages: bool,
         tag: str | None,
         source_id: str | None = None,
+        kind: str | None = None,
     ) -> str | None:
         parts = []
         r18_filter = self._visibility_filter(allow_r18, allow_all_ages)
@@ -153,7 +219,22 @@ class SearchService:
         if source_id:
             safe_source = source_id.replace("\\", "\\\\").replace('"', '\\"')
             parts.append(f'source_id = "{safe_source}"')
+        kind_part = self._kind_filter(kind)
+        if kind_part:
+            parts.append(kind_part)
         return " AND ".join(parts) if parts else None
+
+    def _retrieve_attrs(self, index_name: str, attr: str) -> list[str]:
+        """Fields to return for candidate scoring (never ``content`` unless asked)."""
+        base = (
+            self.BOOK_RETRIEVE_ATTRS
+            if index_name == self.INDEX_BOOKS
+            else self.CHAPTER_RETRIEVE_ATTRS
+        )
+        attrs = list(base)
+        if attr and attr not in attrs:
+            attrs.append(attr)
+        return attrs
 
     def search_books(
         self,
@@ -165,6 +246,7 @@ class SearchService:
         allow_all_ages: bool = True,
         tag: str | None = None,
         source_id: str | None = None,
+        kind: str | None = None,
     ) -> dict:
         self._ensure_index(self.INDEX_BOOKS)
         self._ensure_index(self.INDEX_CHAPTERS)
@@ -179,7 +261,7 @@ class SearchService:
                 "category_names",
             ],
         }
-        filters = self._combined_filter(allow_r18, allow_all_ages, tag, source_id)
+        filters = self._combined_filter(allow_r18, allow_all_ages, tag, source_id, kind)
         if filters:
             options["filter"] = filters
         try:
@@ -198,6 +280,7 @@ class SearchService:
         allow_all_ages: bool = True,
         tag: str | None = None,
         source_id: str | None = None,
+        kind: str | None = None,
     ) -> dict:
         self._ensure_index(self.INDEX_BOOKS)
         self._ensure_index(self.INDEX_CHAPTERS)
@@ -214,7 +297,7 @@ class SearchService:
                 "category_names",
             ],
         }
-        filters = self._combined_filter(allow_r18, allow_all_ages, tag, source_id)
+        filters = self._combined_filter(allow_r18, allow_all_ages, tag, source_id, kind)
         if filters:
             options["filter"] = filters
         try:
@@ -260,9 +343,15 @@ class SearchService:
         filters: str | None,
     ) -> dict:
         options = {
-            "limit": self.CANDIDATE_LIMIT,
+            "limit": (
+                self.CONTENT_CANDIDATE_LIMIT if attr == "content"
+                else self.CANDIDATE_LIMIT
+            ),
             "offset": 0,
             "attributesToSearchOn": [attr],
+            # Cap the payload: without this a chapter search returned every
+            # candidate's full 100 KB body (313 MB for one page click).
+            "attributesToRetrieve": self._retrieve_attrs(index_name, attr),
             "showRankingScore": True,
         }
         if filters:
@@ -279,6 +368,7 @@ class SearchService:
         options = {
             "limit": self.CANDIDATE_LIMIT,
             "offset": 0,
+            "attributesToRetrieve": self._retrieve_attrs(index_name, ""),
         }
         if filters:
             options["filter"] = filters
@@ -584,6 +674,7 @@ class SearchService:
         scope: str = "all",
         tag: str | None = None,
         source_id: str | None = None,
+        kind: str | None = None,
         offset: int = 0,
         limit: int = 20,
         allow_r18: bool = True,
@@ -602,7 +693,7 @@ class SearchService:
         if not active:
             if tag:
                 filters = self._combined_filter(
-                    allow_r18, allow_all_ages, tag, source_id,
+                    allow_r18, allow_all_ages, tag, source_id, kind,
                 )
                 if scope in ("all", "books"):
                     result = self._search_all_with_filter(self.INDEX_BOOKS, filters)
@@ -653,7 +744,7 @@ class SearchService:
             )
 
         filters = self._combined_filter(
-            allow_r18, allow_all_ages, tag, source_id,
+            allow_r18, allow_all_ages, tag, source_id, kind,
         )
         book_cond_maps: dict[int, dict[str, tuple[int, dict]]] = {}
         chapter_cond_maps: dict[int, dict[str, tuple[int, dict]]] = {}
@@ -857,6 +948,7 @@ class SearchService:
                         "is_r18": book.is_r18,
                         "tags": tags,
                         "category_names": book.category_names,
+                        "kind": normalize_kind(book.kind),
                     }
                     book_meta[book.id] = doc
                     self.index_book(doc)
@@ -886,6 +978,7 @@ class SearchService:
                         "is_r18": bool(meta.get("is_r18", False)),
                         "tags": meta.get("tags") or [],
                         "category_names": meta.get("category_names") or [],
+                        "kind": meta.get("kind") or KIND_NOVEL,
                     })
                     if len(batch) >= self.CHAPTER_BUFFER_SIZE:
                         self.client.index(self.INDEX_CHAPTERS).add_documents(batch)
@@ -896,6 +989,152 @@ class SearchService:
                     result["chapters"] += len(batch)
 
         await _rebuild()
+        return result
+
+    KIND_BACKFILL_BATCH = 1000
+
+    def index_missing_kind(self, index_name: str) -> bool:
+        """Whether an index still holds documents without the ``kind`` field.
+
+        The field was added after both indexes already held the whole library,
+        and a document without it matches neither ``kind = "novel"`` nor
+        ``kind = "comic"`` -- so ``/novels`` and ``/comics`` search would return
+        nothing until it is backfilled.
+        """
+        self._ensure_index(index_name)
+        try:
+            result = self.client.index(index_name).search("", {
+                "limit": 1,
+                "filter": "kind NOT EXISTS",
+                "attributesToRetrieve": ["id"],
+            })
+        except Exception as exc:
+            logger.warning("Could not probe {} for kind: {}", index_name, exc)
+            # Do not trigger a full backfill on an unknown index state.
+            return False
+        return bool(result.get("hits"))
+
+    async def sync_book_kinds(
+        self,
+        *,
+        force: bool = False,
+        book_ids: list[str] | None = None,
+    ) -> dict:
+        """Copy each book's ``kind`` onto its documents in both search indexes.
+
+        Uses ``update_documents`` so only ``kind`` is merged into the existing
+        documents.  Three callers, three shapes:
+
+        * ``book_ids`` given (after ``/books/reclassify``) -- refresh only the
+          books whose kind actually changed, plus their chapters;
+        * ``force=True`` -- rewrite the whole library;
+        * default (the startup path) -- skip an index whose probe finds nothing
+          missing, so a normal restart never re-indexes the whole library.
+
+        Chapters need the field too: a ``content`` search runs against the
+        chapters index, so without it a search started on /novels or /comics
+        would silently return nothing.
+        """
+        self._ensure_index(self.INDEX_BOOKS)
+        self._ensure_index(self.INDEX_CHAPTERS)
+        targets = None
+        if book_ids is not None:
+            targets = [str(book_id) for book_id in book_ids if book_id]
+            if not targets:
+                return {"books": 0, "chapters": 0, "skipped": True}
+            need_books = need_chapters = True
+        else:
+            need_books = force or self.index_missing_kind(self.INDEX_BOOKS)
+            need_chapters = force or self.index_missing_kind(self.INDEX_CHAPTERS)
+        result = {"books": 0, "chapters": 0, "skipped": not (need_books or need_chapters)}
+        if result["skipped"]:
+            return result
+
+        from sqlalchemy import select
+
+        from app.core.database import SessionLocal
+        from app.models import Book, Chapter
+
+        batches = (
+            [targets[i : i + self.KIND_BACKFILL_BATCH] for i in range(0, len(targets), self.KIND_BACKFILL_BATCH)]
+            if targets is not None
+            else None
+        )
+
+        async with SessionLocal() as db:
+            books_index = self.client.index(self.INDEX_BOOKS)
+            chapters_index = self.client.index(self.INDEX_CHAPTERS)
+
+            async def _book_docs(book_query) -> list[dict]:
+                rows = (await db.execute(book_query)).all()
+                return [
+                    {"id": str(book_id), "kind": normalize_kind(kind)}
+                    for book_id, kind in rows
+                ]
+
+            async def _chapter_docs(chapter_query) -> list[dict]:
+                rows = (await db.execute(chapter_query)).all()
+                return [
+                    {"id": str(chapter_id), "kind": normalize_kind(kind)}
+                    for chapter_id, kind in rows
+                ]
+
+            if batches is not None:
+                # Targeted refresh: one round trip per batch for books and for
+                # their chapters.
+                for batch in batches:
+                    if need_books:
+                        docs = await _book_docs(
+                            select(Book.id, Book.kind).where(Book.id.in_(batch))
+                        )
+                        if docs:
+                            books_index.update_documents(docs)
+                            result["books"] += len(docs)
+                    if need_chapters:
+                        docs = await _chapter_docs(
+                            select(Chapter.id, Book.kind)
+                            .join(Book, Book.id == Chapter.book_id)
+                            .where(Chapter.book_id.in_(batch))
+                        )
+                        if docs:
+                            chapters_index.update_documents(docs)
+                            result["chapters"] += len(docs)
+            else:
+                if need_books:
+                    last_id = ""
+                    while True:
+                        docs = await _book_docs(
+                            select(Book.id, Book.kind)
+                            .where(Book.id > last_id)
+                            .order_by(Book.id)
+                            .limit(self.KIND_BACKFILL_BATCH)
+                        )
+                        if not docs:
+                            break
+                        last_id = docs[-1]["id"]
+                        books_index.update_documents(docs)
+                        result["books"] += len(docs)
+                if need_chapters:
+                    last_id = ""
+                    while True:
+                        docs = await _chapter_docs(
+                            select(Chapter.id, Book.kind)
+                            .join(Book, Book.id == Chapter.book_id)
+                            .where(Chapter.id > last_id)
+                            .order_by(Chapter.id)
+                            .limit(self.KIND_BACKFILL_BATCH)
+                        )
+                        if not docs:
+                            break
+                        last_id = docs[-1]["id"]
+                        chapters_index.update_documents(docs)
+                        result["chapters"] += len(docs)
+
+        logger.info(
+            "Backfilled search kind: {} books, {} chapters",
+            result["books"],
+            result["chapters"],
+        )
         return result
 
     def delete_book_from_index(self, book_id: str) -> None:

@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import Author, Book, BookTag, Chapter
 from app.repositories.tag import TagRepository
 from app.services.book_enrichment import enrich_book_metadata
+from app.services.book_kind import normalize_kind
 from app.services.search import search_service
 from app.services.storage import BookStorage
 
@@ -116,6 +117,7 @@ class ManualImportService:
             "is_r18": book.is_r18,
             "tags": book_tags,
             "category_names": book_category_names,
+            "kind": normalize_kind(getattr(book, "kind", None)),
         })
 
         created = 0
@@ -152,6 +154,7 @@ class ManualImportService:
                 "tags": book_tags,
                 "category_names": book_category_names,
                 "is_r18": book.is_r18,
+                "kind": normalize_kind(getattr(book, "kind", None)),
             })
             created += 1
 

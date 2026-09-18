@@ -184,6 +184,10 @@ async def reclassify_books(
         "scan_content": bool(scan_content),
         "force": bool(force),
         "source_id": source_id,
+        # Ids whose kind changed, so the caller can refresh just those documents
+        # in the search index instead of re-indexing the whole library.
+        # ``/api/books/reclassify`` pops this before serializing the response.
+        "changed_book_ids": [],
     }
 
     sources = {
@@ -220,6 +224,7 @@ async def reclassify_books(
             if kind != normalize_kind(book.kind):
                 book.kind = kind
                 result["updated"] += 1
+                result["changed_book_ids"].append(book.id)
 
         if pending:
             chapter_rows = (
@@ -246,6 +251,7 @@ async def reclassify_books(
                 if book is not None and normalize_kind(book.kind) != KIND_COMIC:
                     book.kind = KIND_COMIC
                     result["updated"] += 1
+                    result["changed_book_ids"].append(book.id)
 
         for book in books:
             if normalize_kind(book.kind) == KIND_COMIC:
