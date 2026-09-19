@@ -56,7 +56,8 @@ curl -X POST http://localhost:8088/api/crawl/tasks \
 > （以及 `YUEDU_PLAYWRIGHT_CONCURRENCY`，每只 Chromium 约 200–300MB）。
 - 无头浏览器（webJs / webView 书源）受 `YUEDU_PLAYWRIGHT_CONCURRENCY`（默认 3）限制，
   并且同样走书源限速，避免几十个 Chromium 同时打一个站点。
-- 429/5xx 自动退避重试；设置 `SYNC_IGNORE_RATE_LIMIT=true` 才会忽略书源自身的限速。
+- 429/5xx 自动退避重试，Cloudflare 的 520-527 一律按瞬态上游故障处理（它们会单独计数、
+  不会把整个任务判成“被反爬”），设置 `SYNC_IGNORE_RATE_LIMIT=true` 才会忽略书源自身的限速。
 - `SYNC_PAGE_BATCH_SIZE`（默认 0）> 0 时，任务每处理 N 页就保存 `next_page` 并重新排队，
   间隔由 `SYNC_BATCH_INTERVAL_MS` 控制。
 - Admin 里配置的代理会写进共享 storage，backend / crawler 都能读到。
@@ -140,6 +141,37 @@ Admin → 代理里填的是别的主机地址，容器访问不到。crawler/ba
 > （日志里是 `ReadError` / `ClosedResourceError` / `pop from an empty deque`）。
 > 现在换客户端只是「退休」旧客户端（新请求用新连接池，老请求跑完再关），并且这三类流
 > 级错误也算瞬态，不会再凑够 10 本把任务判成「被反爬」。
+
+### 整本书都报 `Upstream server returned a transient 5xx error page`，但浏览器里站点正常
+
+先分清“真 5xx”和“误判”，两者都会出现这句话。
+
+2026-09-19 修（误判）：判定“这是 Cloudflare/origin 5xx 错误页”原本用的是「页面里出现
+`cloudflare` **且**出现 `error`」。但 Cloudflare 会给**所有**接入站点注入
+`static.cloudflareinsights.com/beacon.min.js`，Blogger 的页面又自带 `'iserror': false`，
+于是正常文章也命中：中文成人文学网-短篇（blog.xbookcn.net）一次任务 **9 本书全部**报这条错误，
+而站点返回的其实是 138KB 的正常正文。现在只认 Cloudflare 自己的措辞与标记
+（`Web server is returning an unknown error`、`Error code: 520`、`cf-error-details`…），
+其余情况要求“5xx 码 + error 字样出现在同一个 30KB 以内的小页面里”。
+升级后重新同步该源即可，**不需要**动 Cookie 或代理。
+
+真 5xx（Cloudflare 520-527）是站点回源失败：哪台客户端来都一样，属瞬态，会自动重试，
+任务也会在 60s/120s 后整体重试。2026-09-19 起这类错误不再交给无头浏览器渲染
+（渲染出来还是同一张错误页，每个请求要多花约 50 秒），也统一按瞬态计数——一批 520
+不会再被算成“连续失败”而中止整个任务。站点持续 520 时只能等它恢复，或者把该源的
+「同步间隔」调大、降低触发概率。
+
+### 书页能识别（书名/作者都对），但目录是 0 章，或章节内容是本站的列表页
+
+书源没有写 `ruleBookInfo.tocUrl` 时，按 Legado 语义**目录就在书页上**；但插件会先从书页的
+链接里**猜**一个目录页（链接文字含「目录 / 章节列表 / 查看全部章节」…），猜错时会拿站点的
+全站索引当目录。典型：中文成人文学网-短篇的正文页侧栏链到 `/search/label/目录索引`，
+书源自己的 `ruleToc` 在那页上只能生成「章节 = 该索引页」这一条自引用记录，整本书于是 0 章。
+
+2026-09-19 起：**猜出来的**目录页如果没解析出章节、或解析出的条目全都指向它自己，就在
+**书页**上重跑书源自己的 `ruleToc`（Legado 的默认行为），再不行才回退到通用链接扫描。
+书源**自己声明**的 `tocUrl` 不受影响（那种情况下解析不出章节会明确报
+「书源目录规则已失效」，见下面那节）。
 
 ### 章节报 Chapter returned empty content
 

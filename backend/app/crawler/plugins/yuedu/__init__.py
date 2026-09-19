@@ -422,6 +422,46 @@ REMOVED_PAGE_MARKERS = (
 )
 
 
+# Ids Cloudflare only emits on its own error pages ("Error 520 / Web server is
+# returning an unknown error", 521-527).  They never appear on a healthy page.
+CLOUDFLARE_ERROR_IDS = (
+    "cf-error-details",
+    "cf-error-overview",
+    "cf-error-code",
+)
+
+# Cloudflare names the failure inside the error page itself: 520 "Web server is
+# returning an unknown error", 521 "Web server is down", 522 "Connection timed
+# out", 523 "Origin is unreachable", 524 "A timeout occurred", 525/526 TLS.
+CLOUDFLARE_ERROR_PHRASES = (
+    "web server is returning an unknown error",
+    "web server is down",
+    "connection timed out",
+    "origin is unreachable",
+    "a timeout occurred",
+    "ssl handshake failed",
+    "invalid ssl certificate",
+)
+
+# Cloudflare's *plain text* 5xx body is literally ``error code: 520``.
+UPSTREAM_ERROR_CODE_RE = re.compile(r"error\s+code:?\s*5\d{2}\b")
+
+# Origin/nginx style error pages: a 5xx code and the word "error" next to each
+# other.  Deliberately paired with :data:`UPSTREAM_ERROR_PAGE_MAX_CHARS` so a
+# real article that happens to contain such a phrase cannot be mistaken for an
+# error page.
+UPSTREAM_ERROR_BODY_RE = re.compile(
+    r"(?:\berror\b|错误)[^<]{0,40}\b5\d{2}\b"
+    r"|\b5\d{2}\b[^<]{0,40}(?:bad gateway|service unavailable"
+    r"|internal server error|gateway time-?out|错误)"
+)
+
+# An upstream error page is a stub (Cloudflare's own is ~7 KB); a real book or
+# chapter page is far bigger.  Anything above this is never treated as an error
+# page on wording alone.
+UPSTREAM_ERROR_PAGE_MAX_CHARS = 30000
+
+
 def has_contextual_block_marker(text: str) -> bool:
     """Whether an ambiguous block phrase appears in a blocking context.
 
@@ -962,6 +1002,48 @@ class YueduPlugin:
         # happily returns navigation links.
         toc_from_rules = bool(toc)
         android_toc_rule = self._uses_android_js_rule("ruleToc", "chapterList")
+        # ``_find_toc_url`` only *guesses* a catalogue URL from a link on the
+        # book page, and the guess can land on a site-wide index instead of this
+        # book's TOC.  On 中文成人文学网 (blog.xbookcn.net) the post links to
+        # ``/search/label/目录索引``, and the source's ruleToc -- written for the
+        # post itself, which is also Legado's default when
+        # ``ruleBookInfo.tocUrl`` is empty -- then returned one self-referential
+        # entry ("book title -> the index URL"), which the chapter loop dropped
+        # as a duplicate of the book title and left the book with 0 chapters.
+        # A guessed page that yields nothing, or only entries pointing back at
+        # itself, is useless: run the source's own rules on the book page
+        # instead of letting the guess decide.
+        guessed_toc_is_useless = (
+            not toc
+            or all(
+                self._make_absolute(
+                    str(entry.get("chapterUrl") or ""),
+                    toc_url,
+                ).rstrip("/") == toc_url.rstrip("/")
+                for entry in toc
+            )
+        )
+        if (
+            guessed_toc_is_useless
+            and not toc_url_from_rules
+            and toc_url.rstrip("/") != identity_url.rstrip("/")
+        ):
+            self.engine.set_page_url(identity_url)
+            retry_toc = self._resolve_toc_entries(
+                self.engine.parse_toc(html),
+                identity_url,
+            )
+            self.engine.set_page_url(identity_url if retry_toc else toc_url)
+            if retry_toc:
+                toc = retry_toc
+                toc_from_rules = True
+                toc_url = identity_url
+                toc_html = html
+                self._chapter_image_manifest = self._read_chapter_image_manifest()
+            else:
+                # Keep the generic fallback below reachable: a list of
+                # self-referential entries is not a chapter list.
+                toc = []
         if not toc and not android_toc_rule:
             # The configured ruleToc may be outdated. Fall back to the generic
             # chapter scanner on the real TOC page (book page or full list).
@@ -4961,7 +5043,13 @@ class YueduPlugin:
                     else:
                         resp = await client.post(url, json=body, headers=headers)
 
-                    if resp.status_code in (403, 520):
+                    # 403 is the WAF/challenge gate, which a browser can clear.
+                    # 5xx (incl. Cloudflare's 520-527) is an upstream failure:
+                    # retrying it is useful, rendering it in Chromium is not --
+                    # the browser just renders the same error page, which cost a
+                    # Chromium launch (and ~50s) per request while 要撸小说 was
+                    # answering 520.
+                    if resp.status_code == 403:
                         if attempt < 2:
                             headers = self._with_403_fallback(headers)
                             await asyncio.sleep(1.0 + random.uniform(0.5, 1.0))
@@ -4991,7 +5079,7 @@ class YueduPlugin:
                         if browser_html:
                             return browser_html
                         raise self._blocked_page_error(url)
-                    if resp.status_code in (429, 500, 502, 503, 504):
+                    if self._is_transient_upstream_status(resp.status_code):
                         retry_after = resp.headers.get("Retry-After", "")
                         wait = (
                             float(retry_after)
@@ -5160,19 +5248,45 @@ class YueduPlugin:
         failures — treating them as a book with 0 chapters produced misleading
         "no usable metadata" errors and wasted the whole sync on a transient blip,
         so callers should surface this as a retryable error instead.
+
+        The check has to stay *specific*.  The previous
+        ``"cloudflare" in html and "error" in html`` test looked harmless, but
+        every Cloudflare-fronted site ships
+        ``static.cloudflareinsights.com/beacon.min.js`` and Blogger ships
+        ``'iserror': false`` in its own JS — so ordinary posts matched it.  A
+        2026-09-19 task against 中文成人文学网 (blog.xbookcn.net) failed **all 9**
+        books with "transient 5xx error page" while the site was answering 200
+        with the real 138 KB post.  Match Cloudflare's own wording/ids, and for
+        everything else require a 5xx code next to an error word in a document
+        far too small to be an article.
         """
         if not html:
             return False
         lowered = html.lower()
-        if "web server is returning an unknown error" in lowered:
+        if any(marker in lowered for marker in CLOUDFLARE_ERROR_IDS):
             return True
-        if "error code 5" in lowered:
+        if UPSTREAM_ERROR_CODE_RE.search(lowered):
             return True
-        if ("cloudflare" in lowered and "error" in lowered) or "cf-error" in lowered:
+        if len(lowered) > UPSTREAM_ERROR_PAGE_MAX_CHARS:
+            return False
+        if "cloudflare" in lowered and any(
+            phrase in lowered for phrase in CLOUDFLARE_ERROR_PHRASES
+        ):
             return True
-        if re.search(r"\b(?:error|could not be found)\b[^<]{0,40}\b5\d{2}\b", lowered):
-            return True
-        return False
+        return bool(UPSTREAM_ERROR_BODY_RE.search(lowered))
+
+    @staticmethod
+    def _is_transient_upstream_status(status: int) -> bool:
+        """Whether an HTTP status is an upstream hiccup worth retrying.
+
+        Cloudflare answers 520-527 when its edge cannot talk to the origin and
+        origins answer 500-504 of their own; both come and go within minutes.
+        Treating them as retryable (instead of a WAF gate) also means
+        ``sync.py`` sees the "(HTTP 52x)" signature and classifies the failure as
+        transient, so a burst of them no longer counts towards
+        ``SYNC_MAX_CONSECUTIVE_FAILURES`` and aborts the whole task.
+        """
+        return status == 429 or 500 <= status < 600
 
     @staticmethod
     def _looks_like_removed_page(html: str) -> bool:
@@ -5346,7 +5460,10 @@ class YueduPlugin:
                         req_headers = dict(headers)
                         req_headers["Host"] = original_host
                     resp = await client.get(req_url, headers=req_headers)
-                    if resp.status_code in (403, 520):
+                    # 403 is the WAF/challenge gate, which a browser can clear.
+                    # 5xx (incl. Cloudflare's 520-527) is an upstream failure:
+                    # see :meth:`_is_transient_upstream_status`.
+                    if resp.status_code == 403:
                         if attempt < 2:
                             headers = self._with_403_fallback(headers)
                             await asyncio.sleep(1.0 + random.uniform(0.5, 1.0))
@@ -5377,9 +5494,9 @@ class YueduPlugin:
                             return browser_html
                         # The WAF blocked plain HTTP *and* the browser could not
                         # clear the challenge.  Surface a clear hint instead of a
-                        # bare httpx 403/520 that hides the real cause.
+                        # bare httpx 403 that hides the real cause.
                         raise self._blocked_page_error(url)
-                    if resp.status_code in (429, 500, 502, 503, 504):
+                    if self._is_transient_upstream_status(resp.status_code):
                         retry_after = resp.headers.get("Retry-After", "")
                         wait = (
                             float(retry_after)

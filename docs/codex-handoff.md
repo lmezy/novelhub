@@ -58,7 +58,7 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 
 ## 2. 当前状态（2026-09-19）
 
-- 后端全量测试 **702 passed**：`cd backend && python -m pytest -q`
+- 后端全量测试 **708 passed**：`cd backend && python -m pytest -q`
 - Source Engine 闭环已完成并可用：导入书源 → 搜索 → 目录 → 正文 → Storage/DB/搜索 →
   网页阅读。当前工作重心是**同步稳定性与线上排错**，不是新增架构能力。
 - **AI 功能已补齐并在线可用**（第 18/19/20/27 节）：后端配置/上下文/流式/划词/RAG +
@@ -78,7 +78,8 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
   `maxTotalHits=10000` 仍是硬顶。
 - 仓库已是"本地代码 = 线上代码"的状态（2026-09-19 部署）；**此后新改动仍需
   `docker compose build <服务>` + `up -d`**，线上镜像不会自动跟随本地代码。
-  **第 29/30 节的改动（搜索联合查询 + progress 500）尚未部署**，生效要重建 backend。
+  **第 29/30/31 节的改动（搜索联合查询 + progress 500 + 5xx 误判/目录猜测 + 搜索上一页）
+  尚未部署**，生效要重建 backend/crawler（前端那处还要重建 frontend）。
 - crawler 侧近 24h 无崩溃、无回归（第 30 节）：失败任务全部核到站点侧（CF 挑战/520）或
   代理侧（节点抖动），没有「同步过的书被改判失败」。
 - 待用户处理（代码修不了，属站点侧防护，见第 4 节）：SiS文學網 / 御宅屋 /
@@ -146,6 +147,9 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 | 高级搜索（多条件）怎么填都是 0 条 | 多条件路径每个条件只取 1000 条候选（`CANDIDATE_LIMIT`），`category=言情` 一类条件命中 1847 本，交集被截断后恒为空 | 见第 28 节（`_candidate_window()`：books 元数据 10000） |
 | 两个**正文**条件的 AND 恒为 0、翻页也 0 | 每个正文条件各自只取前 300 名候选（按相关性），而「铃」「仙」各命中近万章，两个前 300 几乎不重叠 → 交集恒为空 | 见第 29 节（`_same_field_conjunction`：同属性 AND 改走引擎联合查询） |
 | 首页每次加载报 `GET /api/progress` 500 | `ReadingProgressOut.chapter_id` 必填 `str`，而该列是 `ON DELETE SET NULL`（重同步会置空） | 见第 29 节（`schemas/progress.py` 改 `str \| None`） |
+| 站点一切正常，整本书却报 `Upstream server returned a transient 5xx error page`（中文成人文学网 9/9 本全挂） | “5xx 错误页”判定用了 `cloudflare` + `error` 裸子串，而正常页面必带 `cloudflareinsights` beacon、Blogger 页面自带 `'iserror': false` | 见第 31 节（`_looks_like_upstream_error`） |
+| 书页能识别、书名作者都对，目录却是 0 章 | 书源没写 `ruleBookInfo.tocUrl`，`_find_toc_url` 猜到的“目录页”其实是全站索引；书源自己的 `ruleToc` 在那页只解析出“章节=该索引页”的自引用条目 | 见第 31 节（`fetch_book` 在书页上重跑 ruleToc） |
+| 高级搜索点「上一页」：页码变了，列表还是当前页 | 路由 watcher 每次都从 `ADVANCED_CACHE_KEY`（只存“最后访问的那一页”）重画，把刚切回的页覆盖掉了 | 见第 31 节（`BooksPage.vue`） |
 
 ---
 
@@ -873,3 +877,62 @@ JS 空结果不再说「环境无法执行」），后端 **702 passed**；线�
 **顺带发现（未改）**：h528（風月文學網）17247 本书的章节正文里混进了整页导航/广告
 （正文规则没命中时回退到整页文本），章节标题被写成「书名 | 分站 | 分類 | 最新文章」。
 这是**内容质量**问题（不是失败），要修得看该书的 `ruleToc`/`ruleContent` 回退顺序。
+
+## 31. 2026-09-19：搜索「上一页」不生效；中文成人文学网整本报 5xx（其实是误判）
+
+**现象**（用户反馈）：① 搜索有多页结果时，点「下一页」正常，点「上一页」页码会变但列表
+还是当前页；② 全站同步里 `中文成人文学网-短篇(简体)`（xbookcn）**全程**报 5xx/520 代理失败，
+`要撸小说`（yaoluku）偶尔报；③ 代理本身可用（浏览器能上网）。
+
+**排查（只读线上 + 容器内影子回归）**：
+
+1. **搜索翻页**：`BooksPage.vue` 的高级搜索把「最后一页」存进 `sessionStorage` 的
+   `ADVANCED_CACHE_KEY`，而 `watch(() => route.query, loadCurrentView)` 每次 offset 变化都会
+   从这份快照重画。点「上一页」时 `runAdvancedSearch(0)` 走**缓存命中**分支（只写按 offset
+   分页的 `novelhub:books-search-pages`，不回写快照）→ `router.replace` 触发 watcher →
+   快照里仍是第 2 页 → 列表被覆盖回第 2 页。页码来自 URL，所以看起来“页码动了、内容没动”。
+2. **xbookcn 的 5xx 是误判**（决定性证据）：在 crawler 容器里用真实源码请求
+   `https://blog.xbookcn.net/2022/02/blog-post.html`，`_get` 返回的是 **138,425 字节的正常
+   Blogger 文章**（`<title>猎美陷阱-短篇成人情色小说</title>`），但
+   `_looks_like_upstream_error()` 返回 **True** —— 命中的是 `("cloudflare" in html and
+   "error" in html)`：正常页面里有 `static.cloudflareinsights.com/beacon.min.js`，
+   Blogger 自己的配置里又写着 `'iserror': false`。于是 9 本书全部被判“上游 5xx”，
+   连着 10 本非瞬态失败，任务以「Cloudflare 520/5xx…已中止」收尾。**代理和站点都没问题。**
+3. **修完误判后还有第二层**：xbookcn 的 `ruleBookInfo.tocUrl` 是空的，依 Legado 语义目录就
+   在书页上；而 `_find_toc_url` 从书页链接里猜到了 `/search/label/目录索引`（链接文字含
+   “目录”）。书源自己的 `ruleToc`（`@js:[{name: book.name||"正文", url: baseUrl}]`）在那页上
+   只能返回“章节 = 该索引页”这一条自引用记录，随后又被 `title == book_title` 丢掉 → **0 章**。
+4. **yaolu 的 520 是真的**：`curl -x http://127.0.0.1:27890` 对 `www.yaoluku.com` 现在也稳定
+   返回 Cloudflare `error code: 520`（`cf-ray …-KIX`，走的是 mihomo 的 `日本JP-HY2`）；一小时后
+   同一路径恢复正常。属站点/边缘侧瞬态。但旧代码把 520 交给无头浏览器渲染（每个请求多花约
+   50 s，渲染出来还是同一张错误页），浏览器再失败时报的是 `anti-bot/captcha`，被 `sync.py`
+   当成**非瞬态**失败计数，这正是“一批 520 把任务判成被反爬中止”的来源。
+
+**改动落点**：
+
+- `plugins/yuedu/__init__.py::_looks_like_upstream_error`：只认 Cloudflare 自己的措辞/标记
+  （`web server is returning an unknown error`、`error code: 52x`、`cf-error-details/-overview/
+  -code`），其余要求“5xx 码 + error 字样同现”且页面 < 30 KB（`UPSTREAM_ERROR_PAGE_MAX_CHARS`）。
+- `_is_transient_upstream_status()`：`429` 与全部 5xx 统一按**可重试的上游故障**处理；`_get`/
+  `_post` 里 `403` 才走 `_with_403_fallback` + 无头浏览器（520 不再渲染），失败后抛
+  `Request failed after retries: … (HTTP 52x)` —— 命中 `TRANSIENT_BOOK_MARKERS` 的
+  `request failed after retries`，于是 520-527 不再计入“连续失败中止任务”。
+- `fetch_book`：猜出来的目录页（`toc_url_from_rules == False`）如果**没解析出章节**、或解析出的
+  条目**全都指向它自己**，就在书页上重跑书源自己的 `ruleToc`（Legado 的默认语义）；
+  书源自己声明的 `tocUrl` 不受影响，猜错时仍保留通用扫描兜底。
+- `frontend/src/pages/BooksPage.vue`：新增 `advancedCacheKey()/rememberAdvancedPage()`，
+  缓存命中分支也回写 `ADVANCED_CACHE_KEY`；`loadCurrentView` 恢复高级搜索时优先取
+  **URL 里 offset 对应的那一页**，取不到才回退到快照。
+
+**验证**：新增 6 个后端测试（改动前 5 个失败）；`pytest` **708 passed**；
+`npm run typecheck && npm run build` 通过。线上只读影子回归（`/tmp` 加载改动文件，跑完删除，
+`docker diff` 无 `app/**.py` 改动）：xbookcn `fetch_book` → 书名「猎美陷阱」/作者「坑神」/
+**1 章**，`fetch_chapter_content` → **44,213 字**正常正文。
+
+**仍有效/未做**：
+
+- 真 520（yaolu）代码修不了：站点回源失败期间任何客户端都一样，靠 `SYNC_TASK_MAX_AUTO_RETRIES`
+  的 60s/120s 自动重试，或把该源的「同步间隔」调大以减少触发概率。
+- `UPSTREAM_ERROR_PAGE_MAX_CHARS = 30000` 是“正常文章不可能这么小”的工程判断：
+  真被超大的自建 5xx 页面挡住时，HTTP 状态码那一层仍会重试。
+

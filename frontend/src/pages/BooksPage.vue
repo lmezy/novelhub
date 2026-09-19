@@ -35,6 +35,9 @@ interface Condition {
   mode: MatchMode
   value: string
 }
+// ``activeConditions()`` drops ``enabled`` and the blank rows; the page cache key
+// has to be built from exactly what was sent to the API.
+type ActiveCondition = Pick<Condition, "field" | "mode" | "value">
 interface RemoteBook {
   source_id: string
   source_name: string
@@ -159,6 +162,27 @@ function writeCachedPage(key: string, page: CachedPage) {
   writeSessionCache(SEARCH_PAGES_KEY, all)
 }
 
+// Advanced search paging is keyed by the condition set *and* the offset.  The
+// view keeps one "last page" snapshot in ADVANCED_CACHE_KEY, and the route
+// watcher restores from it on every query change: writing only the offset-keyed
+// page made the watched route change reload the page being left behind, so
+// "上一页" moved the page number while the list stayed on the current page.
+function advancedCacheKey(conds: ActiveCondition[], matchMode: "and" | "or", offset: number) {
+  return `adv|${bookKind.value}|${matchMode}|${JSON.stringify(conds)}|${offset}`
+}
+
+function rememberAdvancedPage(conds: ActiveCondition[], matchMode: "and" | "or", hits: SearchHit[], total: number, offset: number) {
+  writeCachedPage(advancedCacheKey(conds, matchMode, offset), { hits, total })
+  writeSessionCache(ADVANCED_CACHE_KEY, {
+    conditions: conditions.value,
+    match: matchMode,
+    kind: bookKind.value,
+    results: hits,
+    total,
+    offset,
+  })
+}
+
 const activeCategory = computed(() => String(route.query.category || ""))
 const activeSource = computed(() => String(route.query.source || route.query.source_id || ""))
 const currentOffset = computed(() => Math.max(0, Number(route.query.offset || 0) || 0))
@@ -265,9 +289,13 @@ async function loadCurrentView() {
       if (cached && (cached.kind || "") === bookKind.value) {
         conditions.value = cached.conditions
         match.value = cached.match
-        advancedResults.value = cached.results
-        advancedTotal.value = cached.total
         advancedActive.value = true
+        // The snapshot only remembers the last page visited; prefer the page
+        // cached for the offset in the URL, so an offset change (上一页 / 下一页)
+        // does not repaint the previous page.
+        const page = readCachedPage(advancedCacheKey(activeConditions(), cached.match, currentOffset.value))
+        advancedResults.value = page ? page.hits : cached.results
+        advancedTotal.value = page ? page.total : cached.total
       } else {
         advancedActive.value = false
       }
@@ -406,12 +434,16 @@ async function runAdvancedSearch(offset = 0) {
     advancedError.value = i18n.t("search_condition_placeholder")
     return
   }
-  const cacheKey = `adv|${bookKind.value}|${match.value}|${JSON.stringify(conds)}|${offset}`
+  const cacheKey = advancedCacheKey(conds, match.value, offset)
   const cachedPage = readCachedPage(cacheKey)
   if (cachedPage) {
     advancedResults.value = cachedPage.hits
     advancedTotal.value = cachedPage.total
     advancedActive.value = true
+    // Refresh the session snapshot as well.  The route watcher below re-reads it
+    // on every query change, so leaving the *previous* page in it put that page
+    // straight back on screen ("上一页" changed the number but not the list).
+    rememberAdvancedPage(conds, match.value, cachedPage.hits, cachedPage.total, offset)
     await router.replace({ path: listPath.value, query: { advanced: "1", offset: String(offset) } })
     return
   }
@@ -429,8 +461,7 @@ async function runAdvancedSearch(offset = 0) {
     advancedResults.value = res.hits
     advancedTotal.value = res.total
     advancedActive.value = true
-    writeCachedPage(cacheKey, { hits: res.hits, total: res.total })
-    writeSessionCache(ADVANCED_CACHE_KEY, { conditions: conditions.value, match: match.value, kind: bookKind.value, results: res.hits, total: res.total, offset })
+    rememberAdvancedPage(conds, match.value, res.hits, res.total, offset)
     await router.replace({ path: listPath.value, query: { advanced: "1", offset: String(offset) } })
   } catch (e) {
     advancedError.value = e instanceof Error ? e.message : i18n.t("search_failed")

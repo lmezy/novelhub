@@ -524,6 +524,64 @@ def test_looks_like_upstream_error():
     assert YueduPlugin._looks_like_upstream_error(
         "<html><body><h1>鬼父：母女花丧失</h1><div>正文</div></body></html>"
     ) is False
+    # Cloudflare's other edge failures: 521 "Web server is down",
+    # 523 "Origin is unreachable", 524 "A timeout occurred", and the DOM ids
+    # Cloudflare only emits on its own error pages.
+    assert YueduPlugin._looks_like_upstream_error(
+        '<html><body><h1 class="heading-primary">Error 521</h1>'
+        "<span>Web server is down</span></body></html>"
+    ) is True
+    assert YueduPlugin._looks_like_upstream_error(
+        '<html><body><div id="cf-error-details">Origin is unreachable</div>'
+        "</body></html>"
+    ) is True
+    assert YueduPlugin._looks_like_upstream_error(
+        "<html><body>error code: 524</body></html>"
+    ) is True
+    # An origin (nginx) error page served with HTTP 200.
+    assert YueduPlugin._looks_like_upstream_error(
+        "<html><head><title>502 Bad Gateway</title></head><body>nginx</body></html>"
+    ) is True
+
+
+def test_looks_like_upstream_error_ignores_healthy_cloudflare_pages():
+    """中文成人文学网's real posts were flagged as 5xx error pages.
+
+    Every Cloudflare-fronted site loads
+    ``static.cloudflareinsights.com/beacon.min.js`` and Blogger ships
+    ``'iserror': false`` in its own JS, so ``"cloudflare" in html and "error" in
+    html`` matched healthy 138 KB posts: a 2026-09-19 task failed all 9 books
+    with "transient 5xx error page" while the site answered 200.
+    """
+    healthy = (
+        "<!DOCTYPE html><html><head><title>猎美陷阱-短篇成人情色小说</title>"
+        "<script>var cfg = {'iserror': false, 'ispost': true};</script>"
+        '<script type="module" '
+        'src="https://static.cloudflareinsights.com/beacon.min.js/v31"></script>'
+        "</head><body>" + ("<p>正文</p>" * 60) + "</body></html>"
+    )
+
+    assert "cloudflareinsights" in healthy and "error" in healthy.lower()
+    assert YueduPlugin._looks_like_upstream_error(healthy) is False
+
+
+def test_looks_like_upstream_error_ignores_long_documents():
+    """A book/chapter body is never an error page, whatever it mentions."""
+    long_page = (
+        "<html><head><title>说明书</title></head><body>"
+        + ("chapter 520 error " * 3000)
+        + "</body></html>"
+    )
+    assert len(long_page) > 30000
+    assert YueduPlugin._looks_like_upstream_error(long_page) is False
+
+
+def test_is_transient_upstream_status():
+    """Cloudflare 520-527 and origin 5xx are retryable; 403/404 are not."""
+    for status in (429, 500, 501, 502, 503, 504, 520, 521, 522, 523, 524, 525, 527, 530):
+        assert YueduPlugin._is_transient_upstream_status(status) is True, status
+    for status in (200, 204, 301, 302, 400, 401, 403, 404, 410, 451):
+        assert YueduPlugin._is_transient_upstream_status(status) is False, status
 
 
 @pytest.mark.asyncio
@@ -1843,6 +1901,72 @@ async def test_get_uses_browser_fallback_for_http_block_response():
     assert html == "<html><body>browser page</body></html>"
     assert captured["url"] == "https://example.com/page"
     assert captured["options"]["fallback_http"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_retries_cloudflare_5xx_without_launching_a_browser():
+    """Cloudflare 520 is retried as an upstream error, not rendered.
+
+    Rendering it in Chromium only produced the same error page (~50 s and one
+    Chromium launch per request while 要撸小说 answered 520), and when the
+    browser itself failed the error was reported as an anti-bot/captcha page --
+    which ``sync.py`` then counted as a *deterministic* failure towards
+    ``SYNC_MAX_CONSECUTIVE_FAILURES`` and aborted the whole task.
+    """
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.yaoluku.com",
+        "concurrentRate": "0",
+    })
+    client = _fake_http_client([httpx.Response(520, content=b"error code: 520")] * 3)
+    browser = AsyncMock(side_effect=AssertionError("520 must not open a browser"))
+
+    with (
+        patch.object(plugin, "_get_http_client", AsyncMock(return_value=client)),
+        patch.object(plugin, "_get_with_web_js", browser),
+        patch("asyncio.sleep", AsyncMock()),
+        patch(
+            "app.services.proxy_config.get_proxy_config",
+            return_value=ProxyConfig(enabled=False),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match=r"HTTP 520"):
+            await plugin._get("https://www.yaoluku.com/book/57162/225679.html")
+
+    assert client.calls == 3
+    browser.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_523_is_reported_as_a_transient_upstream_error():
+    """521-527 must end in a *transient* error, not a bare httpx status error.
+
+    A repeated 523 used to escape as ``httpx.HTTPStatusError`` ("Server error
+    '523 '"), whose message carries none of the markers ``sync.py`` looks for --
+    so a burst of them counted as deterministic failures towards
+    ``SYNC_MAX_CONSECUTIVE_FAILURES`` and aborted the whole task.
+    """
+    from app.services.sync import SyncService
+
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.yaoluku.com",
+        "concurrentRate": "0",
+    })
+    client = _fake_http_client([httpx.Response(523, content=b"origin unreachable")] * 3)
+
+    with (
+        patch.object(plugin, "_get_http_client", AsyncMock(return_value=client)),
+        patch("asyncio.sleep", AsyncMock()),
+        patch(
+            "app.services.proxy_config.get_proxy_config",
+            return_value=ProxyConfig(enabled=False),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match=r"HTTP 523") as caught:
+            await plugin._get("https://www.yaoluku.com/book/57162/225679.html")
+
+    assert client.calls == 3
+    assert SyncService._is_transient_book_fetch(caught.value) is True
+    assert SyncService._is_transient_chapter_error(caught.value) is True
 
 
 @pytest.mark.asyncio
@@ -4158,6 +4282,49 @@ async def test_fetch_book_still_scans_book_page_when_toc_url_is_a_guess():
         "https://example.com/novel/123/1.html",
         "https://example.com/novel/123/2.html",
     ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_book_retries_toc_rules_on_book_page_when_the_guess_is_an_index():
+    """中文成人文学网: the ruleToc targets the post, ``_find_toc_url`` picked 目录索引.
+
+    Parsing the guessed page with the source's own rules produced a single
+    self-referential entry ("猎美陷阱" -> /search/label/目录索引), which the
+    chapter loop then dropped for reusing the book title -- so the book came back
+    with 0 chapters even though the site answered normally (2026-09-19).
+    """
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://blog.xbookcn.net",
+        "ruleBookInfo": {"name": "h3@text"},
+        "ruleToc": {
+            "chapterList": "@js:[{\"name\": book.name || \"正文\", \"url\": baseUrl}]",
+            "chapterName": "name",
+            "chapterUrl": "url",
+        },
+        "concurrentRate": "0",
+    })
+    book_url = "https://blog.xbookcn.net/2022/02/blog-post.html"
+    label_url = (
+        "https://blog.xbookcn.net/search/label/%E7%9B%AE%E5%BD%95%E7%B4%A2%E5%BC%95"
+    )
+    book_html = (
+        "<html><body><h3>猎美陷阱</h3>"
+        f"<a href='{label_url}'>目录索引</a>"
+        "<div class='post-body'>正文内容</div></body></html>"
+    )
+    label_html = (
+        "<html><head><title>目录索引-短篇成人情色小说</title></head>"
+        "<body><div class='post'>another post</div></body></html>"
+    )
+
+    async def fake_get(url):
+        return book_html if url == book_url else label_html
+
+    with patch.object(plugin, "_get", fake_get):
+        book = await plugin.fetch_book(book_url)
+
+    assert [c.title for c in book.chapters] == ["猎美陷阱"]
+    assert [c.url for c in book.chapters] == [book_url]
 
 
 XBOOKCN_LABEL_HTML = """

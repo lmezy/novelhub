@@ -67,6 +67,10 @@ backend 启动会后台自动回填一次（`POST /api/search/index/kinds` 可�
 
 前端另外把已取回的搜索页放进 `sessionStorage`，翻页与返回不再重跑查询。
 
+> 高级搜索的分页缓存按「条件 + offset」分页存，恢复视图时优先取 **URL 里 offset 对应的那一页**。
+> 2026-09-19 修：以前只把“最后访问的那一页”存进快照，而路由 offset 一变就会从快照重画，
+> 于是点「上一页」页码变了、列表却还是当前页。
+
 ## Rule compatibility
 
 The search implementation follows Legado behavior:
