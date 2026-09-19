@@ -8,6 +8,7 @@
 | 文档 | 内容 |
 |---|---|
 | [NovelHub-AI-Development-Context.md](NovelHub-AI-Development-Context.md) | 项目定位、模块职责、规则驱动原则、改动红线 |
+| [legado-rule-spec-diff.md](legado-rule-spec-diff.md) | **书源规则引擎 vs Legado 权威实现的差异表**（改规则引擎前先查这里；含 API 缺口与有意偏差的区分） |
 | [../README.md](../README.md) | 安装、启动、书源导入、书架、本地导入、阅读器 |
 | [../yuedu/README.md](../yuedu/README.md) | 开源阅读（Legado）源码说明与书源规则格式参考 |
 
@@ -102,6 +103,11 @@
 - **点开书籍/漫画要等很久、点进章节正文或图片也要等很久** →
   [reading-performance.md](reading-performance.md) + [codex-handoff.md](codex-handoff.md) 第 22 节
 - 想连服务器看真实任务与日志 → [codex-handoff.md](codex-handoff.md) 第 1、5 节
+- **要改书源插件的代码、找不到某个方法在哪个文件** →
+  [NovelHub-AI-Development-Context.md](NovelHub-AI-Development-Context.md) §2 +
+  [codex-handoff.md](codex-handoff.md) 第 32 节（插件已按职责拆成 18 个模块）
+- 时间戳又对不上 / 差 8 小时 → [codex-handoff.md](codex-handoff.md) 第 32 节
+  （约定是 `core/clock.py::naive_now()`；`deleted_accounts.deleted_at` 是唯一 aware 列）
 
 ## 文档维护约定
 

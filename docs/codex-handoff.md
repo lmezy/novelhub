@@ -544,11 +544,10 @@ AI **不会**自动改书源、不自动导 Cookie、不处理验证码；「自
 **仍有效**：
 - 线上真要解决搬山人，得在 **设置 → 书源 → 编辑 → 同步间隔** 填 `60`（或按实测调整）。
   代价很直接：1 本书 50 章 ≈ 50 分钟，27 本全站 ≈ 20 小时以上，只配真正需要的源。
-- **时区问题还有残留**（本次没动）：`services/cookie_health.py`、`repositories/cookie.py`、
-  `plugins/alicesw/login.py` 把用户填的本地 `expired_at` 与 UTC `now()` 比较 →
-  **Cookie 被判过期的时刻偏晚 8 小时**；`services/token_service.py`、
-  `routes/source_changes.py`、`services/account.py` 写的是 UTC（前端显示早 8 小时）。
-  要统一就照 `core/clock.py` 的说明一次性改完，别只改一半。
+- **时区已统一（第 32 节已修完，本行原先写着"还有残留"）**：约定是
+  `core/clock.py::naive_now()` = naive 本地墙钟。`deleted_accounts.deleted_at` 是 schema 里
+  **唯一** `DateTime(timezone=True)` 列，`account.py` 必须继续用 aware UTC；JWT `exp`、
+  备份文件名与 manifest 时间戳也按各自规范保留 UTC。
 
 ## 22. 2026-09-18：点开书籍/章节要等很久（`/books/{id}/sources` 12 秒 + 图片零缓存）
 
@@ -935,4 +934,77 @@ JS 空结果不再说「环境无法执行」），后端 **702 passed**；线�
   的 60s/120s 自动重试，或把该源的「同步间隔」调大以减少触发概率。
 - `UPSTREAM_ERROR_PAGE_MAX_CHARS = 30000` 是“正常文章不可能这么小”的工程判断：
   真被超大的自建 5xx 页面挡住时，HTTP 状态码那一层仍会重试。
+
+## 32. 2026-09-19：拆分 `YueduPlugin` 上帝类 + 统一时区 + 收敛瞬态异常体系
+
+**背景（不是线上故障，是维护性）**：`plugins/yuedu/__init__.py` 涨到 **5,972 行**，其中
+`YueduPlugin` **一个类 142 个方法** —— HTTP 客户端池、线路健康度、Playwright、TOC 猜测、
+通用解析、标记判定、图片相册、书架、登录全塞在一起。第 7～31 节每一个 bug 都藏在这一个文件里。
+
+**改动落点（三件，互相独立）**：
+
+1. **按职责拆成 18 个模块**，`__init__.py` 从 5,972 行降到 ~434 行，只留 7 个方法
+   （`__init__`/`configure`/`_normalize_source_config`/`display_name`/`source_group`/
+   `set_request_interval_seconds`/`update_book` = 插件协议面 + 共享类级缓存）。
+   拆法是 **mixin**：`class YueduPlugin(UrlsMixin, ParsingMixin, ExploreMixin, BookMixin,
+   ChapterMixin, ImagesMixin, BookshelfMixin, AuthMixin, RenderMixin, PageKindMixin,
+   TransportMixin)`。方法体一行未改，全部按 AST 按名搬迁，因此**对外行为不变**。
+
+   | 模块 | 行数 | 职责 |
+   |---|---|---|
+   | `transport.py` | 1057 | 客户端池 + 退休机制、线路健康度、限流、`header` 规则、DoH、`_get`/`_post` |
+   | `parsing.py` | 862 | 通用 HTML → 书名/作者/封面/标签 + 文本清洗 |
+   | `explore.py` | 807 | `exploreUrl`、分类、目录分页模板学习、关键词搜索 |
+   | `book.py` | 557 | `fetch_book`、TOC 解析与猜测 |
+   | `render.py` | 389 | Playwright 渲染、浏览器信号量、挑战等待 |
+   | `urls.py` | 364 | 书页/章节页判定、`{{page}}` 模板、`,{...}` URL 选项 |
+   | `chapter.py` | 358 | 正文与图片章节、相册翻页 |
+   | `bookshelf.py` | 294 | 书架解析（Cookie 体检用） |
+   | `markers.py` | 236 | 页面判定词表（验证码/5xx/已删除）+ 窗口确认 |
+   | `selectors.py` | 224 | 通用选择器/导航/目录词表 |
+   | `page_kind.py` | 189 | `_is_blocked_page`/`_looks_like_upstream_error` 等判定 |
+   | `images.py` | 149 | 正文图片下载 + 死链缓存 |
+   | `auth.py` / `errors.py` / `common.py` | 36/23/17 | Cookie 与登录；错误分类再导出；规范 logger |
+
+   **`logger` 名字没变**（`common.py` 用字面量 `"app.crawler.plugins.yuedu"`，不是
+   `__name__`），所以日志里的 grep 前缀照旧。`from app.crawler.plugins.yuedu import
+   is_transient_transport_error / has_contextual_block_marker` 仍可用（`__init__` 再导出）。
+
+2. **时区统一**（第 21 节标注的"还有残留"已清完，那行已改）。约定 = `core/clock.py` 的
+   naive 本地墙钟。修了 `cookie_health.py`、`alicesw/login.py`、`ai_diagnosis.py`、
+   `repositories/cookie.py`、`token_service.py`、`routes/source_changes.py`。
+   **两处是隐性崩溃**：`expired_at` 是 naive 列却与 aware UTC 比较 →
+   `TypeError: can't compare offset-naive and offset-aware datetimes`，只在 Cookie 填了
+   过期时间时触发，会让整个 2 点体检崩掉。
+   `repositories/cookie.py::list_active()` 另有真 bug：`Cookie.expired_at is None` 是 Python
+   身份比较（恒 `False`），`False | BinaryExpression` 直接抛 `TypeError` —— 该方法**从未执行成功过**，
+   已成 `.is_(None)`。`account.py` 是 schema 里唯一 aware 列，**保留 aware UTC**。
+
+3. **瞬态错误只有一份清单**：原先插件一份（`plugins/yuedu/errors.py`）、`services/sync.py`
+   一份，**已经漂移** —— `EndOfStream`/`WouldBlock` 在插件里可重试、在任务级却是永久失败，
+   于是这种故障会计入「连续失败」并可能中止整个任务（正是第 13/14/15 节那类误判）。
+   现统一到 `core/transient.py`，两侧共用同一个 `is_transient_transport_error()`。
+   分类**故意仍按 MRO 类名**（不 `isinstance`）：异常来自 httpx/anyio/playwright/httpcore，
+   按类名才与库无关，也才能在 `str(exc)` 为空时仍认出来。
+   **`RequestError` 被显式排除**：`httpx.HTTPStatusError ⊂ httpx.RequestError`，列上它会让
+   **每个** HTTP 状态错误（含 404）都变成"网络抖动"可重试；状态码该由状态码判定。
+
+**验证**：`cd backend && python -m pytest -q` → **746 passed**（基线 708 + 时区 12 + 分类 26），
+49.9s，0 failed。逐阶段验证：Stage A/B 后 720、C 后 720、D/E 后 720、WS2 后 746。
+`test_source_interval.py` 的 3 个失败是**本次重构的合法副作用**（limiter 换模块后
+`monkeypatch.setattr(yuedu_module, "asyncio", fake)` 打空，测试退化成真睡 60s，整轮从 50s 涨到 172s），
+已改成按 `YueduPlugin._sleep_rate_limit.__module__` **动态解析拥有者模块**，以后再搬家不会再脆断。
+**未部署**；线上仍是 2026-09-19 之前那版。
+
+**仍有效/未做**：
+
+- 拆分是**纯搬迁**：`__init__.py` 每个方法体一字未改，`git diff` 为 +102 / −5640（无行尾噪音）。
+  要改行为就改对应模块，别再往 `__init__.py` 里加方法。
+- `rule_engine.py`（1775 行）与 `jsoup_shim.js`（1237 行）**本次未拆**，仍是最大的两个文件；
+  10 个测试里仍有以 `__init__` 模块全局为 patch 目标的写法，动 import 结构前先 grep
+  `monkeypatch.setattr` / `patch(`。
+- `repositories/cookie.py::list_active()` 目前在 `app/` 和 `tests/` 都**没有调用方**。
+- `services/backup.py`、`services/jwt.py`、`core/events.py` 的 UTC 用法是**刻意保留**的
+  （外部文件规范 / RFC 7519 / 不落库的内存排序），见第 32 节的判定口径。
+
 

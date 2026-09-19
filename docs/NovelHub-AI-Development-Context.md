@@ -35,6 +35,13 @@ Scheduler 容器：Celery Beat（定时同步、cookie 健康检查）
 | `frontend/` | 阅读、搜索、管理界面 | 不写业务逻辑 |
 | Storage 抽象 | `save_book/save_chapter/save_cover/read/delete/exists`；当前本地磁盘，未来可接 S3/WebDAV | 业务层不直接 `open()/write()` |
 
+**YueDu 插件已按职责拆分**（2026-09-19，见 [codex-handoff.md](codex-handoff.md) 第 32 节）：
+`plugins/yuedu/__init__.py` 从 5,972 行降到约 434 行，只留插件协议面与共享类级缓存；
+其余方法按 mixin 分到 `transport` / `parsing` / `explore` / `book` / `render` / `urls` /
+`chapter` / `bookshelf` / `page_kind` / `images` / `auth`，词表在 `markers` / `selectors`，
+瞬态错误分类在 **`app/core/transient.py`**（全项目唯一一份），`common.py` 提供规范 `logger`。
+**新方法加到对应模块，不要再堆回 `__init__.py`。**
+
 ## 3. 规则驱动（核心原则）
 
 书源（YueDu / Legado JSON）是唯一入口：**不要为单个网站写死逻辑**，也不要再加“一个网站
