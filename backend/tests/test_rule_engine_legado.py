@@ -1448,3 +1448,94 @@ def test_source_config_keys_do_not_leak_between_evaluations():
         "String(source.loginUrl) + '|' + source.bookSourceUrl;", ""
     ) == "|https://s.test"
 
+
+# ---------------------------------------------------------------------------
+# Referer default for JS-issued requests (docs/js-http-request-side.md §6.1).
+#
+# `Reload()` already built one from the source URL, but the `java.*` path never
+# did: only `java.connect` went through `__nhSourceHeaders`, while `java.get` /
+# `java.post` / `java.ajax` passed the caller's headers straight through.
+#
+# The default now lives in `__nhFinalHeaders`, called at the top of
+# `__nhCurlRaw` -- the single funnel every request uses.  That placement is why
+# the tests are split: the transformation is unit-tested directly, the wiring is
+# proved by stubbing `__nhCurlRaw`, and one structural assertion closes the gap
+# (a stub replaces `__nhCurlRaw`, so it cannot observe that call).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_java_requests_default_the_referer_to_the_source_url():
+    engine = YueduRuleEngine({"bookSourceUrl": "https://s.test"})
+
+    js = (
+        "globalThis.__nhSetSourceConfig({bookSourceUrl: 'https://s.test'});"
+        "JSON.stringify(__nhFinalHeaders({})) + '|' +"
+        # A caller-supplied Referer must win.
+        "JSON.stringify(__nhFinalHeaders({Referer: 'https://other/'})) + '|' +"
+        # Other headers survive untouched.
+        "JSON.stringify(__nhFinalHeaders({'User-Agent': 'UA'}));"
+    )
+
+    assert engine._try_eval_js(js, "") == (
+        '{"Referer":"https://s.test"}'
+        '|{"Referer":"https://other/"}'
+        '|{"User-Agent":"UA","Referer":"https://s.test"}'
+    )
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_no_referer_is_added_when_the_source_url_is_empty():
+    engine = _engine()
+
+    assert engine._try_eval_js(
+        "globalThis.__nhSetSourceConfig({bookSourceUrl: ''});"
+        "JSON.stringify(__nhFinalHeaders({}));",
+        "",
+    ) == "{}"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_every_java_http_entry_point_reaches_curl_raw():
+    """The four entry points all funnel through `__nhCurlRaw`.
+
+    Together with `__nhFinalHeaders` being applied there (asserted structurally
+    below) this is what makes the Referer default reach every path -- the stub
+    itself cannot observe the transformation, because it replaces the function
+    that performs it.
+    """
+    engine = YueduRuleEngine({"bookSourceUrl": "https://s.test"})
+
+    js = (
+        "var __saved = __nhCurlRaw; var __seen = [];"
+        "__nhCurlRaw = function (url, method, body, headers) {"
+        "  __seen.push(method + ' ' + url); return 'STUB';"
+        "};"
+        "try {"
+        "  java.get('https://s.test/a');"
+        "  java.post('https://s.test/b', 'x=1');"
+        "  java.ajax('https://s.test/c');"
+        "  java.connect('https://s.test/d').getBody();"
+        "} finally { __nhCurlRaw = __saved; }"
+        "__seen.join('|');"
+    )
+
+    assert engine._try_eval_js(js, "") == (
+        "GET https://s.test/a|POST https://s.test/b"
+        "|GET https://s.test/c|GET https://s.test/d"
+    )
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_curl_raw_applies_the_default_headers():
+    """Structural check closing the one gap a stub cannot cover.
+
+    If this ever fails, the Referer default silently stops applying to the
+    `java.*` path while every other test still passes.
+    """
+    engine = _engine()
+
+    assert engine._try_eval_js(
+        "String(__nhCurlRaw).indexOf('__nhFinalHeaders(headers)') >= 0;", ""
+    ) is True
+

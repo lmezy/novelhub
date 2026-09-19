@@ -799,8 +799,32 @@ var __nhSourceConfig = {};
 var __nhContent = '';
 var __nhProxy = (typeof process !== 'undefined' && process.env && process.env.DSH_HTTP_PROXY) || '';
 
+// Default headers applied to *every* JS-issued request.
+//
+// `Reload()` already built a Referer from the source URL (Legado does the same),
+// but the `java.*` path never did: `java.get` / `java.post` / `java.ajax` passed
+// the caller's headers straight through, and only `java.connect` used
+// `__nhSourceHeaders`.  Sites that check the referer therefore saw a bare request
+// from any source whose rules fetch through `java.*`.
+//
+// Applied here, at the single funnel every request goes through, rather than at
+// the four call sites.  A caller-supplied Referer always wins.
+function __nhFinalHeaders(headers) {
+  var out = {};
+  if (headers) {
+    for (var k in headers) {
+      if (headers[k] !== undefined && headers[k] !== null) out[k] = headers[k];
+    }
+  }
+  if (!('Referer' in out) && __nhSourceConfig.bookSourceUrl) {
+    out['Referer'] = __nhSourceConfig.bookSourceUrl;
+  }
+  return out;
+}
+
 function __nhCurlRaw(url, method, body, headers, timeoutSec) {
   var execSync = require('child_process').execSync;
+  headers = __nhFinalHeaders(headers);
   var args = [];
   if (__nhProxy) {
     args.push("-x '" + String(__nhProxy).replace(/'/g, "'\\''") + "' -k");
