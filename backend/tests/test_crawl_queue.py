@@ -9,14 +9,16 @@ from sqlalchemy.exc import MissingGreenlet
 
 from app.services.crawl_runner import (
     _next_pending_tasks,
+    _task_slot_budget,
     _worker_loop,
     run_crawl_task_async,
+    task_concurrency_limit,
 )
 from app.core.database import get_db
 from app.main import app
 from app.services.auth import get_current_user
 from app.services.sync import SyncPaused
-from app.core.config import settings
+from app.core.config import db_pool_capacity, settings
 
 
 @pytest.mark.asyncio
@@ -633,3 +635,136 @@ async def test_run_crawl_task_async_survives_expired_orm_state_on_failure():
     # that just started reports its own (empty) progress.
     assert task.result["books_failed"] == 9
     assert task.progress["books_failed"] == 0
+
+
+def test_pool_capacity_tracks_the_configured_pool():
+    """The engine really builds the pool ``db_pool_capacity`` promises.
+
+    Long-lived holders are sized from ``db_pool_capacity``, so if the engine
+    stopped using ``DB_POOL_SIZE``/``DB_MAX_OVERFLOW`` the two would drift apart
+    and the clamp below would be sized against a pool that does not exist.
+    """
+    from app.core import database
+
+    pool = database.engine.pool
+    assert pool.size() + pool._max_overflow == db_pool_capacity()
+    assert pool.size() == int(settings.DB_POOL_SIZE)
+    assert pool._max_overflow == int(settings.DB_MAX_OVERFLOW)
+
+    with patch.object(settings, "DB_POOL_SIZE", 4), patch.object(
+        settings, "DB_MAX_OVERFLOW", 6
+    ):
+        assert database._pool_kwargs() == {"pool_size": 4, "max_overflow": 6}
+        assert db_pool_capacity() == 10
+
+
+def test_pool_capacity_never_reaches_zero():
+    """``0/0`` (or nonsense) must not leave every caller waiting forever."""
+    with patch.object(settings, "DB_POOL_SIZE", 0), patch.object(
+        settings, "DB_MAX_OVERFLOW", 0
+    ):
+        assert db_pool_capacity() == 1
+    with patch.object(settings, "DB_POOL_SIZE", "abc"), patch.object(
+        settings, "DB_MAX_OVERFLOW", None
+    ):
+        assert db_pool_capacity() == 30
+
+
+def test_task_slots_stay_below_the_pool():
+    """Tasks are always fewer than the connections they will each hold.
+
+    Every running task keeps one pooled connection for its whole life, so a task
+    count at or above the pool means the surplus waits ``pool_timeout`` and then
+    fails with "QueuePool limit of size 10 overflow 20 reached" -- which is
+    exactly what happened online on 2026-09-19.
+    """
+    with patch.object(settings, "DB_POOL_SIZE", 10), patch.object(
+        settings, "DB_MAX_OVERFLOW", 20
+    ):
+        assert _task_slot_budget() == 26
+        assert _task_slot_budget() < db_pool_capacity()
+
+    with patch.object(settings, "DB_POOL_SIZE", 3), patch.object(
+        settings, "DB_MAX_OVERFLOW", 3
+    ):
+        assert _task_slot_budget() == 2
+
+    # A pool too small to reserve anything still yields one usable slot.
+    with patch.object(settings, "DB_POOL_SIZE", 1), patch.object(
+        settings, "DB_MAX_OVERFLOW", 0
+    ):
+        assert _task_slot_budget() == 1
+
+
+def test_task_concurrency_limit_cannot_exceed_the_pool():
+    """An operator asking for more tasks than connections must not get them."""
+    with patch.object(settings, "DB_POOL_SIZE", 10), patch.object(
+        settings, "DB_MAX_OVERFLOW", 20
+    ):
+        # Default: "one worker per source", bounded by the pool.
+        with patch.object(settings, "SYNC_WORKER_CONCURRENCY", 0):
+            assert task_concurrency_limit() == 26
+        # A ceiling below the budget is honoured.
+        with patch.object(settings, "SYNC_WORKER_CONCURRENCY", 5):
+            assert task_concurrency_limit() == 5
+        # A ceiling above the budget is clamped down to it.  This is the
+        # regression: it used to return the number asked for (or a flat 32)
+        # regardless of how many connections the pool could actually serve.
+        with patch.object(settings, "SYNC_WORKER_CONCURRENCY", 100):
+            assert task_concurrency_limit() == 26
+
+
+@pytest.mark.asyncio
+async def test_worker_loop_starts_no_more_tasks_than_the_pool_can_serve():
+    """The loop itself must stop at the budget, not at the requested batch.
+
+    Reproduces the online failure shape: many sources pending, a pool that can
+    serve far fewer.  Before the clamp the loop started a flat batch of 32.
+    """
+    pending = [(f"task-{i}", f"src-{i}") for i in range(40)]
+    started: list[str] = []
+    release = asyncio.Event()
+    filled = asyncio.Event()
+
+    async def fake_next(limit, exclude_sources=None):
+        running = {s for _, s in pending if s in (exclude_sources or set())}
+        ready = [pair for pair in pending if pair[1] not in running]
+        return ready[:limit]
+
+    async def fake_run(task_id: str) -> dict:
+        started.append(task_id)
+        if len(started) >= budget:
+            filled.set()
+        await release.wait()
+        return {"status": "completed", "task_id": task_id}
+
+    with patch.object(settings, "DB_POOL_SIZE", 3), patch.object(
+        settings, "DB_MAX_OVERFLOW", 3
+    ), patch.object(settings, "SYNC_WORKER_CONCURRENCY", 0):
+        budget = task_concurrency_limit()
+        assert budget == 2
+        with (
+            patch(
+                "app.services.crawl_runner._next_pending_tasks",
+                side_effect=fake_next,
+            ),
+            patch(
+                "app.services.crawl_runner.run_crawl_task_async",
+                side_effect=fake_run,
+            ),
+        ):
+            worker = asyncio.create_task(_worker_loop())
+            try:
+                await asyncio.wait_for(filled.wait(), timeout=5)
+                # Give the loop room to over-schedule if it is going to.
+                await asyncio.sleep(0.3)
+            finally:
+                release.set()
+                worker.cancel()
+                try:
+                    await worker
+                except asyncio.CancelledError:
+                    pass
+
+    assert len(started) == budget
+

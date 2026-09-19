@@ -1,4 +1,4 @@
-﻿from sqlalchemy.ext.asyncio import (
+from sqlalchemy.ext.asyncio import (
     create_async_engine,
     async_sessionmaker,
     AsyncSession,
@@ -7,16 +7,30 @@ from sqlalchemy.pool import NullPool
 
 from .config import settings
 
+def _pool_kwargs() -> dict:
+    """Pool sizing for ``engine``, taken from the configured connection budget.
+
+    Kept in one place because the budget is also the hard ceiling for anything
+    that holds a connection for a long time (see
+    ``app.services.crawl_runner.task_concurrency_limit``): if the engine stopped
+    honouring these two settings, that ceiling would be sized against a pool the
+    process does not actually have.
+    """
+    return {
+        "pool_size": int(settings.DB_POOL_SIZE),
+        "max_overflow": int(settings.DB_MAX_OVERFLOW),
+    }
+
+
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=False,
     pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=20,
     pool_recycle=3600,
     connect_args={
         "statement_cache_size": 0,
     },
+    **_pool_kwargs(),
 )
 
 SessionLocal = async_sessionmaker(

@@ -14,7 +14,7 @@ from loguru import logger
 from sqlalchemy import select, update
 
 from app.core.clock import naive_now
-from app.core.config import settings, sync_source_concurrency
+from app.core.config import db_pool_capacity, settings, sync_source_concurrency
 from app.core.database import SessionLocal
 from app.models import CrawlTask
 
@@ -501,6 +501,36 @@ def _spawn_auto_diagnosis(task_id: str) -> None:
     task.add_done_callback(_diagnosis_tasks.discard)
 
 
+# Connections held back from the task slots below.  A running task keeps one
+# connection for its whole life, while the queue loop (``_next_pending_tasks``)
+# and the failure writers (``_write_task_row``) need one of their own -- often
+# exactly when every task is failing at once.  Reserving them keeps that
+# simultaneous case from having to wait for a connection that no task will
+# release before the pool times out.
+_TASK_CONNECTION_RESERVE = 4
+
+
+def _task_slot_budget() -> int:
+    """How many crawl tasks this process's connection pool can actually serve."""
+    return max(1, db_pool_capacity() - _TASK_CONNECTION_RESERVE)
+
+
+def task_concurrency_limit() -> int:
+    """Effective ceiling on concurrently running crawl tasks.
+
+    ``SYNC_WORKER_CONCURRENCY`` is the operator's ceiling and ``0`` means "one
+    worker per source".  The pool budget is a *hard* one: every running task
+    holds a pooled connection for the entire full-site sync
+    (``run_crawl_task_async`` opens its session once and keeps it), so a task
+    beyond the pool cannot make progress at all -- it just waits
+    ``pool_timeout`` and then fails with "QueuePool limit of size 10 overflow 20
+    reached".  Whichever ceiling is lower wins.
+    """
+    configured = sync_source_concurrency()
+    budget = _task_slot_budget()
+    return budget if configured <= 0 else min(configured, budget)
+
+
 async def _worker_loop() -> None:
     """Run every book source in its own worker, in parallel.
 
@@ -511,10 +541,12 @@ async def _worker_loop() -> None:
     still sees only the request rate it declared.
 
     ``SYNC_WORKER_CONCURRENCY <= 0`` (the default) therefore means "one worker
-    per source"; a positive value keeps a global ceiling for small hosts.
-    A single source never runs two tasks at once.
+    per source", bounded by the connection budget rather than by a fixed batch
+    size -- see ``task_concurrency_limit``.  A positive value keeps a global
+    ceiling for small hosts, still bounded by that same budget.  A single source
+    never runs two tasks at once.
     """
-    limit = sync_source_concurrency()
+    limit = task_concurrency_limit()
     claimed: set[str] = set()
     active: dict[asyncio.Task, tuple[str, str]] = {}
     running_sources: set[str] = set()
@@ -531,20 +563,19 @@ async def _worker_loop() -> None:
             _spawn_auto_diagnosis(task_id)
 
     def _free_slots() -> int:
-        if limit <= 0:
-            # Bounded batch: enough to fill every empty slot without loading an
-            # unbounded pending backlog into memory.
-            return 32
+        # Bounded batch: enough to fill every free slot without loading an
+        # unbounded pending backlog into memory.  Never more than the pool can
+        # serve, so the loop can only start tasks that can get a connection.
         return max(1, limit - len(active))
 
     while True:
-        while limit <= 0 or len(active) < limit:
+        while len(active) < limit:
             candidates = await _next_pending_tasks(_free_slots(), running_sources)
             if not candidates:
                 break
             started_any = False
             for task_id, source in candidates:
-                if limit > 0 and len(active) >= limit:
+                if len(active) >= limit:
                     break
                 if task_id in claimed or source in running_sources:
                     continue

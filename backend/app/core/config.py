@@ -17,6 +17,17 @@ class Settings(BaseSettings):
     DATABASE_URL:str
 
 
+    # Connections this process's SQLAlchemy pool may open: ``pool_size`` are kept
+    # open, ``max_overflow`` further ones are opened on demand and closed again.
+    # Every process owns its own pool (each uvicorn worker, the queue worker and
+    # each celery worker), so the sum across the stack has to stay under the
+    # database's ``max_connections``.  The defaults keep the historical
+    # hard-coded 10 + 20; lower them per service when the stack shares a small
+    # database.
+    DB_POOL_SIZE:int=10
+    DB_MAX_OVERFLOW:int=20
+
+
 
     REDIS_HOST:str="redis"
 
@@ -78,6 +89,25 @@ class Settings(BaseSettings):
 
 
 settings=Settings()
+
+def db_pool_capacity() -> int:
+    """Connections this process's pool can serve at the same time.
+
+    The upper bound of one SQLAlchemy pool, and therefore the hard ceiling on
+    anything that holds a connection for a long time (see
+    ``crawl_runner.task_concurrency_limit``).  Never below 1, so a mistyped
+    ``0/0`` cannot make every caller wait for a connection that can never exist.
+    """
+    try:
+        size = int(settings.DB_POOL_SIZE)
+    except (TypeError, ValueError):
+        size = 10
+    try:
+        overflow = int(settings.DB_MAX_OVERFLOW)
+    except (TypeError, ValueError):
+        overflow = 20
+    return max(1, size + overflow)
+
 
 def sync_thread_count() -> int:
     """Effective concurrent thread pool size, capped like Legado's MAX_THREAD."""
