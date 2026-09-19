@@ -66,7 +66,8 @@
 | **D-03** JSONPath 列表结果写成 Python repr | ✅ 顺带修复 | `7e17f78` | 同上；`$.tags` 由 `['p', 'q']` 变为按行 `p\nq` |
 | **C-22/C-23 第一批 6 个**（`md5Encode16`/`digestHex`/`digestBase64Str`/`HMacHex`/`HMacBase64`/`htmlFormat`） | ✅ 已补 | `8437b31` | 6 条新测试用**已发布标准向量**（RFC 1321 / FIPS 180-4 / RFC 4231）；撤掉改动 6 条全失败；760 → 766 |
 | M-7 / M-8 / M-9 / M-10、D-13、D-14 | ⏳ **待裁决**（可能是有意偏差，改了可能是倒退） | — | — |
-| C-23 对称加密族（`createSymmetricCrypto` + AES/DES/3DES 共 20 个） | ⏳ 待补 | — | 规范已读到 `help/crypto/SymmetricCryptoAndroid.kt`：输入解码是「像 hex 就 hex，否则 Base64」。**残留不确定**：key 长度归一化在 hutool 基类里，源码不在本仓库，需以 NIST 向量验证密文本身、并标注该点无法从仓库核实 |
+| **C-23 对称加密族**（`createSymmetricCrypto` + AES 10 / DES 4 / 3DES 4 = 19 个） | ✅ 已补 | `d8ef160` | 密文用 **FIPS-197 / NIST SP 800-38A** 向量验证（AES-128-ECB `69c4e0d8…c55a` 精确匹配）+ PKCS5/CBC/3DES 往返 + hex/Base64 自动判别；撤掉改动 7 条全失败；766 → 773 |
+| C-23 非对称加密与签名（`createAsymmetricCrypto`、`createSign`） | ⏳ 待补 | — | 需 RSA；Node 有 `crypto` 支持，但 hutool 的 AsymmetricCrypto/Sign 封装语义需先读 `help/crypto/AsymmetricCrypto.kt`（86 行）与 `Sign.kt`（26 行） |
 | C-22 其余（`timeFormat`/`timeFormatUTC`/`toURL`/`toNumChapter`/`strToBytes`/`bytesToStr`/base64·hex 字节数组变体） | ⏳ 待补 | — | `timeFormatUTC` 的 `SimpleTimeZone(sh)` 单位可疑（`sh` 按 JDK 是毫秒，但书源多半当小时传），需先找到真实调用例再定 |
 | C-22 中 `t2s`/`s2t` | ❌ 不实现 | — | 依赖第三方 JVM 词典，见第 6 节更正 |
 | C-18/C-19/C-20 请求侧（书源 `header` / 已导入 Cookie / 限速进 JS HTTP） | ⏳ 待补（改动现有行为，风险较高） | — | — |
@@ -337,6 +338,13 @@
 >
 > 附录 C 的 F 节把 `t2s`/`s2t` 列在"可实现但未实现"里 —— 附录按"逐字未改"原则保留原样，
 > **以本节为准**。
+
+> **运行时限制补充（2026-09-19，补 C-23 时发现）**：**单 DES（`DES/ECB/…`、`DES/CBC/…`）
+> 在 Node 17+ 上不可用** —— OpenSSL 3 把单 DES 移进了 legacy provider，
+> `des-ecb`/`des-cbc` 根本不在 `crypto.getCiphers()` 里，调用即 `ERR_OSSL_EVP_UNSUPPORTED`。
+> 这与 Android 无关，是运行时的限制。实现选择**报出带原因的清晰错误**（而非静默返回 `null`），
+> 让书源自身的 `try/catch` 与爬虫日志都能看到原因。**3DES 不受影响**（`des-ede3-*` 存在）。
+> 另外 `createSymmetricCrypto` 是**惰性**的：只在真正加解密时才建 cipher，构造对象本身不报错。
 
 **缺失名称全表（69）**
 
