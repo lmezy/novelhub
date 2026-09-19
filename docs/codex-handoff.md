@@ -1155,5 +1155,49 @@ JS 上下文 `source.*` 身份键（`13542b2`）、`java.*` 请求的 Referer �
 **下一步**：`createSign`（已确认可做，顺带能覆盖 EC/DSA），以及第 33 节清单里剩下的
 D（三处变量存储收敛）。本轮**未部署、未推送**。
 
+## 36. 2026-09-19：`java.createSign`（C-23 签名）—— C-23 收口
+
+接着第 35 节把签名的另一半也做了（`ad166b1`），依据同样是 hutool 5.8.22 原文：
+
+* `SecureUtil.createSignature` 把算法名**原样**交给 `Signature.getInstance`，
+  所以 JCE 的 `<摘要>with<RSA|ECDSA|DSA>` 就是规范，而且**大小写不敏感**。
+* `SignAlgorithm` 的 17 个常量里，那三个 PSS 用的是 `SHA256WithRSA/PSS` 这种写法
+  （大写 `W` 加斜杠），枚举自己的注释写着 `// 需要BC库加入支持`。**Legado 未打包
+  BouncyCastle，所以这三个名字在 Legado 里也抛 `NoSuchAlgorithmException`** ——
+  本实现同样在构造时报错，是对齐而非缩水。这一点很值得记住：
+  "我们不支持" 和 "Legado 也不支持" 是两件事，能查清就必须查清。
+* `Sign.init` 先建 `Signature` 再 `super.init()`，后者无密钥时生成密钥对；
+  DSA 在 L=1024 时 N 被标准固定为 160（不是猜的），EC 取 256 位曲线
+  （Legado 无密钥时生成的密钥对没人能验，选哪条 256 位曲线不可观测）。
+
+**实现**：RSA / ECDSA / DSA × MD5..SHA-512（含 SHA-512/224、SHA-3、RIPEMD160），
+`sign` / `signHex` / `verify`，密钥仍是 PKCS#8 / SPKI DER，并与
+`createAsymmetricCrypto` **共用密钥解析与类型校验**（所以 EC 钥匙丢给
+`SHA256withRSA` 会像 Legado 一样被拒）。明确不支持且构造时报错：`NONEwithRSA`、
+`MD2withRSA`、三个 PSS 名与 JDK 别名 `SHA256withRSAandMGF1`、`Ed25519`。
+
+**一处已知差异**：`verify` 对长度错误的签名返回 `false`，Java 的 SunJCE 会抛
+`SignatureException`。`verify` 不是 `JsHelp.md` 文档化的书源接口，取"验不过"
+更安全，已注明。
+
+**验证**（834 → 839 passed）：RSASSA-PKCS1-v1_5 是**确定性**的，所以签名结果与
+pyca/cryptography **逐字节相等**（SHA-256 / SHA-1 / MD5）；ECDSA / DSA 随机，
+验的是"pyca 的签名能验过、换消息的验不过、自签自验能过"；
+Wycheproof `rsa_signature_2048_sha256_test.json` 的**已发布**向量与
+`InvalidSignature` 向量分别验过/验不过。
+
+变异测试 **11/11 被杀**，但其中「去掉 PSS 专用分支」**第一次活了下来**：
+断言只查消息里有没有 `RSAandMGF1`，而通用错误消息会**回显算法名**，原串
+`SHA256withRSAandMGF1` 里就含这个子串。改成只有该分支才产出的措辞
+（`PSS 签名`）之后才被杀。
+
+**这是本轮第二次被变异测试抓到"断言因为错误的原因通过"**（第一次是第 35 节
+的 OAEP 那条）。规律很清楚：**凡是断言"错误消息里包含某个词"，只要那个词
+会出现在回显的输入里，断言就是假的。** 断言必须挑只有目标分支才会产出的措辞。
+
+**C-23 至此收口**：对称加密族、非对称加密、签名三块都补完并各自有独立来源的
+向量验证。剩下的是第 33 节清单里的 D（三处变量存储收敛）。**未部署、未推送。**
+
+
 
 

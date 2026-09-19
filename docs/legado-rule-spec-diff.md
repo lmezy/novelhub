@@ -70,7 +70,7 @@ M-7（`@text` 换行）**有意保留**，已在代码与测试里注明。细�
 | **C-23 对称加密族**（`createSymmetricCrypto` + AES 10 / DES 4 / 3DES 4 = 19 个） | ✅ 已补 | `d8ef160` | 密文用 **FIPS-197 / NIST SP 800-38A** 向量验证（AES-128-ECB `69c4e0d8…c55a` 精确匹配）+ PKCS5/CBC/3DES 往返 + hex/Base64 自动判别；撤掉改动 7 条全失败；766 → 773 |
 | **C-22 第二批 8 个**（`strToBytes`/`bytesToStr`/`base64DecodeToByteArray`/`hexDecodeToByteArray`/`hexEncodeToString`/`randomUUID`/`toURL` ×2） | ✅ 已补 | `203c98f` | 8 条新测试；撤掉改动 8 条全失败；773 → 781。`toURL` 复现了 `java.net.URL` 的两处 WHATWG 差异（显式默认端口、`+`→空格） |
 | **C-23 非对称加密**（`createAsymmetricCrypto`，RSA 族） | ✅ 已补 | `0a4089a` | 13 条新测试；Wycheproof `rsa_pkcs1_2048_test.json` 全量 **67/67 一致**；13 处变异 **13/13 被杀**；821 → 834。原文对照与四处「照直觉写就会错」见下节 |
-| C-23 `createSign` | ⏳ **上一版判定有误**：实为可实现 | — | 上一版说「方法名来自 hutool，源码不在仓库」，但 hutool 是公开依赖（`libs.versions.toml:40` 已钉 `hutool = "5.8.22"`），`Sign.java` 可取原文。方法面就是 `sign`/`signHex`/`verify` 加 Legado 自己的四个 `setXxxKey`。本次未做，理由见该节末 |
+| **C-23 签名**（`createSign`，RSA / ECDSA / DSA） | ✅ 已补 | `ad166b1` | 5 条新测试；RSA PKCS#1 v1.5 与 **pyca/cryptography 逐字节相等**（确定性）；Wycheproof `rsa_signature_2048_sha256_test.json` 已发布向量验过、`InvalidSignature` 验不过；11 处变异 **11/11 被杀**；834 → 839。原文核实与「不支持清单」见下节末 |
 | **C-22 第三批**（`toNumChapter` + `fullToHalf`/`chineseNumToInt`/`stringToInt`） | ✅ 已补 | `bfabd75` | 6 条新测试；撤掉改动 6 条全失败；781 → 787。复刻了 Kotlin Int 整除、`Integer.parseInt` 严格性；**未复刻**其不可达的"一零二五"分支（守卫条件自相矛盾，属死代码） |
 | **C-22 第四批**（`timeFormat`、`timeFormatUTC`） | ✅ 已补 | `6dc568a` | 5 条新测试；撤掉改动 5 条全失败；787 → 792。`dateFormat` 是固定模式 `yyyy/MM/dd HH:mm`；`sh` 按 `SimpleTimeZone` 语义为**毫秒**（已钉住）；依赖区域设置的 `MMM`/`E` 抛可读错误而非静默输出数字 |
 | C-22 中 `t2s`/`s2t` | ❌ 不实现 | — | 依赖第三方 JVM 词典，见第 6 节更正 |
@@ -143,13 +143,45 @@ pyca/cryptography、**纯 Python `pow()`**（NoPadding 与全部手工构造的�
 完全不经过 OpenSSL）、以及 hutool 原文。13 处变异逐一施加，**13/13 被杀**
 （其中一次变异还暴露出 OAEP 那条断言写得太松、被"错的原因"通过，已收紧）。
 
-**`createSign`：上一版的「做不到」同样要更正。** hutool `Sign.java` 是公开源码，
-方法面是继承来的 `sign(byte[])` / `sign(String)` / `signHex(...)` / `verify(byte[], byte[])`
-加上 Legado 自己的四个 `setXxxKey` 重载；算法名是 JCE 的 `<摘要>with<RSA|ECDSA|DSA>`，
-Node 的 `crypto.createSign(<digest>)` 会按密钥类型自动选签名方案（RSA 默认 PKCS#1 v1.5、
-ECDSA 输出 ASN.1 DER，都与 JCE 一致）—— **可做**，还能顺带覆盖 EC/DSA。
-本次不做，是为了把非对称加密本身做扎实（补码语义是这里风险最高的一环），
-留作独立的一步。
+### C-23 签名（`createSign`，`ad166b1`）
+
+同一个更正：上一版说「方法名来自 hutool，源码不在仓库」——hutool 是公开依赖。
+取原文后确认：
+
+| 行为 | 原文 | 含义 |
+|---|---|---|
+| 算法名（`SecureUtil.createSignature`） | `Signature.getInstance(algorithm)`，**原样透传** | JCE 的 `<摘要>with<RSA\|ECDSA\|DSA>` 就是规范，且**大小写不敏感** |
+| 可用的名字（`SignAlgorithm`） | 17 个常量，值就是 JCE 名 | 除 14 个 `<摘要>with<算法>` 外，还有 `SHA256WithRSA/PSS`、`SHA384WithRSA/PSS`、`SHA512WithRSA/PSS` |
+| PSS | 枚举注释：`// 需要BC库加入支持` | **Legado 未打包 BC，所以这三个名字在 Legado 里也是抛 `NoSuchAlgorithmException`** —— 本实现同样在构造时报错，不是缩水 |
+| 构造顺序（`Sign.init`） | `signature = SecureUtil.createSignature(algorithm)` **先**，`super.init()` 后 | 算法名非法 → 构造即失败；随后无密钥则 `initKeys()` 生成密钥对 |
+| 密钥生成（`KeyUtil.generateKeyPair`） | `DEFAULT_KEY_SIZE = 1024`；EC 键长 >256 时压到 256 | DSA 在 L=1024 时 N 由标准固定为 160，不是猜的 |
+| 方法面 | `sign(byte[])`、`sign(String)`（UTF-8）、`signHex(...)`、`verify(byte[], byte[])` | `JsHelp.md` 只文档化了 `sign`/`signHex`；`verify` 是 hutool 自己的方法 |
+
+**已实现**：RSA / ECDSA / DSA ×（MD5、SHA-1、SHA-224/256/384/512、SHA-512/224、
+SHA-512/256、SHA3-224/256/384/512、RIPEMD160）；`sign` / `signHex` / `verify`；
+`setPrivateKey` / `setPublicKey`（PKCS#8 / SPKI DER，与 `createAsymmetricCrypto`
+共用解析与**密钥类型校验**，所以 EC 钥匙丢给 `SHA256withRSA` 会像 Legado 一样被拒）。
+
+**明确不支持，且在构造时报错**：`NONEwithRSA`（无摘要）、`MD2withRSA`（OpenSSL 3
+没有 md2）、上面三个 PSS 名字与 JDK 的别名 `SHA256withRSAandMGF1`（盐长度与 MGF1
+由 JCE 自定，hutool 也没钉住，无法保证字节一致）、`Ed25519`（无摘要，Node 需要
+一次性 `crypto.sign(null, …)` 而不是 `createSign`）。
+
+**一处已知差异**：`verify` 对**长度错误**的签名返回 `false`，而 Java 的 SunJCE
+会抛 `SignatureException`。`verify` 是 hutool 的方法而非书源文档化的接口，取
+"验不过" 这个答案更安全，已在代码注释与测试里注明。
+
+**验证**：5 条新测试。
+* RSASSA-PKCS1-v1_5 **是确定性的**，所以签名结果与 **pyca/cryptography 逐字节相等**
+  （SHA-256 / SHA-1 / MD5 三个摘要各一条，外加大小写不敏感与 `sign(String)` 的 UTF-8 语义）。
+* ECDSA 与 DSA 是随机的，因此验的是「pyca 生成的签名能验过 / 换一条消息的签名验不过 /
+  自己签的能自己验过」。
+* Wycheproof `rsa_signature_2048_sha256_test.json`（**已发布**）：valid 向量验过，
+  `InvalidSignature` 向量、被改掉一个 nibble 的签名、以及短签名都验不过。
+* 11 处变异逐一施加，**11/11 被杀**。其中「去掉 PSS 专用分支」**第一次存活**——
+  因为断言只查消息里有没有 `RSAandMGF1`，而通用错误消息会回显算法名，
+  原串里就含这个子串；改用只有该分支才产出的措辞（`PSS 签名`）之后才被杀。
+  这是本轮第二次被变异测试抓到「断言因为错误的原因通过」。
 
 ### 附：实测复核记录（真实引擎，非静态阅读）
 
