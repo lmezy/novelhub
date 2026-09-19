@@ -1120,3 +1120,90 @@ def test_an_unsupported_charset_raises_a_readable_error():
 
     assert value != "no-error"
     assert "iconv" in value
+
+
+# ---------------------------------------------------------------------------
+# `java.toNumChapter` (JsExtensions.kt:916-924) -- normalises 「第N章」.
+#
+# The expected values come from reading Legado's code, not from this
+# implementation: `stringToInt` = `fullToHalf` → strip whitespace →
+# `Integer.parseInt` → else `chineseNumToInt`, and the result is rebuilt from the
+# three capture groups of `(第)(.+?)(章)`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_to_num_chapter_normalises_arabic_and_chinese_numerals():
+    engine = _engine()
+
+    js = (
+        "java.toNumChapter('第一章') + '|' +"
+        "java.toNumChapter('第十二章') + '|' +"
+        "java.toNumChapter('第 7 章') + '|' +"
+        "java.toNumChapter('第十章') + '|' +"
+        "java.toNumChapter('第两章');"
+    )
+
+    assert engine._try_eval_js(js, "") == "第1章|第12章|第7章|第10章|第2章"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_to_num_chapter_converts_full_width_digits():
+    """`fullToHalf` maps ！..～ (U+FF01..U+FF5E) down by 65248."""
+    engine = _engine()
+
+    assert engine._try_eval_js(
+        "java.toNumChapter('第１２３章');", ""
+    ) == "第123章"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_to_num_chapter_uses_kotlin_integer_division():
+    """「一千二」 is 1200: `tmpNum * prev / 10` truncates in Kotlin."""
+    engine = _engine()
+
+    assert engine._try_eval_js(
+        "java.toNumChapter('第一千二章') + '|' +"
+        "java.toNumChapter('第一千零二十五章');",
+        "",
+    ) == "第1200章|第1025章"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_to_num_chapter_returns_input_when_the_pattern_does_not_match():
+    engine = _engine()
+
+    assert engine._try_eval_js(
+        "java.toNumChapter('没有数字') + '|' +"
+        "String(java.toNumChapter(null));",
+        "",
+    ) == "没有数字|null"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_to_num_chapter_drops_text_outside_the_match():
+    """Legado quirk, pinned: only the three groups are kept.
+
+    ``(第)(.+?)(章)`` matches the first 「第…章」 and the result is rebuilt from
+    the groups, so everything else in the string is discarded --
+    ``第1章和第2章`` becomes ``第1章``.
+    """
+    engine = _engine()
+
+    assert engine._try_eval_js(
+        "java.toNumChapter('第1章和第2章');", ""
+    ) == "第1章"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_to_num_chapter_yields_minus_one_for_an_unmapped_character():
+    """`chineseNumToInt` returns -1 when `ChnMap` has no entry, so 「第X章」 -> 第-1章.
+
+    Faithful to Legado (`runCatching { … }.getOrDefault(-1)`), and the reason a
+    caller should not treat the output as always numeric.
+    """
+    engine = _engine()
+
+    assert engine._try_eval_js(
+        "java.toNumChapter('第X章');", ""
+    ) == "第-1章"

@@ -1327,6 +1327,102 @@ function __nhJsURL(url, baseUrl) {
   };
 }
 
+// ---- Legado chapter-number helpers (utils/StringUtils.kt, JsExtensions.kt:916) ----
+
+/** `StringUtils.fullToHalf`: full-width space and ！..～ become half-width. */
+function __nhFullToHalf(input) {
+  var s = String(input === undefined || input === null ? '' : input);
+  var out = '';
+  for (var i = 0; i < s.length; i++) {
+    var code = s.charCodeAt(i);
+    if (code === 12288) out += ' ';
+    else if (code >= 65281 && code <= 65374) out += String.fromCharCode(code - 65248);
+    else out += s[i];
+  }
+  return out;
+}
+
+/** `StringUtils.chnMap`: two numeral sets plus the 两/百/千/万/亿 multipliers. */
+var __nhChnMap = (function () {
+  var map = {};
+  var lower = '零一二三四五六七八九十';
+  var upper = '〇壹贰叁肆伍陆柒捌玖拾';
+  for (var i = 0; i <= 10; i++) {
+    map[lower[i]] = i;
+    map[upper[i]] = i;
+  }
+  map['两'] = 2;
+  map['百'] = 100;
+  map['佰'] = 100;
+  map['千'] = 1000;
+  map['仟'] = 1000;
+  map['万'] = 10000;
+  map['亿'] = 100000000;
+  return map;
+})();
+
+/**
+ * `StringUtils.chineseNumToInt`.
+ *
+ * Legado's first branch -- the "一零二五" digit-by-digit form -- is **dead
+ * code**: its guard is `cn.size > 1 && chNum.matches("^[单字符]$")`, which can
+ * never hold, because that regex only matches a one-character string.  It is
+ * therefore not ported; the loop below already yields 1025 for that input, so
+ * behaviour is unchanged.
+ *
+ * Returns -1 for an unmapped character, mirroring Legado's
+ * `runCatching { … }.getOrDefault(-1)` -- there `ChnMap[c]!!` throws on the
+ * unknown char.
+ */
+function __nhChineseNumToInt(chNum) {
+  var cn = String(chNum).split('');
+  var result = 0, tmp = 0, billion = 0;
+  try {
+    for (var i = 0; i < cn.length; i++) {
+      var cur = __nhChnMap[cn[i]];
+      if (cur === undefined) throw new Error('unmapped char: ' + cn[i]);
+      if (cur === 100000000) {
+        result += tmp;
+        result *= cur;
+        billion = billion * 100000000 + result;
+        result = 0;
+        tmp = 0;
+      } else if (cur === 10000) {
+        result += tmp;
+        result *= cur;
+        tmp = 0;
+      } else if (cur >= 10) {
+        if (tmp === 0) tmp = 1;
+        result += cur * tmp;
+        tmp = 0;
+      } else {
+        var prev = i >= 1 ? __nhChnMap[cn[i - 1]] : undefined;
+        // Kotlin's Int division truncates, so 一千二 -> 1200 needs a floor here.
+        tmp = (i >= 2 && i === cn.length - 1 && prev > 10)
+          ? Math.floor(cur * prev / 10)
+          : tmp * 10 + cur;
+      }
+    }
+    result += tmp + billion;
+    return result;
+  } catch (e) {
+    return -1;
+  }
+}
+
+/** `StringUtils.stringToInt`. */
+function __nhStringToInt(str) {
+  if (str === null || str === undefined) return -1;
+  var num = __nhFullToHalf(str).replace(/\s+/g, '');
+  // Java's Integer.parseInt is strict -- it rejects "12abc", which JS parseInt
+  // would cheerfully read as 12.
+  if (/^[+-]?\d+$/.test(num)) {
+    var parsed = parseInt(num, 10);
+    return isNaN(parsed) ? -1 : parsed;
+  }
+  return __nhChineseNumToInt(num);
+}
+
 var java = {
   // ---- HTTP: Legado java.get / java.post return a Response object ----
   get: function (url, headers) {
@@ -1434,6 +1530,15 @@ var java = {
     return require('crypto').randomUUID();
   },
   toURL: function (url, baseUrl) { return __nhJsURL(url, baseUrl); },
+  toNumChapter: function (s) {
+    // JsExtensions.kt:916-924 -- `titleNumPattern` is `(第)(.+?)(章)`; when it
+    // does not match, the input is returned unchanged.
+    if (s === null || s === undefined) return null;
+    var str = String(s);
+    var m = /第(.+?)章/.exec(str);
+    if (!m) return str;
+    return '第' + __nhStringToInt(m[1]) + '章';
+  },
   md5Encode: function (s) { return __nhMd5(s); },
   md5: function (s) { return __nhMd5(s); },
   encodeURI: function (s) { return encodeURIComponent(String(s)); },
