@@ -109,17 +109,22 @@ Node 侧 shim 的 `curl`（`jsoup_shim.js` 的 `__nhCurlRaw`），而 shim 手�
 
 ## 6. 实施第 1 级时新发现的两处问题（留给第 2 级）
 
-### 6.1 `java.*` 的 HTTP 路径**根本不设 Referer**
+### 6.1 `java.*` 的 HTTP 路径**根本不设 Referer** —— ✅ 已补（`a75158e`）
 
 第 1 级原以为"注入 `bookSourceUrl` 就顺带修好了 JS 请求的 Referer"。实测否定了这个判断：
 
-- `jsoup_shim.js:1892` 的 `if (__nhSourceConfig.bookSourceUrl) headers['Referer'] = …`
-  位于 **`Reload(url)`**（L1888-1895，Legado 的全局函数，UAA 类书源用）里；
-- `java.ajax` / `java.connect` / `java.get` / `java.post` / `java.head` 这些路径
-  **完全没有 Referer 逻辑**。
+- `jsoup_shim.js` 的 `if (__nhSourceConfig.bookSourceUrl) headers['Referer'] = …`
+  位于 **`Reload(url)`**（Legado 的全局函数，UAA 类书源用）里；
+- `java.ajax` / `java.connect` / `java.get` / `java.post` 这些路径
+  **完全没有 Referer 逻辑** —— 只有 `java.connect` 走 `__nhSourceHeaders`，
+  其余把调用方 headers 原样透传。
 
-所以第 1 级只让 `Reload()` 的 Referer 生效。给 `java.*` 补 Referer 属于第 2 级
-（与补 `header` 是同一处改动，一起做更自然）。
+**已修**：新增 `__nhFinalHeaders`，在 `__nhCurlRaw` 顶部调用 ——
+那是**所有 JS 请求的唯一入口**，比在四个调用点各加一遍更不易漏。
+调用方自己传的 Referer 优先。
+
+**仍未做**：`header` 注入本身（第 2 级的另一半）。它会让 JS 请求的 UA/Referer
+全面改变，收益明确但影响面大，单独一批提交以便回滚。
 
 ### 6.2 source config 会**跨求值泄漏**（与第 9 节的"上下文串味"同型）—— ✅ 已修（`a4be164`）
 
