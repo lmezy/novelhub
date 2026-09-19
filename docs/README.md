@@ -9,6 +9,7 @@
 |---|---|
 | [NovelHub-AI-Development-Context.md](NovelHub-AI-Development-Context.md) | 项目定位、模块职责、规则驱动原则、改动红线 |
 | [legado-rule-spec-diff.md](legado-rule-spec-diff.md) | **书源规则引擎 vs Legado 权威实现的差异表**（改规则引擎前先查这里；含 API 缺口与有意偏差的区分） |
+| [js-http-request-side.md](js-http-request-side.md) | **方案（未实现）**：让 JS 发起的请求带上书源 `header` / 已导入 Cookie / 限速——改动点、分级风险与决策点 |
 | [../README.md](../README.md) | 安装、启动、书源导入、书架、本地导入、阅读器 |
 | [../yuedu/README.md](../yuedu/README.md) | 开源阅读（Legado）源码说明与书源规则格式参考 |
 
