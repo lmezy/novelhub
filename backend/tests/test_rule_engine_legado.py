@@ -1539,3 +1539,83 @@ def test_curl_raw_applies_the_default_headers():
         "String(__nhCurlRaw).indexOf('__nhFinalHeaders(headers)') >= 0;", ""
     ) is True
 
+
+# ===========================================================================
+# CHARACTERISATION TESTS -- these assert CURRENT behaviour, not the spec.
+#
+# Each of these pins a place where NovelHub deliberately-or-accidentally differs
+# from Legado and the difference has NOT been adjudicated yet
+# (docs/legado-rule-spec-diff.md section 1; "待裁决" rows of the progress table).
+#
+# They exist so the behaviour cannot change silently: whoever edits one of these
+# code paths gets a failing test whose docstring says what Legado does instead,
+# and has to decide consciously.  Do NOT "fix" a test here to match a code change
+# before reading the docstring -- and when the decision is made, update the
+# docstring to record which way it went.
+# ===========================================================================
+
+
+def test_characterisation_text_joins_with_newlines_not_spaces():
+    """M-7：`@text` 用 `\\n` 连接，Legado（jsoup `Element.text()`）用空格。
+
+    当前 `'a\\nb'` vs Legado `'a b'`。
+    **建议保留 NovelHub 的行为**（`\\n` 对正文/简介更有用），只补一条注释说明是有意偏差；
+    若决定对齐 Legado，请同时改这条测试。
+    """
+    engine = _engine()
+
+    assert engine._eval_css("<div>a<br>b</div>", "div@text") == "a\nb"
+
+
+def test_characterisation_html_returns_inner_not_outer_html():
+    """M-8：`@html` 返回**内层** HTML，Legado 返回 `outerHtml()`（含元素自身标签）。
+
+    当前 `'hi'` vs Legado `'<div class="x">hi</div>'`。
+    旁证 `@all` 用的是外层 `str(el)` 且与 Legado 一致 —— 说明"删不删 script/style"对齐了，
+    只有"内层/外层"没对齐。**倾向对齐 Legado**，但需先确认没有书源依赖内层行为。
+    """
+    engine = _engine()
+
+    assert engine._eval_css("<div class='x'>hi</div>", ".x@html") == "hi"
+
+
+def test_characterisation_owntext_is_identical_to_textnodes():
+    """M-9：`@ownText` 与 `@textNodes` 被实现成完全相同（都 `\\n` 连接）。
+
+    Legado 的 `ownText` 是 jsoup 规范化后**空格**连接（`'a b'`），
+    `textNodes` 才是 `\\n` 连接（`'a\\nb'`）—— 后者 NovelHub **是对的**。
+    只有 `ownText` 不一致，看起来是抄漏而非有意设计，**建议改**。
+    """
+    engine = _engine()
+
+    assert engine._eval_css("<div>a<br>b</div>", "div@ownText") == "a\nb"
+    assert engine._eval_css("<div>a<br>b</div>", "div@textNodes") == "a\nb"
+
+
+def test_characterisation_dedupe_swallows_duplicate_text():
+    """M-10：去重施加在**集合层面、对所有取值模式生效**；Legado 只对属性分支去重。
+
+    两个内容相同的 `<span>` + `span@text` 当前只返回 1 条 `'same'`，Legado 返回 2 条。
+    **会静默吞掉合法重复内容**（列表页同名项、正文重复段落），比多一条更难排查。
+    **建议对齐 Legado**。注意本条最初被误判为"缺少去重"，实测证明是写反了。
+    """
+    engine = _engine()
+
+    assert engine._eval_css(
+        "<div><span>same</span><span>same</span></div>", "span@text"
+    ) == "same"
+
+
+def test_characterisation_multivalued_attribute_yields_nothing():
+    """D-13：多值属性（`class="body strikeout"`）使**整条字段为空**。
+
+    bs4 对多值属性返回 list，取值处抛 `TypeError` 被吞 → 当前 `None`；
+    Legado 的 `attr()` 返回 `'body strikeout'`。
+    这是**明确的 bug**（不是取舍），**建议对齐 Legado**。
+    """
+    engine = _engine()
+
+    assert engine._eval_css(
+        '<div class="body strikeout">x</div>', ".body@class"
+    ) is None
+
