@@ -16,6 +16,7 @@ docs
 storage
 .codex
 .agents
+.commandcode
 .gitignore
 *.md
 !Dockerfile*
