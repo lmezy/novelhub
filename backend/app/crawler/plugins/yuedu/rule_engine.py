@@ -295,6 +295,57 @@ class _RuleAnalyzer:
         st_buf.append(q[self._start_x:])
         return "".join(st_buf)
 
+    def inner_rule_braced(
+        self,
+        inner: str,
+        fn: Callable[[str], str | None],
+    ) -> str:
+        """Port of Legado's ``innerRule(inner, startStep=1, endStep=1, fr)``.
+
+        Legado has **two** ``innerRule`` overloads and they differ in the no-match
+        case, so picking the wrong one changes behaviour:
+
+        * this one (``RuleAnalyzer.kt:308-332``) finds every ``inner`` prefix whose
+          ``{...}`` group is balanced in the *code* sense, calls ``fn`` on the text
+          between the braces, and returns **""** when nothing was substituted;
+        * ``inner_rule`` above (``:339-365``) returns the *original* string instead.
+
+        ``AnalyzeByJSonPath.getString`` calls this one with ``"{$."`` and relies on
+        the empty result to decide whether to fall back to reading the whole rule
+        as JSONPath (``AnalyzeByJSonPath.kt:41-48``).
+        """
+        q = self._queue
+        pos = self._pos
+        start_x = self._start_x
+        parts: list[str] = []
+        il = len(inner)
+
+        while True:
+            idx = q.find(inner, pos)
+            if idx == -1:
+                break
+            before = idx  # the ``{`` that opens the group
+            self._pos = before
+            if not self._chomp_code_balanced("{", "}"):
+                # Not a balanced group: ``inner`` was ordinary text here, so keep
+                # looking past it (Legado does ``pos += inner.length``).
+                pos = before + il
+                continue
+            inner_text = q[before + 1: self._pos - 1]
+            result = fn(inner_text)
+            if result:
+                parts.append(q[start_x:before])
+                parts.append(result)
+                start_x = self._pos
+                self._start_x = start_x
+            pos = self._pos
+
+        if start_x == 0:
+            return ""
+        parts.append(q[self._start_x:])
+        return "".join(parts)
+
+
 class YueduRuleEngine:
     """Evaluates YueDu book source rules against HTML or JSON responses."""
 
@@ -1331,8 +1382,7 @@ class YueduRuleEngine:
             rl = rl.strip()
             if not rl:
                 continue
-            val = self._jsonpath(raw, rl)
-            resolved = str(val) if val is not None else ""
+            resolved = self._eval_json_fragment(raw, rl)
             if resolved:
                 results.append(resolved)
                 if elem_type in ("||", "|"):
@@ -1340,6 +1390,53 @@ class YueduRuleEngine:
         if not results:
             return None
         return "\n".join(results)
+
+    def _eval_json_fragment(self, raw: Any, rule: str) -> str:
+        """Evaluate one JSONPath fragment and return its text (``""`` if empty).
+
+        Legado's JSONPath rule has **two** layers
+        (``AnalyzeByJSonPath.kt:35-48``): first substitute every ``{$.rule...}``
+        inner rule (each resolved recursively), and only if that substituted
+        nothing, read the rule itself as a JSONPath:
+
+        ```kotlin
+        result = ruleAnalyzes.innerRule("{$.") { getString(it) }
+        if (result.isEmpty()) {
+            val ob = ctx.read<Any>(rule)
+            result = if (ob is List<*>) ob.joinToString("\\n") else ob.toString()
+        }
+        ```
+
+        Only the second layer existed here, so a book source that reaches across
+        JSON fields with ``{$.field}`` resolved to nothing -- which surfaces as an
+        empty title/author, a 0-chapter TOC, or "书源未返回可同步的书籍".
+        """
+        if "{$" in rule:
+            analyzer = _RuleAnalyzer(rule, code_balance=True)
+            substituted = analyzer.inner_rule_braced(
+                "{$.", lambda inner: self._eval_json_fragment(raw, inner.strip()),
+            )
+            if substituted:
+                return substituted
+        return self._to_json_text(self._jsonpath(raw, rule))
+
+    @staticmethod
+    def _to_json_text(val: Any) -> str:
+        """Render a JSONPath result the way Legado's ``getString`` does.
+
+        A list becomes newline-joined (``ob.joinToString("\\n")``); anything else
+        is its string form.  ``None`` becomes ``""`` so callers can treat "no
+        value" and "empty value" alike, which is what the ``||`` chain and the
+        caller's ``if resolved:`` both expect.
+
+        This used to be ``str(val)``, which leaked a Python repr into the field:
+        ``$.data.tags`` produced ``['p', 'q']`` where Legado gives ``p\\nq``.
+        """
+        if val is None:
+            return ""
+        if isinstance(val, list):
+            return "\n".join(str(item) for item in val)
+        return str(val)
 
     def _eval_xpath(self, raw: Any, rule: str) -> Any:
         """Evaluate an XPath rule, honouring Legado's ``&&`` / ``||`` combination.

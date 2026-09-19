@@ -655,6 +655,47 @@ def test_xpath_single_fragment_is_unaffected():
     assert engine._eval_xpath(XPATH_HTML, "//div[@id='b']") == "BBB"
 
 
+# ---------------------------------------------------------------------------
+# JSONPath ``{$.rule}`` inner rules (docs/legado-rule-spec-diff.md M-1).
+# Legado substitutes them first and only falls back to reading the whole rule as
+# JSONPath when nothing was substituted (AnalyzeByJSonPath.kt:35-48); only the
+# fallback existed here, so a rule reaching across JSON fields resolved to
+# nothing.
+# ---------------------------------------------------------------------------
+
+JSON_DOC = {"data": {"id": "42"}, "tags": ["p", "q"], "n": 7}
+
+
+def test_jsonpath_inner_rule_is_substituted():
+    engine = _engine()
+
+    assert engine._eval_json(JSON_DOC, "{$.data.id}") == "42"
+
+
+def test_jsonpath_inner_rule_inside_a_longer_template():
+    engine = _engine()
+
+    assert engine._eval_json(JSON_DOC, "id-{$.data.id}") == "id-42"
+
+
+def test_jsonpath_without_inner_rule_still_reads_directly():
+    """Control: the plain JSONPath path is unchanged."""
+    engine = _engine()
+
+    assert engine._eval_json(JSON_DOC, "$.data.id") == "42"
+
+
+def test_jsonpath_list_result_is_newline_joined_not_a_python_repr():
+    """D-03: ``str(val)`` leaked ``['p', 'q']`` into the field.
+
+    Legado joins a list result with newlines
+    (``ob.joinToString("\\n")``).
+    """
+    engine = _engine()
+
+    assert engine._eval_json(JSON_DOC, "$.tags") == "p\nq"
+
+
 def test_chapter_list_rule_with_fallback_produces_chapters():
     engine = YueduRuleEngine({
         "bookSourceUrl": "https://example.com",
