@@ -1897,12 +1897,40 @@ function Url() {
   return (typeof baseUrl !== 'undefined' && baseUrl) ? baseUrl : (__nhVars.baseUrl || '');
 }
 
+// Keys the Python bootstrap owns and refreshes on every evaluation.
+//
+// They are cleared before each merge, because the Node subprocess is
+// **persistent**: a key the previous evaluation set would otherwise stay
+// readable.  `chapter` is the one that actually bit -- `_build_js_context` only
+// injects it when a chapter context exists, so a later chapter-less evaluation
+// used to read back the *previous* chapter's title/url (the same class of bug as
+// codex-handoff section 9, "上一本书的上下文串味").
+//
+// Variables written by `java.put` / `source.put` must NOT be listed here: those
+// are the `@put`/`get` store and have to survive across evaluations.
+var __nhContextKeys = [
+  'baseUrl', 'bookUrl', 'sourceUrl', 'bookSourceUrl', 'url', 'book', 'chapter',
+  'bookSourceName', 'bookSourceGroup', 'bookSourceType', 'bookUrlPattern',
+  'customOrder', 'loginUrl', 'searchUrl', 'header',
+];
+
+function __nhDropContextKeys(target, incoming) {
+  for (var i = 0; i < __nhContextKeys.length; i++) {
+    var key = __nhContextKeys[i];
+    if (!(key in incoming)) delete target[key];
+  }
+}
+
 function __nhSetSourceConfig(cfg) {
   if (!cfg) return;
+  __nhDropContextKeys(__nhSourceConfig, cfg);
   for (var k in cfg) { if (cfg[k] !== undefined) __nhSourceConfig[k] = cfg[k]; }
 }
 function __nhSetVars(vars) {
   if (!vars) return;
+  // NB: only the context keys above are cleared.  `java.put` writes straight into
+  // `__nhVars`, so a blanket reset would destroy the @put store.
+  __nhDropContextKeys(__nhVars, vars);
   for (var k in vars) { if (vars[k] !== undefined) __nhVars[k] = vars[k]; }
 }
 

@@ -1389,17 +1389,62 @@ def test_the_header_rule_is_still_not_injected():
     the raw string would work for JSON-form headers and silently drop
     script-form ones.  When tier 2 lands, this test should be updated.
 
-    The key is deleted first because the Node side keeps a **persistent**
-    subprocess and `__nhSetSourceConfig` merges rather than replaces, so an
-    earlier test that sets `header` would otherwise leak into this one.
+    No manual cleanup is needed: the bootstrap clears the context keys it owns on
+    every evaluation, which is what `test_context_keys_do_not_leak...` pins.
     """
     engine = YueduRuleEngine({
         "bookSourceUrl": "https://s.test",
         "header": '@js:JSON.stringify({"User-Agent":"UA-1"})',
     })
 
-    assert engine._try_eval_js(
-        "delete globalThis.__nhSourceConfig.header;"
-        "JSON.stringify(source.header);",
+    assert engine._try_eval_js("JSON.stringify(source.header);", "") == '""'
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_context_keys_do_not_leak_but_put_variables_survive():
+    """Stale context must not survive, but `Put()` variables must.
+
+    The Node subprocess is persistent, and the bootstrap used to *merge* the
+    context, so a key present in one evaluation stayed readable in the next.
+    `chapter` is the one that bites: `_build_js_context` only injects it when a
+    chapter context exists, so a later chapter-less evaluation read back the
+    previous chapter's title/url -- the same class of bug as codex-handoff
+    section 9 ("上一本书的上下文串味").
+    """
+    engine = _engine()
+
+    first = engine._try_eval_js(
+        "globalThis.__nhSetVars({chapter: {title: '第一章'}});"
+        "Put('keptVar', 'kept');"
+        "String(source.get('chapter') ? 'chapter-seen' : 'no-chapter');",
         "",
-    ) == '""'
+    )
+    assert first == "chapter-seen"
+
+    # The second call's bootstrap injects the engine context, which has no
+    # `chapter`: the stale object must be gone while Put()'s value survives.
+    second = engine._try_eval_js(
+        "String(source.get('chapter') ? 'chapter-seen' : 'no-chapter') + '|'"
+        " + Get('keptVar');",
+        "",
+    )
+    assert second == "no-chapter|kept"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_source_config_keys_do_not_leak_between_evaluations():
+    """Same clearing rule for the source config the `source.*` getters read."""
+    with_login = YueduRuleEngine({
+        "bookSourceUrl": "https://s.test",
+        "loginUrl": "https://s.test/login",
+    })
+    assert with_login._try_eval_js("source.loginUrl;", "") == "https://s.test/login"
+
+    # A different source, same persistent subprocess: the old loginUrl must not
+    # be visible through its getter.
+    without_login = YueduRuleEngine({"bookSourceUrl": "https://s.test"})
+
+    assert without_login._try_eval_js(
+        "String(source.loginUrl) + '|' + source.bookSourceUrl;", ""
+    ) == "|https://s.test"
+
