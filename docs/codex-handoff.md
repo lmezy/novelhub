@@ -1198,6 +1198,55 @@ Wycheproof `rsa_signature_2048_sha256_test.json` 的**已发布**向量与
 **C-23 至此收口**：对称加密族、非对称加密、签名三块都补完并各自有独立来源的
 向量验证。剩下的是第 33 节清单里的 D（三处变量存储收敛）。**未部署、未推送。**
 
+## 37. 2026-09-19：变量存储收敛（第 33 节清单的最后一项 D）
+
+`1b590b0`。这条从一开始就被记为"风险最高"，原因是它同时动 Python 的 `_variables`
+和 JS 的两个存储，改错的表现是**静默丢变量**。做完之后的结论是：**要动手之前先弄清
+Legado 到底有几个存储 —— 答案是三个，不是"一个"**。
+
+**关键事实**：`AnalyzeRule.kt:776` 的 `bindings["java"] = this` 意味着 `java` 就是
+`AnalyzeRule` 实例，所以 `java.put`/`java.get` 与 `@put`/`@get` **是同一组函数**：
+
+```
+@put:{k:v} -> putRule -> put(k, getString(v))   // :181,:399-403
+java.put   -> put(key, value)                   // :740-749
+@get:k     -> get(key)                          // :699
+java.get   -> get(key)                          // :754-769
+```
+
+`put` 只写 chapter/book/ruleData/source 中第一个非空层，`get` 逐层回落、**链尾是
+`source.get`**。而 `cache.*` 是 `CacheManager`、`source.put` 是 `BaseSource.put`
+（`CacheManager` 的另一个前缀 `v_<sourceKey>_<key>`）—— 三者互不相通。
+
+所以"三处变量存储收敛"的正确含义**不是把三个并成一个**，而是分成 Legado 真正有的
+那三个：规则变量（四条路径共用）、`cache`、`source`。改前的实际状态是
+`java.put` 与 `cache.*` 挤在同一个对象里（互相看得见），而 `@put` 与 `java.get`
+分在两个对象里（永远看不见）—— 两个方向都错。
+
+**两处判断上的坑，记下来**：
+
+1. **B-5 那条「建议用例」是错的**。它写 `@get:{baseUrl}` 应读出页面 URL，但那是
+   NovelHub 自有行为：Legado 从不 `put("baseUrl", …)`（全仓库只有 `ReadRssActivity.kt:487`
+   的 `put("url", …)`，与书源无关），所以 `get("baseUrl")` 在没人 `@put` 过它时就是 `""`。
+   照那条用例写测试，等于把 NovelHub 的偏差固化成"规范"。
+2. **删除必须能跨语言同步**。`putVariable(key, null)` 在 Legado 是删除，所以 Python 侧
+   的合并回写不能只做 upsert：JS 存储里**少了**的键要按删除处理。但这里有个安全边界 ——
+   只有在真的收到那份上报时才这样做，否则进程崩掉/超时留下的空存储会被读成"脚本删光了
+   所有变量"，一次失败就清空全书变量。为此加了 `last_rule_vars_seen`，并专门写了一条
+   测试钉住它。
+
+**跨进程上报**：bootstrap 在结果/错误块**之前**附带一份规则变量（`__CODEX_VARS_*`）——
+放在前面是因为 `_read_result` 遇到 `__CODEX_RESULT_END__` / `__CODEX_ERROR_END__` 就
+停止读取。抛异常的脚本同样要上报，因为它的 `java.put` 已经执行过了。
+
+**验证**（839 → 846 passed）：7 条新测试；15 处变异逐一施加，**15/15 被杀**。
+
+**没做的两件事**（都记在 spec-diff 的 D 节）：跨请求持久化（需要给 Book 加列，越界）、
+`_variables` 里上下文与规则变量仍未分开（只有书源显式 `@put` 一个上下文同名键时才看得出来）。
+
+**第 33 节清单至此全部处理完**：A-3/A-4/A-5/M-1、C-22/C-23 全部 API、M-7..M-10/D-13
+的裁决、请求侧 B/C、B-5、D。**未部署、未推送。**
+
 
 
 

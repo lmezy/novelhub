@@ -74,6 +74,8 @@ M-7（`@text` 换行）**有意保留**，已在代码与测试里注明。细�
 | **C-22 第三批**（`toNumChapter` + `fullToHalf`/`chineseNumToInt`/`stringToInt`） | ✅ 已补 | `bfabd75` | 6 条新测试；撤掉改动 6 条全失败；781 → 787。复刻了 Kotlin Int 整除、`Integer.parseInt` 严格性；**未复刻**其不可达的"一零二五"分支（守卫条件自相矛盾，属死代码） |
 | **C-22 第四批**（`timeFormat`、`timeFormatUTC`） | ✅ 已补 | `6dc568a` | 5 条新测试；撤掉改动 5 条全失败；787 → 792。`dateFormat` 是固定模式 `yyyy/MM/dd HH:mm`；`sh` 按 `SimpleTimeZone` 语义为**毫秒**（已钉住）；依赖区域设置的 `MMM`/`E` 抛可读错误而非静默输出数字 |
 | C-22 中 `t2s`/`s2t` | ❌ 不实现 | — | 依赖第三方 JVM 词典，见第 6 节更正 |
+| **B-5** `@get:{key}` 未实现 | ✅ 已补 | `1b590b0` | `@get:key` 与 `@get:{key}` 视作同一键，未知键读作 ""。**该条原「建议用例」需更正**：它写 `@get:{baseUrl}` 应读出页面 URL —— 那是 NovelHub 自有行为。Legado 从不 `put("baseUrl", …)`（全仓库仅 `ReadRssActivity.kt:487` 有 `put("url", …)`，与书源无关），所以 `get("baseUrl")` 在没有任何规则 `@put` 过它时是 `""` |
+| **D / B-10** 三处变量存储收敛 | ✅ 已收敛（跨请求持久化仍缺） | `1b590b0` | `@put`/`@get` 与 `java.put`/`java.get` 合成同一个存储；`cache`、`source` 各自独立；每次求值前**替换式**播种，上一本书的变量不会漏进下一本；15 处变异 **15/15 被杀**；839 → 846。跨请求持久化需要 DB 列，仍是不做项 —— 见下节 |
 | C-18/C-19/C-20 请求侧（书源 `header` / 已导入 Cookie / 限速进 JS HTTP） | ⏳ 待补（改动现有行为，风险较高） | — | — |
 | M-5（XPath 静默降级）、C-1（两套 `java.*` stub） | ⏳ 待评估（架构级，需差分 oracle） | — | — |
 
@@ -182,6 +184,86 @@ SHA-512/256、SHA3-224/256/384/512、RIPEMD160）；`sign` / `signHex` / `verify
   因为断言只查消息里有没有 `RSAandMGF1`，而通用错误消息会回显算法名，
   原串里就含这个子串；改用只有该分支才产出的措辞（`PSS 签名`）之后才被杀。
   这是本轮第二次被变异测试抓到「断言因为错误的原因通过」。
+
+### D. 变量存储：Legado 只有一个，NovelHub 曾有互不相通的三个（`1b590b0`）
+
+`AnalyzeRule.kt` 里 `java` 绑定**就是** `AnalyzeRule` 实例：
+
+```kotlin
+bindings["java"] = this          // :776
+```
+
+所以四条路径是同一组函数，不是四个功能：
+
+| 路径 | 落到哪 |
+|---|---|
+| `@put:{k:v}` | `putRule` → `put(k, getString(v))`（:181, :399-403） |
+| `@get:k` | `get(key)`（:601-604 取键，:699 求值） |
+| `java.put` | `put(key, value)`（:740-749） |
+| `java.get` | `get(key)`（:754-769） |
+
+```kotlin
+fun put(key: String, value: String): String {
+    chapter?.putVariable(key, value)
+        ?: book?.putVariable(key, value)
+        ?: ruleData?.putVariable(key, value)
+        ?: source?.put(key, value)
+}
+fun get(key: String): String {
+    when (key) { "bookName" -> book?.let { return it.name }
+                 "title" -> chapter?.let { return it.title } }
+    return chapter?.getVariable(key)?.takeIf { it.isNotEmpty() }
+        ?: book?.getVariable(key)?.takeIf { it.isNotEmpty() }
+        ?: ruleData?.getVariable(key)?.takeIf { it.isNotEmpty() }
+        ?: source?.get(key)?.takeIf { it.isNotEmpty() }
+        ?: ""
+}
+```
+
+要点：`put` 只写第一个非空层，`get` 逐层回落，**链尾是 `source.get`**；`bookName` /
+`title` 两个键在查存储之前先由上下文回答。
+
+而 NovelHub 改前是三个互不相通的存储：Python `self._variables`（`@put` 写、`{{var}}` 读，
+还混着上下文）、JS `__nhVars`（上下文 + `source.put` + `Get/Put`）、JS `__nhCache`
+（`java.put/get` 与 `cache.*` 共用）。后果两条：
+
+1. `@put:{k:v}` 之后 `java.get('k')` 永远是空 —— 反之亦然。书源里"存进规则、脚本读"
+   的写法必然失效。
+2. `cache.put('k', v)` 与 `java.put('k', v)` 互相看得见。Legado 里 `cache` 是
+   `CacheManager`，`java.put` 是规则变量，`source.put` 又是 `CacheManager` 里另一个前缀
+   （`BaseSource.kt:224-234` 的 `v_<sourceKey>_<key>`）—— 三个不同的存储。
+
+**改法**（也就是"收敛"的实际含义：不是把三个并成一个，而是分成 Legado 真正有的那三个）：
+
+* JS 侧：`__nhRuleVars`（规则变量）、`__nhSourceVars`（按 source 分键）、`__nhCache`
+  （`cache.*`）。`java.put/get` 走规则变量，`get` 末尾回落到 `source.get`（链尾）；
+  `cache` 与 `source` 互不相通；`source.put` 不再覆盖上下文。`Get`/`Put`/`Set` 不是
+  Legado 的绑定（`buildScriptBindings` 里没有它们），保留但改走同一个规则变量存储，
+  `Get` 仍可回落到上下文。
+* Python 侧：把 `_variables` 里属于**上下文**的键（`baseUrl`/`bookUrl`/`sourceUrl`/`url`/
+  `book`/`chapter`/`contentTitle`）排除在推送与回并之外。这样 `java.get('baseUrl')`
+  仍是 `""`（Legado 里那是 Rhino 绑定而非变量），脚本里的 `java.put('baseUrl', …)`
+  也不会把后续规则的 `baseUrl` 改掉。
+* 每次求值前用 `__nhSeedRuleVars` **替换**（而非合并）JS 的存储，求值后把 JS 的存储合并回
+  `_variables`。`JsRuntime` 是单例、Node 子进程被所有书源共用，合并式播种会让上一本书的
+  变量漏进下一本 —— 与之前修掉的 cookie jar、`chapter` 上下文同类。这也顺带替代了旧
+  `__nhCache` 意外提供的"跨请求持久化"：那种持久化既不分书也不分源。
+* 上报通道：bootstrap 在结果/错误块之前附带一份规则变量，`_read_result` 收进
+  `last_rule_vars`。删除也要能同步，所以**未出现在上报里的键按删除处理** —— 但只在真的
+  收到上报时才这样做（`last_rule_vars_seen`），否则一次求值失败就会清空全部变量。
+
+**验证**：7 条新测试；15 处变异逐一施加，**15/15 被杀**（839 → 846）。
+
+**剩下的两个缺口，都不打算做**：
+
+1. **跨请求持久化（B-10 的另一半）**。Legado 的 `book?.putVariable` 会
+   `variable = GSON.toJson(variableMap)` 写回 Book 实体，所以详情页 `@put` 的变量在目录/
+   正文请求里还能读到。要在 NovelHub 做到需要给 Book 加列或复用现有列，属"不改数据库
+   语义"的边界之外；当前是每次分析一个引擎，只在同一次分析内有效。
+2. **`_variables` 仍把上下文与规则变量混在一个字典里**。影响面很窄：只有书源**显式**
+   `@put` 一个上下文同名的键（`baseUrl` 等）时才看得出来 —— 此时 `@get:baseUrl` 会读到它
+   （Legado 也会），但 Python 侧的上下文也跟着变了（Legado 不会，那边绑定与变量表是两回事）。
+   彻底分开要把 `_variables` 拆成两个字典、牵动十来处调用，价值不足，记录在此。
 
 ### 附：实测复核记录（真实引擎，非静态阅读）
 
