@@ -871,3 +871,136 @@ def test_html_format_runs_the_legado_pipeline():
         "<span>d</span><img src=\"/i.png\">')",
         "",
     ) == "\u3000\u3000a b\n\u3000\u3000c\n\u3000\u3000d<img src=\"/i.png\">"
+
+
+# ---------------------------------------------------------------------------
+# Symmetric crypto (docs/legado-rule-spec-diff.md C-23)
+#
+# Legado's `createSymmetricCrypto` returns a hutool SymmetricCrypto; here it is a
+# small object with encrypt/encryptBase64/encryptHex/decrypt/decryptStr.  The
+# cipher itself is checked against the **FIPS-197 / NIST SP 800-38A** vector, so a
+# wrong algorithm mapping or a padding mistake cannot pass unnoticed; the
+# round-trips are only there to prove the mode/IV wiring does not throw.
+#
+# Known gap: hutool's key/IV normalisation for invalid lengths lives in hutool
+# (a gradle dependency, not in this repository) and is not replicated.
+# ---------------------------------------------------------------------------
+
+_AES_KEY_HEX = "000102030405060708090a0b0c0d0e0f"
+_AES_KEY_STR = "0123456789abcdef"  # 16 ASCII chars -> 16 UTF-8 bytes -> AES-128
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_aes_128_ecb_matches_the_fips197_vector():
+    """FIPS-197 appendix C.1 / NIST SP 800-38A: the cipher itself is correct."""
+    engine = _engine()
+
+    value = engine._try_eval_js(
+        "java.createSymmetricCrypto('AES/ECB/NoPadding',"
+        " Buffer.from('" + _AES_KEY_HEX + "','hex'), null)"
+        ".encryptHex(Buffer.from('00112233445566778899aabbccddeeff','hex'));",
+        "",
+    )
+
+    assert value == "69c4e0d86a7b0430d8cdb78070b4c55a"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_aes_pkcs5padding_round_trip():
+    engine = _engine()
+
+    assert engine._try_eval_js(
+        "var c = java.createSymmetricCrypto('AES/ECB/PKCS5Padding', '"
+        + _AES_KEY_STR + "', null);"
+        "c.decryptStr(c.encryptBase64('hello world'));",
+        "",
+    ) == "hello world"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_aes_cbc_round_trip_uses_the_iv():
+    engine = _engine()
+
+    assert engine._try_eval_js(
+        "var c = java.createSymmetricCrypto('AES/CBC/PKCS5Padding',"
+        " Buffer.from('" + _AES_KEY_HEX + "','hex'),"
+        " Buffer.from('" + _AES_KEY_HEX + "','hex'));"
+        "c.decryptStr(c.encryptBase64('hello cbc'));",
+        "",
+    ) == "hello cbc"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_decrypt_auto_detects_hex_and_base64():
+    """`SymmetricCryptoAndroid.decrypt` uses hex when the input looks like hex."""
+    engine = _engine()
+
+    js = (
+        "var c = java.createSymmetricCrypto('AES/ECB/PKCS5Padding', '"
+        + _AES_KEY_STR + "', null);"
+        "c.decryptStr(c.encryptHex('detect me')) + '|' +"
+        "c.decryptStr(c.encryptBase64('detect me'));"
+    )
+
+    assert engine._try_eval_js(js, "") == "detect me|detect me"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_3des_round_trip():
+    """3DES is still available under OpenSSL 3 (`des-ede3-*`)."""
+    engine = _engine()
+
+    assert engine._try_eval_js(
+        "var c = java.createSymmetricCrypto('DESede/ECB/PKCS5Padding',"
+        " Buffer.from('0123456789abcdef0123456789abcdef0123456789abcdef','hex'),"
+        " null);"
+        "c.decryptStr(c.encryptBase64('hello 3des'));",
+        "",
+    ) == "hello 3des"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_aes_encode_to_string_decrypts_like_legado():
+    """Faithful port of a Legado quirk, pinned so it cannot be "tidied" away.
+
+    `aesEncodeToString` is documented as "encrypt AES to String" but its body is
+    `.decryptStr(data)`.  Book sources were written against that, so this must
+    keep decrypting; `aesEncodeToBase64String` is the one that encrypts.
+    """
+    engine = _engine()
+
+    js = (
+        "var k = '" + _AES_KEY_STR + "';"
+        "var t = 'AES/ECB/PKCS5Padding';"
+        "var c = java.createSymmetricCrypto(t, k, null);"
+        "var b64 = c.encryptBase64('plain');"
+        "java.aesEncodeToString(b64, k, t, '') + '|' +"
+        "(java.aesEncodeToBase64String('plain', k, t, '') === b64);"
+    )
+
+    assert engine._try_eval_js(js, "") == "plain|true"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_single_des_fails_with_a_readable_reason():
+    """OpenSSL 3 put single DES behind its legacy provider, which Node leaves off.
+
+    The point of the test is that the failure is *readable and catchable* -- a
+    book source's own try/catch (and the crawler log) get the reason, instead of
+    "java.desDecodeToString is not a function" or a silent empty field.
+    """
+    engine = _engine()
+
+    value = engine._try_eval_js(
+        "var msg;"
+        "try {"
+        "  java.createSymmetricCrypto('DES/ECB/PKCS5Padding',"
+        "    Buffer.from('0123456789abcdef','hex'), null).encryptBase64('x');"
+        "  msg = 'no-error';"
+        "} catch (e) { msg = String(e && e.message ? e.message : e); }"
+        "msg;",
+        "",
+    )
+
+    assert value != "no-error"
+    assert "legacy provider" in value

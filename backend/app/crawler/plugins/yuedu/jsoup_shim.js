@@ -1125,6 +1125,122 @@ function __nhHtmlFormatKeepImg(html) {
   return out;
 }
 
+// ---- Legado symmetric crypto (JsEncodeUtils.kt + help/crypto/SymmetricCryptoAndroid.kt) ----
+
+/**
+ * Legado's `isHex()`: whether a string is a hex byte string.
+ *
+ * Also requires an even length here.  `HexUtil.decodeHex` throws on an
+ * odd-length string in Legado, so requiring an even length lets such a value
+ * fall through to the Base64 branch instead of failing the whole rule.
+ * Identical whenever Legado succeeds, strictly more forgiving where it throws.
+ */
+function __nhIsHex(s) {
+  var t = String(s === undefined || s === null ? '' : s).replace(/\s+/g, '');
+  return t.length > 0 && t.length % 2 === 0 && /^[0-9a-fA-F]+$/.test(t);
+}
+
+/** Decode a ciphertext argument the way `SymmetricCryptoAndroid.decrypt` does. */
+function __nhCryptoDecode(data) {
+  var s = String(data === undefined || data === null ? '' : data);
+  if (__nhIsHex(s)) return Buffer.from(s.replace(/\s+/g, ''), 'hex');
+  return Buffer.from(s, 'base64');
+}
+
+/** Map a Java/JCE transformation onto a Node cipher name. */
+function __nhCipherName(transformation, keyLen) {
+  var parts = String(transformation || 'AES').split('/');
+  var algo = (parts[0] || 'AES').trim().toUpperCase();
+  var mode = (parts[1] || 'ECB').trim().toLowerCase();
+  var base;
+  if (algo === 'AES') {
+    base = 'aes-' + (keyLen === 24 ? 192 : (keyLen === 32 ? 256 : 128));
+  } else if (algo === 'DESEDE' || algo === 'TRIPLEDES' || algo === '3DES') {
+    base = keyLen === 16 ? 'des-ede' : 'des-ede3';
+  } else if (algo === 'DES') {
+    base = 'des';
+  } else {
+    base = algo.toLowerCase();
+  }
+  return base + '-' + mode;
+}
+
+/** JCE "NoPadding" turns Node's PKCS#7 auto-padding off. */
+function __nhCipherAutoPadding(transformation) {
+  var padding = (String(transformation || '').split('/')[2] || 'PKCS5Padding')
+    .trim().toLowerCase();
+  return padding.indexOf('nopadding') === -1;
+}
+
+/**
+ * Port of Legado's `createSymmetricCrypto(transformation, key, iv)`.
+ *
+ * Legado returns a hutool `SymmetricCrypto`; only the five methods book sources
+ * call are provided.  The returned object builds a fresh cipher per operation,
+ * because a Node Cipher cannot be reused after `final()`.
+ *
+ * **Known gap**: hutool's `SymmetricCrypto(String, byte[])` normalises a key or
+ * IV whose length is invalid for the algorithm.  That logic lives in hutool -- a
+ * gradle dependency, not in this repository -- so it is **not** replicated here;
+ * an invalid length raises instead of being silently padded.  Standard lengths
+ * (AES 16/24/32, DES 8, 3DES 24) are exact, and the AES-128-ECB path is verified
+ * against the FIPS-197 vector in the tests.
+ */
+function __nhSymmetricCrypto(transformation, key, iv) {
+  var keyBytes = Buffer.isBuffer(key) ? key
+    : (key === undefined || key === null ? Buffer.alloc(0)
+      : Buffer.from(String(key), 'utf-8'));
+  var ivBytes = Buffer.isBuffer(iv) ? iv
+    : (iv === undefined || iv === null || iv === '' ? null
+      : Buffer.from(String(iv), 'utf-8'));
+  var name = __nhCipherName(transformation, keyBytes.length);
+  var autoPadding = __nhCipherAutoPadding(transformation);
+
+  function cipher(encrypting) {
+    var ivArg = (ivBytes && ivBytes.length) ? ivBytes : null;
+    try {
+      var c = encrypting
+        ? require('crypto').createCipheriv(name, keyBytes, ivArg)
+        : require('crypto').createDecipheriv(name, keyBytes, ivArg);
+      c.setAutoPadding(autoPadding);
+      return c;
+    } catch (e) {
+      // Single DES needs OpenSSL 3's legacy provider, which Node 17+ leaves off:
+      // "des-ecb"/"des-cbc" are absent from crypto.getCiphers() and every call
+      // fails with ERR_OSSL_EVP_UNSUPPORTED.  Re-throw with the reason attached
+      // so the book source's own try/catch -- and the crawler log -- say *why*,
+      // instead of a bare "unsupported" (3DES is unaffected: des-ede3-* exists).
+      var singleDes = /^des-/.test(name) && !/^des-ede/.test(name);
+      throw new Error(
+        'createSymmetricCrypto(' + transformation + ') 失败: '
+        + (e && e.message ? e.message : String(e))
+        + (singleDes
+          ? ' —— 单 DES 在 OpenSSL 3 下需 legacy provider，本运行时不可用'
+          : '')
+      );
+    }
+  }
+
+  function toBuffer(data) {
+    return Buffer.isBuffer(data) ? data : Buffer.from(String(data), 'utf-8');
+  }
+
+  function run(encrypting, data) {
+    var c = cipher(encrypting);
+    return Buffer.concat([c.update(data), c.final()]);
+  }
+
+  return {
+    encrypt: function (data) { return run(true, toBuffer(data)); },
+    encryptBase64: function (data) {
+      return run(true, toBuffer(data)).toString('base64');
+    },
+    encryptHex: function (data) { return run(true, toBuffer(data)).toString('hex'); },
+    decrypt: function (data) { return run(false, __nhCryptoDecode(data)); },
+    decryptStr: function (data) { return run(false, __nhCryptoDecode(data)).toString('utf-8'); },
+  };
+}
+
 var java = {
   // ---- HTTP: Legado java.get / java.post return a Response object ----
   get: function (url, headers) {
@@ -1258,6 +1374,122 @@ var java = {
     } catch (e) { return ''; }
   },
   htmlFormat: function (str) { return __nhHtmlFormatKeepImg(str); },
+  createSymmetricCrypto: function (transformation, key, iv) {
+    // Deliberately NOT wrapped in try/catch: Legado's own createSymmetricCrypto
+    // throws too, and an unavailable algorithm must surface as a readable error
+    // rather than a null that silently empties the field.
+    return __nhSymmetricCrypto(transformation, key, iv);
+  },
+  // ---- AES family (JsEncodeUtils.kt:91-279) --------------------------------
+  // These are faithful ports of Legado's own (deprecated) wrappers, including two
+  // inconsistencies that a "sensible" reimplementation would silently fix -- and
+  // fixing them would diverge from the book sources written against Legado:
+  //
+  //   1. `aesEncodeToString` is documented as "encrypt AES to String" but its
+  //      body calls `.decryptStr(data)` -- it *decrypts*.
+  //   2. `aesDecodeArgsBase64Str` Base64-decodes key/iv, while
+  //      `aesEncodeArgsBase64Str` passes them through raw, even though both
+  //      document the key as "Base64后的密钥".
+  //
+  // Also note the `*Base64*` decode variants are byte-identical to the plain ones:
+  // `SymmetricCryptoAndroid.decrypt(String)` already auto-detects hex vs Base64.
+  aesDecodeToByteArray: function (str, key, transformation, iv) {
+    var c = java.createSymmetricCrypto(transformation, key, iv);
+    return c ? c.decrypt(str) : null;
+  },
+  aesDecodeToString: function (str, key, transformation, iv) {
+    var c = java.createSymmetricCrypto(transformation, key, iv);
+    return c ? c.decryptStr(str) : null;
+  },
+  aesBase64DecodeToByteArray: function (str, key, transformation, iv) {
+    return java.aesDecodeToByteArray(str, key, transformation, iv);
+  },
+  aesBase64DecodeToString: function (str, key, transformation, iv) {
+    return java.aesDecodeToString(str, key, transformation, iv);
+  },
+  aesEncodeToByteArray: function (data, key, transformation, iv) {
+    var c = java.createSymmetricCrypto(transformation, key, iv);
+    return c ? c.encrypt(data) : null;
+  },
+  aesEncodeToString: function (data, key, transformation, iv) {
+    // Legado's body is `.decryptStr(data)` despite the name -- kept as-is.
+    var c = java.createSymmetricCrypto(transformation, key, iv);
+    return c ? c.decryptStr(data) : null;
+  },
+  aesEncodeToBase64ByteArray: function (data, key, transformation, iv) {
+    var c = java.createSymmetricCrypto(transformation, key, iv);
+    return c ? Buffer.from(c.encryptBase64(data), 'utf-8') : null;
+  },
+  aesEncodeToBase64String: function (data, key, transformation, iv) {
+    var c = java.createSymmetricCrypto(transformation, key, iv);
+    return c ? c.encryptBase64(data) : null;
+  },
+  aesDecodeArgsBase64Str: function (data, key, mode, padding, iv) {
+    var c = java.createSymmetricCrypto(
+      'AES/' + mode + '/' + padding,
+      Buffer.from(String(key), 'base64'),
+      Buffer.from(String(iv), 'base64')
+    );
+    return c ? c.decryptStr(data) : null;
+  },
+  aesEncodeArgsBase64Str: function (data, key, mode, padding, iv) {
+    // Legado does NOT Base64-decode key/iv here (unlike the decode variant).
+    var c = java.createSymmetricCrypto('AES/' + mode + '/' + padding, key, iv);
+    return c ? c.encryptBase64(data) : null;
+  },
+  // ---- DES family (JsEncodeUtils.kt:281-320) --------------------------------
+  // Single DES cannot work on this runtime (OpenSSL 3 legacy provider, see
+  // __nhSymmetricCrypto).  The wrappers still exist so a source calling them gets
+  // a readable reason rather than "java.desDecodeToString is not a function".
+  desDecodeToString: function (data, key, transformation, iv) {
+    var c = java.createSymmetricCrypto(transformation, key, iv);
+    return c ? c.decryptStr(data) : null;
+  },
+  desBase64DecodeToString: function (data, key, transformation, iv) {
+    // Byte-identical to the plain variant in Legado too.
+    return java.desDecodeToString(data, key, transformation, iv);
+  },
+  desEncodeToString: function (data, key, transformation, iv) {
+    // Legado: `String(createSymmetricCrypto(…).encrypt(data))` -- the raw
+    // ciphertext bytes reinterpreted as text, not base64 and not hex.
+    var c = java.createSymmetricCrypto(transformation, key, iv);
+    return c ? c.encrypt(data).toString('utf-8') : null;
+  },
+  desEncodeToBase64String: function (data, key, transformation, iv) {
+    var c = java.createSymmetricCrypto(transformation, key, iv);
+    return c ? c.encryptBase64(data) : null;
+  },
+  // ---- 3DES family (JsEncodeUtils.kt:322-427) -------------------------------
+  // Legado uses three different key/iv conventions across its "ArgsBase64"
+  // helpers, so each one is ported as written:
+  //   aesDecodeArgsBase64Str        key b64, iv b64
+  //   aesEncodeArgsBase64Str        key raw, iv raw
+  //   tripleDES*ArgsBase64Str       key b64, iv raw
+  // Normalising them would silently break any source written against Legado.
+  tripleDESDecodeStr: function (data, key, mode, padding, iv) {
+    var c = java.createSymmetricCrypto('DESede/' + mode + '/' + padding, key, iv);
+    return c ? c.decryptStr(data) : null;
+  },
+  tripleDESDecodeArgsBase64Str: function (data, key, mode, padding, iv) {
+    var c = java.createSymmetricCrypto(
+      'DESede/' + mode + '/' + padding,
+      Buffer.from(String(key), 'base64'),
+      iv
+    );
+    return c ? c.decryptStr(data) : null;
+  },
+  tripleDESEncodeBase64Str: function (data, key, mode, padding, iv) {
+    var c = java.createSymmetricCrypto('DESede/' + mode + '/' + padding, key, iv);
+    return c ? c.encryptBase64(data) : null;
+  },
+  tripleDESEncodeArgsBase64Str: function (data, key, mode, padding, iv) {
+    var c = java.createSymmetricCrypto(
+      'DESede/' + mode + '/' + padding,
+      Buffer.from(String(key), 'base64'),
+      iv
+    );
+    return c ? c.encryptBase64(data) : null;
+  },
 };
 
 var source = {
