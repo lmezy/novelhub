@@ -1007,6 +1007,515 @@ def test_single_des_fails_with_a_readable_reason():
 
 
 # ---------------------------------------------------------------------------
+# Asymmetric crypto (docs/legado-rule-spec-diff.md, item E)
+#
+# `java.createAsymmetricCrypto` is Legado's `AsymmetricCrypto(transformation)`,
+# i.e. hutool 5.8.22 (JsEncodeUtils.kt:77-81).  Every expectation below comes
+# from hutool's own source -- KeyUtil, BaseAsymmetric, RSAPadding, CipherWrapper,
+# AsymmetricEncryptor/Decryptor -- plus three independent oracles:
+#
+#   * Wycheproof `rsa_pkcs1_2048_test.json`: published RSAES-PKCS1-v1_5
+#     decryption vectors.  The whole file (33 keys, 67 tests -- 42 valid and 25
+#     invalid, covering InvalidPkcs1Padding, Sslv23Padding, InvalidCiphertext-
+#     Format and CVE-2021-3580) was swept against this shim and matched 67/67.
+#     tcId 3 and tcId 9 are the two kept here.
+#   * pyca/cryptography (OpenSSL) for the OAEP ciphertext.
+#   * pure-Python `pow()` for the NoPadding case *and* for every hand-built
+#     padding block, so the shim's own PKCS#1 validation is what is tested.
+#
+# The hand-built blocks exist because OpenSSL cannot be the oracle for invalid
+# PKCS#1 padding: its RSA_PKCS1_PADDING decryption implements implicit rejection
+# and returns a pseudo-random buffer where Java throws BadPaddingException.  A
+# book source with a try/catch fallback would silently receive garbage, so the
+# shim does the padding itself on top of RSA_NO_PADDING.
+# ---------------------------------------------------------------------------
+
+_RSA_PKCS8_B64 = (
+    "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCzUQorzUzmRMW1lK5QWeErLwVL"
+    "ZY1dpZWaL98YcbgIvD3z5ijSeS5RqtXBJLQ72kU9ylzeS88o571O/7oMtLdCu7bVoBPLY9GqOong"
+    "JifvU5i1LAz9l9IIq+uNfJvOC76wGaht21ib6ymlt0v4YQdcZ3yB1DDwMMJlJHr508kUDMtlMJ0H"
+    "4K3B79Fc8X57BV19o4aORkjMOhgPDuf44eexgJijORtM5xYemNV6+KlH4gGkY+LWu8qAWeVwbp3+"
+    "2PSFZGX/pxLtGqGOiI0S3GqgnOlez8qDzFsLFdsJyGR/XVJMDy52IKNBa5YjytwPCXr1cyYcmMhA"
+    "CqEq845DythNAgMBAAECggEAGlAtDupse2niHVg5EB9wVFbtDvhS+0f+IQcfVMXzPIzrBmxi1yfj"
+    "LSbFgTcyn4nTGVMlt5UmTBldhUcvdQfb0JYdKVH5NaJrNPCsJNFUkOESiptxOJFbx9v6j+OWNXEx"
+    "xUOunJhQc2jZzrCMHGGYo+2nrqGFoOl2zULCLQDwA9nxnZbqTJr8v+FEHMyALPsGifWdgExqTk9A"
+    "TBUXR0XtbLi8iO8LM7oNKoDjXkO8kPNQBS5yAW51sA01ejgcnA1GcGnKZgiHyYd2Y0n8xDRgtKpR"
+    "a84Hnt2HuhZDB7dSwnftlSitO6C/GHc0ntO3lmpsJAEQQJv00PreDGj9rdhH/QKBgQDsElzzfjEK"
+    "L/RiY7my4GKdY5AAXsiJE9T7cb1N2FYSRJiq66mD17or2ULmTSI/63ojr01gXv7qa9cNOa/pnTWj"
+    "qhXnShdod4CTvg7dSo0Jst723Jtn/4V2RiXC4ZI220xAHOMKJXLT7LT5abetGcUiwC13RGVnbho3"
+    "dsVNYkg0iwKBgQDCdCq82Yl71LC2cflz/IKo+Eq/VwX/iN1BlIYjr+ncpg3GVDOQdn/q6+tTlXbu"
+    "i/phtfy8qUp873WgkVDFQPqWlN2ABK0jcYyIkEkhk2nJn0RY1K/BSPbwffhzJKltnPezhd2GIkFK"
+    "GDL58pRG8FDC1aZAdkncQatw4js9zCLJhwKBgQCWqXmNJQJjQAu2J3NCiBYn4Hzs35EYewG4n/Rz"
+    "FBiKfCD7JIABVtLIXVZm6N9s7/n5gE3frYD/V2feVuzAKccr9scX359k2q/Cms+dx5CPmgrWfiDo"
+    "lJk2zLoY0CGixP67BDSaKyBHxJAThbbl0MaR0RizP4GAKzKsJy7wnkL61QKBgAVU9BsLh/aKRXIr"
+    "O+DPSrHhZQNMGpEAKrjynp754tq2/ueyRVuvtCA36dL35TPzSKFHQS/XIIC+fCYz9dgCyRw55rzs"
+    "4+Z15ZmVAzxVc3Ag2tnosw0EuCit+5MErVShGjWk9QcJh2rFsRgja6dqTXyaKR3ZYHsWneHRgjhW"
+    "kZmfAoGAHGQBidm/6MYjgzIQp2xCDG9E5ddg4lmRbOwq4rFWRWlg/ZXidHZgw4lWIlDwVQSc+rfl"
+    "wwOVSThKeiquscgk069wlIKoz5tYcCKgCx8HIttQ8zyybcIN0iRdUmXfYe4pg8k4whZ9zuEh/EtE"
+    "ecI35yjPYzq2CowOzQT85+O6pVk="
+)
+_RSA_SPKI_B64 = (
+    "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAs1EKK81M5kTFtZSuUFnhKy8FS2WNXaWV"
+    "mi/fGHG4CLw98+Yo0nkuUarVwSS0O9pFPcpc3kvPKOe9Tv+6DLS3Qru21aATy2PRqjqJ4CYn71OY"
+    "tSwM/ZfSCKvrjXybzgu+sBmobdtYm+sppbdL+GEHXGd8gdQw8DDCZSR6+dPJFAzLZTCdB+Ctwe/R"
+    "XPF+ewVdfaOGjkZIzDoYDw7n+OHnsYCYozkbTOcWHpjVevipR+IBpGPi1rvKgFnlcG6d/tj0hWRl"
+    "/6cS7RqhjoiNEtxqoJzpXs/Kg8xbCxXbCchkf11STA8udiCjQWuWI8rcDwl69XMmHJjIQAqhKvOO"
+    "Q8rYTQIDAQAB"
+)
+# Wycheproof rsa_pkcs1_2048_test.json group 0: tcId 3 is a valid vector (its
+# message is the hex of "Test"), tcId 9 carries InvalidPkcs1Padding.
+_WY_PKCS1_VALID_CT = (
+    "4501b4d669e01b9ef2dc800aa1b06d49196f5a09fe8fbcd037323c60eaf027bfb98432be4e4a2"
+    "6c567ffec718bcbea977dd26812fa071c33808b4d5ebb742d9879806094b6fbeea63d25ea314"
+    "1733b60e31c6912106e1b758a7fe0014f075193faa8b4622bfd5d3013f0a32190a95de61a3"
+    "604711bc62945f95a6522bd4dfed0a994ef185b28c281f7b5e4c8ed41176d12d9fc1b837e6"
+    "a0111d0132d08a6d6f0580de0c9eed8ed105531799482d1e466c68c23b0c222af7fc12ac27"
+    "9bc4ff57e7b4586d209371b38c4c1035edd418dc5f960441cb21ea2bedbfea86de0d7861e8"
+    "1021b650a1de51002c315f1e7c12debe4dcebf790caaa54a2f26b149cf9e77d"
+)
+_WY_PKCS1_VALID_MSG = "54657374"
+_WY_PKCS1_INVALID_CT = (
+    "6e0d507f66e16d4b7373a504c6d48692aaa541fdd59eeb5d4a2cd91f6000ce9b5734a232d654"
+    "1a78729ac82152d3a30b51950a24ae379a108ed20fa4ec7542fe2281c2dd5de685564d15182f"
+    "3c73e9c0135ebc993f5acd240a343d3257997582328c31be215c7349375406aa78a3ac3532"
+    "7226839bee2f1a4a0f8e6e06986cb33806c93e0b0c1d6cfd23f4a68c1f2a38c74b8df70f28"
+    "0984a840c710c52279034d04f61e313d4bcd8b3b5c58468a44565a1acb2eefc6d49044be71"
+    "63e64ed84b5e7991ecba274a3a7ee4defb842a86ac4cbf2d3bfc9cf870ae025a3e2fbc7759"
+    "16a59579763c06eb84ad8edd1d03787e609ad446de43ebed16330ab06716fa73"
+)
+# OAEP, produced by pyca/cryptography with the same key.
+_OAEP_SHA1_MSG = "novelhub-oaep-sha1"
+_OAEP_SHA1_CT = (
+    "842f5e73bc3f563efdc0dab81371509b1f9c27d774bc87cc9522eb0a075d4547395fc6286279"
+    "3a6bea162d6f41893357a666e886e9f7761f9e7a676219c94990004f44be7bad2afd78515b44"
+    "e0b7acf0280bcb893e6a80b69d14a2f7b9431cd4b752fdced130b5ca2960e15f22f3edb613c9"
+    "9da390b70344f5bc45fa32f5cef32f75f609a51fac19390185ee712a3f491789d269f85623"
+    "06a2d115fcfe236709666e5a8aedc6571399801ad795eb59960eba9118a36b8835674bae6c"
+    "91e557672464df4ab4cb259823f409a0432d11c7236d68b04090413ebe23fc7a4cd550becf"
+    "575b595b7a58a53a2628c9f2aed7547469e3d8a4b2498e89ee24134a5a4210"
+)
+# NoPadding: a 256-byte block and its raw RSA public-key transform, from
+# pure-Python pow().
+_NOPAD_BLOCK_HEX = (
+    "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425"
+    "262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b"
+    "4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f70"
+    "7172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495"
+    "969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9ba"
+    "bbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf"
+    "e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"
+)
+_NOPAD_CT = (
+    "839fb895812a8082e5880beded340993fd73a55477fd9e50585d1a09bd4e4d67d61564d03b39"
+    "66c68b17928d571a2b87784bc35a31a763ae84c31d121f8f8b8dde41cff90706c52a7fdf6af"
+    "db1d29cd2682f5f2d50b3d5f6faf101027ed28ae0bbb2518662a3d5edc7e065c076015901d37"
+    "18376418ccab61ac9c5678906ae0139689bcee5b0f109dc3959d376d145c39d15a9d6a3bb34f"
+    "93879cda9d2858b2308128d82e581df1c46c4e716c586681c2023c57776660577af28325bda8"
+    "d200bdc1934497c3ad32cfde37600c79cbf6ea616e10a5ba4875598b708295d5fab5f0fe95f2"
+    "d5eaac3a02ee9675534cc60b86aaa8b31c7d44e00567176060d15b241"
+)
+# Modulus and public exponent, so the test file can raise a block to a
+# ciphertext itself and craft any padding case it likes.
+_RSA_N_HEX = (
+    "b3510a2bcd4ce644c5b594ae5059e12b2f054b658d5da5959a2fdf1871b808bc3df3e628d279"
+    "2e51aad5c124b43bda453dca5cde4bcf28e7bd4effba0cb4b742bbb6d5a013cb63d1aa3a89e0"
+    "2627ef5398b52c0cfd97d208abeb8d7c9bce0bbeb019a86ddb589beb29a5b74bf861075c677c"
+    "81d430f030c265247af9d3c9140ccb65309d07e0adc1efd15cf17e7b055d7da3868e4648cc3a"
+    "180f0ee7f8e1e7b18098a3391b4ce7161e98d57af8a947e201a463e2d6bbca8059e5706e9dfe"
+    "d8f4856465ffa712ed1aa18e888d12dc6aa09ce95ecfca83cc5b0b15db09c8647f5d524c0f2e"
+    "7620a3416b9623cadc0f097af573261c98c8400aa12af38e43cad84d"
+)
+_RSA_E_HEX = "10001"
+# A P-256 PKCS#8 key, to check that a key of the wrong algorithm is refused.
+_EC_PKCS8_B64 = (
+    "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgzFEtvsByckhwcE/3iIUB81ZrPtSv"
+    "y/GMpSga3GzVF7KhRANCAATaPNf0nqUZsOsokhh/1ipHCL3yYKnwprFVLCdSaTRU/PeEpkoVg4KD"
+    "4t9PpAOQwdqefpjxdN+ww9ajULMd2n4x"
+)
+
+_RSA_N = int(_RSA_N_HEX, 16)
+_RSA_E = int(_RSA_E_HEX, 16)
+_RSA_K = (_RSA_N.bit_length() + 7) // 8  # 256, an RSA-2048 modulus
+
+
+def _rsa_public_raw(block: bytes) -> bytes:
+    """Raise one raw block with the fixture's public exponent, in pure Python.
+
+    The ciphertext the shim receives is therefore built without OpenSSL, so an
+    assertion about what the shim does with it is a statement about the shim's
+    own PKCS#1 handling rather than about OpenSSL's.
+    """
+    return pow(int.from_bytes(block, "big"), _RSA_E, _RSA_N).to_bytes(_RSA_K, "big")
+
+
+def _rsa_js(body: str, transformation: str = "RSA") -> str:
+    """A JS fragment with ``c`` bound to a cipher holding the fixture's keys."""
+    return (
+        "var c = java.createAsymmetricCrypto('" + transformation + "');"
+        "c.setPrivateKey(java.base64DecodeToByteArray('" + _RSA_PKCS8_B64 + "'));"
+        "c.setPublicKey(java.base64DecodeToByteArray('" + _RSA_SPKI_B64 + "'));" + body
+    )
+
+
+def _rsa_eval(body: str, transformation: str = "RSA") -> str:
+    return _engine()._try_eval_js(_rsa_js(body, transformation), "")
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_rsa_decrypts_the_published_pkcs1_vector_and_rejects_the_invalid_one():
+    """Wycheproof tcId 3 decrypts; tcId 9 (InvalidPkcs1Padding) raises."""
+    value = _rsa_eval(
+        "var once = function (hexCt) {"
+        "  try { return c.decryptStr(java.hexDecodeToByteArray(hexCt), false); }"
+        "  catch (e) { return 'threw: ' + e.message; }"
+        "};"
+        "once('" + _WY_PKCS1_VALID_CT + "') + '|'"
+        "+ once('" + _WY_PKCS1_INVALID_CT + "');"
+    )
+
+    good, bad = value.split("|", 1)
+
+    assert good == bytes.fromhex(_WY_PKCS1_VALID_MSG).decode()
+    # The whole point of doing the padding by hand: Java throws here, OpenSSL
+    # would have returned a pseudo-random buffer.
+    assert bad.startswith("threw: ")
+    assert "BadPaddingException" in bad
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_rsa_pkcs1_padding_rules_match_java():
+    """`sun.security.rsa.RSAPadding.unpadV15`, including its 8-byte PS rule.
+
+    Each block is raised to a ciphertext with pure-Python ``pow()``, so these
+    cases cover the rules the published vectors cannot isolate.
+    """
+
+    def block(block_type: int, ps_len: int, message: bytes, fill: int = 0x41) -> bytes:
+        assert 2 + ps_len + 1 + len(message) == _RSA_K
+        return bytes([0, block_type]) + bytes([fill]) * ps_len + b"\x00" + message
+
+    cases = [
+        # PS may be longer than 8 bytes; the message is whatever follows the
+        # first zero byte.
+        ("ps 251", block(2, 251, b"ok"), b"ok"),
+        # ... and exactly 8 is the boundary that Java accepts.
+        ("ps 8", block(2, 8, b"m" * 245), b"m" * 245),
+        # ... while 7 is the boundary it rejects.
+        ("ps 7", block(2, 7, b"m" * 246), None),
+        # No 0x00 separator at all.
+        ("no separator", bytes([0, 2]) + b"\x41" * (_RSA_K - 2), None),
+        # A type 1 block (`00 01 FF..FF 00 M`) is what a *public* key decrypts,
+        # not a private one.
+        ("type 1 for private key", block(1, 8, b"m" * 245, fill=0xFF), None),
+        # The header's first byte must be 0x00.
+        ("header 01 02", bytes([1, 2]) + b"\x41" * (_RSA_K - 2), None),
+        # A zero *after* the separator belongs to the message, not to the
+        # separator search.
+        (
+            "zero inside the message",
+            bytes([0, 2]) + b"\x41" * 12 + b"\x00" + b"\x00\x01\x02" + b"\x41" * (_RSA_K - 18),
+            b"\x00\x01\x02" + b"\x41" * (_RSA_K - 18),
+        ),
+    ]
+
+    value = _rsa_eval(
+        "var cases = [" + ",".join("'" + _rsa_public_raw(b).hex() + "'" for _, b, _ in cases) + "];"
+        "var out = [];"
+        "for (var i = 0; i < cases.length; i++) {"
+        "  try {"
+        "    out.push('ok:' + c.decrypt(java.hexDecodeToByteArray(cases[i]), false).toString('hex'));"
+        "  } catch (e) { out.push('err'); }"
+        "}"
+        "out.join(';');"
+    )
+    got = value.split(";")
+
+    assert len(got) == len(cases)
+    for (label, _block, expected), actual in zip(cases, got):
+        assert actual == ("err" if expected is None else "ok:" + expected.hex()), label
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_rsa_pkcs1_plaintext_limit_is_k_minus_11():
+    """`RSAPadding.padV15` allows at most `k - 11` bytes -- two header bytes, at
+    least 8 padding bytes and the separator -- and JCE reports the overflow as
+    IllegalBlockSizeException rather than silently emitting a bad block."""
+    limit = _RSA_K - 11
+    value = _rsa_eval(
+        "var why = function (fn) { try { fn(); return 'no-error'; }"
+        "  catch (e) { return e.message; } };"
+        "c.encrypt('x'.repeat(" + str(limit) + "), true).length + '|'"
+        "+ why(function () { c.encrypt('x'.repeat(" + str(limit + 1) + "), true); });"
+    )
+    length, message = value.split("|", 1)
+
+    assert length == str(_RSA_K)
+    assert str(limit) in message
+    assert "IllegalBlockSizeException" in message
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_rsa_pkcs1_block_type_follows_the_key_that_owns_the_operation():
+    """`RSACipher.engineInit`: type 2 for encrypt+public / decrypt+private,
+    type 1 for encrypt+private / decrypt+public.  Decrypting a type 2 block
+    with the public key must therefore fail, and vice versa."""
+    value = _rsa_eval(
+        "var d = function (hexCt, usePublic) {"
+        "  try { return c.decryptStr(java.hexDecodeToByteArray(hexCt), usePublic); }"
+        "  catch (e) { return 'err'; }"
+        "};"
+        "var pub = c.encryptHex('x', true);"
+        "var priv = c.encryptHex('x', false);"
+        "d(pub, false) + '|' + d(pub, true) + '|' + d(priv, true) + '|' + d(priv, false);"
+    )
+
+    assert value == "x|err|x|err"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_rsa_default_transformation_is_pkcs1padding():
+    """A bare "RSA" means RSA/ECB/PKCS1Padding, as in JCE, and the names are
+    case-insensitive."""
+    names = ["RSA", "RSA/ECB/PKCS1Padding", "RSA/NONE/PKCS1Padding", "rsa/ecb/pkcs1padding"]
+    value = _engine()._try_eval_js(
+        "var out = [];"
+        "var names = [" + ",".join("'" + n + "'" for n in names) + "];"
+        "for (var i = 0; i < names.length; i++) {"
+        "  try {"
+        "    var x = java.createAsymmetricCrypto(names[i]);"
+        "    x.setPrivateKey(java.base64DecodeToByteArray('" + _RSA_PKCS8_B64 + "'));"
+        "    out.push(x.decryptStr(java.hexDecodeToByteArray('" + _WY_PKCS1_VALID_CT + "'), false));"
+        "  } catch (e) { out.push('threw: ' + e.message); }"
+        "}"
+        "out.join('|');",
+        "",
+    )
+
+    assert value == "|".join([bytes.fromhex(_WY_PKCS1_VALID_MSG).decode()] * len(names))
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_rsa_nopadding_is_the_raw_modular_transform():
+    """`NoPadding` skips the padding entirely, in both directions.
+
+    The ciphertext and the block both come from pure-Python `pow()`, so the
+    equality is a cross-implementation check rather than a round-trip.
+    """
+    value = _rsa_eval(
+        "c.decrypt(java.hexDecodeToByteArray('" + _NOPAD_CT + "'), false).toString('hex')"
+        "+ '|' + c.encryptHex(java.hexDecodeToByteArray('" + _NOPAD_BLOCK_HEX + "'), true);",
+        "RSA/ECB/NoPadding",
+    )
+
+    assert value == _NOPAD_BLOCK_HEX + "|" + _NOPAD_CT
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_rsa_oaep_works_only_from_the_spelling_without_with():
+    """`OAEPPadding` is usable; every `OAEPWith…AndMGF1Padding` spelling is not.
+
+    hutool's `KeyUtil.getAlgorithmAfterWith` keeps what follows the **last**
+    "with", so "RSA/ECB/OAEPWithSHA-1AndMGF1Padding" becomes
+    "SHA-1AndMGF1Padding" and fails in `KeyPairGenerator.getInstance` before a
+    Cipher exists -- in Legado too.  Reproducing that quirk matters: it is why
+    the OAEP digest/MGF1 pairing never has to be guessed.
+    """
+    value = _rsa_eval(
+        "c.decryptStr(java.hexDecodeToByteArray('" + _OAEP_SHA1_CT + "'), false);",
+        "RSA/ECB/OAEPPadding",
+    )
+    assert value == _OAEP_SHA1_MSG
+
+    for spelling, mangled in (
+        ("RSA/ECB/OAEPWithSHA-1AndMGF1Padding", "SHA-1AndMGF1Padding"),
+        ("RSA/ECB/OAEPWithSHA-256AndMGF1Padding", "SHA-256AndMGF1Padding"),
+    ):
+        message = _engine()._try_eval_js(
+            "var out;"
+            "try { java.createAsymmetricCrypto('" + spelling + "'); out = 'constructed'; }"
+            "catch (e) { out = e.message; }"
+            "out;",
+            "",
+        )
+        assert message != "constructed"
+        # The name hutool derives from the spelling is what has to fail: the
+        # message must name it, otherwise a "helpful" fix to getAlgorithmAfterWith
+        # would quietly turn this into an unsupported-padding error instead.
+        assert '解析为 "' + mangled + '"' in message
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_rsa_use_public_key_defaults_to_the_public_key():
+    """Kotlin `usePublicKey: Boolean? = true` with
+    `when (usePublicKey) { true -> PublicKey; else -> PrivateKey }`.
+
+    `@JvmOverloads` gives Rhino a one-argument overload for the omitted case, so
+    an omitted argument means the *public* key while an explicit `null` or
+    `false` means the private one.  A source that sets only a private key and
+    then calls `decrypt(data)` therefore uses a random public key -- in Legado
+    too (see the next test).
+    """
+    value = _rsa_eval(
+        "var ct = c.encryptBase64('x', true);"
+        "var st = c.encryptBase64('y', false);"
+        "var one = function (fn) { try { return fn(); } catch (e) { return 'err'; } };"
+        "one(function () { return c.decryptStr(ct); }) + '|'"
+        "+ one(function () { return c.decryptStr(ct, null); }) + '|'"
+        "+ one(function () { return c.decryptStr(ct, false); }) + '|'"
+        "+ one(function () { return c.decryptStr(st, true); }) + '|'"
+        "+ one(function () { return c.decryptStr(st, undefined); });"
+    )
+
+    assert value == "err|x|x|y|err"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_rsa_keys_are_pkcs8_or_spki_der_and_the_getters_round_trip():
+    """`KeyUtil.generatePrivateKey` wraps the bytes in a `PKCS8EncodedKeySpec`
+    and `setPrivateKey(String)` is `key.encodeToByteArray()` -- plain UTF-8, with
+    no PEM or Base64 handling -- so a PEM string fails in Legado as well."""
+    value = _rsa_eval(
+        "var why = function (fn) { try { fn(); return 'no-error'; }"
+        "  catch (e) { return e.message; } };"
+        "(c.getPublicKeyBase64() === '" + _RSA_SPKI_B64 + "') + '|'"
+        "+ (c.getPrivateKeyBase64() === '" + _RSA_PKCS8_B64 + "') + '|'"
+        "+ why(function () {"
+        "    java.createAsymmetricCrypto('RSA').setPrivateKey('-----BEGIN PRIVATE KEY-----');"
+        "  }) + '|'"
+        "+ why(function () {"
+        "    java.createAsymmetricCrypto('RSA')"
+        "      .setPrivateKey(java.base64DecodeToByteArray('" + _EC_PKCS8_B64 + "'));"
+        "  }) + '|'"
+        "+ why(function () {"
+        "    java.createAsymmetricCrypto('RSA').setPrivateKey(Buffer.from('nope', 'utf-8'));"
+        "  });"
+    )
+    ok_pub, ok_priv, pem, wrong_type, garbage = value.split("|", 4)
+
+    assert (ok_pub, ok_priv) == ("true", "true")
+    assert "PEM" in pem
+    assert "ec" in wrong_type and "RSA" in wrong_type
+    assert "PKCS#8" in garbage
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_rsa_constructor_generates_a_pair_eagerly_like_legado():
+    """`BaseAsymmetric.init` calls `initKeys()` as soon as both keys are null,
+    so every `createAsymmetricCrypto` generates a 1024-bit pair first
+    (`KeyUtil.DEFAULT_KEY_SIZE`).
+
+    Two consequences are pinned here: only setting the private key leaves that
+    random public key in place (so a flagless `decrypt` cannot work), and
+    `setXxxKey(null)` is how the key really becomes absent.
+    """
+    value = _rsa_eval(
+        "var g = java.createAsymmetricCrypto('RSA');"
+        "var pub = g.getPublicKeyBase64();"
+        "var pair = g.decryptStr(g.encryptBase64('x', true), false);"
+        "var only = java.createAsymmetricCrypto('RSA');"
+        "only.setPrivateKey(java.base64DecodeToByteArray('" + _RSA_PKCS8_B64 + "'));"
+        "var ct = c.encryptBase64('x', true);"
+        "var flagless = function () { try { return only.decryptStr(ct); }"
+        "  catch (e) { return 'err'; } };"
+        "(pub !== '" + _RSA_SPKI_B64 + "') + '|'"
+        "+ (g.getPrivateKeyBase64() !== '" + _RSA_PKCS8_B64 + "') + '|'"
+        # A 1024-bit RSA SubjectPublicKeyInfo is 162 DER bytes.
+        "+ java.base64DecodeToByteArray(pub).length + '|'"
+        "+ pair + '|' + flagless() + '|' + only.decryptStr(ct, false) + '|'"
+        "+ (function () {"
+        "    var n = java.createAsymmetricCrypto('RSA');"
+        "    n.setPublicKey(null);"
+        "    try { n.encrypt('x', true); return 'no-error'; }"
+        "    catch (e) { return e.message; }"
+        "  })();"
+    )
+    fresh_pub, fresh_priv, der_len, pair, flagless, flagged, npe = value.split("|", 6)
+
+    assert (fresh_pub, fresh_priv, der_len) == ("true", "true", "162")
+    assert pair == "x"
+    assert flagless == "err"
+    assert flagged == "x"
+    # BaseAsymmetric.getKeyByType, message verbatim.
+    assert npe == "Public key must not null when use it !"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_rsa_string_arguments_follow_the_encrypt_decrypt_asymmetry():
+    """`AsymmetricEncryptor.encrypt(String, …)` is `StrUtil.utf8Bytes(data)`,
+    while `AsymmetricDecryptor.decrypt(String, …)` first runs the string through
+    `SecureUtil.decode` (hex when it is all hex digits, else Base64).  A ByteArray
+    is taken raw, which is what Kotlin's `is ByteArray -> String(decrypt(…))`
+    branch relies on."""
+    value = _rsa_eval(
+        "var b64 = c.encryptBase64('明文-abc', true);"
+        "var hexCt = c.encryptHex('明文-abc', true);"
+        "var why = function (fn) { try { fn(); return 'no-error'; }"
+        "  catch (e) { return e.message; } };"
+        "c.decryptStr(b64, false) + '|'"
+        "+ c.decryptStr(hexCt, false) + '|'"
+        "+ c.decryptStr(java.hexDecodeToByteArray(hexCt), false) + '|'"
+        "+ why(function () { c.encrypt(123, true); });"
+    )
+
+    assert value == "明文-abc|明文-abc|明文-abc|Unexpected input type"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_rsa_block_size_splits_the_data_only_when_it_is_set():
+    """hutool's `doFinal` is a single operation while the block size is < 0 --
+    which is the case for RSA on Legado, since `Cipher.getBlockSize()` only
+    returns a size when BouncyCastle is on the classpath.  Setting one switches
+    to `doFinalWithBlock`, and 0 must not loop forever the way it does in Java."""
+    value = _rsa_eval(
+        "var one = c.encrypt('y'.repeat(200), true).length;"
+        "var defaultSize = c.getEncryptBlockSize() + ',' + c.getDecryptBlockSize();"
+        "var s = java.createAsymmetricCrypto('RSA');"
+        "s.setPrivateKey(java.base64DecodeToByteArray('" + _RSA_PKCS8_B64 + "'));"
+        "s.setPublicKey(java.base64DecodeToByteArray('" + _RSA_SPKI_B64 + "'));"
+        "s.setEncryptBlockSize(128);"
+        "s.setDecryptBlockSize(256);"
+        "var two = s.encrypt('y'.repeat(200), true).length;"
+        "var round = s.decryptStr(s.encrypt('y'.repeat(200), true), false) === 'y'.repeat(200);"
+        "var z = java.createAsymmetricCrypto('RSA');"
+        "z.setPublicKey(java.base64DecodeToByteArray('" + _RSA_SPKI_B64 + "'));"
+        "z.setEncryptBlockSize(0);"
+        "var zero = z.encrypt('y'.repeat(200), true).length;"
+        "defaultSize + '|' + one + '|' + two + '|' + round + '|' + zero;"
+    )
+
+    assert value == "-1,-1|256|512|true|256"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_create_asymmetric_crypto_rejects_what_legado_rejects():
+    """Only RSA can be constructed, for two separate reasons that both apply to
+    Legado: it ships no BouncyCastle (so `Cipher.getInstance` fails for anything
+    else) and hutool's `getAlgorithmAfterWith` mangles any spelling containing
+    "with"."""
+    cases = {
+        "EC": "EC",
+        # hutool folds ECDSA/SM2/ECIES onto EC before looking it up.
+        "SM2": '"EC"',
+        "RSA/CBC/PKCS1Padding": "ECB",
+        "RSA/ECB": "变换需形如",
+        "RSA/ECB/ISO9796-1Padding": "不支持补码方式",
+    }
+    expressions = []
+    for transformation in cases:
+        expressions.append(
+            "(function () {"
+            "  try { java.createAsymmetricCrypto('" + transformation + "'); return 'no-error'; }"
+            "  catch (e) { return e.message; }"
+            "})()"
+        )
+    value = _engine()._try_eval_js("[" + ",".join(expressions) + "].join('\\n');", "")
+
+    for (transformation, needle), message in zip(cases.items(), value.split("\n")):
+        assert "no-error" != message, transformation
+        assert needle in message, transformation
+
+
+# ---------------------------------------------------------------------------
 # Legado byte / charset / URL helpers (C-22 remainder)
 #
 # `java.toURL` is the interesting one: Legado parses with `java.net.URL`, whose

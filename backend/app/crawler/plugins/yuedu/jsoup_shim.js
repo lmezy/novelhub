@@ -1348,6 +1348,474 @@ function __nhSymmetricCrypto(transformation, key, iv) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Asymmetric crypto (hutool AsymmetricCrypto / KeyUtil, 5.8.22)
+//
+// Legado's JsEncodeUtils.kt:77-81 is `AsymmetricCrypto(transformation)`, and
+// help/crypto/AsymmetricCrypto.kt adds only the ByteArray/String `setXxxKey`
+// overloads on top of hutool.  Everything below is derived from that hutool
+// source, which is a gradle dependency rather than part of this repository:
+//
+//   BaseAsymmetric.init      -- keys are generated *eagerly* when both are null
+//   BaseAsymmetric.getKeyByType -- throws when the requested half is null
+//   KeyUtil.generate{Pri,Pub}Key -- PKCS8EncodedKeySpec / X509EncodedKeySpec,
+//                                   i.e. the bytes must already be DER
+//   KeyUtil.getAlgorithmAfterWith + getMainAlgorithm -- "SHA256withRSA" -> "RSA"
+//   SecureUtil.createCipher   -- Cipher.getInstance(transformation), unmodified
+//   AsymmetricCrypto.doFinal  -- one shot unless a block size is set
+//   AsymmetricEncryptor/Decryptor -- String handling differs per direction
+//
+// Legado ships **no BouncyCastle** (no bcprov anywhere in the tree, and
+// GlobalBouncyCastleProvider only falls back to the JDK when the class is
+// missing), so `Cipher.getBlockSize()` is 0 for RSA: no implicit segmentation,
+// and non-RSA transformations fail inside `Cipher.getInstance`.  Both facts are
+// reproduced here instead of being "fixed".
+// ---------------------------------------------------------------------------
+
+/**
+ * hutool `KeyUtil.getMainAlgorithm(getAlgorithmAfterWith(algorithm))`.
+ *
+ * Verbatim from KeyUtil.java:
+ *   `if (StrUtil.startWithIgnoreCase(algorithm, "ECIESWith")) return "EC";`
+ *   `int indexOfWith = StrUtil.lastIndexOfIgnoreCase(algorithm, "with");
+ *    if (indexOfWith > 0) algorithm = StrUtil.subSuf(algorithm, indexOfWith + 4);`
+ *   `if ("ECDSA"|"SM2"|"ECIES".equalsIgnoreCase(algorithm)) algorithm = "EC";`
+ *   getMainAlgorithm: the part before the first '/', when that index is > 0.
+ *
+ * This is what `KeyFactory.getInstance` / `KeyPairGenerator.getInstance` get, so
+ * "SHA256withRSA" -> "RSA" and "RSA/ECB/PKCS1Padding" -> "RSA".
+ */
+function __nhKeyFactoryAlgorithm(algorithm) {
+  var a = String(algorithm === undefined || algorithm === null ? '' : algorithm);
+  if (/^ECIESWith/i.test(a)) return 'EC';
+  var withIndex = a.toLowerCase().lastIndexOf('with');
+  if (withIndex > 0) a = a.substring(withIndex + 4);
+  if (/^(ECDSA|SM2|ECIES)$/i.test(a)) a = 'EC';
+  var slash = a.indexOf('/');
+  if (slash > 0) a = a.substring(0, slash);
+  return a;
+}
+
+/**
+ * hutool `Base16Codec.decode`: blanks are removed and an **odd** length gets a
+ * leading "0" (`"abc"` -> bytes 0a bc), so `HexUtil.decodeHex` never throws on
+ * an odd-length string.
+ */
+function __nhHexDecode(hex) {
+  var t = String(hex === undefined || hex === null ? '' : hex).replace(/\s+/g, '');
+  if (t.length % 2 !== 0) t = '0' + t;
+  return Buffer.from(t, 'hex');
+}
+
+/**
+ * hutool `SecureUtil.decode(String)`:
+ * `Validator.isHex(key) ? HexUtil.decodeHex(key) : Base64.decode(key)`.
+ *
+ * `Validator.isHex` is `RegexPool.HEX` = `^[a-fA-F0-9]+$` -- no whitespace is
+ * tolerated and the length may be odd -- so a string of hex digits that happens
+ * to contain no `=` is read as hex even when the author meant Base64, exactly as
+ * in Legado.
+ */
+function __nhSecureUtilDecode(data) {
+  var s = String(data === undefined || data === null ? '' : data);
+  if (/^[0-9a-fA-F]+$/.test(s)) return __nhHexDecode(s);
+  return Buffer.from(s, 'base64');
+}
+
+/**
+ * Map the padding part of a JCE transformation onto what this shim implements.
+ *
+ * `SecureUtil.createCipher` hands the transformation to `Cipher.getInstance`
+ * untouched, so the JCE names are the spec.  `PKCS1Padding` is re-done by hand
+ * on top of RSA_NO_PADDING (see __nhRsaPadV15) because OpenSSL and Java disagree
+ * about invalid padding.
+ *
+ * Only `OAEPPadding` is listed for OAEP: it is the only OAEP spelling that
+ * survives hutool's `getAlgorithmAfterWith` (see __nhRsaCipherSpec), so
+ * `OAEPWithSHA-256AndMGF1Padding` and friends cannot be constructed in Legado
+ * either -- which also means the OAEP/MGF1 digest pairing never has to be
+ * guessed.
+ */
+function __nhRsaPaddingSpec(transformation, paddingName) {
+  var p = String(paddingName === undefined || paddingName === null ? '' : paddingName)
+    .toLowerCase().replace(/[-_\s]/g, '');
+  if (p === '' || p === 'pkcs1padding') return { padding: 'pkcs1' };
+  if (p === 'nopadding') return { padding: 'none' };
+  if (p === 'oaep' || p === 'oaeppadding') return { padding: 'oaep', oaepHash: 'sha1' };
+  throw new Error(
+    'createAsymmetricCrypto(' + transformation + ') 失败: 不支持补码方式 "'
+    + paddingName + '"'
+  );
+}
+
+/**
+ * The RSA half of `Cipher.getInstance(transformation)`.
+ *
+ * The key algorithm is resolved **first**, because `BaseAsymmetric.init` calls
+ * `initKeys()` -> `KeyUtil.generateKeyPair(algorithm)` before `initCipher()`, and
+ * `getAlgorithmAfterWith` keeps only what follows the **last** "with".  So
+ * "RSA/ECB/OAEPWithSHA-1AndMGF1Padding" resolves to "SHA-1AndMGF1Padding" and
+ * fails before a Cipher is even created -- a hutool quirk that is reproduced
+ * here rather than "fixed", because a source cannot use that spelling in Legado
+ * either.  "RSA/ECB/OAEPPadding" contains no "with" and does work.
+ */
+function __nhRsaCipherSpec(transformation) {
+  var t = String(transformation === undefined || transformation === null ? '' : transformation);
+  var factoryAlg = __nhKeyFactoryAlgorithm(t);
+  if (!/^rsa$/i.test(factoryAlg)) {
+    throw new Error(
+      'createAsymmetricCrypto(' + t + ') 失败: 只有 RSA 变换能构造成功（密钥算法解析为 "'
+      + factoryAlg + '"）。Legado 未打包 BouncyCastle，Cipher.getInstance 对非 RSA 变换'
+      + '会抛 NoSuchAlgorithmException；而 hutool 的 getAlgorithmAfterWith 只保留最后一个 '
+      + '"with" 之后的内容，所以含 "with" 的写法在那里连密钥对都生成不出来'
+      + '（"RSA/ECB/OAEPPadding" 不含 "with"，可用）'
+    );
+  }
+  var parts = t.split('/');
+  if (parts.length === 1) return __nhRsaPaddingSpec(t, 'PKCS1Padding');
+  if (parts.length !== 3) {
+    throw new Error(
+      'createAsymmetricCrypto(' + t + ') 失败: 变换需形如 "RSA" 或 "RSA/ECB/PKCS1Padding"'
+    );
+  }
+  var mode = (parts[1] || '').trim().toUpperCase();
+  // NONE is accepted as well: matching Java when it accepts NONE matters more
+  // than refusing it if it happens not to, since the result is identical.
+  if (mode !== 'ECB' && mode !== 'NONE') {
+    throw new Error('createAsymmetricCrypto(' + t + ') 失败: RSA 只有 ECB 模式');
+  }
+  return __nhRsaPaddingSpec(t, (parts[2] || '').trim());
+}
+
+/**
+ * The bytes Legado's `setPrivateKey`/`setPublicKey` would hand to
+ * `KeyUtil.generate{Private,Public}Key`.
+ *
+ * AsymmetricCrypto.kt:22,32 make the String overload `key.encodeToByteArray()` --
+ * plain UTF-8 bytes, **not** a Base64/hex decode and **not** PEM de-armouring --
+ * and `KeyUtil` wraps the result in a `PKCS8EncodedKeySpec`/`X509EncodedKeySpec`
+ * without parsing it.  A PEM string therefore fails in Legado as well; the error
+ * says so and shows the one-line conversion, because otherwise this is an
+ * extremely confusing failure to debug from a book source.
+ */
+function __nhAsymKeyBytes(key, kind) {
+  if (Buffer.isBuffer(key)) return key;
+  if (typeof key === 'string') {
+    if (key.indexOf('-----BEGIN') >= 0) {
+      throw new Error(
+        'set' + kind + 'Key(...) 失败: 参数是 PEM 文本。Legado 的 String 重载只是把字符串'
+        + '按 UTF-8 当字节用（KeyUtil 直接套 PKCS#8/X.509 规范，不做 PEM 解析），PEM 在 '
+        + 'Legado 里同样会失败。请先转成 DER 字节，例如先去掉首尾行、去掉空白，再用 '
+        + 'java.base64DecodeToByteArray(...) 解码'
+      );
+    }
+    return Buffer.from(key, 'utf-8');
+  }
+  throw new Error('set' + kind + 'Key(...) 失败: 只接受 ByteArray 或 String');
+}
+
+/** Java `KeyFactory`/`KeyPairGenerator` algorithm name -> Node's key type. */
+function __nhNodeKeyType(algorithm) {
+  var a = String(algorithm === undefined || algorithm === null ? '' : algorithm).toLowerCase();
+  if (a === 'rsa') return 'rsa';
+  if (a === 'ec') return 'ec';
+  if (a === 'dsa') return 'dsa';
+  return a;
+}
+
+/**
+ * `KeyUtil.generatePrivateKey` (= `new PKCS8EncodedKeySpec(key)` through
+ * `KeyFactory.getInstance(alg)`) and its public-key twin.
+ *
+ * Node infers the key type from the DER, while Java's KeyFactory is pinned to
+ * the transformation's algorithm, so the parsed type is checked against
+ * `__nhKeyFactoryAlgorithm` -- otherwise an EC key would be accepted where
+ * Legado throws InvalidKeySpecException.
+ */
+function __nhAsymParseKey(der, type, kind, transformation) {
+  var parsed;
+  try {
+    parsed = type === 'pkcs8'
+      ? require('crypto').createPrivateKey({ key: der, format: 'der', type: 'pkcs8' })
+      : require('crypto').createPublicKey({ key: der, format: 'der', type: 'spki' });
+  } catch (e) {
+    throw new Error(
+      'set' + kind + 'Key(...) 失败: 需要 '
+      + (type === 'pkcs8' ? 'PKCS#8' : 'X.509/SPKI') + ' DER 字节（'
+      + der.length + ' 字节）: ' + (e && e.message ? e.message : String(e))
+    );
+  }
+  var factoryAlg = __nhKeyFactoryAlgorithm(transformation);
+  var expected = __nhNodeKeyType(factoryAlg);
+  if (parsed.asymmetricKeyType !== expected) {
+    throw new Error(
+      'set' + kind + 'Key(...) 失败: 密钥类型是 ' + parsed.asymmetricKeyType + '，而 '
+      + 'KeyFactory.getInstance("' + factoryAlg + '") 在 Legado 里会抛 '
+      + 'InvalidKeySpecException'
+    );
+  }
+  return parsed;
+}
+
+/**
+ * Legado's `usePublicKey: Boolean? = true`, with
+ * `when (usePublicKey) { true -> KeyType.PublicKey; else -> KeyType.PrivateKey }`.
+ *
+ * `@JvmOverloads` also emits a one-argument overload, and that is the one Rhino
+ * picks when JS leaves the argument out -- so *omitted* selects the public key
+ * while an explicit `null`/`false` (or anything that is not `true`) selects the
+ * private key.  `arguments.length` is what tells the two apart here.
+ */
+function __nhUsePublicKey(args, index) {
+  if (args.length <= index) return true;
+  return args[index] === true;
+}
+
+/** The modulus size in bytes, which `sun.security.rsa.RSAPadding` calls `k`. */
+function __nhRsaModulusBytes(key) {
+  var bits = key.asymmetricKeyDetails && key.asymmetricKeyDetails.modulusLength;
+  if (!bits) throw new Error('无法确定 RSA 密钥长度（expected an RSA key）');
+  return bits >> 3;
+}
+
+/**
+ * `sun.security.rsa.RSAPadding.padV15`: type 2 (`00 02 PS 00 M`, random non-zero
+ * PS) for a public key, type 1 (`00 01 FF…FF 00 M`) for a private key.
+ */
+function __nhRsaPadV15(data, k, type) {
+  var max = k - 11;
+  if (data.length > max) {
+    // JCE turns the BadPaddingException into IllegalBlockSizeException here.
+    throw new Error(
+      'RSA 加密失败: PKCS#1 v1.5 明文最长 ' + max + ' 字节（k=' + k + '），实际 '
+      + data.length + ' 字节 —— Java 抛 IllegalBlockSizeException'
+    );
+  }
+  var psLen = k - 3 - data.length;
+  var ps;
+  if (type === 1) {
+    ps = Buffer.alloc(psLen, 0xff);
+  } else {
+    // PS must contain no zero byte; redrawing a zero byte keeps it uniform.
+    ps = require('crypto').randomBytes(psLen);
+    for (var i = 0; i < psLen; i++) {
+      while (ps[i] === 0) ps[i] = require('crypto').randomBytes(1)[0];
+    }
+  }
+  return Buffer.concat([Buffer.from([0, type]), ps, Buffer.from([0]), data]);
+}
+
+/**
+ * `sun.security.rsa.RSAPadding.unpadV15`, including the "8 bytes of padding are
+ * required" rule (`if (ofs < 10) ok = false`).
+ *
+ * This exists because OpenSSL does **not** behave like Java here: for an invalid
+ * block its RSA_PKCS1_PADDING decryption returns a pseudo-random buffer instead
+ * of failing, so a book source with a `try/catch` fallback would silently get
+ * garbage.  The Wycheproof InvalidPkcs1Padding vectors pin the difference.
+ */
+function __nhRsaUnpadV15(block, type) {
+  var k = block.length;
+  var sep = -1;
+  var ok = block[0] === 0 && block[1] === type;
+  if (ok) {
+    if (type === 2) {
+      // The separator is the first zero after the two header bytes, so every
+      // byte before it is non-zero by construction.
+      for (var i = 2; i < k; i++) {
+        if (block[i] === 0) { sep = i; break; }
+      }
+      // `sep < 10` also rejects "no separator at all" (sep stays -1).
+      if (sep < 10) ok = false;
+    } else {
+      // PS must be all 0xff, then the 0x00 separator.
+      for (var j = 2; j < k; j++) {
+        if (block[j] !== 0xff) { sep = j; break; }
+      }
+      // block[-1] is undefined, so a missing separator fails this too.
+      if (sep < 10 || block[sep] !== 0) ok = false;
+    }
+  }
+  if (!ok) {
+    throw new Error(
+      'RSA 解密失败: PKCS#1 v1.5 补码无效（Java 抛 BadPaddingException）'
+    );
+  }
+  return block.slice(sep + 1);
+}
+
+/**
+ * Port of `java.createAsymmetricCrypto(transformation)`.
+ *
+ * Only the methods book sources call are provided.  Two behaviours that look
+ * like bugs are deliberate:
+ *
+ *   1. A key pair is generated on **every** call, before any key is set
+ *      (`BaseAsymmetric.init` -> `initKeys`).  So `setPrivateKey` alone leaves a
+ *      random public key in place, and `decrypt(data)` -- whose default is the
+ *      *public* key -- then fails with a padding error rather than working.
+ *   2. With no BouncyCastle on Legado's classpath `Cipher.getBlockSize()` is 0,
+ *      so the block sizes stay -1 and there is no segmentation at all.
+ */
+function __nhAsymmetricCrypto(transformation) {
+  var spec = __nhRsaCipherSpec(transformation);
+  var crypto = require('crypto');
+
+  // KeyUtil.generateKeyPair(algorithm) with KeyUtil.DEFAULT_KEY_SIZE = 1024.
+  var generated = crypto.generateKeyPairSync('rsa', { modulusLength: 1024 });
+  var publicKey = generated.publicKey;
+  var privateKey = generated.privateKey;
+  var encryptBlockSize = -1;
+  var decryptBlockSize = -1;
+
+  function keyFor(usePublic) {
+    var key = usePublic ? publicKey : privateKey;
+    if (key === null) {
+      // BaseAsymmetric.getKeyByType, message verbatim.
+      throw new Error(usePublic
+        ? 'Public key must not null when use it !'
+        : 'Private key must not null when use it !');
+    }
+    return key;
+  }
+
+  /** Legado's `data: Any`: ByteArray is raw; a String is UTF-8 or hex/Base64. */
+  function inputBytes(data, encrypting) {
+    if (Buffer.isBuffer(data)) return data;
+    if (typeof data === 'string') {
+      // AsymmetricEncryptor: `encrypt(StrUtil.utf8Bytes(data), keyType)`;
+      // AsymmetricDecryptor: `decrypt(SecureUtil.decode(data), keyType)`.
+      return encrypting ? Buffer.from(data, 'utf-8') : __nhSecureUtilDecode(data);
+    }
+    throw new Error('Unexpected input type');
+  }
+
+  /** One raw RSA operation with no padding, i.e. the modular exponentiation. */
+  function noPadding(encrypting, usePublic, block, key) {
+    var opts = { key: key, padding: require('crypto').constants.RSA_NO_PADDING };
+    if (encrypting) {
+      return usePublic ? crypto.publicEncrypt(opts, block) : crypto.privateEncrypt(opts, block);
+    }
+    return usePublic ? crypto.publicDecrypt(opts, block) : crypto.privateDecrypt(opts, block);
+  }
+
+  /**
+   * A single RSA operation over one block.
+   *
+   * `PKCS1Padding` is built on top of RSA_NO_PADDING so that the block can be
+   * validated in JS the way `sun.security.rsa.RSAPadding` does; the other
+   * paddings go straight to Node, whose checks do match Java's (an OAEP block
+   * that fails to decode makes OpenSSL report an error rather than fabricate a
+   * message).
+   */
+  function rawOp(encrypting, usePublic, data, key) {
+    if (spec.padding === 'pkcs1') {
+      var k = __nhRsaModulusBytes(key);
+      // A ciphertext longer than the modulus is rejected, but a shorter one is
+      // left-padded with zeros -- OpenSSL does that for RSA_NO_PADDING, and it
+      // is what Java's RSACipher does with its input buffer too, so a source
+      // that lost a leading 0x00 byte still gets the same answer.
+      if (!encrypting && data.length > k) {
+        throw new Error(
+          'RSA 解密失败: 密文长度 ' + data.length + ' 字节，超过密钥长度 ' + k
+          + ' 字节（Java 抛 BadPaddingException）'
+        );
+      }
+      // The block *type* follows the key that owns the operation, not the
+      // direction: `RSACipher.engineInit` picks BLOCKTYPE_2 for encrypt+public
+      // and decrypt+private, BLOCKTYPE_1 for the other two.
+      var type = (encrypting === usePublic) ? 2 : 1;
+      var block = encrypting ? __nhRsaPadV15(data, k, type) : data;
+      var out = noPadding(encrypting, usePublic, block, key);
+      return encrypting ? out : __nhRsaUnpadV15(out, type);
+    }
+    var opts = { key: key, padding: require('crypto').constants.RSA_NO_PADDING };
+    if (spec.padding === 'oaep') {
+      opts.padding = require('crypto').constants.RSA_PKCS1_OAEP_PADDING;
+      opts.oaepHash = spec.oaepHash;
+    }
+    if (encrypting) {
+      return usePublic ? crypto.publicEncrypt(opts, data) : crypto.privateEncrypt(opts, data);
+    }
+    return usePublic ? crypto.publicDecrypt(opts, data) : crypto.privateDecrypt(opts, data);
+  }
+
+  /**
+   * hutool `AsymmetricCrypto.doFinal` / `doFinalWithBlock`: one shot while the
+   * block size is < 0, otherwise the data is cut into equal chunks that are
+   * enciphered independently and concatenated.  A block size of 0 would loop
+   * forever in Java; here it falls back to one shot.
+   */
+  function doFinal(encrypting, usePublic, buf) {
+    var key = keyFor(usePublic);
+    var max = encrypting ? encryptBlockSize : decryptBlockSize;
+    if (max <= 0 || buf.length <= max) return rawOp(encrypting, usePublic, buf, key);
+    var parts = [];
+    for (var off = 0; off < buf.length; off += max) {
+      parts.push(rawOp(
+        encrypting, usePublic, buf.slice(off, Math.min(off + max, buf.length)), key
+      ));
+    }
+    return Buffer.concat(parts);
+  }
+
+  var api = {
+    setPrivateKey: function (key) {
+      privateKey = key === null || key === undefined
+        ? null
+        : __nhAsymParseKey(__nhAsymKeyBytes(key, 'Private'), 'pkcs8', 'Private', transformation);
+      return api;
+    },
+    setPublicKey: function (key) {
+      publicKey = key === null || key === undefined
+        ? null
+        : __nhAsymParseKey(__nhAsymKeyBytes(key, 'Public'), 'spki', 'Public', transformation);
+      return api;
+    },
+    // BaseAsymmetric: `Base64.encode(key.getEncoded())`, null when unset.
+    getPrivateKeyBase64: function () {
+      return privateKey === null
+        ? null
+        : privateKey.export({ format: 'der', type: 'pkcs8' }).toString('base64');
+    },
+    getPublicKeyBase64: function () {
+      return publicKey === null
+        ? null
+        : publicKey.export({ format: 'der', type: 'spki' }).toString('base64');
+    },
+    getEncryptBlockSize: function () { return encryptBlockSize; },
+    setEncryptBlockSize: function (n) { encryptBlockSize = Number(n) | 0; return api; },
+    getDecryptBlockSize: function () { return decryptBlockSize; },
+    setDecryptBlockSize: function (n) { decryptBlockSize = Number(n) | 0; return api; },
+    encrypt: function (data, usePublicKey) {
+      var usePublic = __nhUsePublicKey(arguments, 1);
+      return doFinal(true, usePublic, inputBytes(data, true));
+    },
+    encryptHex: function (data, usePublicKey) {
+      var usePublic = __nhUsePublicKey(arguments, 1);
+      // HexUtil.encodeHexStr: lowercase.
+      return doFinal(true, usePublic, inputBytes(data, true)).toString('hex');
+    },
+    encryptBase64: function (data, usePublicKey) {
+      var usePublic = __nhUsePublicKey(arguments, 1);
+      // EncoderUtils.base64Encode(ByteArray) = Base64.NO_WRAP, i.e. standard
+      // RFC 4648 with '=' padding and no line breaks.
+      return doFinal(true, usePublic, inputBytes(data, true)).toString('base64');
+    },
+    decrypt: function (data, usePublicKey) {
+      var usePublic = __nhUsePublicKey(arguments, 1);
+      return doFinal(false, usePublic, inputBytes(data, false));
+    },
+    decryptStr: function (data, usePublicKey) {
+      var usePublic = __nhUsePublicKey(arguments, 1);
+      // Kotlin `is ByteArray -> String(decrypt(data, keyType))` is UTF-8, and
+      // `is String -> decryptStr(data, keyType)` ends in StrUtil.str(..., UTF-8).
+      return doFinal(false, usePublic, inputBytes(data, false)).toString('utf-8');
+    },
+  };
+  return api;
+}
+
 // ---- Legado byte/charset helpers (JsExtensions.kt) ----
 
 /**
@@ -1810,6 +2278,10 @@ var java = {
     // throws too, and an unavailable algorithm must surface as a readable error
     // rather than a null that silently empties the field.
     return __nhSymmetricCrypto(transformation, key, iv);
+  },
+  createAsymmetricCrypto: function (transformation) {
+    // Same reasoning as createSymmetricCrypto above.
+    return __nhAsymmetricCrypto(transformation);
   },
   // ---- AES family (JsEncodeUtils.kt:91-279) --------------------------------
   // These are faithful ports of Legado's own (deprecated) wrappers, including two
