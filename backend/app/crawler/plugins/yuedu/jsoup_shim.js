@@ -1423,6 +1423,95 @@ function __nhStringToInt(str) {
   return __nhChineseNumToInt(num);
 }
 
+// ---- Legado date formatting (JsExtensions.kt:512-525, AppConst.kt:38) ----
+
+/**
+ * Format an instant with a Java `SimpleDateFormat` pattern subset.
+ *
+ * Implemented by shifting the instant by `offsetMs` and then reading the *UTC*
+ * getters, which is equivalent to formatting in a timezone with that offset and
+ * needs no timezone database.
+ *
+ * `SimpleDateFormat(pattern, Locale.getDefault())` also localises textual fields
+ * (`MMM`, `EEE`) from the device locale; those need per-locale tables, so they
+ * raise a readable error rather than silently emitting the pattern letter.
+ * Numeric fields -- the ones real `timeFormat` patterns use -- are exact.
+ */
+function __nhFormatDate(ms, pattern, offsetMs) {
+  var d = new Date(Number(ms) + (Number(offsetMs) || 0));
+  var p = String(pattern === undefined || pattern === null ? '' : pattern);
+  var out = '';
+  var pad = function (n, width) {
+    var s = String(Math.abs(Math.trunc(n)));
+    while (s.length < width) s = '0' + s;
+    return s;
+  };
+
+  for (var i = 0; i < p.length;) {
+    var ch = p[i];
+    if (ch === "'") { // Java quoting: '' is a literal quote
+      if (p[i + 1] === "'") { out += "'"; i += 2; continue; }
+      var close = p.indexOf("'", i + 1);
+      if (close === -1) { out += p.slice(i + 1); break; }
+      out += p.slice(i + 1, close);
+      i = close + 1;
+      continue;
+    }
+    var n = 1;
+    while (i + n < p.length && p[i + n] === ch) n++;
+    var field;
+    switch (ch) {
+      case 'y':
+        field = n === 2 ? pad(d.getUTCFullYear() % 100, 2) : pad(d.getUTCFullYear(), n);
+        break;
+      case 'M':
+        if (n >= 3) {
+          // Java: MMM/MMMM are the localised month NAME, not a number.
+          throw new Error(
+            'SimpleDateFormat 模式 "M"×' + n + ' (在 "' + p + '" 中) 是本地化月份名，'
+            + 'Node 侧未实现；请改用 M/MM'
+          );
+        }
+        field = n === 2 ? pad(d.getUTCMonth() + 1, 2) : String(d.getUTCMonth() + 1);
+        break;
+      case 'd':
+        field = n >= 2 ? pad(d.getUTCDate(), 2) : String(d.getUTCDate());
+        break;
+      case 'H': // 0-23
+        field = n >= 2 ? pad(d.getUTCHours(), 2) : String(d.getUTCHours());
+        break;
+      case 'h': { // 1-12
+        var h12 = d.getUTCHours() % 12;
+        field = n >= 2 ? pad(h12 === 0 ? 12 : h12, 2) : String(h12 === 0 ? 12 : h12);
+        break;
+      }
+      case 'm':
+        field = n >= 2 ? pad(d.getUTCMinutes(), 2) : String(d.getUTCMinutes());
+        break;
+      case 's':
+        field = n >= 2 ? pad(d.getUTCSeconds(), 2) : String(d.getUTCSeconds());
+        break;
+      case 'S':
+        field = pad(d.getUTCMilliseconds(), n);
+        break;
+      case 'a':
+        field = d.getUTCHours() < 12 ? 'AM' : 'PM';
+        break;
+      default:
+        if (/[a-zA-Z]/.test(ch)) {
+          throw new Error(
+            'SimpleDateFormat 模式 "' + ch + '" (在 "' + p + '" 中) 依赖区域设置，'
+            + 'Node 侧未实现；请改用数字字段 (y/M/d/H/h/m/s/S/a)'
+          );
+        }
+        field = ch; // not a pattern letter -> literal
+    }
+    out += field;
+    i += n;
+  }
+  return out;
+}
+
 var java = {
   // ---- HTTP: Legado java.get / java.post return a Response object ----
   get: function (url, headers) {
@@ -1538,6 +1627,24 @@ var java = {
     var m = /第(.+?)章/.exec(str);
     if (!m) return str;
     return '第' + __nhStringToInt(m[1]) + '章';
+  },
+  timeFormat: function (time) {
+    // JsExtensions.kt:523-525 -> `AppConst.dateFormat.format(Date(time))`, and
+    // `AppConst.dateFormat` is the fixed pattern "yyyy/MM/dd HH:mm"
+    // (AppConst.kt:38).  Formatting happens in the runtime's default timezone;
+    // getTimezoneOffset() makes that correct across DST with no tz database.
+    var ms = Number(time);
+    return __nhFormatDate(
+      ms, 'yyyy/MM/dd HH:mm', -new Date(ms).getTimezoneOffset() * 60000
+    );
+  },
+  timeFormatUTC: function (time, format, sh) {
+    // JsExtensions.kt:512-518 -> `SimpleDateFormat(format)` with
+    // `timeZone = SimpleTimeZone(sh, "UTC")`.  `SimpleTimeZone`'s rawOffset is in
+    // **milliseconds**, so `sh` is milliseconds here too: a caller passing 8 gets
+    // ~UTC (8 ms), and one passing 28800000 gets UTC+8.  Kept faithful rather
+    // than "helpfully" treating small values as hours.
+    return __nhFormatDate(Number(time), format, Number(sh) || 0);
   },
   md5Encode: function (s) { return __nhMd5(s); },
   md5: function (s) { return __nhMd5(s); },

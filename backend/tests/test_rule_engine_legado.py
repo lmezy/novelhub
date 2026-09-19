@@ -1207,3 +1207,100 @@ def test_to_num_chapter_yields_minus_one_for_an_unmapped_character():
     assert engine._try_eval_js(
         "java.toNumChapter('第X章');", ""
     ) == "第-1章"
+
+
+# ---------------------------------------------------------------------------
+# `java.timeFormat` / `java.timeFormatUTC` (JsExtensions.kt:512-525)
+#
+# `timeFormat` is `AppConst.dateFormat.format(Date(time))` and `AppConst.dateFormat`
+# is the fixed pattern "yyyy/MM/dd HH:mm" (AppConst.kt:38).  `timeFormatUTC` is
+# `SimpleDateFormat(format)` with `timeZone = SimpleTimeZone(sh, "UTC")`, and
+# SimpleTimeZone's rawOffset is in **milliseconds** -- pinned below, because
+# treating `sh` as hours would be a silent divergence from Legado.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_time_format_utc_offset_is_milliseconds():
+    engine = _engine()
+
+    js = (
+        "java.timeFormatUTC(0, 'yyyy/MM/dd HH:mm', 0) + '|' +"
+        "java.timeFormatUTC(0, 'yyyy/MM/dd HH:mm', 28800000) + '|' +"
+        # SimpleTimeZone(8) is an 8-MILLISECOND offset, i.e. still ~UTC.
+        "java.timeFormatUTC(0, 'yyyy/MM/dd HH:mm', 8);"
+    )
+
+    assert engine._try_eval_js(js, "") == (
+        "1970/01/01 00:00|1970/01/01 08:00|1970/01/01 00:00"
+    )
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_time_format_utc_handles_rollover_and_sub_second_fields():
+    engine = _engine()
+
+    # 2021-12-31T16:30:45.123Z at UTC+8 is 2022-01-01 00:30:45.123.
+    js = (
+        "var t = Date.UTC(2021, 11, 31, 16, 30, 45, 123);"
+        "java.timeFormatUTC(t, 'yyyy/MM/dd HH:mm:ss.SSS', 28800000) + '|' +"
+        "java.timeFormatUTC(t, 'yyyy-MM-dd hh:mm a', 28800000) + '|' +"
+        "java.timeFormatUTC(t, 'yy/M/d', 0);"
+    )
+
+    assert engine._try_eval_js(js, "") == (
+        "2022/01/01 00:30:45.123|2022-01-01 12:30 AM|21/12/31"
+    )
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_time_format_utc_honours_java_quoting():
+    """A `'...'` section is a literal, and non-pattern letters pass through."""
+    engine = _engine()
+
+    js = (
+        "var t = Date.UTC(2021, 11, 31, 16, 30, 45, 123);"
+        "java.timeFormatUTC(t, \"yyyy'年'MM'月'dd'日'\", 28800000) + '|' +"
+        "java.timeFormatUTC(0, 'yyyy/MM/dd 周', 0);"
+    )
+
+    assert engine._try_eval_js(js, "") == "2022年01月01日|1970/01/01 周"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_time_format_utc_rejects_a_localised_month_name():
+    """`MMM` is the localised month name, which needs per-locale tables.
+
+    Raising a readable error beats emitting the numeric month where Legado would
+    emit e.g. "Jan".
+    """
+    engine = _engine()
+
+    value = engine._try_eval_js(
+        "var msg;"
+        "try { java.timeFormatUTC(0, 'MMM d', 0); msg = 'no-error'; }"
+        "catch (e) { msg = String(e && e.message ? e.message : e); }"
+        "msg;",
+        "",
+    )
+
+    assert value != "no-error"
+    assert "月份名" in value
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_time_format_uses_the_runtime_local_clock():
+    """`timeFormat` has no offset argument: it formats in the runtime's timezone.
+
+    Compared against Python's own local-time conversion of the same instant, so
+    the assertion holds whatever TZ the test runs under.
+    """
+    import time as _time
+
+    instant_ms = 1640971845123  # 2021-12-31T16:30:45.123Z
+    expected = _time.strftime(
+        "%Y/%m/%d %H:%M", _time.localtime(int(instant_ms / 1000))
+    )
+    engine = _engine()
+
+    assert engine._try_eval_js("java.timeFormat(%d);" % instant_ms, "") == expected
