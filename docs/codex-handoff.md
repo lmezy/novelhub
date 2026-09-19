@@ -58,7 +58,7 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 
 ## 2. 当前状态（2026-09-19）
 
-- 后端全量测试 **690 passed**：`cd backend && python -m pytest -q`
+- 后端全量测试 **702 passed**：`cd backend && python -m pytest -q`
 - Source Engine 闭环已完成并可用：导入书源 → 搜索 → 目录 → 正文 → Storage/DB/搜索 →
   网页阅读。当前工作重心是**同步稳定性与线上排错**，不是新增架构能力。
 - **AI 功能已补齐并在线可用**（第 18/19/20/27 节）：后端配置/上下文/流式/划词/RAG +
@@ -73,10 +73,14 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
   同步路径同一个 helper 也一起受益）；章节图片/封面补 `Cache-Control` 与 **304**；
   阅读器与书详情页的次要请求不再挡在正文前面。详见
   [reading-performance.md](reading-performance.md)。
-- **搜索已修正**（第 28 节）：模糊=每个字都要出现、多条件不再恒空；线上书本 33.5k / 章节
-  116.7k，`maxTotalHits=10000` 仍是硬顶。
+- **搜索已修正**（第 28/29 节）：模糊=每个字都要出现、多条件不再恒空、**同一字段上的多条件 AND
+  改走引擎联合查询**（两个正文条件不再恒为 0，可翻页）；线上书本 33.5k / 章节 116.7k，
+  `maxTotalHits=10000` 仍是硬顶。
 - 仓库已是"本地代码 = 线上代码"的状态（2026-09-19 部署）；**此后新改动仍需
   `docker compose build <服务>` + `up -d`**，线上镜像不会自动跟随本地代码。
+  **第 29/30 节的改动（搜索联合查询 + progress 500）尚未部署**，生效要重建 backend。
+- crawler 侧近 24h 无崩溃、无回归（第 30 节）：失败任务全部核到站点侧（CF 挑战/520）或
+  代理侧（节点抖动），没有「同步过的书被改判失败」。
 - 待用户处理（代码修不了，属站点侧防护，见第 4 节）：SiS文學網 / 御宅屋 /
   第一版主（Cloudflare 挑战）、菠萝猫（GoEdge 验证码）、搬山人（限速，可配同步间隔缓解）
   需浏览器过验证后导入 Cookie；UAA 书源依赖完整 Legado JS 运行时，建议换源。
@@ -138,7 +142,10 @@ WAF / 登录限制；不为单个站点写死逻辑；不在仓库和文档里�
 | 搜索结果被全部过滤、只剩首页链接；书页无 `<title>` 导致 `no usable metadata` | host-only 的 `bookUrlPattern`（只有 scheme+host）当过滤器用；`{{book.name}}` 没有 book 上下文 | 见第 26 节（`_book_url_pattern()`/`_extract_labelled_title()`） |
 | AI 诊断说「书源未配置 Cookie」，但设置 → 书源明明显示「已保存 Cookie」 | 诊断证据只带任务报错 + 规则 JSON，**完全没带 cookies 表的状态**；书源 `header` 里本来就不会有 cookie 字段 | 见第 27 节（`collect_login_state()` + 提示词口径） |
 | 搜索「铃铛」返回一堆只有「铃」或只有「铛」的结果 | Meilisearch 的 CJK 匹配是**逐字**的，`matchingStrategy: last` 只要求最后一个字命中；模糊模式把引擎结果原样返回 | 见第 28 节（`_condition_score` 模糊改为「每个字都要出现」） |
+| 任务同步了几百本书，最后却被判 failed（详情里明明 `books_synced=244`） | 翻到下一目录页时 `discover_books` 抛错（站点转人机验证），`discover_and_sync_all` 循环没兜住 → 整个任务算失败，成果只在库里 | 见第 30 节（本 run 有成果时停止翻页并按正常结果收尾） |
 | 高级搜索（多条件）怎么填都是 0 条 | 多条件路径每个条件只取 1000 条候选（`CANDIDATE_LIMIT`），`category=言情` 一类条件命中 1847 本，交集被截断后恒为空 | 见第 28 节（`_candidate_window()`：books 元数据 10000） |
+| 两个**正文**条件的 AND 恒为 0、翻页也 0 | 每个正文条件各自只取前 300 名候选（按相关性），而「铃」「仙」各命中近万章，两个前 300 几乎不重叠 → 交集恒为空 | 见第 29 节（`_same_field_conjunction`：同属性 AND 改走引擎联合查询） |
+| 首页每次加载报 `GET /api/progress` 500 | `ReadingProgressOut.chapter_id` 必填 `str`，而该列是 `ON DELETE SET NULL`（重同步会置空） | 见第 29 节（`schemas/progress.py` 改 `str \| None`） |
 
 ---
 
@@ -777,3 +784,92 @@ names=[_gid, cf_clearance, _gat_gtag_UA_99929_1, _ga_JKNXPWV2R8, _ga]`，渲染�
   books 窗口同步提高、`PAGE_CACHE_MAX_ENTRIES` 调小（一组 33.6k 排名 ≈5MB，×16 ≈80MB/worker，
   现在约 24MB）。更干净的方案（第 24 节起一直记为「未做」）：**索引期**给书名/作者生成 n-gram
   字段并设成 filterable，让引擎直接用 `filter` 做子串匹配；正文不适合（每章几万个 n-gram）。
+
+## 29. 2026-09-19：两个正文条件的 AND 恒为 0；`GET /api/progress` 500
+
+**现象**：① 高级搜索两个正文条件（正文「铃」AND 正文「仙」）结果 0 条，翻页也是 0；
+② 首页每次加载（`GET /api/progress?user_id=`）500，线上日志 3 条 `ResponseValidationError`。
+
+**根因**：
+
+1. **同一个字段上的多条件 AND 永远不可能有结果**。第 28 节把多条件的每个条件各自取一个候选窗口
+   再在 Python 里求交集，窗口按索引区分（books 10000 / chapters 1000 / `content` 300）。
+   但「正文铃」命中 **9 619** 章、「正文仙」命中 **10 000+** 章，两个条件各自的**前 300 名**
+   （按相关性）几乎不重叠 → 交集恒为空。多条件搜索不是逻辑错，是**取候选的方式**错。
+2. **`ReadingProgressOut.chapter_id` 声明成必填 `str`**，而 `reading_progress.chapter_id` 是
+   `ON DELETE SET NULL`（迁移 0031，重同步删旧章节时置空）→ 只要该用户有一行被清空指针的进度，
+   整个列表接口就 500。首页「继续阅读」因此一直拿不到数据（`catch {}` 静默）。
+
+**改动落点**（`services/search.py`、`schemas/progress.py`）：
+
+- `_same_field_conjunction()`：多条件 AND 且所有条件落在**同一个属性**上时，改走一条引擎联合查询。
+  这是 Meilisearch 唯一能原生表达的 AND：`_conjunction_query()` 把各条件值空格连接，
+  `matchingStrategy: "all"` 只返回**每个词都出现**的文档。实测「铃 仙」= **1 299 章**（0.01-0.4 s），
+  而旧路径是 0。
+- `_conjunction_rank()`：联合查询**只取 `id`**（取正文属性要 12 s/1000 章），结果按引擎相关性
+  排名并进 `_page_cache`；`_conjunction_search()` 按 offset/limit 切片，用
+  `_hydrate_around()`（把查询词带回去，`attributesToCrop` 裁出命中附近的片段）补水本页，
+  再用 `_conjunction_values()` 把这一页的正文取回来做**逐条复核**（引擎的中文匹配是逐字的，
+  `匹配策略 all` 仍可能把「铃」「铛」当成两个词）。复核要求**每个条件都命中**，否则丢弃。
+- 命中数：`engine_total` 与排名一起缓存（`_conjunction_totals`），所以翻页时总数不会从
+  1 299 跳成 1 000；窗口取 `CONJUNCTION_CANDIDATE_LIMIT = 1000`（25 页 ×40）。
+- 引擎不支持 `matchingStrategy`（<1.3）时回退到不带该参数的查询，不会把搜索变成硬失败。
+- `progress.py`：`chapter_id: str | None = None`。
+
+**验证**（线上影子回归，只读）：改动后 `正文铃 AND 正文仙` → `total=1000`（窗口上限）、
+每页 34-40 条、第 1/2 页**零重叠**、抽查 40 条**没有一条**是假命中、每条约 3 s
+（首次冷排名 13-27 s，之后走缓存）；单条件正文搜索不变（`铃` 263 条，翻页正常）。
+后端 **698 passed**（含 6 个联合查询测试 + 2 个 progress NULL 测试）。
+
+**仍有效/未做**：
+
+- 联合查询窗口 1 000 = 25 页；命中 1 299 时只显示到 1 000（宁可比引擎少，也不给翻不到的页）。
+- `content` 检索本身慢（首次冷排名十几秒），同一组条件翻页走缓存（TTL 120 s）。
+- 复核只做前 200 条（`CONJUNCTION_VERIFY_MAX_HITS`），更深的页用引擎排名。
+
+## 30. 2026-09-19：crawler「之前能同步的书现在判失败」——一条真 bug + 站点侧故障
+
+**现象**：用户反馈部分书以前能同步，现在任务结束时被判失败（**Icu 同步了几百本之后才出现
+JS 问题**）。
+
+**排查（只读线上）**：近 24h crawler 只有 6 条 ERROR、0 次重启（`RestartCount=0`），
+其余 285 条是 WARNING。核对到具体书目后分成两类：
+
+| 失败任务 | 报错 | 实测（2026-09-19） |
+|---|---|---|
+| **Icu（hq555）** | `该书源的发现规则是 Legado JS 脚本…当前环境无法执行` | **真 bug，见下**；站点现在正常（`fetch_explore` 实测 **1392 条**），书源 JS 本身没问题 |
+| 中文成人文学网-短篇（27 本全失败） | `Cloudflare 520/5xx` | 走代理 **403 + `Just a moment...`**（CF 挑战页），直连不通；该源 `books` 表里 **0 条**，从没同步成功过 |
+| UAA / 禁漫天堂 | 发现规则是 Legado JS | 这两个是真需要完整 Legado 运行时（第 26 节的口径） |
+| 爱丽丝书屋 | 连续 5 章被拦 | 站点真实限速/验证 |
+| cool18 | 反爬/captcha | 浏览器路径也要过验证 |
+| 要撸 / hq555 部分书 | ConnectError / ConnectTimeout | 代理节点抖动 |
+
+**根因（Icu，`crawl_tasks.result` 是铁证）**：任务 `6efe719b` 的结果是
+`{"books_found": 258, "books_synced": 244, "books_failed": 13}` —— **9 小时里同步了 244 本、
+245 本书在库里（`00:10` → `09:24` 逐个入库）**，然后跑到**下一页目录**时
+`fetch_explore` 返回 0 个分类（站点开始要求人机验证），`fetch_explore` 抛 RuntimeError，
+`discover_and_sync_all` 的循环**没有兜住它** → 整个任务被判 failed，9 小时的成果在任务列表里
+显示成「失败」。错误文案还说是「当前环境无法执行」，而同一个 JS 刚刚成功跑了 244 次。
+
+**改动落点**（`services/sync.py::discover_and_sync_all`）：
+
+- 发现页调用包进 try/except：**本 run 已经同步过书（或已发现书）时，停止翻页并把累计结果作为
+  正常结果返回**（`done=True`），日志记 warning；第一页就崩、但该源库里已有书时同样返回结果
+  （站点抖动，不该判失败）；**全新源 + 第一页就崩**仍然照旧抛错（保留自动重试与 AI 诊断）。
+  `SyncPaused` 原样上抛，暂停/取消语义不变。
+- 顺带把「有一个空目录 + 有 js 书源」那句文案改准：先查库里有没有书（有 → 网络/限速/验证的
+  瞬态提示），再区分「JS 规则本身跑不了」与「JS 跑了但站点没给分类（要人机验证/限流/改版）」。
+
+**验证**：新增 4 个测试（后页崩不掉成绩、第一页崩但库里有书不判失败、全新源仍失败、
+JS 空结果不再说「环境无法执行」），后端 **702 passed**；线上只读跑了一遍 Icu 的
+`fetch_explore` → 1392 条正常。**未在线上重跑整任务**（会真实抓几千次，没有必要）。
+
+**仍有效/未做**：
+
+- 站点要人机验证这件事代码解决不了：Icu 的 JS 自己会 `cookie.removeCookie` +
+  `java.startBrowserAwait(baseUrl, '人机验证')`，按第 4 节的处置在浏览器过验证后导 Cookie。
+- 其余失败任务（CF 520、代理抖动、限速）仍是站点/环境侧，见第 4 节。
+
+**顺带发现（未改）**：h528（風月文學網）17247 本书的章节正文里混进了整页导航/广告
+（正文规则没命中时回退到整页文本），章节标题被写成「书名 | 分站 | 分類 | 最新文章」。
+这是**内容质量**问题（不是失败），要修得看该书的 `ruleToc`/`ruleContent` 回退顺序。

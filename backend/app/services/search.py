@@ -36,6 +36,10 @@ class SearchService:
     # ``id`` + the searched field, which is 0.02-0.7 s for 10 000 documents, and
     # the ordered result is cached for repeat pages.
     METADATA_CANDIDATE_LIMIT = 10_000
+    # Meilisearch's ``pagination.maxTotalHits`` -- the highest page number its
+    # ranking rules will serve (it refuses ``page * hitsPerPage`` beyond this).
+    # Both indexes are created with this value (``_ensure_index``).
+    MAX_TOTAL_HITS = 10_000
     # How long a scored single-condition result stays usable for paging.  Books
     # and chapters keep flowing in while a user pages, so this is deliberately
     # short; the cost of a miss is one scan.
@@ -43,6 +47,22 @@ class SearchService:
     # One entry is at most ~10 000 ``(score, id)`` pairs (~1.5 MB), so 16 keeps
     # the worst case around 24 MB per process.
     PAGE_CACHE_MAX_ENTRIES = 16
+    # Multi-condition (AND/OR) searches used to score every condition on its own
+    # candidate window and intersect the ids in Python.  For two conditions on
+    # the same attribute that is arithmetically hopeless: 正文 「铃」 has 9 619
+    # matching chapters and 正文 「仙」 has 10 000+, but their *top* 300 candidates
+    # barely overlap, so `正文 铃 AND 正文 仙` returned 0 while the real
+    # intersection held 1 299 chapters.  Same-attribute AND now asks the engine
+    # for the conjunction (`matchingStrategy: "all"`) instead, which finds real
+    # intersections at any depth.  The window below is how many of those ranked
+    # hits are scored and cached for paging; it is much larger than the
+    # per-condition window because the engine did the selection already.
+    CONJUNCTION_CANDIDATE_LIMIT = 1000
+    # Page hits are re-checked against the real field text (the engine's CJK
+    # matching drops a term silently sometimes).  The check needs the stored
+    # field, so it is capped: pages beyond this many hits come from the engine's
+    # own match, still ranked, just not re-verified.
+    CONJUNCTION_VERIFY_MAX_HITS = 200
     # Words returned around the match when a chapter body is used as a snippet.
     SNIPPET_CROP_WORDS = 60
     CONTENT_INDEX_LIMIT = 100_000
@@ -132,6 +152,11 @@ class SearchService:
         self._chapter_buffer: list[dict] = []
         self._ensured: set[str] = set()
         self._page_cache: dict[str, tuple[float, list[tuple[int, str]]]] = {}
+        # The engine's own hit count for a conjunction query.  It has to be kept
+        # with the cached ranking, otherwise page 1 would report the engine's
+        # count and page 2 the window's -- the result list would "change" as the
+        # user pages, which is exactly the 0-result complaint this replaces.
+        self._conjunction_totals: dict[str, tuple[float, int | None]] = {}
 
     def _ensure_index(self, name: str, primary_key: str = "id") -> None:
         if name in self._ensured:
@@ -147,7 +172,7 @@ class SearchService:
         else:
             index.update_searchable_attributes(self.SEARCHABLE_CHAPTERS)
         try:
-            index.update_pagination_settings({"maxTotalHits": 10000})
+            index.update_pagination_settings({"maxTotalHits": self.MAX_TOTAL_HITS})
         except Exception:
             pass
         self._ensured.add(name)
@@ -849,6 +874,39 @@ class SearchService:
             return {}
         return {str(hit.get("id")): hit for hit in result.get("hits", []) or []}
 
+    def _hydrate_around(
+        self,
+        index_name: str,
+        ids: list[str],
+        query: str,
+        attr: str,
+    ) -> dict[str, dict]:
+        """Hydrate one page with its body cropped around the match.
+
+        ``_hydrate`` asks with an empty query, so the crop it gets is the head of
+        the chapter; sending the conjunction terms back with the ``id IN`` filter
+        centres the excerpt on the match instead (0.3 s for 40 chapters on the
+        live index), which is what the result list shows.
+        """
+        if not ids:
+            return {}
+        quoted = ", ".join(json.dumps(str(doc_id)) for doc_id in ids)
+        options = {
+            "limit": len(ids),
+            "filter": f"id IN [{quoted}]",
+            "attributesToRetrieve": self._retrieve_attrs(index_name, ""),
+            "attributesToCrop": [attr],
+            "cropLength": self.SNIPPET_CROP_WORDS,
+        }
+        if index_name == self.INDEX_CHAPTERS and "content" not in options["attributesToCrop"]:
+            options["attributesToCrop"].append("content")
+        try:
+            result = self.client.index(index_name).search(query, options)
+        except meilisearch.errors.MeilisearchApiError as exc:
+            logger.warning("Search page hydration failed: {}", exc)
+            return {}
+        return {str(hit.get("id")): hit for hit in result.get("hits", []) or []}
+
     @staticmethod
     def _cropped_content(hit: dict) -> str:
         formatted = hit.get("_formatted") or {}
@@ -981,6 +1039,243 @@ class SearchService:
             )[0]
             self._page_cache.pop(oldest, None)
 
+    # ---- multi-condition AND: one conjunction query, then the same scorer ----
+
+    def _same_field_conjunction(
+        self,
+        active: list[dict],
+        match: str,
+    ) -> tuple[str, str] | None:
+        """``(index, attribute)`` when every condition ANDs one single field.
+
+        That is the shape Meilisearch can answer natively: it returns the
+        documents carrying *all* the query's terms instead of two detached
+        relevance windows whose intersection is usually empty.
+        """
+        if match != "and" or len(active) < 2:
+            return None
+        target: tuple[str, str] | None = None
+        for cond in active:
+            for index_name in (self.INDEX_CHAPTERS, self.INDEX_BOOKS):
+                attr = self._field_attr(index_name, cond["field"])
+                if not attr:
+                    continue
+                candidate = (index_name, attr)
+                if target is None:
+                    target = candidate
+                elif target != candidate:
+                    return None
+                break
+            else:  # pragma: no cover - fields are validated before we get here
+                return None
+        return target
+
+    @staticmethod
+    def _conjunction_query(active: list[dict]) -> str:
+        """The engine query for an AND: one term per condition, deduplicated."""
+        terms: list[str] = []
+        for cond in active:
+            value = str(cond["value"]).strip()
+            if value and value not in terms:
+                terms.append(value)
+        return " ".join(terms)
+
+    def _conjunction_rank(
+        self,
+        index_name: str,
+        attr: str,
+        active: list[dict],
+        filters: str | None,
+        window: int,
+    ) -> tuple[list[tuple[int, str]], int | None]:
+        """Engine-ranked ids for ``cond1 AND cond2 AND …`` on one attribute.
+
+        The query is the whitespace-joined values with ``matchingStrategy:
+        "all"``, which makes Meilisearch return only documents that carry every
+        term (measured on the live chapters index: 铃 + 仙 -> 1 299 documents,
+        versus 0 through the per-condition windows).
+
+        Only ``id`` is retrieved.  Asking for the searched attribute instead
+        costs 12 s per 1 000 chapters on that index, and the *page* re-checks
+        the real text anyway (``_conjunction_search``) -- the engine is only
+        trusted to narrow tens of thousands of matches down to the window.
+
+        Returns the ranked ``(score, id)`` list and the engine's hit count; the
+        count is ``None`` when the engine does not report one.
+        """
+        query = self._conjunction_query(active)
+        if not query:
+            return [], 0
+        options = {
+            "limit": window,
+            "offset": 0,
+            "attributesToSearchOn": [attr],
+            "attributesToRetrieve": ["id"],
+            "matchingStrategy": "all",
+        }
+        if filters:
+            options["filter"] = filters
+        index = self.client.index(index_name)
+        try:
+            result = index.search(query, options)
+        except meilisearch.errors.MeilisearchApiError as exc:
+            # ``matchingStrategy`` needs Meilisearch >= 1.3; an older engine (or
+            # an attribute that is not searchable yet) must not turn a search
+            # into a hard failure.
+            logger.warning("Conjunction search fell back for {}: {}", attr, exc)
+            options.pop("matchingStrategy", None)
+            options.pop("attributesToSearchOn", None)
+            result = index.search(query, options)
+        # Every hit passed the engine's "all terms" gate, so they all satisfy
+        # the conjunction; the page-level gate decides what is displayed.
+        ranked = [(len(active), str(hit.get("id"))) for hit in result.get("hits", []) or []]
+        total = result.get("estimatedTotalHits")
+        return ranked, (int(total) if isinstance(total, int) else None)
+
+    def _conjunction_values(
+        self,
+        index_name: str,
+        ids: list[str],
+        attr: str,
+    ) -> dict[str, str]:
+        """The stored text of ``attr`` for a page's ids, in one engine call."""
+        if not ids or not attr:
+            return {}
+        quoted = ", ".join(json.dumps(str(doc_id)) for doc_id in ids)
+        try:
+            result = self.client.index(index_name).search("", {
+                "limit": len(ids),
+                "filter": f"id IN [{quoted}]",
+                "attributesToRetrieve": ["id", attr],
+            })
+        except meilisearch.errors.MeilisearchApiError as exc:
+            logger.warning("Conjunction verification unavailable: {}", exc)
+            return {}
+        values: dict[str, str] = {}
+        for hit in result.get("hits", []) or []:
+            text = hit.get(attr)
+            # No stored value means the field is not retrievable; report it as
+            # "unknown" so the caller falls back to the engine's own match.
+            values[str(hit.get("id"))] = "" if text is None else str(text)
+        return values
+
+    def _conjunction_search(
+        self,
+        index_name: str,
+        attr: str,
+        active: list[dict],
+        *,
+        filters: str | None,
+        offset: int,
+        limit: int,
+        scope: str,
+    ) -> dict | None:
+        """Answer a same-field AND from one conjunction query, with deep paging.
+
+        Only chapter fields take this path.  Book metadata ANDs are already
+        complete: the 10 000-candidate books window reaches every match, and the
+        engine cannot express ``category = 言情`` as a query term anyway.
+        """
+        if attr not in self.CHAPTER_FIELD_ATTRS.values():
+            return None
+        cache_key = "|".join((
+            "conj", index_name, attr, self._conjunction_query(active),
+            filters or "",
+            ",".join(cond.get("mode") or "exact" for cond in active),
+            str(self.CONJUNCTION_CANDIDATE_LIMIT),
+        ))
+        ranked = self._page_cache_get(cache_key)
+        engine_total: int | None = None
+        now = time.monotonic()
+        cached_total = self._conjunction_totals.get(cache_key)
+        if cached_total is not None and cached_total[0] >= now:
+            engine_total = cached_total[1]
+        if ranked is None:
+            ranked, engine_total = self._conjunction_rank(
+                index_name, attr, active, filters,
+                self.CONJUNCTION_CANDIDATE_LIMIT,
+            )
+            self._page_cache_put(cache_key, ranked)
+            self._conjunction_totals[cache_key] = (
+                now + self.PAGE_CACHE_TTL_SECONDS, engine_total,
+            )
+            for stale in [
+                key for key, (expires_at, _) in self._conjunction_totals.items()
+                if expires_at < now
+            ]:
+                self._conjunction_totals.pop(stale, None)
+        page_rows = ranked[offset : offset + limit]
+        docs = self._hydrate_around(
+            index_name,
+            [row[1] for row in page_rows],
+            self._conjunction_query(active),
+            attr,
+        )
+        page_ids = [row[1] for row in page_rows]
+        # Re-check the page against the stored text: the engine's CJK matching
+        # treats every character as a term, so a multi-character condition can
+        # still come back as a scattered match.
+        stored: dict[str, str] = {}
+        if page_ids and len(page_ids) <= self.CONJUNCTION_VERIFY_MAX_HITS:
+            stored = self._conjunction_values(index_name, page_ids, attr)
+        hits = []
+        for _score, doc_id in page_rows:
+            hit = docs.get(doc_id) or {"id": doc_id}
+            text = stored.get(doc_id)
+            if text is None:
+                hits.append(self._serialize_engine_hit(hit, active[0]["field"], scope))
+                continue
+            score = sum(
+                1
+                for cond in active
+                if self._condition_score(
+                    cond["value"], text, cond.get("mode") or "exact",
+                ) > 0
+            )
+            # This is an AND: every condition must survive the substring gate,
+            # otherwise the engine matched the scattered characters only.
+            if score < len(active):
+                continue
+            hits.append(
+                self._serialize_scored_hit(
+                    hit, score, [cond["field"] for cond in active], scope,
+                )
+            )
+        # The engine's count is capped by the cached ranking: it may count
+        # 1 299 hits while the window kept the best 1 000, and promising pages
+        # the window cannot serve is worse than a slightly smaller total.
+        # ``MAX_TOTAL_HITS`` is Meilisearch's own paging ceiling.
+        total = min(
+            engine_total if engine_total is not None else len(ranked),
+            max(len(ranked), self.MAX_TOTAL_HITS),
+        )
+        total = max(total, offset + len(page_rows))
+        return {"hits": hits, "total": total, "offset": offset, "limit": limit}
+
+    def _serialize_scored_hit(
+        self,
+        hit: dict,
+        score: int,
+        fields: list[str],
+        scope: str,
+    ) -> dict:
+        """A hydrated page hit carrying the Python score of a conjunction."""
+        if scope == "books":
+            payload = self._serialize_engine_hit(hit, fields[0], "books")
+            payload["score"] = score
+            payload["matched_fields"] = fields
+            return payload
+        payload = self._serialize_engine_hit(hit, fields[0], "chapters")
+        payload["score"] = score
+        payload["matched_fields"] = fields
+        # ``_hydrate`` crops the body around the match, so the served snippet is
+        # the engine's own excerpt; the raw ``content`` stays empty here because
+        # the full body is not retrieved for a page.
+        snippet = self._cropped_content(hit)
+        if snippet:
+            payload["snippet"] = snippet
+        return payload
+
     def advanced_search(
         self,
         conditions: list[dict],
@@ -1061,6 +1356,27 @@ class SearchService:
         filters = self._combined_filter(
             allow_r18, allow_all_ages, tag, source_id, kind,
         )
+        # Several conditions on one chapter field (the 正文 「铃」 AND 正文 「仙」
+        # case) are answered by a single conjunction query: intersecting two
+        # detached relevance windows is arithmetically hopeless -- both fields
+        # match tens of thousands of chapters, so their top-300 candidates
+        # almost never overlap and the result was 0.  The engine can express
+        # that AND, and its ranking is what makes paging consistent.
+        if effective_scope in ("books", "chapters"):
+            conjunction = self._same_field_conjunction(active, match)
+            if conjunction is not None:
+                conjunction_result = self._conjunction_search(
+                    conjunction[0],
+                    conjunction[1],
+                    active,
+                    filters=filters,
+                    offset=offset,
+                    limit=limit,
+                    scope=effective_scope,
+                )
+                if conjunction_result is not None:
+                    return conjunction_result
+
         # A single condition is the overwhelmingly common case (the quick search
         # box) and the only one that can be answered with deep paging.  Two or
         # more conditions span fields/AND-OR combinations that Meilisearch cannot

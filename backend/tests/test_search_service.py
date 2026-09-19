@@ -795,3 +795,184 @@ def test_advanced_search_category_condition_matches_book_categories():
     assert result["total"] == 1
     assert result["hits"][0]["category_names"] == ["玄幻", "武侠"]
     assert result["hits"][0]["matched_fields"] == ["category"]
+
+
+# ---- same-field AND: one conjunction query instead of two detached windows ----
+
+def _conjunction_condition():
+    return [
+        {"field": "content", "mode": "exact", "value": "铃"},
+        {"field": "content", "mode": "exact", "value": "仙"},
+    ]
+
+
+def _chapter_hits():
+    return [
+        {"id": "c1", "book_id": "b1", "title": "第1章", "book_title": "铃仙传"},
+        {"id": "c2", "book_id": "b2", "title": "第2章", "book_title": "仙铃录"},
+    ]
+
+
+def _chapter_bodies():
+    return {"c1": "铃儿走进仙山。", "c2": "仙子摇响了铃。"}
+
+
+def _route_chapters(conjunction_hits, stored, engine_total):
+    """Route the mock's calls the way the engine answers them.
+
+    The conjunction query carries the terms; the page hydration (cropped around
+    the match) and the verification fetch are the two ``id IN [...]`` calls that
+    follow it.
+    """
+    by_id = {hit["id"]: hit for hit in conjunction_hits}
+
+    def _search(query, options):
+        if options.get("matchingStrategy"):
+            return {"hits": [{"id": hit["id"]} for hit in conjunction_hits],
+                    "estimatedTotalHits": engine_total}
+        asked = [
+            doc_id for doc_id in stored
+            if f'"{doc_id}"' in str(options.get("filter"))
+        ]
+        attrs = options.get("attributesToRetrieve") or []
+        if "content" in attrs:
+            return {"hits": [{"id": doc_id, "content": stored[doc_id]} for doc_id in asked]}
+        return {"hits": [by_id[doc_id] for doc_id in asked if doc_id in by_id]}
+
+    return _search
+
+
+def test_same_field_and_asks_the_engine_for_the_intersection():
+    """正文 铃 AND 正文 仙 returned 0: two detached windows never overlap.
+
+    正文 「铃」 alone matches 9 619 chapters and 「仙」 matches 10 000+, but their
+    top-300 relevance windows barely overlap, so the Python intersection was
+    empty while 1 299 chapters really carry both.  The engine can express that
+    AND (``matchingStrategy: "all"``), so it does the selection now.
+    """
+    service, _, chapters_index = _service_with_indexes()
+    chapters_index.search.side_effect = _route_chapters(
+        _chapter_hits(), _chapter_bodies(), 1299,
+    )
+
+    result = service.advanced_search(
+        _conjunction_condition(), match="and", scope="all", limit=40,
+    )
+
+    scan = chapters_index.search.call_args_list[0]
+    assert scan.args[0] == "铃 仙"
+    assert scan.args[1]["attributesToSearchOn"] == ["content"]
+    assert scan.args[1]["matchingStrategy"] == "all"
+    assert result["total"] == 1299, "the engine's count is the honest total"
+    assert [hit["id"] for hit in result["hits"]] == ["c1", "c2"]
+    assert result["hits"][0]["type"] == "chapter"
+    assert result["hits"][0]["matched_fields"] == ["content", "content"]
+    assert result["hits"][0]["score"] == 2
+
+
+def test_same_field_and_page_rechecks_the_real_text():
+    """The engine's CJK matching is per character, so the page is re-verified.
+
+    ``matchingStrategy: "all"`` still resolves a multi-character condition into
+    its characters: a chapter holding either character but not the substring
+    must not be served.
+    """
+    service, _, chapters_index = _service_with_indexes()
+    chapters_index.search.side_effect = [
+        {"hits": [{"id": "c1"}, {"id": "c2"}], "estimatedTotalHits": 2},
+        {"hits": []},
+        {"hits": [
+            {"id": "c1", "content": "小镇上的铃铛，仙人来了"},
+            {"id": "c2", "content": "铛的一声，仙子来了"},
+        ]},
+    ]
+
+    result = service.advanced_search(
+        [
+            {"field": "content", "mode": "exact", "value": "铃铛"},
+            {"field": "content", "mode": "exact", "value": "仙"},
+        ],
+        match="and",
+        scope="chapters",
+    )
+
+    # c2 has 铛 and 仙 but never 铃铛, so the substring gate drops it.
+    assert [hit["id"] for hit in result["hits"]] == ["c1"]
+
+
+def test_same_field_and_keeps_engine_hits_when_the_text_is_unavailable():
+    """Verification needs the stored field; a failed fetch must not empty a page."""
+    service, _, chapters_index = _service_with_indexes()
+    chapters_index.search.side_effect = [
+        {"hits": [{"id": "c1"}], "estimatedTotalHits": 1},
+        {"hits": []},
+        {"hits": []},
+    ]
+
+    result = service.advanced_search(
+        _conjunction_condition(), match="and", scope="chapters",
+    )
+
+    assert result["total"] == 1
+    assert [hit["id"] for hit in result["hits"]] == ["c1"]
+
+
+def test_same_field_and_reuses_the_ranking_for_later_pages():
+    service, _, chapters_index = _service_with_indexes()
+    chapters_index.search.side_effect = _route_chapters(
+        _chapter_hits(), _chapter_bodies(), 2,
+    )
+
+    first = service.advanced_search(
+        _conjunction_condition(), match="and", scope="chapters", offset=0, limit=1,
+    )
+    second = service.advanced_search(
+        _conjunction_condition(), match="and", scope="chapters", offset=1, limit=1,
+    )
+
+    scans = [
+        call for call in chapters_index.search.call_args_list
+        if call.args[1].get("matchingStrategy")
+    ]
+    assert len(scans) == 1, "page 2 must come from the cached conjunction ranking"
+    assert first["hits"][0]["id"] == "c1"
+    assert second["hits"][0]["id"] == "c2"
+    assert first["total"] == second["total"] == 2
+
+
+def test_same_field_and_or_match_keeps_the_per_condition_path():
+    """OR is a union, not an intersection: it must not go through the conjunction."""
+    service, _, chapters_index = _service_with_indexes()
+    chapters_index.search.return_value = {"hits": []}
+
+    result = service.advanced_search(
+        _conjunction_condition(), match="or", scope="chapters",
+    )
+
+    queries = [call.args[0] for call in chapters_index.search.call_args_list]
+    assert "铃 仙" not in queries
+    assert result["total"] == 0
+
+
+def test_book_metadata_and_keeps_the_wide_window_path():
+    """Books metadata ANDs already reach every match through the 10 000 window."""
+    service, books_index, chapters_index = _service_with_indexes()
+    books_index.search.return_value = {"hits": []}
+    chapters_index.search.return_value = {"hits": []}
+
+    service.advanced_search(
+        [
+            {"field": "title", "mode": "exact", "value": "晴晴的"},
+            {"field": "title", "mode": "exact", "value": "日记"},
+        ],
+        match="and",
+        scope="books",
+    )
+
+    queries = [call.args[0] for call in books_index.search.call_args_list]
+    assert queries == ["晴晴的", "日记"]
+    assert all(
+        "matchingStrategy" not in call.args[1]
+        for call in books_index.search.call_args_list
+    )
+

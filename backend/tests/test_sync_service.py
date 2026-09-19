@@ -1663,6 +1663,123 @@ async def test_discover_and_sync_all_empty_catalog_without_books_still_fails():
 
 
 @pytest.mark.asyncio
+async def test_discover_and_sync_all_keeps_books_when_a_later_page_breaks():
+    """A catalog page that breaks mid-run must not discard the work already done.
+
+    Icu (hq555) synced 244 books over nine hours, then its JS explore rule
+    answered nothing on the next page (the site started demanding verification)
+    and the whole task was reported as "该书的发现规则是 Legado JS 脚本…当前环境
+    无法执行" -- although the same script had just worked 244 times.  The books
+    were in the library while the task said failed, which is what the user saw.
+    """
+    from app.crawler.base import RemoteShelfBook
+
+    db = _mock_db()
+    db.get.return_value = _source()
+    db.rollback = AsyncMock()
+
+    plugin = AsyncMock()
+    plugin.set_cookie = MagicMock()
+    plugin.discover_books.side_effect = [
+        [
+            RemoteShelfBook(
+                source_book_id="a.html", title="A", author="Author",
+                url="https://example.com/a.html",
+            ),
+            RemoteShelfBook(
+                source_book_id="b.html", title="B", author="Author",
+                url="https://example.com/b.html",
+            ),
+        ],
+        RuntimeError(
+            "该书源的发现规则是 Legado JS 脚本（<js>/@js:），当前环境无法执行"
+        ),
+    ]
+
+    session = AsyncMock()
+    session.__aenter__ = AsyncMock(return_value=_mock_db())
+    session.__aexit__ = AsyncMock(return_value=False)
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.SessionLocal", return_value=session),
+        patch.object(
+            SyncService,
+            "sync_book",
+            AsyncMock(return_value={"book_id": "x", "created_chapters": 2, "skipped_chapters": 1}),
+        ),
+    ):
+        result = await SyncService(db).discover_and_sync_all("src1", max_pages=10)
+
+    assert result["books_synced"] == 2
+    assert result["chapters_created"] == 4
+    # The run is over; reporting it as unfinished would re-queue it forever.
+    assert result["done"] is True
+
+
+@pytest.mark.asyncio
+async def test_discover_and_sync_all_first_page_break_with_library_is_not_a_failure():
+    """Page 1 failing for a source that already has books is a site hiccup."""
+    db = _mock_db()
+    db.get.return_value = _source()
+    db.rollback = AsyncMock()
+    db.scalar.side_effect = [None, "book-id"]
+
+    plugin = AsyncMock()
+    plugin.set_cookie = MagicMock()
+    plugin.discover_books.side_effect = RuntimeError("ConnectError")
+
+    with patch("app.services.sync.get_plugin", return_value=plugin):
+        result = await SyncService(db).discover_and_sync_all("src1", max_pages=10)
+
+    assert result["books_synced"] == 0
+    assert result["done"] is True
+
+
+@pytest.mark.asyncio
+async def test_discover_and_sync_all_first_page_break_without_library_still_fails():
+    """A brand new source whose first page never answers keeps failing loudly."""
+    db = _mock_db()
+    db.get.return_value = _source()
+    db.rollback = AsyncMock()
+    db.scalar.side_effect = [None, None]
+
+    plugin = AsyncMock()
+    plugin.set_cookie = MagicMock()
+    plugin.discover_books.side_effect = RuntimeError("该书源的发现规则是 ...")
+
+    with patch("app.services.sync.get_plugin", return_value=plugin):
+        with pytest.raises(RuntimeError, match="发现规则"):
+            await SyncService(db).discover_and_sync_all("src1", max_pages=10)
+
+
+@pytest.mark.asyncio
+async def test_js_explore_that_returns_nothing_no_longer_claims_it_cannot_run():
+    """The JS rule runs; an empty result means the site, not the environment.
+
+    The old message ("当前环境无法执行") sent the user looking for a different
+    source, while the actual cause was the site asking for verification after
+    hundreds of successful pages.
+    """
+    source = _source()
+    source.config = {"exploreUrl": "<js>return '';</js>"}
+    db = _mock_db()
+    db.get.return_value = source
+    db.rollback = AsyncMock()
+    db.scalar.side_effect = [None, None]
+
+    plugin = AsyncMock()
+    plugin.set_cookie = MagicMock()
+    plugin.discover_books.return_value = []
+
+    with patch("app.services.sync.get_plugin", return_value=plugin):
+        with pytest.raises(ValueError, match="发现规则是 Legado JS 脚本") as excinfo:
+            await SyncService(db).discover_and_sync_all("src1", max_pages=10)
+
+    assert "当前环境无法执行" not in str(excinfo.value)
+    assert "人机验证" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
 async def test_discover_and_sync_all_resume_past_page_budget_completes():
     """Resuming past ``max_pages`` is "already done", not "no books"."""
     db = _mock_db()

@@ -1905,12 +1905,77 @@ class SyncService:
         pages_in_run = 0
         done = max_pages > 0 and start_page > max_pages
 
+        def _result_so_far(*, done_state: bool, next_page: int) -> dict:
+            """The run's counters, as a normal result (not an exception).
+
+            Used when later pages stop answering after this run already synced
+            books: the work is in the library, so the task must report it
+            instead of failing and hiding it.
+            """
+            return {
+                "source_id": source_id,
+                "pages_checked": pages_checked,
+                "books_found": books_found,
+                "books_synced": books_synced,
+                "books_failed": books_failed,
+                "books_filtered": books_filtered,
+                "chapters_created": chapters_created,
+                "chapters_skipped": chapters_skipped,
+                "chapters_failed": chapters_failed,
+                "details": details,
+                "next_page": next_page,
+                "done": done_state,
+            }
+
+        async def _source_has_books() -> bool:
+            try:
+                return await self.db.scalar(
+                    select(Book.id).where(Book.source_id == source_id).limit(1)
+                ) is not None
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "Could not check library for source {}: {}", source_id, exc,
+                )
+                await self.db.rollback()
+                return False
+
         page = start_page
         while max_pages <= 0 or page <= max_pages:
             pages_in_run += 1
             if before_step is not None:
                 await before_step()
-            page_books = await plugin.discover_books(url=url, page=page)
+            try:
+                page_books = await plugin.discover_books(url=url, page=page)
+            except SyncPaused:
+                # Pause/cancel is handled by ``before_step`` and must reach the
+                # runner untouched (``TaskCancelled`` never crosses this layer).
+                raise
+            except Exception as exc:
+                # A catalog page that stops answering must not discard the work
+                # already done in this run.  Icu (hq555) synced 244 books over
+                # nine hours, then its JS explore rule returned nothing on the
+                # next page (the site started demanding verification) and the
+                # whole task was written off as "该书的发现规则是 Legado JS 脚本…
+                # 当前环境无法执行" -- the JS had in fact just worked 244 times,
+                # and the books never showed up anywhere except the library.
+                message = describe_error(exc)
+                await self.db.rollback()
+                if books_synced or books_found:
+                    logger.warning(
+                        "Stopping discovery for {} at page {} after syncing {} books: {}",
+                        source_id, page, books_synced, message,
+                    )
+                    return _result_so_far(done_state=True, next_page=page)
+                if await _source_has_books():
+                    # Page 1 is the only page missing, but this source already
+                    # has books here: the site is having a moment, not the rule.
+                    logger.warning(
+                        "Discovery for {} failed on the first page, but the source "
+                        "already has books in the library: {}",
+                        source_id, message,
+                    )
+                    return _result_so_far(done_state=True, next_page=page)
+                raise
             if not page_books:
                 done = True
                 break
@@ -2181,10 +2246,10 @@ class SyncService:
                     "done": True,
                 }
             config = source.config if isinstance(source.config, dict) else {}
-            if any("<js>" in str(config.get(key) or "") for key in ("ruleExplore", "exploreUrl", "searchUrl")):
-                raise ValueError(
-                    "该书源的发现规则依赖 Legado JS，当前环境未能执行；请更换书源或导入可执行的规则。"
-                )
+            js_discovery = any(
+                "<js>" in str(config.get(key) or "")
+                for key in ("ruleExplore", "exploreUrl", "searchUrl")
+            )
             known_book = await self.db.scalar(
                 select(Book.id).where(Book.source_id == source_id).limit(1)
             )
@@ -2200,6 +2265,18 @@ class SyncService:
                     "书源目录本次未返回任何书籍（网络/代理波动、站点限流或临时验证都可能导致）。"
                     "已入库的书籍不受影响，任务稍后会自动重试；"
                     "若持续失败，请检查代理节点或站点验证状态。"
+                    + _last_explore_diagnosis(plugin)
+                )
+            if js_discovery:
+                # Only reachable with an *empty* library and not one page read:
+                # a JS rule that works intermittently (Icu's explore script ran
+                # 244 times before the site began asking for verification) hit
+                # its site-side branch and returned nothing.
+                raise ValueError(
+                    "该书源的发现规则是 Legado JS 脚本，本次执行没有返回任何分类"
+                    "（脚本本身能运行，通常是站点要求人机验证、限流或页面结构变了）。"
+                    "请在浏览器里过验证后导入 Cookie，或稍后重试；"
+                    "也可以直接换用该网站的其他书源。"
                     + _last_explore_diagnosis(plugin)
                 )
             raise ValueError("书源未返回可同步的书籍，请检查书源规则、Cookie 或站点验证状态。")
