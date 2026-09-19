@@ -48,7 +48,8 @@
 2. **补 `java.*` 可实现的缺失 API（39 个：37 纯计算 + 2 HTTP）** —— 尤其 26 个加密函数（AES/DES/3DES/digest/HMAC）成体系缺失，而这些书源用来做接口签名。注意 `t2s`/`s2t` **不在此列**（依赖第三方 JVM 词典，见第 6 节更正）。
 3. **为 M-5（XPath）建差分测试** —— 不是单点 bug，是结构性降级，只有抽样对比才能定位。
 
-**不要急着改的**：M-7 / M-8 / M-9 可能是**有意的改进**而非缺陷（见各条「影响」），需你裁决。
+**已裁决（2026-09-19）**：M-8 / M-9 / M-10 / D-13 **已对齐 Legado**（`5922136`）；
+M-7（`@text` 换行）**有意保留**，已在代码与测试里注明。细节见进度表那一行。
 
 ---
 
@@ -65,7 +66,7 @@
 | **M-1** `{$.rule}` JSONPath 内嵌规则 | ✅ 已补 | `7e17f78` | 4 条新测试（3 判伪 + 1 对照）；撤掉改动 3 条判伪失败；756 → 760 |
 | **D-03** JSONPath 列表结果写成 Python repr | ✅ 顺带修复 | `7e17f78` | 同上；`$.tags` 由 `['p', 'q']` 变为按行 `p\nq` |
 | **C-22/C-23 第一批 6 个**（`md5Encode16`/`digestHex`/`digestBase64Str`/`HMacHex`/`HMacBase64`/`htmlFormat`） | ✅ 已补 | `8437b31` | 6 条新测试用**已发布标准向量**（RFC 1321 / FIPS 180-4 / RFC 4231）；撤掉改动 6 条全失败；760 → 766 |
-| M-7 / M-8 / M-9 / M-10、D-13、D-14 | ⏳ **待裁决**（改了可能是倒退） | — | **已用特征化测试固化当前行为**（`3d4de73`，`test_characterisation_*`）—— 每条 docstring 写明 Legado 是什么样、当前是什么样、建议是什么。改动这些路径会让测试失败，强制读到说明；已用突变演示验证过这张网真的能拦住改动 |
+| M-7 / M-8 / M-9 / M-10、D-13 | ✅ **已裁决并落地**（`5922136`） | `5922136` | 对齐 4 条（M-8 外层 `@html`、M-9 `@ownText` 空格连接、M-10 去重只作用于属性分支、D-13 多值属性返回完整串）；**保留** M-7（`@text` 保持 `\n`，已注明是有意偏差）。先以特征化测试固化当前行为（`3d4de73`），改动后 4 条测试如预期失败并被更新为 Legado 值，另加 2 条边界测试。807 → 809 passed |
 | **C-23 对称加密族**（`createSymmetricCrypto` + AES 10 / DES 4 / 3DES 4 = 19 个） | ✅ 已补 | `d8ef160` | 密文用 **FIPS-197 / NIST SP 800-38A** 向量验证（AES-128-ECB `69c4e0d8…c55a` 精确匹配）+ PKCS5/CBC/3DES 往返 + hex/Base64 自动判别；撤掉改动 7 条全失败；766 → 773 |
 | **C-22 第二批 8 个**（`strToBytes`/`bytesToStr`/`base64DecodeToByteArray`/`hexDecodeToByteArray`/`hexEncodeToString`/`randomUUID`/`toURL` ×2） | ✅ 已补 | `203c98f` | 8 条新测试；撤掉改动 8 条全失败；773 → 781。`toURL` 复现了 `java.net.URL` 的两处 WHATWG 差异（显式默认端口、`+`→空格） |
 | C-23 非对称加密与签名（`createAsymmetricCrypto`、`createSign`） | ⏳ 待补，**有不可核实缺口** | — | `KeyUtil.generatePrivateKey(algorithm, bytes)` 的密钥解析回退链（PEM / PKCS#8 / 裸 Base64）在 hutool 里，源码不在本仓库；且 `decrypt` 默认用**公钥**（`usePublicKey=true`）语义反直觉。建议先明确用途再投入 |
