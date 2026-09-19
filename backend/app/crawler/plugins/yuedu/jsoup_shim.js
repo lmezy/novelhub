@@ -1241,6 +1241,92 @@ function __nhSymmetricCrypto(transformation, key, iv) {
   };
 }
 
+// ---- Legado byte/charset helpers (JsExtensions.kt) ----
+
+/**
+ * Map a Java charset name onto a Node Buffer encoding.
+ *
+ * Node's Buffer only knows utf-8/latin1/utf-16le/ascii.  The Chinese charsets a
+ * book source may ask for (GBK/GB2312/GB18030/Big5) are **not** available --
+ * they would need an iconv dependency -- so they raise a readable error instead
+ * of silently producing mojibake.
+ */
+function __nhBufferEncoding(name) {
+  var c = String(name === undefined || name === null ? 'UTF-8' : name)
+    .trim().toLowerCase().replace(/[-_]/g, '');
+  if (c === '' || c === 'utf8') return 'utf-8';
+  if (c === 'iso88591' || c === 'latin1') return 'latin1';
+  if (c === 'utf16' || c === 'utf16le' || c === 'unicode') return 'utf16le';
+  if (c === 'ascii' || c === 'usascii') return 'ascii';
+  if (c === 'gbk' || c === 'gb2312' || c === 'gb18030' || c === 'big5'
+      || c === 'eucjp' || c === 'shiftjis' || c === 'euckr') {
+    throw new Error(
+      'charset ' + name + ' 在 Node 侧无内建支持'
+      + '（Buffer 仅支持 utf-8/latin1/utf-16le/ascii），需要 iconv 依赖才能实现'
+    );
+  }
+  return c; // let Buffer reject anything else
+}
+
+/**
+ * The port as *written* in a URL string, or -1.
+ *
+ * Needed because the WHATWG URL normalises a scheme's default port away:
+ * `new URL('http://x:80/p').port` is `''`, while Java's `URL.getPort()` returns
+ * 80.  Legado builds `origin` from `URL.getPort()`, so the explicit port has to
+ * be recovered from the raw text or `http://x:80` would come back as `http://x`.
+ */
+function __nhExplicitPort(s) {
+  var m = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/?#]*?:(\d+)(?=[/?#]|$)/
+    .exec(String(s === undefined || s === null ? '' : s));
+  return m ? parseInt(m[1], 10) : -1;
+}
+
+/**
+ * Port of Legado's `java.toURL` (`utils/JsURL.kt`).
+ *
+ * Legado parses with `java.net.URL`, and two of its behaviours differ from the
+ * WHATWG URL Node provides, so both are reproduced explicitly:
+ *
+ * 1. `origin` keeps a port that was written out, even the scheme's default one
+ *    (see `__nhExplicitPort`).  A relative URL inherits the port from `baseUrl`.
+ * 2. Values are decoded with `URLDecoder`, which turns `+` into a space;
+ *    `decodeURIComponent` does not, so `+` is replaced first.
+ */
+function __nhJsURL(url, baseUrl) {
+  var raw = String(url);
+  var hasBase = baseUrl !== undefined && baseUrl !== null && baseUrl !== '';
+  var u = hasBase ? new URL(raw, String(baseUrl)) : new URL(raw);
+
+  var port = __nhExplicitPort(raw);
+  if (port < 0 && !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw)) {
+    port = __nhExplicitPort(baseUrl); // relative URL: the authority is the base's
+  }
+  if (port < 0) port = u.port === '' ? -1 : parseInt(u.port, 10);
+
+  var searchParams = null;
+  if (u.search && u.search.length > 1) {
+    searchParams = {};
+    u.search.slice(1).split('&').forEach(function (pair) {
+      var kv = pair.split('=');
+      if (kv.length >= 2) {
+        // Java: split("=", limit = 2) then URLDecoder on the remainder.
+        searchParams[kv[0]] = decodeURIComponent(
+          kv.slice(1).join('=').replace(/\+/g, ' ')
+        );
+      }
+    });
+  }
+  return {
+    host: u.hostname,
+    origin: port > 0
+      ? u.protocol + '//' + u.hostname + ':' + port
+      : u.protocol + '//' + u.hostname,
+    pathname: u.pathname,
+    searchParams: searchParams,
+  };
+}
+
 var java = {
   // ---- HTTP: Legado java.get / java.post return a Response object ----
   get: function (url, headers) {
@@ -1322,6 +1408,32 @@ var java = {
     } catch (e) { return ''; }
   },
   stringToHex: function (s) { return Buffer.from(String(s), 'utf-8').toString('hex'); },
+  // ---- Legado byte / charset / URL helpers (JsExtensions.kt:388-…, 916-924) --
+  strToBytes: function (str, charsetName) {
+    return Buffer.from(String(str), __nhBufferEncoding(charsetName));
+  },
+  bytesToStr: function (bytes, charsetName) {
+    return Buffer.from(bytes).toString(__nhBufferEncoding(charsetName));
+  },
+  base64DecodeToByteArray: function (str) {
+    // Legado returns null for a blank input (`isNullOrBlank`).
+    if (str === null || str === undefined || String(str).trim() === '') return null;
+    return Buffer.from(String(str), 'base64');
+  },
+  hexDecodeToByteArray: function (hex) {
+    var clean = String(hex === undefined || hex === null ? '' : hex).replace(/\s+/g, '');
+    if (clean.length % 2 !== 0) clean = clean.slice(0, -1);
+    return Buffer.from(clean, 'hex');
+  },
+  hexEncodeToString: function (utf8) {
+    // hutool `HexUtil.encodeHexStr(String)` hashes the string's UTF-8 bytes.
+    return Buffer.from(String(utf8), 'utf-8').toString('hex');
+  },
+  randomUUID: function () {
+    // Java's `UUID.randomUUID().toString()`: lowercase, hyphenated, v4.
+    return require('crypto').randomUUID();
+  },
+  toURL: function (url, baseUrl) { return __nhJsURL(url, baseUrl); },
   md5Encode: function (s) { return __nhMd5(s); },
   md5: function (s) { return __nhMd5(s); },
   encodeURI: function (s) { return encodeURIComponent(String(s)); },

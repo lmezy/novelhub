@@ -1004,3 +1004,119 @@ def test_single_des_fails_with_a_readable_reason():
 
     assert value != "no-error"
     assert "legacy provider" in value
+
+
+# ---------------------------------------------------------------------------
+# Legado byte / charset / URL helpers (C-22 remainder)
+#
+# `java.toURL` is the interesting one: Legado parses with `java.net.URL`, whose
+# behaviour differs from the WHATWG URL in two ways that a naive port would miss,
+# and both are pinned below.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_str_to_bytes_and_bytes_to_str_round_trip():
+    engine = _engine()
+
+    assert engine._try_eval_js(
+        "java.bytesToStr(java.strToBytes('中文abc'));", ""
+    ) == "中文abc"
+    # The charset-taking overload is in the signature too.
+    assert engine._try_eval_js(
+        "java.bytesToStr(java.strToBytes('abc', 'UTF-8'), 'UTF-8');", ""
+    ) == "abc"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_hex_encode_to_string_and_decode_to_bytes():
+    engine = _engine()
+
+    assert engine._try_eval_js(
+        "java.hexEncodeToString('abc') + '|' +"
+        "java.bytesToStr(java.hexDecodeToByteArray('616263'));",
+        "",
+    ) == "616263|abc"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_base64_decode_to_byte_array_nulls_a_blank_input():
+    """Legado returns null for a blank string (`isNullOrBlank`)."""
+    engine = _engine()
+
+    assert engine._try_eval_js(
+        "String(java.base64DecodeToByteArray('   ') === null) + '|' +"
+        "java.bytesToStr(java.base64DecodeToByteArray('aGVsbG8='));",
+        "",
+    ) == "true|hello"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_random_uuid_is_a_lowercase_v4():
+    engine = _engine()
+
+    assert engine._try_eval_js(
+        "/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}"
+        "-[0-9a-f]{12}$/.test(java.randomUUID());",
+        "",
+    ) is True
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_to_url_matches_java_url_semantics():
+    """`+` decodes to a space (`URLDecoder`), and host/origin/pathname split as in JsURL."""
+    engine = _engine()
+
+    js = (
+        "var u = java.toURL('https://a.b/c/d?x=1&y=%E4%B8%AD&z=a+b#f');"
+        "u.host + '|' + u.origin + '|' + u.pathname + '|' + u.searchParams.z;"
+    )
+
+    assert engine._try_eval_js(js, "") == "a.b|https://a.b|/c/d|a b"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_to_url_keeps_an_explicit_default_port():
+    """Java's `URL.getPort()` returns 80 for `http://x:80`; the WHATWG URL drops it.
+
+    Legado builds `origin` from `URL.getPort()`, so the port has to be read off
+    the raw string -- otherwise `http://x:80` silently becomes `http://x`.
+    """
+    engine = _engine()
+
+    assert engine._try_eval_js(
+        "java.toURL('http://x:80/p').origin + '|' +"
+        "java.toURL('http://x/p').origin;",
+        "",
+    ) == "http://x:80|http://x"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_to_url_resolves_against_a_base_url():
+    engine = _engine()
+
+    assert engine._try_eval_js(
+        "var u = java.toURL('/rel', 'https://a.b/base/');"
+        "u.origin + u.pathname;",
+        "",
+    ) == "https://a.b/rel"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_an_unsupported_charset_raises_a_readable_error():
+    """GBK/GB2312/Big5 need iconv; Node's Buffer cannot do them.
+
+    A clear error beats silently returning mojibake for a Chinese source.
+    """
+    engine = _engine()
+
+    value = engine._try_eval_js(
+        "var msg;"
+        "try { java.strToBytes('x', 'GBK'); msg = 'no-error'; }"
+        "catch (e) { msg = String(e && e.message ? e.message : e); }"
+        "msg;",
+        "",
+    )
+
+    assert value != "no-error"
+    assert "iconv" in value
