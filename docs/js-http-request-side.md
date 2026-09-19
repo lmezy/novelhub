@@ -123,8 +123,24 @@ Node 侧 shim 的 `curl`（`jsoup_shim.js` 的 `__nhCurlRaw`），而 shim 手�
 那是**所有 JS 请求的唯一入口**，比在四个调用点各加一遍更不易漏。
 调用方自己传的 Referer 优先。
 
-**仍未做**：`header` 注入本身（第 2 级的另一半）。它会让 JS 请求的 UA/Referer
-全面改变，收益明确但影响面大，单独一批提交以便回滚。
+**更新（2026-09-19）：为什么不建议"顺手就注进去"**
+
+具体障碍不是"风险"这种笼统说法，而是一个**递归 + 同步/异步**的组合问题：
+
+1. `_build_js_context` 是在**进入 JS 求值之前**被调用的（`_try_eval_js` 先建上下文，
+   再交给 `runtime.eval_js_sync`）。而 `header` 规则可能是 `@js:` 脚本，
+   要拿到它的**求值结果**就得先跑一次 JS —— 从 `_build_js_context` 里跑，
+   就会再次进入 `_build_js_context`，**无限递归**。
+2. 所以求值必须走插件侧已有的 Python 路径（`transport._build_headers` +
+   `_header_rule_cache`），它是 **async** 的；而 `_build_js_context` 是 **sync** 的。
+   把 async 结果塞进 sync 的上下文构建，只有两种落法：
+   - **在进入 JS 之前先算好、经 `extra_context` 传下去**：需要改 5 个调用点；
+   - **加一个"只读缓存"的同步访问器**：实现简单，但代价是
+     **在第一次 Python 侧请求算好 header 之前，JS 请求拿不到 header** ——
+     这是个可观察的行为差异，得先想清楚能不能接受。
+
+这两条都要动 `_build_js_context` 的输入链路，属"改现有行为"，**建议单独一批、
+单独回滚**，并且最好能在真实站点上对照 crawler 日志验证，而不是只跑单测。
 
 ### 6.2 source config 会**跨求值泄漏**（与第 9 节的"上下文串味"同型）—— ✅ 已修（`a4be164`）
 
