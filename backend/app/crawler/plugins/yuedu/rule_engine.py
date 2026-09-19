@@ -138,32 +138,54 @@ class _RuleAnalyzer:
         self._split_tail(separators)
 
     def _split_tail(self, separators: tuple[str, ...]) -> None:
+        """Emit the remaining fragments once the first separator is consumed.
+
+        Two positions are tracked, mirroring Legado's ``startX`` (start of the
+        not-yet-emitted fragment) and ``pos`` (search cursor):
+
+        * ``seg_start`` -- where the pending fragment begins;
+        * ``scan``      -- where to look for the next separator.
+
+        They must not be conflated.  A balanced ``[]``/``()`` group sitting
+        before a separator has to be skipped before that separator can be
+        trusted, because it may live *inside* the group (``b[x="||"]``), but
+        skipping it may only advance the cursor -- the text between ``seg_start``
+        and the group is still part of the fragment.
+
+        Advancing the fragment start as well **dropped the whole fragment**:
+        ``a||b[x]||c`` split into ``['a', '', 'c']`` instead of
+        ``['a', 'b[x]', 'c']``, and ``_split_element_steps('div.x@a[@href]/b')``
+        lost the ``a[@href]`` step.  Because ``_get_elements_from_root`` uses the
+        same analyzer, every ``bookList``/``chapterList`` with a bracketed
+        non-first fragment silently lost that fragment too.
+        """
         q = self._queue
-        pos = self._pos
+        seg_start = self._pos
+        scan = seg_start
         sep = self.elements_type
         step = self._step
         r = self._rule
 
         while True:
-            idx = q.find(sep, pos)
+            idx = q.find(sep, scan)
             if idx == -1:
-                r.append(q[pos:])
+                r.append(q[seg_start:])
                 break
             end = idx
-            st = self._find_any(pos, "[", "(")
+            st = self._find_any(scan, "[", "(")
             if st != -1 and st < end:
                 self._pos = st
                 next_ch = "]" if q[st] == "[" else ")"
                 if not self._chomp_balanced(q[st], next_ch):
                     raise RuleUnbalancedError(f"{q[:st]}后未平衡")
-                if self._pos > end:
-                    self._start = self._pos
-                    self._split_tail(separators)
-                    return
-                pos = self._pos
+                # Move only the cursor past the group and re-scan from there:
+                # if the separator turned out to be inside the group it must not
+                # split the rule, and ``seg_start`` must stay put either way.
+                scan = self._pos
                 continue
-            r.append(q[pos:end])
-            pos = end + step
+            r.append(q[seg_start:end])
+            seg_start = end + step
+            scan = seg_start
 
     def _find_any(self, pos: int, *chars: str) -> int:
         q = self._queue

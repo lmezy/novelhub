@@ -531,6 +531,52 @@ def test_list_rule_separator_inside_brackets_is_kept_whole():
     assert [el.get_text(strip=True) for el in items] == ["A"]
 
 
+# ---------------------------------------------------------------------------
+# A fragment after the first one must survive a bracketed group (codex-handoff
+# section 8 / docs/legado-rule-spec-diff.md A-3).
+#
+# The test above only covers the *first* fragment, which is emitted by
+# ``_split_head`` and was always correct.  Every fragment after the first goes
+# through ``_split_tail``, which advanced its fragment start past the text it had
+# only meant to *skip over* while hunting for the separator -- so the fragment
+# was dropped.  ``bookList``/``chapterList`` share the same analyzer, so such a
+# rule silently returned nothing.
+# ---------------------------------------------------------------------------
+
+
+def test_split_rule_keeps_a_bracketed_non_first_fragment():
+    # The separator sits *inside* the group: it must not split the rule at all.
+    assert _RuleAnalyzer('a||b[x="||"]||c').split_rule("&&", "||", "%%") \
+        == ["a", 'b[x="||"]', "c"]
+
+
+def test_split_rule_keeps_a_bracketed_non_first_fragment_without_inner_separator():
+    # The group merely precedes the separator.  This case is broader than the
+    # one above: it dropped the fragment even though no separator was inside.
+    assert _RuleAnalyzer("a||b[x]||c").split_rule("&&", "||", "%%") \
+        == ["a", "b[x]", "c"]
+
+
+def test_split_element_steps_keeps_a_bracketed_step():
+    """``div.x@a[@href]/b`` is two ``@`` steps; neither may be lost."""
+    engine = _engine()
+
+    assert engine._split_element_steps("div.x@a[@href]/b") \
+        == ["div.x", "a[@href]/b"]
+
+
+def test_list_rule_keeps_a_bracketed_middle_fragment_that_matches():
+    """End-to-end: the mid fragment is the one that selects the elements."""
+    engine = _engine()
+    html = (
+        '<html><body><div class="mid"><a href="/m">M</a></div></body></html>'
+    )
+
+    items = engine._get_elements(html, ".no1||.mid a[href]||.no2")
+
+    assert [el.get_text(strip=True) for el in items] == ["M"]
+
+
 def test_chapter_list_rule_with_fallback_produces_chapters():
     engine = YueduRuleEngine({
         "bookSourceUrl": "https://example.com",
