@@ -12,6 +12,7 @@ from loguru import logger
 
 from app.crawler.base import EmptyTocError
 from app.crawler.registry import get_plugin
+from app.core import transient as core_transient
 from app.core.config import settings, sync_thread_count
 from app.core.database import SessionLocal
 from app.core.events import emit, EventType
@@ -135,45 +136,13 @@ CONTENT_IMAGE_RE = re.compile(
 )
 MAX_CONTENT_IMAGES_PER_CHAPTER = 512
 
-# Exception class names that always mean "the network/proxy hiccuped", even
-# when the exception carries no message at all.  HTTPX and asyncio timeouts are
-# created without arguments, so ``str(exc)`` is empty; matching on message text
-# alone classified them as deterministic rule/Cookie failures, and ten of them
-# in a row aborted the whole task with a misleading "被反爬" message.
-TRANSIENT_EXCEPTION_NAMES = frozenset({
-    "TimeoutError",           # asyncio.TimeoutError / playwright TimeoutError
-    "ConnectionError",
-    "ConnectTimeout",
-    "ReadTimeout",
-    "WriteTimeout",
-    "PoolTimeout",
-    "ConnectError",
-    "ReadError",
-    "WriteError",
-    "RemoteProtocolError",
-    "TransportError",         # HTTPX base class for the above
-    "TimeoutException",       # HTTPX timeout base class
-    "RequestError",           # HTTPX request base class
-    "NetworkError",
-    "ClientConnectionError",
-    "ServerDisconnectedError",
-    # anyio stream errors.  HTTPX runs on anyio, and when a pooled client or
-    # its socket is torn down (proxy restart, mihomo reload) the in-flight
-    # requests surface these instead of a HTTPX exception; they stringify to
-    # "" so only the class name reveals what happened (crawler container,
-    # 2026-09-14 burst).
-    "ClosedResourceError",
-    "BrokenResourceError",
-    "BusyResourceError",
-    "IncompleteReadError",
-})
-
-# Concurrency artefacts raised from inside the transport/browser stack while a
-# shared client is being replaced -- never a book-source rule problem, but they
-# carry a message instead of a HTTPX class name, so they are matched on text.
-TRANSIENT_MESSAGE_MARKERS = (
-    "pop from an empty deque",
-)
+# The transient *exception* taxonomy lives in exactly one place now:
+# ``app.core.transient``.  This module used to keep its own list, which drifted
+# from the plugin's -- ``EndOfStream``/``WouldBlock`` were retryable in the
+# request loop but permanent here, so such a failure could count toward the
+# "连续失败" abort.  ``TRANSIENT_EXCEPTION_NAMES`` is re-exported for callers
+# that still import it from here.
+TRANSIENT_EXCEPTION_NAMES = core_transient.TRANSIENT_EXCEPTION_NAMES
 
 # Book-level transient markers (a book that failed for one of these is retried
 # later; "empty content" counts here because a source can answer with an empty
@@ -199,8 +168,12 @@ TRANSIENT_CHAPTER_MARKERS = (
 
 
 def _exception_names(exc: BaseException) -> set[str]:
-    """All class names in an exception's MRO (works without importing HTTPX)."""
-    return {cls.__name__ for cls in type(exc).__mro__}
+    """All class names in an exception's MRO (works without importing HTTPX).
+
+    Kept as a thin alias so existing call sites read normally; the taxonomy
+    itself is :mod:`app.core.transient`.
+    """
+    return core_transient.exception_names(exc)
 
 
 def describe_error(exc: BaseException | None) -> str:
@@ -362,13 +335,12 @@ class SyncService:
         """Whether a failed book fetch is a transient error worth retrying
         (Cloudflare 5xx / upstream error, browser load timeout, or a dropped
         connection) rather than a deterministic rule/Cookie problem."""
-        if _exception_names(exc) & TRANSIENT_EXCEPTION_NAMES:
-            return True
-        message = str(exc).lower()
-        if any(marker in message for marker in TRANSIENT_MESSAGE_MARKERS):
-            # Never a rule/Cookie answer: ten of these in a row used to abort
+        if core_transient.is_transient_transport_error(exc):
+            # Covers the socket/stream class names *and* the "pop from an empty
+            # deque" concurrency artefact: ten of these in a row used to abort
             # the whole task with a misleading "被反爬" message.
             return True
+        message = str(exc).lower()
         if any(marker in message for marker in TRANSIENT_BOOK_MARKERS):
             return True
         response = getattr(exc, "response", None)
@@ -384,12 +356,10 @@ class SyncService:
         stopping the current book early for: continuing only sends dozens of
         doomed requests while the origin is down.
         """
-        if _exception_names(exc) & TRANSIENT_EXCEPTION_NAMES:
+        if core_transient.is_transient_transport_error(exc):
             return True
-        message = str(exc).lower()
-        if any(marker in message for marker in TRANSIENT_MESSAGE_MARKERS):
-            return True
-        return any(marker in message for marker in TRANSIENT_CHAPTER_MARKERS)
+        return any(marker in str(exc).lower()
+                   for marker in TRANSIENT_CHAPTER_MARKERS)
 
     @staticmethod
     def _chapter_concurrency(

@@ -6,6 +6,7 @@ from typing import Optional
 
 from loguru import logger
 
+from app.core.clock import naive_now
 from app.core.database import SessionLocal
 from app.services.cookie_crypto import safe_decrypt_cookie
 from app.repositories.cookie import CookieRepository
@@ -28,8 +29,7 @@ class AliceSWLogin:
                 logger.warning("No cookie found for source={}", self.source_id)
                 return None
 
-            from datetime import datetime, timezone
-            if cookie.expired_at and cookie.expired_at < datetime.now(timezone.utc):
+            if cookie.expired_at and cookie.expired_at < naive_now():
                 logger.warning("Cookie for source={} is expired", self.source_id)
                 return None
 

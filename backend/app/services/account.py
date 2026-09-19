@@ -10,11 +10,18 @@ from app.models import DeletedAccount, User
 RESERVATION_DAYS = 3
 
 
+# ``deleted_accounts.deleted_at`` is ``DateTime(timezone=True)`` (an absolute
+# instant), unlike every naive local-time column elsewhere in the schema, so the
+# cutoff below is deliberately aware UTC -- see ``core/clock.py``.
+def _reservation_cutoff() -> datetime:
+    return datetime.now(timezone.utc) - timedelta(days=RESERVATION_DAYS)
+
+
 async def username_available(db: AsyncSession, username: str) -> str | None:
     active = await db.scalar(select(User.id).where(User.username == username))
     if active:
         return "Username already exists"
-    cutoff = datetime.now(timezone.utc) - timedelta(days=RESERVATION_DAYS)
+    cutoff = _reservation_cutoff()
     deleted = await db.scalar(
         select(DeletedAccount.id).where(
             DeletedAccount.username == username,
@@ -37,7 +44,7 @@ async def email_available(db: AsyncSession, email: str | None) -> str | None:
     )
     if active:
         return "Email already exists"
-    cutoff = datetime.now(timezone.utc) - timedelta(days=RESERVATION_DAYS)
+    cutoff = _reservation_cutoff()
     deleted = await db.scalar(
         select(DeletedAccount.id).where(
             func.lower(DeletedAccount.email) == email.lower(),

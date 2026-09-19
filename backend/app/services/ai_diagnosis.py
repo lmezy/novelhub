@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Iterable
 from uuid import uuid4
 
@@ -29,6 +29,7 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.clock import naive_now
 from app.core.database import SessionLocal
 from app.models import Cookie, CrawlTask, Source, SourceCredential, SyncDiagnosis
 from app.services.ai_client import AIError, LLMClient
@@ -212,7 +213,7 @@ async def collect_login_state(db: AsyncSession, source_id: str | None) -> dict[s
             or datetime.min.replace(tzinfo=None),
         )
         plaintext, decrypted = _cookie_plaintext(newest.cookie_data or "")
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        now = naive_now()
         state.update({
             "configured": True,
             "count": len(rows),

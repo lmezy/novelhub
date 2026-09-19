@@ -5,12 +5,12 @@ via auto_login when credentials are available.
 """
 
 import asyncio
-from datetime import datetime, timezone
 from uuid import uuid4
 
 from loguru import logger
 from sqlalchemy import select
 
+from app.core.clock import naive_now
 from app.core.database import SessionLocal
 from app.crawler.registry import get_plugin
 from app.models import Cookie
@@ -66,7 +66,7 @@ class CookieHealthService:
             async def _check_one(cookie) -> dict:
                 detail = {"source": cookie["source"], "cookie_id": cookie["id"]}
                 expired_at = cookie["expired_at"]
-                if expired_at and expired_at < datetime.now(timezone.utc):
+                if expired_at and expired_at < naive_now():
                     detail["reason"] = "expired"
                     refresh_result = await CookieHealthService._try_refresh(db, cookie)
                     detail.update(refresh_result)

@@ -2,13 +2,14 @@
 
 import hashlib
 import secrets
-from datetime import datetime, timezone
+from datetime import timedelta
 from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
+from app.core.clock import naive_now
 from app.models.api_token import ApiToken
 
 
@@ -27,10 +28,11 @@ class TokenService:
 
         expires_at = None
         if expires_days:
-            expires_at = datetime.now(timezone.utc).replace(
+            # ``api_tokens.expires_at`` is a naive DateTime on the DB's local
+            # wall clock, so write local time here (not UTC).
+            expires_at = naive_now().replace(
                 hour=23, minute=59, second=59
             )
-            from datetime import timedelta
             expires_at += timedelta(days=expires_days)
 
         token = ApiToken(
@@ -54,9 +56,9 @@ class TokenService:
         )
         if token is None or not token.is_active:
             return None
-        if token.expires_at and token.expires_at < datetime.now(timezone.utc):
+        if token.expires_at and token.expires_at < naive_now():
             return None
-        token.last_used_at = datetime.now(timezone.utc)
+        token.last_used_at = naive_now()
         self.db.add(token)
         await self.db.commit()
         return token

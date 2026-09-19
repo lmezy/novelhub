@@ -1,5 +1,4 @@
 from uuid import uuid4
-from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
@@ -7,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.clock import naive_now
 from app.core.database import get_db
 from app.models import Book, CrawlTask, Source, SourceChange, User
 from app.schemas.source_change import SourceChangeCreate, SourceChangeOut, SourceChangeReview
@@ -100,7 +100,7 @@ async def create_change(
             source_data=payload.source_data,
             status="approved",
             reviewer_id=user.id,
-            reviewed_at=datetime.now(timezone.utc),
+            reviewed_at=naive_now(),
         )
         return change
 
@@ -219,7 +219,7 @@ async def review_change(
 
     change.reviewer_id = reviewer.id
     change.review_note = payload.note
-    change.reviewed_at = datetime.now(timezone.utc)
+    change.reviewed_at = naive_now()
     await db.commit()
     await db.refresh(change)
     if payload.action == "approve" and change.action == "create" and change.source_data:

@@ -6,11 +6,11 @@ sync gets captcha-blocked, so the admin UI can override the pace per source.
 """
 
 import asyncio
+import sys
 from types import SimpleNamespace
 
 import pytest
 
-import app.crawler.plugins.yuedu as yuedu_module
 from app.crawler.plugins.yuedu import YueduPlugin
 from app.services.source_interval import (
     MAX_SYNC_INTERVAL_SECONDS,
@@ -47,6 +47,19 @@ class _SleepRecorder:
 
 def _plugin(config: dict | None = None) -> YueduPlugin:
     return YueduPlugin(config or {"bookSourceUrl": "https://example.test"})
+
+
+def _patch_rate_limiter(monkeypatch, fake) -> None:
+    """Point the limiter's ``asyncio`` at ``fake`` so nothing really sleeps.
+
+    ``_sleep_rate_limit`` used to live in the package ``__init__`` and every test
+    here patched that module's global.  It now lives in a mixin module of its
+    own, so patching the package global silently missed and the tests fell
+    through to real 60-second sleeps.  Resolving the *owning* module from the
+    function keeps this correct wherever the limiter moves next.
+    """
+    owner = sys.modules[YueduPlugin._sleep_rate_limit.__module__]
+    monkeypatch.setattr(owner, "asyncio", fake)
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +124,7 @@ def test_set_request_interval_seconds_ignores_garbage():
 @pytest.mark.asyncio
 async def test_configured_interval_paces_requests(monkeypatch):
     fake = _SleepRecorder()
-    monkeypatch.setattr(yuedu_module, "asyncio", fake)
+    _patch_rate_limiter(monkeypatch, fake)
 
     plugin = _plugin()
     plugin.set_request_interval_seconds(60)
@@ -129,7 +142,7 @@ async def test_configured_interval_paces_requests(monkeypatch):
 @pytest.mark.asyncio
 async def test_configured_interval_beats_concurrent_rate(monkeypatch):
     fake = _SleepRecorder()
-    monkeypatch.setattr(yuedu_module, "asyncio", fake)
+    _patch_rate_limiter(monkeypatch, fake)
 
     # 搬山人 ships concurrentRate=1000 (1s) while the site wants a minute.
     plugin = _plugin({"bookSourceUrl": "https://bs.test", "concurrentRate": "1000"})
@@ -144,7 +157,7 @@ async def test_configured_interval_beats_concurrent_rate(monkeypatch):
 @pytest.mark.asyncio
 async def test_zero_interval_means_explicitly_unthrottled(monkeypatch):
     fake = _SleepRecorder()
-    monkeypatch.setattr(yuedu_module, "asyncio", fake)
+    _patch_rate_limiter(monkeypatch, fake)
 
     plugin = _plugin({"bookSourceUrl": "https://off.test", "concurrentRate": "1000"})
     plugin.set_request_interval_seconds(0)
@@ -158,7 +171,7 @@ async def test_zero_interval_means_explicitly_unthrottled(monkeypatch):
 @pytest.mark.asyncio
 async def test_unset_interval_keeps_the_source_concurrent_rate(monkeypatch):
     fake = _SleepRecorder()
-    monkeypatch.setattr(yuedu_module, "asyncio", fake)
+    _patch_rate_limiter(monkeypatch, fake)
 
     plugin = _plugin({"bookSourceUrl": "https://rate.test", "concurrentRate": "2/1000"})
 
@@ -176,7 +189,7 @@ async def test_ignore_rate_limit_still_wins_over_a_configured_interval(monkeypat
     from app.core.config import settings
 
     fake = _SleepRecorder()
-    monkeypatch.setattr(yuedu_module, "asyncio", fake)
+    _patch_rate_limiter(monkeypatch, fake)
     monkeypatch.setattr(settings, "SYNC_IGNORE_RATE_LIMIT", True)
 
     plugin = _plugin()
