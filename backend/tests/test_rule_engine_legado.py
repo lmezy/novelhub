@@ -577,6 +577,40 @@ def test_list_rule_keeps_a_bracketed_middle_fragment_that_matches():
     assert [el.get_text(strip=True) for el in items] == ["M"]
 
 
+def test_list_rule_strips_the_replace_regex_suffix_before_selecting():
+    """``##pattern##replacement`` is not part of the selector (A-5).
+
+    Legado strips it before parsing -- ``AnalyzeRule.kt:707-709`` is literally
+    ``rule = ruleStrS[0].trim()``.  Leaving it in the list rule meant a ``|``
+    inside the pattern was taken for an extra fallback separator (NovelHub's
+    ``SEPARATORS`` carries a bare ``|``), which shredded the rule and made the
+    whole ``bookList``/``chapterList`` return nothing.
+    """
+    engine = _engine()
+    html = (
+        '<html><body><ul class="list">'
+        "<li>a</li><li>b</li></ul></body></html>"
+    )
+
+    assert [
+        el.get_text(strip=True)
+        for el in engine._get_elements(html, r".list li##\s+|\s+")
+    ] == ["a", "b"]
+
+
+def test_list_rule_without_a_suffix_is_unaffected():
+    """Control for the case above: the plain selector behaves identically."""
+    engine = _engine()
+    html = (
+        '<html><body><ul class="list">'
+        "<li>a</li><li>b</li></ul></body></html>"
+    )
+
+    assert [
+        el.get_text(strip=True) for el in engine._get_elements(html, ".list li")
+    ] == ["a", "b"]
+
+
 def test_chapter_list_rule_with_fallback_produces_chapters():
     engine = YueduRuleEngine({
         "bookSourceUrl": "https://example.com",

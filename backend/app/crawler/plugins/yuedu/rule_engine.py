@@ -681,6 +681,15 @@ class YueduRuleEngine:
         books at all because of it, and Icu's search rule
         (``.novelContainer[-1]@…&&.novelContainer[-2]@…``) never matched.
         """
+        # Legado strips the ``##pattern##replacement`` suffix *before* parsing a
+        # rule -- ``AnalyzeRule.kt:707-709`` does ``rule = ruleStrS[0].trim()``
+        # and keeps the remainder only for value replacement.  So the suffix must
+        # never reach the selector or the separator scan.  On a list rule that
+        # matters twice over: a ``|`` inside the pattern (``".list li##\s+|\s+"``)
+        # was taken for an extra fallback separator, which shredded the rule and
+        # made the whole ``bookList``/``chapterList`` return nothing at all.
+        rule, _ = self._split_xpath_transform(rule)
+
         analyzer = _RuleAnalyzer(rule)
         try:
             fragments = analyzer.split_rule(*self.SEPARATORS)
