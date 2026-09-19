@@ -1381,23 +1381,19 @@ def test_reload_sends_the_source_url_as_referer():
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
-def test_the_header_rule_is_still_not_injected():
-    """Tier-1 boundary, pinned on purpose.
+def test_the_header_rule_is_exposed_raw_like_legados_source_field():
+    """Tier 1 deliberately did NOT inject `header`; tier 2 now injects it **raw**.
 
-    The `header` rule may itself be an `@js:` script, so it has to be evaluated
-    before it can be merged (tier 2 of docs/js-http-request-side.md).  Injecting
-    the raw string would work for JSON-form headers and silently drop
-    script-form ones.  When tier 2 lands, this test should be updated.
-
-    No manual cleanup is needed: the bootstrap clears the context keys it owns on
-    every evaluation, which is what `test_context_keys_do_not_leak...` pins.
+    An evaluated header cannot be produced on the Python side: the rule may be a
+    script, and evaluating it from `_build_js_context` (which runs before the JS
+    evaluation) would recurse forever.  So the raw rule is injected and the shim
+    evaluates it in-process -- which also means `source.header` returns the rule
+    as written, exactly like Legado's source field.
     """
-    engine = YueduRuleEngine({
-        "bookSourceUrl": "https://s.test",
-        "header": '@js:JSON.stringify({"User-Agent":"UA-1"})',
-    })
+    rule = '@js:JSON.stringify({"User-Agent":"UA-1"})'
+    engine = YueduRuleEngine({"bookSourceUrl": "https://s.test", "header": rule})
 
-    assert engine._try_eval_js("JSON.stringify(source.header);", "") == '""'
+    assert engine._try_eval_js("source.header;", "") == rule
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
@@ -1638,4 +1634,77 @@ def test_text_join_stays_newline_on_purpose():
     engine = _engine()
 
     assert engine._eval_css("<div>a<br>b</div>", "div@text") == "a\nb"
+
+
+# ---------------------------------------------------------------------------
+# The source's `header` rule now reaches JS-issued requests (tier 2).
+#
+# Legado seeds every `java.*` request from the book source's `header` field, which
+# may be plain JSON or a script.  Only `java.connect` used to merge it, and only in
+# its JSON form, so a source's declared UA never applied on the `java.*` path --
+# some sites answer that with their mobile page (codex-handoff section 8).
+#
+# The rule is evaluated inside the shim (`__nhParseHeaders`), which is why the
+# assertions call it directly: `__nhCurlRaw` applies it, and a stub of `__nhCurlRaw`
+# replaces the function that carries it out.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_a_json_header_rule_reaches_js_requests():
+    engine = YueduRuleEngine({"header": '{"User-Agent":"UA-JSON"}'})
+
+    assert engine._try_eval_js(
+        "__nhFinalHeaders({})['User-Agent'];", ""
+    ) == "UA-JSON"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_a_script_header_rule_is_evaluated_in_process():
+    """Both spellings Legado sources use: `@js:` and `<js>…</js>`."""
+    engine = YueduRuleEngine({
+        "header": '@js:JSON.stringify({"User-Agent":"UA-AT"})',
+    })
+    assert engine._try_eval_js("__nhFinalHeaders({})['User-Agent'];", "") == "UA-AT"
+
+    tagged = YueduRuleEngine({
+        "header": '<js>JSON.stringify({"User-Agent":"UA-TAG"})</js>',
+    })
+    assert tagged._try_eval_js("__nhFinalHeaders({})['User-Agent'];", "") == "UA-TAG"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_a_header_script_can_use_the_well_known_bindings():
+    """`baseUrl` and friends are passed in explicitly.
+
+    A module-level shim function cannot see the `var baseUrl` the bootstrap
+    declares inside the user-code closure, so the script is run through
+    `new Function(...)` with those names bound.
+    """
+    engine = YueduRuleEngine({
+        "bookSourceUrl": "https://s.test",
+        "header": '@js:JSON.stringify({"X-From": baseUrl})',
+    })
+
+    assert engine._try_eval_js(
+        "__nhFinalHeaders({})['X-From'];", ""
+    ) == "https://s.test"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_a_caller_supplied_header_wins_over_the_source_rule():
+    engine = YueduRuleEngine({"header": '{"User-Agent":"UA-SRC","X-A":"1"}'})
+
+    assert engine._try_eval_js(
+        "JSON.stringify(__nhFinalHeaders({'User-Agent': 'UA-CALL'}));", ""
+    ) == '{"User-Agent":"UA-CALL","X-A":"1"}'
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_a_broken_header_rule_is_ignored_rather_than_failing_the_request():
+    engine = YueduRuleEngine({"header": '@js:throw new Error("boom")'})
+
+    assert engine._try_eval_js(
+        "JSON.stringify(__nhFinalHeaders({}));", ""
+    ) == "{}"
 

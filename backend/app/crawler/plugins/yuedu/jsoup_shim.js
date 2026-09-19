@@ -799,21 +799,79 @@ var __nhSourceConfig = {};
 var __nhContent = '';
 var __nhProxy = (typeof process !== 'undefined' && process.env && process.env.DSH_HTTP_PROXY) || '';
 
-// Default headers applied to *every* JS-issued request.
+// Turn a `header` rule / header argument into a plain object.
+//
+// The rule may be plain JSON, or a script -- Legado sources write both
+// `@js:JSON.stringify({...})` and `<js>…</js>`.  Scripts are evaluated **here**,
+// inside the shim, for two reasons: the shim is already a JS environment, and
+// evaluating them on the Python side would have to call back into this same
+// evaluation from `_build_js_context`, which runs *before* it (infinite
+// recursion), while also having to bridge async→sync.
+//
+// `new Function` rather than a bare `eval` so the well-known bindings are in
+// scope: a module-level function cannot see the `var baseUrl` the bootstrap
+// declares inside the user-code closure, so `baseUrl` / `book` / `source` …
+// are passed in explicitly, sourced from `__nhVars` (which the bootstrap seeds).
+// This is not a new sandbox exposure: running book-source JS is the shim's job.
+function __nhParseHeaders(raw) {
+  if (!raw) return {};
+  var parsed = raw;
+  if (typeof raw === 'string') {
+    var text = raw.trim();
+    if (!text) return {};
+    var script = null;
+    if (/^@js:/i.test(text)) script = text.slice(4);
+    else if (/^<js>/i.test(text) && /<\/js>\s*$/i.test(text)) {
+      script = text.slice(4, text.lastIndexOf('</js>'));
+    }
+    try {
+      if (script !== null) {
+        var fn = new Function(
+          'java', 'source', 'cookie', 'cache', '__nhVars',
+          'baseUrl', 'bookUrl', 'sourceUrl', 'url', 'book', 'chapter',
+          'return (' + script + ');'
+        );
+        parsed = fn(
+          java, source, cookie, cache, __nhVars,
+          __nhVars.baseUrl || '', __nhVars.bookUrl || '',
+          __nhVars.sourceUrl || '', __nhVars.url || '',
+          __nhVars.book || {}, __nhVars.chapter || {}
+        );
+        if (typeof parsed === 'string') parsed = JSON.parse(parsed);
+      } else {
+        parsed = JSON.parse(text);
+      }
+    } catch (e) {
+      return {}; // a broken header rule must not break the request
+    }
+  }
+  if (!parsed || typeof parsed !== 'object') return {};
+  var out = {};
+  for (var k in parsed) {
+    if (parsed[k] !== undefined && parsed[k] !== null) out[k] = String(parsed[k]);
+  }
+  return out;
+}
+
+// Headers applied to *every* JS-issued request: the source's own `header` rule
+// first, then this call's headers, then a default Referer.
 //
 // `Reload()` already built a Referer from the source URL (Legado does the same),
 // but the `java.*` path never did: `java.get` / `java.post` / `java.ajax` passed
 // the caller's headers straight through, and only `java.connect` used
-// `__nhSourceHeaders`.  Sites that check the referer therefore saw a bare request
-// from any source whose rules fetch through `java.*`.
+// `__nhSourceHeaders`.  Sites that check the referer saw a bare request from any
+// source whose rules fetch through `java.*`; likewise the source's declared UA
+// never applied, so some sites answered with their mobile page
+// (codex-handoff section 8).
 //
 // Applied here, at the single funnel every request goes through, rather than at
-// the four call sites.  A caller-supplied Referer always wins.
+// the four call sites.  A caller-supplied header always wins over the source's.
 function __nhFinalHeaders(headers) {
-  var out = {};
-  if (headers) {
-    for (var k in headers) {
-      if (headers[k] !== undefined && headers[k] !== null) out[k] = headers[k];
+  var out = __nhParseHeaders(__nhSourceConfig.header);
+  var extra = (typeof headers === 'string') ? __nhParseHeaders(headers) : headers;
+  if (extra) {
+    for (var k in extra) {
+      if (extra[k] !== undefined && extra[k] !== null) out[k] = extra[k];
     }
   }
   if (!('Referer' in out) && __nhSourceConfig.bookSourceUrl) {

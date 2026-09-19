@@ -414,6 +414,18 @@ class YueduRuleEngine:
             if value is not None:
                 context[key] = value
         context["bookSourceUrl"] = self.base_url
+        # The source's ``header`` rule, injected **raw**.
+        #
+        # It may be plain JSON or a script (``@js:JSON.stringify({...})`` /
+        # ``<js>…</js>``).  Evaluating it here would be wrong twice over: a script
+        # needs the JS runtime, and calling back into it from ``_build_js_context``
+        # -- which runs *before* the evaluation -- would recurse forever.  The shim
+        # is itself a JS environment, so it evaluates the rule in-process instead
+        # (``__nhParseHeaders``); ``source.header`` consequently returns the rule as
+        # written, exactly like Legado's source field.
+        header_rule = self.config.get("header")
+        if header_rule:
+            context["header"] = header_rule
         if self._chapter_context:
             context["chapter"] = self._chapter_context
         if extra_context:
