@@ -1339,6 +1339,15 @@ class YueduRuleEngine:
                 results.append(val)
         if not results:
             return None
+        # Legado dedupes **only** in its attribute branch -- ``getResultLast``'s
+        # ``else`` does ``if (url.isBlank() || textS.contains(url)) continue``,
+        # while the text/textNodes/ownText/html/all branches append blindly.
+        # Deduping every mode silently swallowed legitimate repeats: two
+        # identical ``<span>`` under ``span@text`` returned one value instead of
+        # two (legado-rule-spec-diff.md M-10).
+        mode = attr_suffix.strip().lower() or "text"
+        if mode in self._CSS_MODES_WITHOUT_DEDUPE:
+            return results
         seen: set[str] = set()
         unique: list[str] = []
         for val in results:
@@ -1346,6 +1355,9 @@ class YueduRuleEngine:
                 seen.add(val)
                 unique.append(val)
         return unique
+
+    #: Modes whose results Legado keeps verbatim (no cross-element dedupe).
+    _CSS_MODES_WITHOUT_DEDUPE = ("text", "textnodes", "owntext", "html", "all")
 
     @staticmethod
     def _split_css_attr(rule: str) -> tuple[str, str]:
@@ -1363,21 +1375,44 @@ class YueduRuleEngine:
     def _extract_css_value(el: Tag, attr: str) -> str:
         attr = attr.strip().lower()
         if not attr or attr == "text":
+            # DELIBERATE DEVIATION, decided 2026-09-19: jsoup's ``Element.text()``
+            # normalises whitespace and joins blocks with a **space**; keeping the
+            # newline is more useful for chapter bodies and synopses, so NovelHub
+            # stays as-is.  Pinned by test_text_join_stays_newline_on_purpose.
             return el.get_text("\n", strip=True)
         if attr == "textnodes":
+            # Legado: each direct text node trimmed, joined with "\n".
             texts = [t.strip() for t in el.find_all(string=True, recursive=False) if t.strip()]
             return "\n".join(texts)
         if attr == "owntext":
+            # Legado uses jsoup's ``ownText()``, which normalises whitespace and
+            # joins the direct text nodes with a **space**.  This used to be
+            # byte-identical to ``textnodes`` above (both "\n"), which was a
+            # copy-paste slip rather than a decision (M-9).
             texts = [t.strip() for t in el.find_all(string=True, recursive=False) if t.strip()]
-            return "\n".join(texts)
+            return " ".join(texts)
         if attr == "html":
+            # Legado's ``html`` branch removes script/style and then returns
+            # ``elements.outerHtml()`` -- the **outer** HTML, tag included.
+            # Returning ``decode_contents()`` (inner) dropped the element's own
+            # tags (M-8).
             for tag in el.find_all(["script", "style"]):
                 tag.decompose()
-            return el.decode_contents()
+            return str(el)
         if attr == "all":
+            # ``outerHtml()`` without the script/style removal -- already correct.
             return str(el)
         val = el.get(attr)
-        return val if val else ""
+        if val is None:
+            return ""
+        if isinstance(val, list):
+            # bs4 hands back a list for multi-valued attributes (``class``,
+            # ``rel``, ...).  Legado's ``attr()`` returns the raw string, so
+            # ``class="body strikeout"`` must come back as "body strikeout" --
+            # the list used to reach the caller and raise a swallowed
+            # TypeError, emptying the whole field (D-13).
+            return " ".join(str(item) for item in val)
+        return str(val)
 
     def _eval_json(self, raw: Any, rule: str) -> Any:
         if isinstance(raw, str):
