@@ -368,6 +368,21 @@ class YueduRuleEngine:
         self._js_content: Any = None
         self._is_json_context: bool = False
         self._js_runtime: "JsRuntime | None" = None
+        # The Cookie the *user* imported for this source.  It cannot come from the
+        # book source JSON (Legado's schema has no cookie field -- that is why the
+        # AI diagnosis missed it, codex-handoff section 27), so the plugin hands it
+        # over explicitly via ``set_configured_cookie``.
+        self._configured_cookie: str = ""
+
+    def set_configured_cookie(self, cookie: str | None) -> None:
+        """Provide the user-imported Cookie so JS-issued requests carry it.
+
+        Previously nothing seeded the shim's cookie jar with it, so a
+        Cookie-authenticated source whose rules fetch through ``java.*`` got
+        nothing -- the same symptom class as sections 8/19, where the fix only
+        covered the Python path.
+        """
+        self._configured_cookie = cookie or ""
 
     def _get_js_runtime(self) -> "JsRuntime":
         if self._js_runtime is None:
@@ -426,6 +441,12 @@ class YueduRuleEngine:
         header_rule = self.config.get("header")
         if header_rule:
             context["header"] = header_rule
+        # The reserved ``__nhCookie`` key, not ``cookie``: the shim already has a
+        # module-level ``cookie`` *object* (``cookie.get``/``cookie.put``), and a
+        # context key of that name would overwrite it.  Every context key lands in
+        # ``__nhSourceConfig`` anyway, which is where the shim reads it from.
+        if self._configured_cookie:
+            context["__nhCookie"] = self._configured_cookie
         if self._chapter_context:
             context["chapter"] = self._chapter_context
         if extra_context:

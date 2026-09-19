@@ -794,6 +794,8 @@ var org = {
 // ---------------- java / cookie / cache / Legado globals shims ----------------
 var __nhCache = {};
 var __nhCookieJar = [];
+// Which source the session jar currently belongs to (see __nhSetSourceConfig).
+var __nhCookieSource = null;
 var __nhVars = {};
 var __nhSourceConfig = {};
 var __nhContent = '';
@@ -853,6 +855,25 @@ function __nhParseHeaders(raw) {
   return out;
 }
 
+// The Cookie sent on JS-issued requests: the user-imported Cookie first, then
+// anything the script stored itself via `setCookie`.
+//
+// The imported Cookie arrives under the reserved `__nhCookie` config key (see
+// `YueduRuleEngine._build_js_context`); `cookie` would collide with this file's
+// own `cookie` object.  Nothing used to seed it at all, so `java.getCookie()`
+// always returned "" and JS requests went out unauthenticated -- a
+// Cookie-authenticated source whose rules fetch through `java.*` could never get
+// its content, the same symptom class as codex-handoff sections 8/19.
+function __nhCookieHeader() {
+  var parts = [];
+  var configured = __nhSourceConfig.__nhCookie;
+  if (configured) parts.push(String(configured));
+  for (var i = 0; i < __nhCookieJar.length; i++) {
+    if (__nhCookieJar[i]) parts.push(String(__nhCookieJar[i]));
+  }
+  return parts.join('; ');
+}
+
 // Headers applied to *every* JS-issued request: the source's own `header` rule
 // first, then this call's headers, then a default Referer.
 //
@@ -873,6 +894,10 @@ function __nhFinalHeaders(headers) {
     for (var k in extra) {
       if (extra[k] !== undefined && extra[k] !== null) out[k] = extra[k];
     }
+  }
+  if (!('Cookie' in out)) {
+    var cookieHeader = __nhCookieHeader();
+    if (cookieHeader) out['Cookie'] = cookieHeader;
   }
   if (!('Referer' in out) && __nhSourceConfig.bookSourceUrl) {
     out['Referer'] = __nhSourceConfig.bookSourceUrl;
@@ -1647,7 +1672,7 @@ var java = {
   httpGet: function (url, headers) {
     return new __nhResponse(url, __nhCurlRaw(url, 'GET', null, headers), 200, {});
   },
-  getCookie: function () { return __nhCookieJar.join('; '); },
+  getCookie: function () { return __nhCookieHeader(); },
   setCookie: function (c) { if (c) __nhCookieJar.push(String(c)); return c; },
   getCookies: function () { return __nhCookieJar.slice(); },
   getLoginInfo: function () { return null; },
@@ -1905,7 +1930,7 @@ var source = {
   remove: function (k) { delete __nhVars[String(k)]; },
   getLoginInfo: function () { return null; },
   getLoginInfoMap: function () { return null; },
-  getCookie: function () { return __nhCookieJar.join('; '); },
+  getCookie: function () { return __nhCookieHeader(); },
   setCookie: function (c) { if (c) __nhCookieJar.push(String(c)); return c; },
 };
 ['bookSourceUrl', 'bookSourceName', 'bookSourceGroup', 'bookSourceType',
@@ -1923,7 +1948,7 @@ var source = {
 });
 
 var cookie = {
-  getCookie: function () { return __nhCookieJar.join('; '); },
+  getCookie: function () { return __nhCookieHeader(); },
   setCookie: function (c) { if (c) __nhCookieJar.push(String(c)); return c; },
   getCookies: function () { return __nhCookieJar.slice(); },
 };
@@ -1993,7 +2018,7 @@ function Url() {
 var __nhContextKeys = [
   'baseUrl', 'bookUrl', 'sourceUrl', 'bookSourceUrl', 'url', 'book', 'chapter',
   'bookSourceName', 'bookSourceGroup', 'bookSourceType', 'bookUrlPattern',
-  'customOrder', 'loginUrl', 'searchUrl', 'header',
+  'customOrder', 'loginUrl', 'searchUrl', 'header', '__nhCookie',
 ];
 
 function __nhDropContextKeys(target, incoming) {
@@ -2005,6 +2030,15 @@ function __nhDropContextKeys(target, incoming) {
 
 function __nhSetSourceConfig(cfg) {
   if (!cfg) return;
+  // Session cookies written by `java.setCookie` belong to the source that wrote
+  // them, but `JsRuntime` is a singleton and this subprocess is shared by every
+  // source -- so without this a cookie written while syncing source A would be
+  // sent on source B's requests.  Clear the jar when the source changes; an
+  // engine that only refreshes the same source keeps its session.
+  if (cfg.bookSourceUrl !== undefined && cfg.bookSourceUrl !== __nhCookieSource) {
+    __nhCookieSource = cfg.bookSourceUrl;
+    __nhCookieJar.length = 0;
+  }
   __nhDropContextKeys(__nhSourceConfig, cfg);
   for (var k in cfg) { if (cfg[k] !== undefined) __nhSourceConfig[k] = cfg[k]; }
 }

@@ -208,6 +208,8 @@ class YueduPlugin(UrlsMixin, ParsingMixin, ExploreMixin, BookMixin, ChapterMixin
         self.engine = YueduRuleEngine(self.config)
         self.base_url = self.config.get("bookSourceUrl", "")
         self._chapter_image_manifest = []
+        # A Cookie may have been set before this engine existed.
+        self._sync_cookie_to_engine()
 
     @staticmethod
     def _normalize_source_config(

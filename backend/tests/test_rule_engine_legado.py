@@ -1708,3 +1708,110 @@ def test_a_broken_header_rule_is_ignored_rather_than_failing_the_request():
         "JSON.stringify(__nhFinalHeaders({}));", ""
     ) == "{}"
 
+
+# ---------------------------------------------------------------------------
+# The user-imported Cookie now reaches JS-issued requests.
+#
+# It cannot come from the book source JSON -- Legado's schema has no cookie field
+# (which is exactly why the AI diagnosis missed it, codex-handoff section 27) --
+# so the plugin pushes it to the engine.  Nothing used to seed the shim's jar, so
+# `java.getCookie()` always returned "" and a Cookie-authenticated source whose
+# rules fetch through `java.*` could never get its content: the same symptom class
+# as sections 8/19, where the fix only covered the Python path.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_the_imported_cookie_reaches_js_requests():
+    engine = _engine()
+    engine.set_configured_cookie("uid=1; cf_clearance=abc")
+
+    assert engine._try_eval_js(
+        "__nhFinalHeaders({})['Cookie'];", ""
+    ) == "uid=1; cf_clearance=abc"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_get_cookie_returns_the_imported_cookie():
+    """`java.getCookie()` used to be permanently empty."""
+    engine = _engine()
+    engine.set_configured_cookie("uid=1")
+
+    assert engine._try_eval_js("java.getCookie();", "") == "uid=1"
+    assert engine._try_eval_js("source.getCookie();", "") == "uid=1"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_a_script_set_cookie_is_appended_after_the_imported_one():
+    """`setCookie` keeps its append semantics; the imported cookie is replaced.
+
+    The jar is cleared first: it is deliberately **per source** (see
+    `test_session_cookies_do_not_leak_between_sources`), and every test here uses
+    the same `bookSourceUrl`, so it would otherwise persist between them.
+    """
+    engine = _engine()
+    engine.set_configured_cookie("uid=1")
+
+    assert engine._try_eval_js(
+        "__nhCookieJar.length = 0;"
+        "java.setCookie('session=9');java.getCookie();",
+        "",
+    ) == "uid=1; session=9"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_a_caller_supplied_cookie_wins_over_the_imported_one():
+    engine = _engine()
+    engine.set_configured_cookie("uid=1")
+
+    assert engine._try_eval_js(
+        "__nhCookieJar.length = 0;"
+        "__nhFinalHeaders({Cookie: 'caller=2'})['Cookie'];",
+        "",
+    ) == "caller=2"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_no_cookie_header_without_an_imported_cookie():
+    """Control: a source with no Cookie must not gain an empty header."""
+    engine = _engine()
+
+    assert engine._try_eval_js(
+        "__nhCookieJar.length = 0;"
+        "String(__nhFinalHeaders({})['Cookie']);",
+        "",
+    ) == "undefined"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_the_plugin_pushes_its_cookie_to_the_engine():
+    """`set_cookie` must reach the engine, end to end."""
+    from app.crawler.plugins.yuedu import YueduPlugin
+
+    plugin = YueduPlugin({"bookSourceUrl": "https://s.test"})
+    plugin.set_cookie("uid=1; cf_clearance=abc")
+
+    assert plugin.engine is not None
+    assert plugin.engine._configured_cookie == "uid=1; cf_clearance=abc"
+    assert plugin.engine._try_eval_js(
+        "__nhCookieJar.length = 0; java.getCookie();", ""
+    ) == "uid=1; cf_clearance=abc"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_session_cookies_do_not_leak_between_sources():
+    """`java.setCookie` state is scoped to the source that wrote it.
+
+    `JsRuntime` is a singleton, so every source shares one Node subprocess and one
+    module-level jar.  Without clearing it on a source change, a session cookie
+    written while syncing source A would be sent on source B's requests.
+    """
+    source_a = YueduRuleEngine({"bookSourceUrl": "https://a.test"})
+    source_a._try_eval_js("java.setCookie('fromA=1');", "")
+    assert source_a._try_eval_js("java.getCookie();", "") == "fromA=1"
+
+    # A different source must not inherit it.
+    source_b = YueduRuleEngine({"bookSourceUrl": "https://b.test"})
+
+    assert source_b._try_eval_js("java.getCookie();", "") == ""
+
