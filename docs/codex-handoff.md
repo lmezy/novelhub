@@ -1315,4 +1315,13 @@ scheduler    若干进程
 
 **顺带确认的第 1 节结论**：NAS 用预构建镜像 —— compose 里 backend/crawler/scheduler **只有 `image:` 没有 `build:`**，代码是 COPY 进镜像的（只有 `./storage` 与 `/imports` 是 bind mount），所以 `docker compose restart` 不会让代码生效，必须重建镜像。注意部署目录 `/volume1/docker/NovelHub/novelhub/backend` 里的源码停留在 8/10（`plugins/yuedu/` 还是拆分前那 4 个文件），**不是**构建镜像用的那份。
 
-**尚未做的**：代码未重新构建进镜像（`lonezy/novelhub-{backend,crawler}`）、postgres 未重建（仍是 50）、提交未推送。
+**部署机制（复核）**：绿联 Docker 可视化上的「重新部署」**不是 restart**，而是 compose v5.1.3 的 `up -d`：容器 label 里有 `com.docker.compose.*` 与 `replace`，四个镜像的 `RepoDigests` 非空（说明是从 Docker Hub 拉的），NAS 上 buildx 缓存最新记录停在 5～6 周前（NAS 不 build）。所以这次改 `command:` 后的一次点击会**连 postgres 一起重建**，`max_connections=200` 随之生效。
+
+**一个已经踩到的坑**：线上镜像 build 于 `20:11–20:13`，而 `1b590b0`（变量存储收敛）提交于 `20:05:47` —— 镜像里却没有它（`__nhRuleVars=0`、`last_rule_vars=0`）。原因只能是构建时那个 checkout 落后于本地：提交还没 push，构建机 pull 不到。**构建前必须先 push、再在构建机上 pull**，并在 push 镜像前自检：
+
+```bash
+docker run --rm --entrypoint sh lonezy/novelhub-crawler:latest \
+  -c "grep -c task_concurrency_limit /app/backend/app/services/crawl_runner.py"   # 必须 >= 1
+```
+
+**尚未做的**：代码未重新构建进镜像（`lonezy/novelhub-{backend,crawler,scheduler}`）、postgres 未重建（仍是 50）。提交已推送：`827a684` = `origin/develop`。
