@@ -44,8 +44,8 @@
 
 **最值得先做的三件事**（按收益/成本排序）：
 
-1. **补 `{$.rule}`（M-1）** —— 纯缺失，JSON 书源整类受影响，实现成本低。
-2. **补 `java.*` 的纯计算 API（C-1 里的 41 个）** —— 尤其 26 个加密函数（AES/DES/3DES/digest/HMAC）成体系缺失，而这些书源用来做接口签名；不需要 Android，纯实现。
+1. **补 `{$.rule}`（M-1）** —— 纯缺失，JSON 书源整类受影响，实现成本低。**已完成**（`7e17f78`）。
+2. **补 `java.*` 可实现的缺失 API（39 个：37 纯计算 + 2 HTTP）** —— 尤其 26 个加密函数（AES/DES/3DES/digest/HMAC）成体系缺失，而这些书源用来做接口签名。注意 `t2s`/`s2t` **不在此列**（依赖第三方 JVM 词典，见第 6 节更正）。
 3. **为 M-5（XPath）建差分测试** —— 不是单点 bug，是结构性降级，只有抽样对比才能定位。
 
 **不要急着改的**：M-7 / M-8 / M-9 可能是**有意的改进**而非缺陷（见各条「影响」），需你裁决。
@@ -319,16 +319,26 @@
 
 | 所需运行时 | 个数 | 说明 |
 |---|---|---|
-| **纯计算（可实现，没有任何借口）** | **39** | 26 个加密（AES/DES/3DES/digest/HMAC/md5Encode16）+ `timeFormat`/`timeFormatUTC`/`htmlFormat`/`t2s`/`s2t`/`toURL`/`toNumChapter`/`randomUUID`/`strToBytes`/`bytesToStr`/base64·hex 字节数组变体 |
+| **纯计算（可实现）** | **37** | 26 个加密（AES/DES/3DES/digest/HMAC/`md5Encode16`）+ `timeFormat`/`timeFormatUTC`/`htmlFormat`/`toURL`/`toNumChapter`/`randomUUID`/`strToBytes`/`bytesToStr`/base64·hex 字节数组变体/`hexEncodeToString` |
+| HTTP（可实现） | 2 | `getSource`、`ajaxAll` |
+| **依赖第三方 JVM 词典（同样不现实）** | **2** | `t2s`、`s2t` —— 见下方更正 |
 | Android 专属（按设计无法实现） | 23 | 文件读写删、zip/rar/7z 解压、TTF 字体、`androidId`、`openUrl`、`logType` |
 | 需要真实浏览器 | 5 | `webView`、`webViewGetSource`、`webViewGetOverrideUrl`、`startBrowser`、`importScript` |
-| HTTP（可实现） | 2 | `getSource`、`ajaxAll` |
+
+> **更正（2026-09-19）**：本表初版把 `t2s`/`s2t` 计入"纯计算可实现"，**这是错的**。
+> 读规范后确认：Legado 的 `ChineseUtils`（`utils/ChineseUtils.kt`，仅 51 行）只是一个包装，
+> 真正的转换词典在第三方库 **`com.github.liuyueyi.quick.transfer`** 里。
+> 要在 JS 侧实现就得把该库的词典数据一并搬过来，所以它和 Android 专属项一样不现实。
+> 因此「不需要 Android 且真能实现」的数字是 **39**（37 纯计算 + 2 HTTP），不是初版的 41。
+>
+> 附录 C 的 F 节把 `t2s`/`s2t` 列在"可实现但未实现"里 —— 附录按"逐字未改"原则保留原样，
+> **以本节为准**。
 
 **缺失名称全表（69）**
 
-纯计算（39）：
+纯计算（37，不含 `t2s`/`s2t`）：
 `strToBytes` `bytesToStr` `base64DecodeToByteArray` `hexDecodeToByteArray`
-`hexEncodeToString` `timeFormatUTC` `timeFormat` `htmlFormat` `t2s` `s2t`
+`hexEncodeToString` `timeFormatUTC` `timeFormat` `htmlFormat`
 `toNumChapter` `toURL` `randomUUID` `md5Encode16` `createSymmetricCrypto`
 `createAsymmetricCrypto` `createSign` `aesDecodeToByteArray` `aesDecodeToString`
 `aesDecodeArgsBase64Str` `aesBase64DecodeToByteArray` `aesBase64DecodeToString`
