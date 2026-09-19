@@ -1304,3 +1304,102 @@ def test_time_format_uses_the_runtime_local_clock():
     engine = _engine()
 
     assert engine._try_eval_js("java.timeFormat(%d);" % instant_ms, "") == expected
+
+
+# ---------------------------------------------------------------------------
+# Source identity reaching JS (docs/js-http-request-side.md, tier 1).
+#
+# The shim exposes `source.bookSourceUrl`, `source.bookSourceName`, … as getters
+# over `__nhSourceConfig`, but only `sourceUrl` was ever injected, so all of them
+# read back as "".  `bookSourceUrl` also feeds the Referer of JS-issued requests.
+# ---------------------------------------------------------------------------
+
+_SOURCE_CONFIG = {
+    "bookSourceUrl": "https://s.test",
+    "bookSourceName": "测试源",
+    "bookSourceGroup": "分组A",
+    # 0 is the *text* source type -- a legitimate falsy value.
+    "bookSourceType": 0,
+    "bookUrlPattern": r"https://s.test/book/\d+",
+    "customOrder": 7,
+    "loginUrl": "https://s.test/login",
+    "searchUrl": "https://s.test/search?q={{key}}",
+}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_source_identity_keys_reach_the_js_context():
+    engine = YueduRuleEngine(dict(_SOURCE_CONFIG))
+
+    assert engine._try_eval_js(
+        "source.bookSourceUrl + '|' + source.bookSourceName + '|'"
+        " + source.bookSourceGroup + '|' + source.loginUrl + '|'"
+        " + source.customOrder;",
+        "",
+    ) == "https://s.test|测试源|分组A|https://s.test/login|7"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_source_book_source_type_keeps_a_falsy_zero():
+    """`bookSourceType` is 0 for a text source, not "".
+
+    The getters used to be `__nhSourceConfig[key] || ''`, so a source comparing
+    `source.bookSourceType === 0` failed.
+    """
+    engine = YueduRuleEngine(dict(_SOURCE_CONFIG))
+
+    assert engine._try_eval_js(
+        "String(source.bookSourceType) + '|'"
+        " + String(source.bookSourceType === 0);",
+        "",
+    ) == "0|true"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_reload_sends_the_source_url_as_referer():
+    """`Reload()` builds its Referer from `bookSourceUrl` (jsoup_shim.js:1892).
+
+    NOTE: that is the `Reload` path only.  `java.ajax` / `java.connect` /
+    `java.get` / `java.post` set no Referer at all, which is part of tier 2 in
+    docs/js-http-request-side.md.
+    """
+    engine = YueduRuleEngine({"bookSourceUrl": "https://s.test"})
+
+    value = engine._try_eval_js(
+        "var __saved = __nhCurlRaw;"
+        "__nhCurlRaw = function (url, method, body, headers) {"
+        "  return 'REF:' + (headers && headers['Referer']);"
+        "};"
+        "var out;"
+        "try { out = Reload('https://s.test/so'); }"
+        "finally { __nhCurlRaw = __saved; }"
+        "out;",
+        "",
+    )
+
+    assert value == "REF:https://s.test"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_the_header_rule_is_still_not_injected():
+    """Tier-1 boundary, pinned on purpose.
+
+    The `header` rule may itself be an `@js:` script, so it has to be evaluated
+    before it can be merged (tier 2 of docs/js-http-request-side.md).  Injecting
+    the raw string would work for JSON-form headers and silently drop
+    script-form ones.  When tier 2 lands, this test should be updated.
+
+    The key is deleted first because the Node side keeps a **persistent**
+    subprocess and `__nhSetSourceConfig` merges rather than replaces, so an
+    earlier test that sets `header` would otherwise leak into this one.
+    """
+    engine = YueduRuleEngine({
+        "bookSourceUrl": "https://s.test",
+        "header": '@js:JSON.stringify({"User-Agent":"UA-1"})',
+    })
+
+    assert engine._try_eval_js(
+        "delete globalThis.__nhSourceConfig.header;"
+        "JSON.stringify(source.header);",
+        "",
+    ) == '""'

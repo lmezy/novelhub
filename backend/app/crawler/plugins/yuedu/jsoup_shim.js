@@ -1829,7 +1829,13 @@ var source = {
 ['bookSourceUrl', 'bookSourceName', 'bookSourceGroup', 'bookSourceType',
  'bookUrlPattern', 'customOrder', 'loginUrl', 'header', 'searchUrl'].forEach(function (key) {
   Object.defineProperty(source, key, {
-    get: function () { return __nhSourceConfig[key] || ''; },
+    get: function () {
+      // `|| ''` collapsed a legitimate falsy value into "": `bookSourceType` is
+      // 0 for a text source and `customOrder` may be 0, so a source comparing
+      // them with `===` saw "" instead of 0.  Only a genuinely absent key should
+      // read as the empty string.
+      return key in __nhSourceConfig ? __nhSourceConfig[key] : '';
+    },
     configurable: true,
   });
 });

@@ -391,6 +391,29 @@ class YueduRuleEngine:
             "url": self._variables.get("url", book_url),
             "book": self._variables.get("book", {}),
         }
+        # Source identity keys.  The shim exposes ``source.bookSourceUrl``,
+        # ``source.bookSourceName``, … as getters over ``__nhSourceConfig``, but
+        # only ``sourceUrl`` was ever injected, so every one of them read back as
+        # an empty string.  ``bookSourceUrl`` matters twice over: the shim also
+        # uses it to set ``Referer`` on JS-issued requests.
+        #
+        # ``header`` is deliberately NOT injected: that rule may itself be an
+        # ``@js:`` script, so it has to be evaluated first (tier 2 of
+        # ``docs/js-http-request-side.md``).  Passing the raw string would quietly
+        # work for JSON-form headers and quietly drop script-form ones.
+        for key in (
+            "bookSourceName",
+            "bookSourceGroup",
+            "bookSourceType",
+            "bookUrlPattern",
+            "customOrder",
+            "loginUrl",
+            "searchUrl",
+        ):
+            value = self.config.get(key)
+            if value is not None:
+                context[key] = value
+        context["bookSourceUrl"] = self.base_url
         if self._chapter_context:
             context["chapter"] = self._chapter_context
         if extra_context:
