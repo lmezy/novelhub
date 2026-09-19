@@ -64,8 +64,12 @@
 | **A-4** 字段级 XPath 无 `&&`/`\|\|` 组合 | ✅ 已修复 | `da0f94b` | 4 条新测试（3 判伪 + 1 对照）；撤掉修复 3 条判伪失败；752 → 756 |
 | **M-1** `{$.rule}` JSONPath 内嵌规则 | ✅ 已补 | `7e17f78` | 4 条新测试（3 判伪 + 1 对照）；撤掉改动 3 条判伪失败；756 → 760 |
 | **D-03** JSONPath 列表结果写成 Python repr | ✅ 顺带修复 | `7e17f78` | 同上；`$.tags` 由 `['p', 'q']` 变为按行 `p\nq` |
+| **C-22/C-23 第一批 6 个**（`md5Encode16`/`digestHex`/`digestBase64Str`/`HMacHex`/`HMacBase64`/`htmlFormat`） | ✅ 已补 | `8437b31` | 6 条新测试用**已发布标准向量**（RFC 1321 / FIPS 180-4 / RFC 4231）；撤掉改动 6 条全失败；760 → 766 |
 | M-7 / M-8 / M-9 / M-10、D-13、D-14 | ⏳ **待裁决**（可能是有意偏差，改了可能是倒退） | — | — |
-| C-22 编码族、C-23 加密族（26 个）、C-18/C-19/C-20 请求侧 | ⏳ 待补（纯新增，无回归风险） | — | — |
+| C-23 对称加密族（`createSymmetricCrypto` + AES/DES/3DES 共 20 个） | ⏳ 待补 | — | 规范已读到 `help/crypto/SymmetricCryptoAndroid.kt`：输入解码是「像 hex 就 hex，否则 Base64」。**残留不确定**：key 长度归一化在 hutool 基类里，源码不在本仓库，需以 NIST 向量验证密文本身、并标注该点无法从仓库核实 |
+| C-22 其余（`timeFormat`/`timeFormatUTC`/`toURL`/`toNumChapter`/`strToBytes`/`bytesToStr`/base64·hex 字节数组变体） | ⏳ 待补 | — | `timeFormatUTC` 的 `SimpleTimeZone(sh)` 单位可疑（`sh` 按 JDK 是毫秒，但书源多半当小时传），需先找到真实调用例再定 |
+| C-22 中 `t2s`/`s2t` | ❌ 不实现 | — | 依赖第三方 JVM 词典，见第 6 节更正 |
+| C-18/C-19/C-20 请求侧（书源 `header` / 已导入 Cookie / 限速进 JS HTTP） | ⏳ 待补（改动现有行为，风险较高） | — | — |
 | M-5（XPath 静默降级）、C-1（两套 `java.*` stub） | ⏳ 待评估（架构级，需差分 oracle） | — | — |
 
 > **处置原则**：A-3 / A-4 / A-5 修的都是**无争议**项 —— Legado 的行为明确更正确
