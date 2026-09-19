@@ -770,3 +770,104 @@ def test_java_get_string_supports_attribute_and_regex_transform():
     assert engine._try_eval_js(
         'java.getString("//div[@class=\'box\']/a/text()##第一##第1")', ""
     ) == "第1本"
+
+
+# ---------------------------------------------------------------------------
+# JsEncodeUtils: digests / HMACs / htmlFormat
+# (docs/legado-rule-spec-diff.md C-22, C-23)
+#
+# These were missing from the shim entirely, so any book source that signs an API
+# request (the common case for JSON-backed sources) failed with a TypeError.
+#
+# The expected values below are **published test vectors**, not values captured
+# from this implementation -- a hash test that only asserts self-consistency
+# proves nothing:
+#   * MD5("abc")      -- RFC 1321 appendix A.5
+#   * SHA-1("abc")    -- FIPS 180-4 / common test vector
+#   * SHA-256("abc")  -- FIPS 180-4 / common test vector
+#   * HMAC-SHA256(key="Jefe", data="what do ya want for nothing?")
+#                     -- RFC 4231 test case 2
+# ---------------------------------------------------------------------------
+
+MD5_ABC = "900150983cd24fb0d6963f7d28e17f72"
+SHA1_ABC = "a9993e364706816aba3e25717850c26c9cd0d89d"
+SHA256_ABC = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+HMAC_SHA256_JEFE = (
+    "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+)
+
+
+def _b64_of_hex(hex_digest: str) -> str:
+    """Base64 of the raw bytes a hex digest denotes.
+
+    Used to check the ``*Base64`` variants without hand-computing a second
+    vector: once the hex form matches a published vector, this derivation is
+    exact.
+    """
+    import base64
+
+    return base64.b64encode(bytes.fromhex(hex_digest)).decode("ascii")
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_md5_encode16_is_the_middle_sixteen_hex_chars():
+    """``MD5Utils.md5Encode16`` is ``md5Encode(str).substring(8, 24)``."""
+    engine = _engine()
+
+    assert engine._try_eval_js("java.md5Encode('abc')", "") == MD5_ABC
+    assert engine._try_eval_js("java.md5Encode16('abc')", "") == MD5_ABC[8:24]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_digest_hex_matches_published_vectors():
+    engine = _engine()
+
+    assert engine._try_eval_js("java.digestHex('abc', 'MD5')", "") == MD5_ABC
+    assert engine._try_eval_js("java.digestHex('abc', 'SHA-1')", "") == SHA1_ABC
+    assert engine._try_eval_js("java.digestHex('abc', 'SHA-256')", "") == SHA256_ABC
+    # JCE spells it "SHA-1"; book sources also write "SHA1".
+    assert engine._try_eval_js("java.digestHex('abc', 'SHA1')", "") == SHA1_ABC
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_digest_base64_str_is_the_base64_of_the_same_digest():
+    engine = _engine()
+
+    assert engine._try_eval_js(
+        "java.digestBase64Str('abc', 'SHA-256')", ""
+    ) == _b64_of_hex(SHA256_ABC)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_hmac_hex_matches_rfc4231():
+    engine = _engine()
+
+    assert engine._try_eval_js(
+        "java.HMacHex('what do ya want for nothing?', 'HmacSHA256', 'Jefe')", ""
+    ) == HMAC_SHA256_JEFE
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_hmac_base64_is_the_base64_of_the_same_digest():
+    engine = _engine()
+
+    assert engine._try_eval_js(
+        "java.HMacBase64('what do ya want for nothing?', 'HmacSHA256', 'Jefe')", ""
+    ) == _b64_of_hex(HMAC_SHA256_JEFE)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_html_format_runs_the_legado_pipeline():
+    """`java.htmlFormat` is `HtmlFormatter.formatKeepImg` (utils/HtmlFormatter.kt).
+
+    Expected value derived step by step from that file's pipeline: entities
+    collapsed, block tags to newlines, comments and non-img tags stripped,
+    full-width indent applied, ``<img>`` preserved.
+    """
+    engine = _engine()
+
+    assert engine._try_eval_js(
+        "java.htmlFormat('<div>a&nbsp;b</div><p>c</p><!--x-->"
+        "<span>d</span><img src=\"/i.png\">')",
+        "",
+    ) == "\u3000\u3000a b\n\u3000\u3000c\n\u3000\u3000d<img src=\"/i.png\">"

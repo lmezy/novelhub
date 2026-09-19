@@ -1061,6 +1061,70 @@ function __nhGetString(rule) {
   return value;
 }
 
+// ---- Legado JsEncodeUtils helpers (see docs/legado-rule-spec-diff.md C-22/C-23) ----
+
+/**
+ * Normalise a JCE digest name to the OpenSSL spelling Node wants.
+ *
+ * Legado passes the name straight to hutool/`MessageDigest`, and book sources
+ * write both "SHA-1" and "SHA1".  Node accepts "sha1"/"sha256" but not the
+ * hyphenated JCE form, so strip the hyphen for the `SHA-<digits>` family only --
+ * doing it globally would turn "sha3-256" into "sha3256".
+ */
+function __nhHashAlgorithm(name) {
+  var a = String(name === undefined || name === null ? '' : name)
+    .trim().toLowerCase().replace(/\s+/g, '');
+  // Java's Mac names are "HmacSHA256"/"HmacMD5"; OpenSSL (Node) wants
+  // "sha256"/"md5".  hutool's `HMac(algorithm, key)` takes the Java spelling.
+  a = a.replace(/^hmac[-_]?/, '');
+  // JCE spells digests "SHA-1"/"SHA-256"; book sources also write "SHA1".  Strip
+  // the hyphen for the SHA-<digits> family only -- doing it globally would turn
+  // "sha3-256" into "sha3256".
+  var m = /^sha-?(\d+)$/.exec(a);
+  if (m) return 'sha' + m[1];
+  return a;
+}
+
+/**
+ * Port of Legado's `HtmlFormatter.formatKeepImg` with a null redirect URL.
+ *
+ * The nine-step pipeline is copied from `utils/HtmlFormatter.kt:24-35`.  Note the
+ * tag-stripping regexes there are plain `toRegex()` calls, i.e. **case
+ * sensitive** -- only `formatImagePattern` sets `CASE_INSENSITIVE` -- so the
+ * character-class patterns below deliberately omit the `i` flag.
+ *
+ * The `,{...}` URL-option suffix that Legado splits off before absolutising is
+ * not handled here: `java.htmlFormat` calls `formatKeepImg(str)` with no
+ * redirect URL, and with a null base the split-then-rejoin yields the same
+ * string, so the raw URL is equivalent.
+ */
+function __nhHtmlFormatKeepImg(html) {
+  if (html === null || html === undefined) return '';
+  var text = String(html)
+    .replace(/(&nbsp;)+/g, ' ')
+    .replace(/(&ensp;|&emsp;)/g, ' ')
+    .replace(/(&thinsp;|&zwnj;|&zwj;|\u2009|\u200C|\u200D)/g, '')
+    .replace(/<\/?(?:div|p|br|hr|h\d|article|dd|dl)[^>]*>/g, '\n')
+    .replace(/<!--[^>]*-->/g, '')
+    .replace(/<\/?(?!img)[a-zA-Z]+(?=[ >])[^<>]*>/g, '')
+    .replace(/\s*\n+\s*/g, '\n\u3000\u3000')
+    .replace(/^[\n\s]+/, '\u3000\u3000')
+    .replace(/[\n\s]+$/, '');
+
+  var imgPattern = /<img[^>]*\ssrc\s*=\s*['"]([^'"<>]*\{[^}]+\})['"][^>]*>|<img[^>]*\s(?:data-src|src)\s*=\s*['"]([^'">]+)['"][^>]*>|<img[^>]*\sdata-[^=>]*=\s*['"]([^'">]*)['"][^>]*>/gi;
+  var out = '';
+  var pos = 0;
+  var m;
+  while ((m = imgPattern.exec(text)) !== null) {
+    out += text.slice(pos, m.index);
+    var src = m[1] || m[2] || m[3] || '';
+    out += '<img src="' + src + '">';
+    pos = m.index + m[0].length;
+  }
+  if (pos < text.length) out += text.slice(pos);
+  return out;
+}
+
 var java = {
   // ---- HTTP: Legado java.get / java.post return a Response object ----
   get: function (url, headers) {
@@ -1156,6 +1220,44 @@ var java = {
     if (max === undefined) { max = min; min = 0; }
     return Math.floor(Math.random() * (max - min)) + min;
   },
+  // ---- JsEncodeUtils: digests and HMACs -------------------------------------
+  // Legado: `digestHex(data, algorithm)` = `DigestUtil.digester(algorithm)
+  // .digestHex(data)` (JsEncodeUtils.kt:438-443), and hutool digests the UTF-8
+  // bytes of the string.  `HMacHex(data, algorithm, key)` =
+  // `HMac(algorithm, key.toByteArray()).digestHex(data)` (:468-474), i.e. the key
+  // is also UTF-8 bytes.
+  md5Encode16: function (s) {
+    // MD5Utils.md5Encode16: `md5Encode(str).substring(8, 24)`.
+    return __nhMd5(s).substring(8, 24);
+  },
+  digestHex: function (data, algorithm) {
+    try {
+      return require('crypto').createHash(__nhHashAlgorithm(algorithm))
+        .update(String(data), 'utf-8').digest('hex');
+    } catch (e) { return ''; }
+  },
+  digestBase64Str: function (data, algorithm) {
+    try {
+      // Base64.NO_WRAP: standard base64, no line breaks.
+      return require('crypto').createHash(__nhHashAlgorithm(algorithm))
+        .update(String(data), 'utf-8').digest('base64');
+    } catch (e) { return ''; }
+  },
+  HMacHex: function (data, algorithm, key) {
+    try {
+      return require('crypto').createHmac(
+        __nhHashAlgorithm(algorithm), Buffer.from(String(key), 'utf-8')
+      ).update(String(data), 'utf-8').digest('hex');
+    } catch (e) { return ''; }
+  },
+  HMacBase64: function (data, algorithm, key) {
+    try {
+      return require('crypto').createHmac(
+        __nhHashAlgorithm(algorithm), Buffer.from(String(key), 'utf-8')
+      ).update(String(data), 'utf-8').digest('base64');
+    } catch (e) { return ''; }
+  },
+  htmlFormat: function (str) { return __nhHtmlFormatKeepImg(str); },
 };
 
 var source = {
