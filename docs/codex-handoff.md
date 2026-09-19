@@ -19,8 +19,8 @@
 密钥登录被服务器拒绝，需用密码 + paramiko。部署目录
 `/volume1/docker/NovelHub/novelhub`，`docker-compose.yaml` 使用主机网络与预构建镜像
 `lonezy/novelhub-{backend,crawler,scheduler,frontend}`。
-**最近一次部署：2026-09-19 00:0x**（backend/crawler/scheduler/frontend 全部重建，
-已包含第 26～28 节；核对过容器里的 `search.py`/`ai_diagnosis.py` 就是仓库这版）。
+**最近一次部署：2026-09-19 20:31**（backend/crawler/scheduler/frontend 重建，代码 = `ad166b1`，
+即第 36 节为止；**缺 `1b590b0`（第 37 节变量存储）和 `f0615b6`（第 38 节连接池预算）**）。
 
 **线上数据库**（注意不是默认端口，`psql` 要带 `-h 127.0.0.1 -p 15432`，密码见 `.env`）：
 
@@ -1247,6 +1247,72 @@ java.get   -> get(key)                          // :754-769
 **第 33 节清单至此全部处理完**：A-3/A-4/A-5/M-1、C-22/C-23 全部 API、M-7..M-10/D-13
 的裁决、请求侧 B/C、B-5、D。**未部署、未推送。**
 
+## 38. 2026-09-19：线上「同步后台报错」——不是规则引擎，是连接池预算 > `max_connections`
 
+`f0615b6`（代码）+ NAS compose 两行（未提交，见下）。
 
+**用户报告**：部署到线上后，同步后台出现报错。
 
+**现象**（只读取证）：
+
+```
+novelhub-postgres  20:42:18.951 ~ 20:42:21.944  12 × FATAL: sorry, too many clients already
+crawler            sqlalchemy.exc.TimeoutError: QueuePool limit of size 10 overflow 20
+                   reached, connection timed out, timeout 30.00   (20:43:02, 20:45:31)
+backend            asyncpg.exceptions.TooManyConnectionsError
+                   → /api/books/... 与 /api/books/.../cover 返回 500
+```
+
+窗口只有 3 分钟，之后**自行恢复**（复查时最近 3 分钟 backend 5xx = 0、crawler 池错误 = 0）。
+
+**先排除本次部署**（遇到"刚部署就报错"最该先做的一步）：
+
+| 证据 | 结果 |
+|---|---|
+| `git log b52e816..HEAD -- backend/app/services/crawl_runner.py backend/app/core/database.py backend/app/core/config.py` | **空**（这三处本次会话没碰过） |
+| 部署前 / 部署后的失败任务数 | **135 : 1**，且那 1 个是 `b.sis.la` 反爬验证码页 |
+| 报错里提到 JS 的两类（`Unsupported URL: @js:`、`反爬规则依赖 Legado JS`） | 发生时间 08-17 ~ 09-19 00:09，**全部早于部署 20 小时以上** |
+| `max_connections=50` 是不是部署时改的 | 不是。postgres 容器 **2026-09-10 17:26 创建后从未重建**，配置自 9/10 起未变 |
+
+**真根因**：`run_crawl_task_async` 一进来就 `async with SessionLocal() as db:`（`crawl_runner.py:239`）并**持有到整站同步结束** —— 也就是说**每个并发任务独占一条连接**。而 `_free_slots()` 在不限并发（`SYNC_WORKER_CONCURRENCY=0`，默认值）时**返回固定 32**，它自己的池却只有 `pool_size=10 + max_overflow=20 = 30`：
+
+```python
+def _free_slots() -> int:
+    if limit <= 0:
+        return 32          # ← 32 > 30：第 31 个任务必然等 30s 池超时后失败
+    return max(1, limit - len(active))
+```
+
+更根本的是整个栈的连接预算。**每个 Python 进程各有自己的池（10+20=30）**，而 backend 跑 `uvicorn --workers 2`、crawler 容器里同时有 `queue_worker` 和 `celery worker`（主进程 + ForkPoolWorker）、scheduler 还有若干进程：
+
+```
+backend      2 × 30 = 60      ← 光 backend 一个服务就超过 max_connections=50
+crawler      queue_worker 30 + celery 主/子 60
+scheduler    若干进程
+                        理论 ≈ 150+；实测空闲时 50 条里也已占 30 条（25 条是应用连接）
+```
+
+**触发点**：20:32 重启 → crawler 启动时 `_reset_stale_running_tasks()` 把上次被 kill 时仍处于 `running` 的 `discover_all` 任务全部改回 `pending`，**20:32:56 一次性起了 7 个**；用户在 20:37 / 20:39 / 20:44 又起了几个 → **11 个全站同步并发**；再加上前端约 0.5s 一轮地轮询 `/api/crawl/tasks/{id}` → 20:42:18 打满 50。
+
+**修法**（`f0615b6`，`backend/app/core/{config,database}.py` + `backend/app/services/crawl_runner.py`）：
+
+1. `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` 让池大小可配（默认仍是 10/20，向后兼容），于是"栈共享一个小数据库"的部署可以按服务缩小池。
+2. `db_pool_capacity()` 报告"一个池实际能同时服务多少连接"；`task_concurrency_limit()` 把并发上限（操作员的 `SYNC_WORKER_CONCURRENCY` **和**"一源一 worker"默认）**都夹到该预算内**，并留 4 条给队列循环与 `_write_task_row` —— 后者恰恰在"所有任务同时失败"时才需要连接。
+3. `_worker_loop` 里 `limit <= 0` 的分支和那个固定的 32 一起删掉：`limit` 现在恒为正，循环条件简化为 `len(active) < limit`，`_free_slots()` 只负责"填满空位且不超预算"。
+
+**验证**（846 → 851 passed）：5 条新测试；7 处变异逐一施加，**7/7 被杀** —— 包括"改回固定 32"、"操作员上限不再夹"、"槽位数等于整个池（不留预留）"、"worker 循环忽略预算"、"引擎不再读池配置"。
+
+**线上 compose 两行**（`/volume1/docker/NovelHub/novelhub/docker-compose.yaml`，已备份为 `docker-compose.yaml.bak-20260919-211037`）：
+
+```diff
+-      -c work_mem=32MB
++      -c work_mem=16MB
+-      -c max_connections=50
++      -c max_connections=200
+```
+
+`work_mem` 一起降是因为它按**每个排序/哈希节点**收费：连接数翻 4 倍而不动它，12G 的 postgres 容器最坏情况内存也会翻 4 倍。改 `command:` 必须**重建 postgres 容器**才生效（数据在 `./data/postgres` bind mount 上，重建不丢数据），所以这条和镜像重建放在同一个窗口做。只改文件不重建 = 不生效（`SHOW max_connections` 仍是 50）。
+
+**顺带确认的第 1 节结论**：NAS 用预构建镜像 —— compose 里 backend/crawler/scheduler **只有 `image:` 没有 `build:`**，代码是 COPY 进镜像的（只有 `./storage` 与 `/imports` 是 bind mount），所以 `docker compose restart` 不会让代码生效，必须重建镜像。注意部署目录 `/volume1/docker/NovelHub/novelhub/backend` 里的源码停留在 8/10（`plugins/yuedu/` 还是拆分前那 4 个文件），**不是**构建镜像用的那份。
+
+**尚未做的**：代码未重新构建进镜像（`lonezy/novelhub-{backend,crawler}`）、postgres 未重建（仍是 50）、提交未推送。
