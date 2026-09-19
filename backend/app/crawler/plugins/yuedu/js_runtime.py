@@ -1,4 +1,4 @@
-﻿"""Node.js-based JavaScript runtime for YueDu book source JS evaluation.
+"""Node.js-based JavaScript runtime for YueDu book source JS evaluation.
 
 Provides real JS execution for:
 - webJs: page-level JS (WebView replacement via Playwright)
@@ -194,6 +194,18 @@ class JsRuntime:
             # command line (WinError 206), so persist it to a temp file.
             bootstrap_code = _JSOUP_SHIM + (
                 'var _buf="";'
+                # The rule-variable store travels back with every answer, so the
+                # Python side stays authoritative: it seeds the store before each
+                # evaluation and merges this copy back into `_variables`.  Emitted
+                # *before* the result/error block because `_read_result` stops at
+                # `__CODEX_RESULT_END__` / `__CODEX_ERROR_END__`.  A script that
+                # throws has still run its `java.put` calls, so the error path
+                # reports the store too.
+                'var _varsOut=function(){'
+                'return (typeof globalThis.__nhRuleVarsOut==="function")'
+                '?("__CODEX_VARS_START__\\n"'
+                '+JSON.stringify(globalThis.__nhRuleVarsOut())'
+                '+"\\n__CODEX_VARS_END__\\n"):"";};'
                 'process.stdin.on("data",function(c){'
                 '_buf+=c.toString();'
                 'var i;'
@@ -202,12 +214,11 @@ class JsRuntime:
                 '_buf=_buf.slice(i+22);'
                 'try{'
                 'var r=eval(cmd);'
-                'process.stdout.write('
-                '"__CODEX_RESULT_START__\\n"'
+                'process.stdout.write(_varsOut()+"__CODEX_RESULT_START__\\n"'
                 '+JSON.stringify(r)+"\\n__CODEX_RESULT_END__\\n")'
                 '}catch(e){'
-                'process.stdout.write('
-                '"__CODEX_ERROR__\\n"+e.message+"\\n__CODEX_ERROR_END__\\n")'
+                'process.stdout.write(_varsOut()+"__CODEX_ERROR__\\n"'
+                '+e.message+"\\n__CODEX_ERROR_END__\\n")'
                 '}}});'
                 'console.log("__CODEX_READY__")'
             )
@@ -293,6 +304,7 @@ class JsRuntime:
         input_value: Any = None,
         context: dict[str, Any] | None = None,
         content: Any = None,
+        rule_vars: dict[str, Any] | None = None,
     ) -> Any:
         """Evaluate a JavaScript expression/code against an input value.
 
@@ -341,9 +353,21 @@ class JsRuntime:
                     if content is not None
                     else "result"
                 )
+                # Seed the rule-variable store (what `@put`/`@get` and
+                # `java.put`/`java.get` share).  Only when the caller supplies it,
+                # so a caller that has no opinion cannot wipe the store; the rule
+                # engine always does, which is what keeps one book's variables out
+                # of the next one's in this shared process.
+                seed_vars = ""
+                if rule_vars is not None:
+                    seed_vars = (
+                        "if(globalThis.__nhSeedRuleVars){globalThis.__nhSeedRuleVars("
+                        + json.dumps(json_safe(rule_vars), ensure_ascii=False) + ");}"
+                    )
                 snippet = (
                     f'(function(){{'
                     f'{context_js}'
+                    f'{seed_vars}'
                     f'var result={input_json};'
                     f'var src={content_json};'
                     f'if(globalThis.__nhSetContent){{globalThis.__nhSetContent(src);}}'
@@ -378,16 +402,31 @@ class JsRuntime:
         input_value: Any = None,
         context: dict[str, Any] | None = None,
         content: Any = None,
+        rule_vars: dict[str, Any] | None = None,
     ) -> Any:
         """Blocking eval for sync callers (rule engine)."""
         if not self._ready and not self.start_sync():
             return None
         try:
             return self._run_sync(
-                lambda: self._eval_js_impl(js_code, input_value, context, content)
+                lambda: self._eval_js_impl(js_code, input_value, context, content, rule_vars)
             )
         except Exception:
             return None
+
+    @property
+    def last_rule_vars(self) -> dict[str, Any]:
+        """The rule-variable store as it stood after the last evaluation."""
+        return getattr(self, "_last_rule_vars", {})
+
+    @property
+    def last_rule_vars_seen(self) -> bool:
+        """Whether the last evaluation actually reported its rule-variable store.
+
+        False means the answer is unknown (the process died, the eval timed out),
+        so a caller must not read the empty store as "everything was deleted".
+        """
+        return bool(getattr(self, "_last_rule_vars_seen", False))
 
     async def eval_js(
         self,
@@ -395,10 +434,11 @@ class JsRuntime:
         input_value: Any = None,
         context: dict[str, Any] | None = None,
         content: Any = None,
+        rule_vars: dict[str, Any] | None = None,
     ) -> Any:
         """Async alias of eval_js_sync() for await-based callers."""
         return await asyncio.to_thread(
-            self.eval_js_sync, js_code, input_value, context, content,
+            self.eval_js_sync, js_code, input_value, context, content, rule_vars,
         )
 
     async def _eval_bytes_impl(self, js_code: str, raw_bytes: bytes) -> bytes | None:
@@ -757,10 +797,18 @@ console.log('__CODEX_RESULT_END__');
 """
 
     async def _read_result(self) -> Any:
-        """Read and parse the result from the Node.js subprocess stdout."""
+        """Read and parse the result from the Node.js subprocess stdout.
+
+        Also collects the rule-variable block the bootstrap emits alongside the
+        answer into ``self._last_rule_vars`` (see ``_start_impl``).
+        """
         lines: list[str] = []
+        vars_lines: list[str] = []
         in_result = False
+        in_vars = False
         had_error = False
+        self._last_rule_vars = {}
+        self._last_rule_vars_seen = False
 
         for _ in range(500):  # safety limit
             line = await asyncio.wait_for(
@@ -770,6 +818,12 @@ console.log('__CODEX_RESULT_END__');
                 break
             decoded = line.decode("utf-8", errors="replace").strip()
 
+            if decoded == "__CODEX_VARS_START__":
+                in_vars = True
+                continue
+            if decoded == "__CODEX_VARS_END__":
+                in_vars = False
+                continue
             if decoded == "__CODEX_ERROR__":
                 had_error = True
                 continue
@@ -784,8 +838,19 @@ console.log('__CODEX_RESULT_END__');
                 continue
             if decoded == "__CODEX_RESULT_END__":
                 break
-            if in_result:
+            if in_vars:
+                vars_lines.append(decoded)
+            elif in_result:
                 lines.append(decoded)
+
+        if vars_lines:
+            try:
+                parsed_vars = json.loads("\n".join(vars_lines))
+            except json.JSONDecodeError:
+                parsed_vars = None
+            if isinstance(parsed_vars, dict):
+                self._last_rule_vars = parsed_vars
+                self._last_rule_vars_seen = True
 
         if not lines:
             return None

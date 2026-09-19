@@ -389,6 +389,56 @@ class YueduRuleEngine:
             self._js_runtime = JsRuntime.get_instance()
         return self._js_runtime
 
+    # `_variables` doubles as this engine's *context* -- Legado keeps those as
+    # Rhino bindings instead (baseUrl / bookUrl / book / chapter / ...).  The rule
+    # variables are everything else.
+    #
+    # Only the rule variables cross into the JS store, in both directions, for two
+    # reasons: `java.get('baseUrl')` must be "" the way it is in Legado (the
+    # binding is not a variable there either), and a script's
+    # `java.put('baseUrl', ...)` must not silently redirect every later rule.
+    _CONTEXT_VARS = frozenset({
+        "baseUrl", "bookUrl", "sourceUrl", "url", "book", "chapter", "contentTitle",
+    })
+
+    def _js_rule_vars(self) -> dict[str, str]:
+        """The `@put`/`@get` store as the JS side should see it.
+
+        Legado's `java` *is* the `AnalyzeRule` (AnalyzeRule.kt:776), so
+        `java.put`/`java.get` and `@put`/`@get` are the same functions; this is
+        what carries Python-side writes into the script.
+        """
+        return {
+            key: value
+            for key, value in self._variables.items()
+            if key not in self._CONTEXT_VARS and isinstance(value, str)
+        }
+
+    def _absorb_js_rule_vars(self, runtime: "JsRuntime") -> None:
+        """Fold back what a script stored with `java.put`.
+
+        `putVariable(key, null)` removes the entry in Legado, so a JS `null` has to
+        delete rather than stringify.  A *missing* key is only a deletion when the
+        evaluation actually reported its store -- otherwise a crashed or timed-out
+        evaluation would wipe every variable.
+        """
+        if not runtime.last_rule_vars_seen:
+            return
+        stored = runtime.last_rule_vars
+        for key, value in stored.items():
+            if key in self._CONTEXT_VARS:
+                continue
+            if value is None:
+                self._variables.pop(key, None)
+            elif isinstance(value, str):
+                self._variables[key] = value
+            else:
+                self._variables[key] = str(value)
+        # Anything the seed provided and the store no longer holds was deleted.
+        for key in self._js_rule_vars():
+            if key not in stored:
+                self._variables.pop(key, None)
+
     def set_chapter_context(self, chapter: dict[str, Any] | None) -> None:
         """Provide the current chapter object so content JS can read
         fields like ``chapter.title`` / ``chapter.tag`` (Legado passes
@@ -1220,6 +1270,11 @@ class YueduRuleEngine:
     def _eval_with_mode(self, raw: Any, rule: str) -> Any:
         if rule.startswith("@js:"):
             return self._try_eval_js(rule[4:].strip(), raw)
+        if rule.lower().startswith("@get:"):
+            # AnalyzeRule.kt:601-604.  The parameter is everything up to the last
+            # character, so `@get:{key}` and `@get:key` name the same key, and an
+            # unknown key reads as "" (`get` ends in `?: ""`).
+            return self.get_variable(rule[5:].strip().strip("{}").strip())
         if rule.startswith("@put:"):
             return None
         if rule.lower().startswith("@xpath:"):
@@ -1714,7 +1769,11 @@ class YueduRuleEngine:
                 raw,
                 context=self._build_js_context(extra_context),
                 content=self._js_content,
+                rule_vars=self._js_rule_vars(),
             )
+            # `java.put` writes to the same store `@put` does in Legado, so what
+            # the script stored has to come back before the next rule runs.
+            self._absorb_js_rule_vars(runtime)
             if result is not None:
                 return result
         except Exception:
@@ -1752,7 +1811,9 @@ class YueduRuleEngine:
                     "baseUrl": self._variables.get("baseUrl", self.base_url),
                     "bookUrl": self._variables.get("bookUrl", self.base_url),
                 },
+                rule_vars=self._js_rule_vars(),
             )
+            self._absorb_js_rule_vars(runtime)
             if isinstance(result, str):
                 return result
         except Exception:

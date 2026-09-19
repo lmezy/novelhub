@@ -792,7 +792,29 @@ var org = {
 };
 
 // ---------------- java / cookie / cache / Legado globals shims ----------------
+// `cache.*` -- Legado binds `cache` to `CacheManager`, a keyed store with an
+// optional TTL.
 var __nhCache = {};
+// The **rule-variable** store.  In Legado `java` *is* the `AnalyzeRule`
+// instance (`bindings["java"] = this`, AnalyzeRule.kt:776), so `java.put`/`get`
+// are literally the same functions `@put`/`@get` call:
+//
+//     put(k, v): chapter?.putVariable ?: book?.putVariable ?: ruleData?.putVariable
+//                ?: source?.put(k, v)                        // :740-749
+//     get(k):    chapter -> book -> ruleData -> source -> "" // :754-769
+//
+// Python owns the authoritative copy (`RuleEngineV2._variables`): it is pushed in
+// with `__nhSeedRuleVars` before every evaluation and read back out afterwards.
+// Seeding *replaces* the store rather than merging into it, which is also what
+// keeps one book's variables out of the next one's -- `JsRuntime` is a singleton
+// and this subprocess is shared by every source (the same hazard as the cookie
+// jar and the `chapter` context, fixed earlier).
+var __nhRuleVars = {};
+// `source.put`/`source.get` go through `BaseSource.put`/`get`, which is a
+// **source**-scoped store (`CacheManager`, key `v_<sourceKey>_<key>`,
+// BaseSource.kt:224-234) -- neither the rule variables nor the Rhino context
+// bindings.  Kept per source so one source's keys cannot be read by another.
+var __nhSourceVars = {};
 var __nhCookieJar = [];
 // Which source the session jar currently belongs to (see __nhSetSourceConfig).
 var __nhCookieSource = null;
@@ -2304,8 +2326,22 @@ var java = {
   // ---- Content helpers used by older YueDu source scripts ----
   setContent: function (value) { return __nhSetContent(value); },
   getString: function (rule) { return __nhGetString(rule); },
-  // ---- legacy variable store (kept for compatibility) ----
-  put: function (k, v) { __nhCache[String(k)] = { value: v, expires: 0 }; return v; },
+  // ---- rule variables (AnalyzeRule.put/get) ----
+  //
+  // Legado's `AnalyzeRule.get` special-cases two keys before consulting the
+  // store: "bookName" -> book.name and "title" -> chapter.title.  Only a
+  // non-empty context value is used here, so a rule that stored its own value
+  // under one of those names still reads it back when this shim has no
+  // book/chapter to offer -- strictly more forgiving than dropping it, and it
+  // cannot change the answer whenever Legado has one.
+  put: function (k, v) {
+    var key = String(k);
+    // `putVariable(key, null)` removes the entry in Legado; everything else is
+    // stored as a string (the JVM signature is `put(String, String)`).
+    if (v === null || v === undefined) { delete __nhRuleVars[key]; return v; }
+    __nhRuleVars[key] = typeof v === 'string' ? v : String(v);
+    return v;
+  },
   // Legado has two overloads: ``java.get(key)`` reads what ``java.put`` stored,
   // ``java.get(url, headers)`` performs an HTTP GET.  Treating the one-argument
   // form as HTTP made ``JSON.parse(java.get('imgInfoList') || '[]')`` (绅士漫画's
@@ -2313,7 +2349,14 @@ var java = {
   get: function (key, headers) {
     var isUrl = arguments.length >= 2 || /^(https?:)?\/\//.test(String(key));
     if (isUrl) return java.httpGet(key, headers);
-    var stored = __nhCacheGet(String(key));
+    key = String(key);
+    var special = __nhGetSpecial(key);
+    if (special !== null) return special;
+    // `@put`/`java.put` first, then the chain's last layer, `source.get`.
+    if (key in __nhRuleVars && __nhRuleVars[key] !== undefined) {
+      return __nhRuleVars[key];
+    }
+    var stored = __nhSourceStore()[key];
     return stored === undefined || stored === null ? '' : stored;
   },
   httpGet: function (url, headers) {
@@ -2579,10 +2622,16 @@ var java = {
 };
 
 var source = {
-  getVariable: function () { return JSON.stringify(__nhVars); },
-  put: function (k, v) { __nhVars[String(k)] = v; return v; },
-  get: function (k) { var v = __nhVars[String(k)]; return v === undefined ? '' : v; },
-  remove: function (k) { delete __nhVars[String(k)]; },
+  getVariable: function () { return JSON.stringify(__nhSourceStore()); },
+  put: function (k, v) {
+    __nhSourceStore()[String(k)] = v;
+    return v;
+  },
+  get: function (k) {
+    var v = __nhSourceStore()[String(k)];
+    return v === undefined || v === null ? '' : v;
+  },
+  remove: function (k) { delete __nhSourceStore()[String(k)]; },
   getLoginInfo: function () { return null; },
   getLoginInfoMap: function () { return null; },
   getCookie: function () { return __nhCookieHeader(); },
@@ -2627,13 +2676,22 @@ var cache = {
 };
 
 // ---- Legado globals ----
+// `Get`/`Put`/`Set` are NOT Legado bindings (`buildScriptBindings` in
+// AnalyzeRule.kt sets only java/cookie/cache/source/book/result/baseUrl/chapter/
+// title/src/nextChapterUrl/rssArticle), so these are this shim's own sugar.  They
+// now go through the same rule-variable store as `java.put`/`@put`, and `Get`
+// still falls back to the context so `Get('bookUrl')` keeps working; a `Put` no
+// longer overwrites the context itself.
 function Get(key) {
   key = String(key);
+  if (key in __nhRuleVars && __nhRuleVars[key] !== undefined) return __nhRuleVars[key];
   if (key in __nhVars && __nhVars[key] !== undefined) return __nhVars[key];
-  return '';
+  // Same last layer as `java.get`: `AnalyzeRule.get` ends at `source.get`.
+  var stored = __nhSourceStore()[key];
+  return stored === undefined || stored === null ? '' : stored;
 }
-function Put(key, value) { __nhVars[String(key)] = value; return value; }
-function Set(key, value) { return Put(key, value); }
+function Put(key, value) { return java.put(key, value); }
+function Set(key, value) { return java.put(key, value); }
 function sleep(ms) {
   ms = parseInt(ms, 10) || 0;
   if (ms <= 0) return;
@@ -2665,11 +2723,62 @@ function Url() {
 // **persistent**: a key the previous evaluation set would otherwise stay
 // readable.  `chapter` is the one that actually bit -- `_build_js_context` only
 // injects it when a chapter context exists, so a later chapter-less evaluation
+// ---- rule-variable store plumbing ------------------------------------------
+
+/**
+ * The store `source.put`/`source.get` share, keyed by source.
+ *
+ * Legado keys these by the source (`v_<sourceKey>_<key>`, BaseSource.kt:224-234)
+ * precisely so two sources cannot read each other's; this Node process is shared
+ * by every source, so the key has to be part of the store here too.
+ */
+function __nhSourceStore() {
+  var key = String(__nhSourceConfig.bookSourceUrl || '');
+  if (!__nhSourceVars[key]) __nhSourceVars[key] = {};
+  return __nhSourceVars[key];
+}
+
+/**
+ * `AnalyzeRule.get`'s two hard-coded keys -- "bookName" -> `book.name` and
+ * "title" -> `chapter.title` (AnalyzeRule.kt:754-763).
+ *
+ * Returns null when this shim has no such context, so the caller falls through
+ * to the store rather than losing the value outright.
+ */
+function __nhGetSpecial(key) {
+  var holder = key === 'bookName' ? __nhVars.book : (key === 'title' ? __nhVars.chapter : null);
+  var value = holder ? holder[key === 'bookName' ? 'name' : 'title'] : null;
+  if (value === undefined || value === null || value === '') return null;
+  return String(value);
+}
+
+/**
+ * Replace the rule-variable store with the engine's copy.
+ *
+ * Replacing (rather than merging) is what makes the Python side authoritative:
+ * whatever a script wrote is read back out with `__nhRuleVarsOut` and merged
+ * into `_variables`, so the next seed carries it forward -- while a different
+ * book's variables can never be observed, even though this process is shared.
+ */
+function __nhSeedRuleVars(vars) {
+  __nhRuleVars = {};
+  if (vars) {
+    for (var k in vars) {
+      if (vars[k] !== undefined && vars[k] !== null) __nhRuleVars[String(k)] = vars[k];
+    }
+  }
+  return __nhRuleVars;
+}
+
+/** The rule-variable store, for the engine to merge back into `_variables`. */
+function __nhRuleVarsOut() { return __nhRuleVars; }
+
 // used to read back the *previous* chapter's title/url (the same class of bug as
 // codex-handoff section 9, "上一本书的上下文串味").
 //
-// Variables written by `java.put` / `source.put` must NOT be listed here: those
-// are the `@put`/`get` store and have to survive across evaluations.
+// Variables written by `java.put` and `source.put` are no longer kept in
+// `__nhVars` at all (they have their own stores below), so this list is purely
+// "which keys describe the page being parsed".
 var __nhContextKeys = [
   'baseUrl', 'bookUrl', 'sourceUrl', 'bookSourceUrl', 'url', 'book', 'chapter',
   'bookSourceName', 'bookSourceGroup', 'bookSourceType', 'bookUrlPattern',
@@ -2699,8 +2808,8 @@ function __nhSetSourceConfig(cfg) {
 }
 function __nhSetVars(vars) {
   if (!vars) return;
-  // NB: only the context keys above are cleared.  `java.put` writes straight into
-  // `__nhVars`, so a blanket reset would destroy the @put store.
+  // NB: only the context keys above are cleared.  `java.put` and `source.put`
+  // write into their own stores, so a blanket reset here is safe.
   __nhDropContextKeys(__nhVars, vars);
   for (var k in vars) { if (vars[k] !== undefined) __nhVars[k] = vars[k]; }
 }
@@ -2710,6 +2819,8 @@ if (typeof globalThis !== 'undefined') {
   globalThis.__nhSetSourceConfig = __nhSetSourceConfig;
   globalThis.__nhSetVars = __nhSetVars;
   globalThis.__nhSetContent = __nhSetContent;
+  globalThis.__nhSeedRuleVars = __nhSeedRuleVars;
+  globalThis.__nhRuleVarsOut = __nhRuleVarsOut;
   globalThis.__nhSourceConfig = __nhSourceConfig;
   globalThis.java = java;
   globalThis.source = source;

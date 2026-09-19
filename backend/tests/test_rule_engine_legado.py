@@ -2264,7 +2264,10 @@ def test_context_keys_do_not_leak_but_put_variables_survive():
     first = engine._try_eval_js(
         "globalThis.__nhSetVars({chapter: {title: '第一章'}});"
         "Put('keptVar', 'kept');"
-        "String(source.get('chapter') ? 'chapter-seen' : 'no-chapter');",
+        # `Get` (this shim's sugar) falls back to the context; `source.get` does
+        # not, because in Legado `source.get` reads a source-scoped
+        # `CacheManager` entry rather than the Rhino bindings.
+        "String(Get('chapter') ? 'chapter-seen' : 'no-chapter');",
         "",
     )
     assert first == "chapter-seen"
@@ -2272,7 +2275,7 @@ def test_context_keys_do_not_leak_but_put_variables_survive():
     # The second call's bootstrap injects the engine context, which has no
     # `chapter`: the stale object must be gone while Put()'s value survives.
     second = engine._try_eval_js(
-        "String(source.get('chapter') ? 'chapter-seen' : 'no-chapter') + '|'"
+        "String(Get('chapter') ? 'chapter-seen' : 'no-chapter') + '|'"
         " + Get('keptVar');",
         "",
     )
@@ -2295,6 +2298,195 @@ def test_source_config_keys_do_not_leak_between_evaluations():
     assert without_login._try_eval_js(
         "String(source.loginUrl) + '|' + source.bookSourceUrl;", ""
     ) == "|https://s.test"
+
+
+# ---------------------------------------------------------------------------
+# Variable stores (docs/legado-rule-spec-diff.md, item D / B-10)
+#
+# Legado has **one** rule-variable store, reached four ways, because `java` *is*
+# the `AnalyzeRule` instance (`bindings["java"] = this`, AnalyzeRule.kt:776):
+#
+#     @put:{k:v}  -> putRule -> put(k, getString(v))   // :181,399-403
+#     @get:k      -> get(key)                          // :699
+#     java.put    -> put(key, value)                   // :740-749
+#     java.get    -> get(key)                          // :754-769
+#
+# `put` writes to the first non-null of chapter / book / ruleData / source, and
+# `get` reads chapter -> book -> ruleData -> **source** -> "".  NovelHub has no
+# book/chapter layers to persist into (that would be a database change), so the
+# reachable part is: one in-process store shared by all four, with `source`'s own
+# store as the chain's last layer.
+#
+# Two other stores are *deliberately* separate, because they are separate in
+# Legado: `cache.*` is `CacheManager`, and `source.put/get` is
+# `BaseSource.put/get` -- `CacheManager` again, but under a `v_<sourceKey>_<key>`
+# key, which is why it is keyed per source here.
+# ---------------------------------------------------------------------------
+
+
+def _vars_engine(**kwargs):
+    return YueduRuleEngine({"bookSourceUrl": "https://s.test", **kwargs})
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_put_and_java_get_are_the_same_store():
+    """`@put:{k:v}` then `java.get(k)` -- the chain that used to be broken.
+
+    Python wrote `@put` into `RuleEngineV2._variables` while the shim kept
+    `java.put`/`java.get` in a separate object, so a rule that stored a variable
+    and a script that read it could never see each other.
+    """
+    engine = _vars_engine()
+    html = "<div>ALPHA</div>"
+    put = '@put:{"tok":"@js:\'abc\'"}'
+
+    # Same rule, then two separate rules: the value has to survive between
+    # evaluations, which is what the Python-side round trip provides.
+    assert engine._eval_field(html, put + '@js:java.get("tok")') == "abc"
+    assert engine._eval_field(html, put) is None
+    assert engine._eval_field(html, '@js:java.get("tok")') == "abc"
+    assert engine.get_variable("tok") == "abc"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_java_put_reaches_the_python_side():
+    """The other direction: a script's `java.put` must be readable by `@get`.
+
+    `putVariable(key, null)` deletes in Legado, so a JS `null` has to delete here
+    rather than being stored as the string "null".
+    """
+    engine = _vars_engine()
+
+    engine._try_eval_js("java.put('fromJs', 'JSVAL'); java.put('gone', 'x');", "")
+    assert engine.get_variable("fromJs") == "JSVAL"
+
+    engine._try_eval_js("java.put('gone', null);", "")
+    assert engine.get_variable("gone") == ""
+    assert engine._eval_field("<div>ALPHA</div>", "@get:fromJs") == "JSVAL"
+    # `java.put` coerces to a string, as the JVM `put(String, String)` does.
+    engine._try_eval_js("java.put('num', 7);", "")
+    assert engine.get_variable("num") == "7"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_get_rule_reads_the_store_and_unknown_keys_are_empty():
+    """`@get:{key}` and `@get:key` name the same key (AnalyzeRule.kt:601-604),
+    and an unknown key reads as "" (`get` ends in `?: ""`)."""
+    engine = _vars_engine()
+    engine.put_variable("tok", "VALUE")
+    engine.set_book({"name": "书名"})
+
+    assert engine._eval_field("<div/>", "@get:tok") == "VALUE"
+    assert engine._eval_field("<div/>", "@get:{tok}") == "VALUE"
+    assert engine._eval_field("<div/>", "@get:nope") == ""
+    # The legacy NovelHub sugar goes through the same store.
+    assert engine._try_eval_js("Get('tok');", "") == "VALUE"
+
+    # `AnalyzeRule.get` answers two keys from the context before the store
+    # (AnalyzeRule.kt:754-763): "bookName" -> book.name, "title" -> chapter.title.
+    assert engine._try_eval_js("java.get('bookName');", "") == "书名"
+    engine.set_chapter_context({"title": "第一章"})
+    assert engine._try_eval_js("java.get('title');", "") == "第一章"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_cache_source_and_rule_variables_are_three_stores():
+    """`cache`, `source` and the rule variables are three different stores.
+
+    Sharing one object made `cache.put('k', v)` readable through `java.get('k')`
+    and vice versa, which in Legado they never are -- and it let `source.put`
+    overwrite the context (`baseUrl`, `bookUrl`, ...), which are Rhino bindings
+    there rather than variables.
+    """
+    engine = _vars_engine()
+
+    assert engine._try_eval_js(
+        "cache.put('k', 'CACHED'); java.put('k', 'RULE'); source.put('k', 'SOURCE');"
+        "java.get('k') + '/' + cache.get('k') + '/' + source.get('k');",
+        "",
+    ) == "RULE/CACHED/SOURCE"
+
+    # `java.get` ends at `source.get` (the chain's last layer); `cache.get` is a
+    # different store and must not see either of the other two.
+    assert engine._try_eval_js(
+        "source.put('onlySource', 'S'); cache.put('onlyCache', 'C');"
+        "java.get('onlySource') + '/' + cache.get('onlySource') + '|'"
+        "+ java.get('onlyCache') + '/' + cache.get('onlyCache');",
+        "",
+    ) == "S/|/C"
+
+    # The source store is keyed by source, so it is not shared either.
+    other = YueduRuleEngine({"bookSourceUrl": "https://other.test"})
+    assert other._try_eval_js("source.get('onlySource') || 'none';", "") == "none"
+    assert engine._try_eval_js("source.get('onlySource');", "") == "S"
+
+    # `source.put('bookUrl', ...)` must not clobber the binding.
+    assert engine._try_eval_js(
+        "source.put('bookUrl', 'http://fake/');"
+        "source.get('bookUrl') + '/' + Get('bookUrl');",
+        "",
+    ) == "http://fake//https://s.test"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_context_keys_are_not_rule_variables():
+    """The context is not part of the rule-variable store, in either direction.
+
+    `java.get('baseUrl')` is "" in Legado (the binding is not a variable there),
+    and a script's `java.put('baseUrl', ...)` must not redirect every later rule
+    -- `_build_js_context` reads `baseUrl` back out of `_variables`.
+    """
+    engine = _vars_engine()
+    engine.set_page_url("https://s.test/book/1")
+
+    assert engine._try_eval_js("java.get('baseUrl');", "") == ""
+    engine._try_eval_js("java.put('baseUrl', 'http://evil/');", "")
+    assert engine._variables["baseUrl"] == "https://s.test/book/1"
+
+    # A rule variable with a normal name still crosses.
+    engine.put_variable("tok", "V")
+    assert engine._try_eval_js("java.get('tok');", "") == "V"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_rule_variables_do_not_leak_between_engines():
+    """The Node process is shared, so seeding must *replace* the store.
+
+    This is the same hazard as the cookie jar and the stale `chapter` context
+    (codex-handoff sections 34-35): a variable written while syncing one book must
+    not be readable while syncing the next.  It also replaces what the old
+    `__nhCache` gave by accident -- process-lifetime persistence that ignored both
+    book and source boundaries, which Legado's per-book store never does.
+    """
+    first = _vars_engine()
+    second = _vars_engine()
+
+    assert first._try_eval_js(
+        "java.put('token', 'FROM-FIRST'); java.get('token');", ""
+    ) == "FROM-FIRST"
+    # A different engine (a different book, same source) must not see it...
+    assert second._try_eval_js("java.get('token');", "") == ""
+    # ...while the engine that owns it still does.
+    assert first._try_eval_js("java.get('token');", "") == "FROM-FIRST"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_a_failed_evaluation_does_not_wipe_the_variables():
+    """The delete-diff only runs when the evaluation actually reported its store.
+
+    `_read_result` leaves the store empty when the subprocess died or the
+    evaluation timed out.  Reading that as "the script deleted everything" would
+    throw away every variable the book had accumulated.
+    """
+    engine = _vars_engine()
+    engine.put_variable("keep", "V")
+    runtime = engine._get_js_runtime()
+    runtime._last_rule_vars = {}
+    runtime._last_rule_vars_seen = False
+
+    engine._absorb_js_rule_vars(runtime)
+
+    assert engine.get_variable("keep") == "V"
 
 
 # ---------------------------------------------------------------------------
