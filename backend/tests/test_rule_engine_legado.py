@@ -611,6 +611,50 @@ def test_list_rule_without_a_suffix_is_unaffected():
     ] == ["a", "b"]
 
 
+# ---------------------------------------------------------------------------
+# XPath field rules must honour ``&&`` / ``||`` (docs/legado-rule-spec-diff.md
+# A-4).  Legado's ``AnalyzeByXPath.getString`` (AnalyzeByXPath.kt:133-154) splits
+# the rule *before* it reaches the XPath engine.  Passing the combined string to
+# lxml raised XPathEvalError, the CSS fallback raised SelectorSyntaxError, and
+# the field came back empty -- so an XPath fallback never fell back.
+# ---------------------------------------------------------------------------
+
+XPATH_HTML = (
+    '<html><body><div id="a">AAA</div><div id="b">BBB</div></body></html>'
+)
+
+
+def test_xpath_or_falls_back_to_the_second_fragment():
+    engine = _engine()
+
+    assert engine._eval_xpath(
+        XPATH_HTML, "//div[@id='missing']||//div[@id='b']",
+    ) == "BBB"
+
+
+def test_xpath_or_takes_the_first_fragment_that_yields_a_value():
+    engine = _engine()
+
+    assert engine._eval_xpath(
+        XPATH_HTML, "//div[@id='a']||//div[@id='b']",
+    ) == "AAA"
+
+
+def test_xpath_and_concatenates_fragments_with_newlines():
+    engine = _engine()
+
+    assert engine._eval_xpath(
+        XPATH_HTML, "//div[@id='a']&&//div[@id='b']",
+    ) == "AAA\nBBB"
+
+
+def test_xpath_single_fragment_is_unaffected():
+    """Control: the plain XPath path keeps working."""
+    engine = _engine()
+
+    assert engine._eval_xpath(XPATH_HTML, "//div[@id='b']") == "BBB"
+
+
 def test_chapter_list_rule_with_fallback_produces_chapters():
     engine = YueduRuleEngine({
         "bookSourceUrl": "https://example.com",

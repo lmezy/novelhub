@@ -1342,16 +1342,64 @@ class YueduRuleEngine:
         return "\n".join(results)
 
     def _eval_xpath(self, raw: Any, rule: str) -> Any:
+        """Evaluate an XPath rule, honouring Legado's ``&&`` / ``||`` combination.
+
+        Legado's ``AnalyzeByXPath.getString`` (``AnalyzeByXPath.kt:133-154``)
+        splits the rule with ``splitRule("&&", "||")`` *before* giving anything to
+        the XPath engine: ``||`` means "the first fragment that yields a value
+        wins", ``&&`` means "concatenate", and the values are joined with a
+        newline.  Handing the combined string straight to lxml instead made it
+        raise ``XPathEvalError``, after which the CSS fallback raised
+        ``SelectorSyntaxError`` -- so ``//div[@id='a']||//div[@id='b']`` returned
+        ``None`` where Legado returns the fallback's value.  Cover rules, TOC
+        URLs and chapter bodies that use an XPath fallback all hit this.
+        """
+        selector, transform = self._split_xpath_transform(rule)
+
+        analyzer = _RuleAnalyzer(selector)
+        try:
+            fragments = analyzer.split_rule("&&", "||")
+            elements_type = analyzer.elements_type
+        except RuleUnbalancedError:
+            logger.debug(
+                "Unbalanced XPath rule, evaluating as a single fragment: {}",
+                selector[:160],
+            )
+            fragments = [selector]
+            elements_type = ""
+
+        fragments = [f.strip() for f in fragments if f.strip()]
+        if not fragments:
+            return None
+        if len(fragments) == 1:
+            return self._eval_xpath_selector(raw, fragments[0], transform)
+
+        results: list[str] = []
+        for fragment in fragments:
+            value = self._eval_xpath_selector(raw, fragment, transform)
+            if value:
+                results.append(value)
+                if elements_type == "||":
+                    break
+        if not results:
+            return None
+        return "\n".join(results)
+
+    def _eval_xpath_selector(
+        self, raw: Any, selector: str, transform: str,
+    ) -> Any:
+        """Evaluate one XPath selector (no ``&&``/``||`` handling).
+
+        A Legado field rule may append a regex transform to an XPath selector
+        (``//div[@class='x']/img/@src##^//##https://``); it is applied to each
+        extracted value.  Feeding the whole string to lxml raised
+        ``XPathEvalError``, and the CSS fallback then raised
+        ``SelectorSyntaxError`` out of ``_eval_xpath`` -- one such cover rule
+        aborted the whole book sync.
+        """
         soup = self._ensure_soup(raw)
         if soup is None:
             return None
-        # A Legado field rule may append a regex transform to an XPath selector
-        # (``//div[@class='x']/img/@src##^//##https://``).  Feeding the whole
-        # string to lxml raised XPathEvalError, and the CSS fallback then raised
-        # SelectorSyntaxError out of ``_eval_xpath`` -- one such cover rule
-        # aborted the whole book sync.  Split the transform off, evaluate the
-        # selector, then post-process each value like Legado does.
-        selector, transform = self._split_xpath_transform(rule)
         try:
             from lxml import etree
             tree = etree.HTML(str(raw))
