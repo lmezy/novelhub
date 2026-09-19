@@ -1,6 +1,9 @@
 # JS 侧 HTTP 的请求上下文：改造方案（C-18 / C-19 / C-20 / C-17）
 
-> 状态：**方案，未实现**。本文件只描述改动与风险，不动代码。
+> 状态：**第 1 级已实现**（`13542b2`，796 passed）；第 2、3 级仍是**方案，未实现**。
+> 本文件只描述改动与风险。
+
+> **实施第 1 级时新发现两处问题**（见 §6），都不在第 1 级范围内，留给第 2 级。
 > 背景条目见 [legado-rule-spec-diff.md](legado-rule-spec-diff.md) 附录 C 的 C-17～C-20。
 
 ## 1. 问题：JS 发起的请求是"裸奔"的
@@ -103,3 +106,36 @@ Node 侧 shim 的 `curl`（`jsoup_shim.js` 的 `__nhCurlRaw`），而 shim 手�
 - 每级都要有**能判伪的测试**（撤掉改动必须失败），并跑全量 `pytest`。
 - 站点行为可能因"请求特征变了"而变化 —— 上线后需对照 crawler 日志的
   失败率，而不是只看测试是否通过。
+
+## 6. 实施第 1 级时新发现的两处问题（留给第 2 级）
+
+### 6.1 `java.*` 的 HTTP 路径**根本不设 Referer**
+
+第 1 级原以为"注入 `bookSourceUrl` 就顺带修好了 JS 请求的 Referer"。实测否定了这个判断：
+
+- `jsoup_shim.js:1892` 的 `if (__nhSourceConfig.bookSourceUrl) headers['Referer'] = …`
+  位于 **`Reload(url)`**（L1888-1895，Legado 的全局函数，UAA 类书源用）里；
+- `java.ajax` / `java.connect` / `java.get` / `java.post` / `java.head` 这些路径
+  **完全没有 Referer 逻辑**。
+
+所以第 1 级只让 `Reload()` 的 Referer 生效。给 `java.*` 补 Referer 属于第 2 级
+（与补 `header` 是同一处改动，一起做更自然）。
+
+### 6.2 source config 会**跨求值泄漏**（与第 9 节的"上下文串味"同型）
+
+- Node 子进程是**常驻**的（`js_runtime.py` 的既定设计，为降低延迟）；
+- 而 `__nhSetSourceConfig`（`jsoup_shim.js:1900-1903`）是**合并**语义：
+  `for (var k in cfg) { … __nhSourceConfig[k] = cfg[k]; }` —— **只覆盖传入的键，不清空旧的**。
+
+后果：上一次求值留下的键会残留到下一次。这在测试里已经真实发生过 ——
+既有测试设过 `header`，泄漏进了后来新增的边界测试，导致全量跑失败而单跑通过。
+
+**生产侧真正有风险的是 `chapter`**：`_build_js_context` 只在
+`if self._chapter_context:` 为真时才注入 `chapter`，所以一个"没有章节上下文"的求值
+会**读到上一章的 title/url**。这正是 `docs/codex-handoff.md` 第 9 节的
+「上一本书的上下文串味」同一类问题。
+
+**建议修法**（第 2 级一起做，需测试）：
+- 要么让 `__nhSetSourceConfig` 先清空已注入的键再写入（**替换**语义）；
+- 要么让 `_build_js_context` **总是**注入全部键（`chapter: {}`），使合并退化为覆盖。
+- 二者都要补一条"连续两次求值、第二次不带章节上下文时读不到上一章"的测试。
