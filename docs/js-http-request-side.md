@@ -121,21 +121,41 @@ Node 侧 shim 的 `curl`（`jsoup_shim.js` 的 `__nhCurlRaw`），而 shim 手�
 所以第 1 级只让 `Reload()` 的 Referer 生效。给 `java.*` 补 Referer 属于第 2 级
 （与补 `header` 是同一处改动，一起做更自然）。
 
-### 6.2 source config 会**跨求值泄漏**（与第 9 节的"上下文串味"同型）
+### 6.2 source config 会**跨求值泄漏**（与第 9 节的"上下文串味"同型）—— ✅ 已修（`a4be164`）
 
 - Node 子进程是**常驻**的（`js_runtime.py` 的既定设计，为降低延迟）；
-- 而 `__nhSetSourceConfig`（`jsoup_shim.js:1900-1903`）是**合并**语义：
-  `for (var k in cfg) { … __nhSourceConfig[k] = cfg[k]; }` —— **只覆盖传入的键，不清空旧的**。
+- 而 `__nhSetSourceConfig` / `__nhSetVars` 原本是**合并**语义：
+  只覆盖传入的键，**不清空旧的**。
 
 后果：上一次求值留下的键会残留到下一次。这在测试里已经真实发生过 ——
-既有测试设过 `header`，泄漏进了后来新增的边界测试，导致全量跑失败而单跑通过。
+既有测试设过 `header`，泄漏进了后来新增的边界测试，导致**全量跑失败而单跑通过**。
 
 **生产侧真正有风险的是 `chapter`**：`_build_js_context` 只在
 `if self._chapter_context:` 为真时才注入 `chapter`，所以一个"没有章节上下文"的求值
 会**读到上一章的 title/url**。这正是 `docs/codex-handoff.md` 第 9 节的
 「上一本书的上下文串味」同一类问题。
 
-**建议修法**（第 2 级一起做，需测试）：
-- 要么让 `__nhSetSourceConfig` 先清空已注入的键再写入（**替换**语义）；
-- 要么让 `_build_js_context` **总是**注入全部键（`chapter: {}`），使合并退化为覆盖。
-- 二者都要补一条"连续两次求值、第二次不带章节上下文时读不到上一章"的测试。
+**实际修法**（已实施）：新增 `__nhContextKeys`（引导层拥有的上下文键），
+两个 setter 在合并前**只清空这些键**。
+关键是**不能一刀切** —— `__nhVars` 同时承载上下文变量与 `Put()`/`source.put` 的
+持久变量，整体替换会直接破坏 `@put` 持久化。测试同时钉住两件事：
+"旧 chapter 读不到"与"Put 变量仍在"。
+
+### 6.3 变量存储有**三处**且互不相通（新发现，未修）
+
+实施 6.2 时发现，`java.*` 与 `source.*` 读写的是**不同的存储**：
+
+| 存储 | 谁在用 |
+|---|---|
+| `__nhVars` | `source.get`/`source.put`、全局 `Get`/`Put`、**引导层注入的上下文** |
+| `__nhCache` | `java.get`/`java.put`（`jsoup_shim.js:1554`、`:1562`） |
+| 引擎 `_variables`（Python） | 规则里的 `@put:{k:v}`（`_get_elements_from_root` 之外的字段路径） |
+
+Legado 里这些是**同一个** ruleData 变量存储。所以：
+
+- 规则里 `@put:{token:abc}`，脚本里 `java.get('token')` → **取不到**；
+- 脚本里 `java.put('x',1)`，规则里 `@get:{x}` → 也取不到。
+
+这与 `legado-rule-spec-diff.md` 的 B-10（`@put` 只写引擎实例、跨引擎读不到）
+是同一族问题的另一面。**修它需要先把三处收敛成一处**，属独立规模，
+建议单独评估，不要和请求侧混在一起改。
