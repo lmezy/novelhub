@@ -1041,10 +1041,13 @@ JS 上下文 `source.*` 身份键（`13542b2`）、`java.*` 请求的 Referer �
 - **5 条行为差异**（D-13 `@class` 多值属性、M-9 `@ownText` 与 `@textNodes` 雷同、
   M-10 去重范围过宽、M-8 `@html` 内层/外层、M-7 `@text` 换行）——
   属"哪种更好"的取舍，**等用户裁决**；建议见 legado-rule-spec-diff.md 第 1 节。
-- **请求侧 `header` 注入**：会让 JS 请求的 UA 全面改变，且求值 `header` 可能嵌套进入同一个
-  JS 求值（递归风险），需先解决再动。方案见 [js-http-request-side.md](js-http-request-side.md) 第 2 级。
-- **请求侧 Cookie 注入 / JS 侧限速**：同文档第 3 级。限速的代价是"每次 JS 请求在 Node 内阻塞"，
-  需先实测对并发同步的影响。
+- **请求侧 `header` 注入**：✅ **已实现**（`47f66ca`）。落法是注入**原始规则**、
+  由 shim 在自己的 JS 环境里求值（`__nhParseHeaders`）—— 同时避开"从
+  `_build_js_context` 里再跑一次 JS 会无限递归"与"求值路径 async / 上下文构建 sync"
+  两个死结，且没有时序缺口。支持纯 JSON、`@js:`、`<js>…</js>` 三种形式。
+  连同 Referer 默认值（`a75158e`），书源声明的请求头现在在 `java.*` 路径上真正生效。
+- **请求侧 Cookie 注入 / JS 侧限速**：见 [js-http-request-side.md](js-http-request-side.md) 第 3 级。
+  限速的代价是"每次 JS 请求在 Node 内阻塞"，需先实测对并发同步的影响。
 - **三处变量存储收敛**：`java.get/put`（`__nhCache`）、`source.get/put`/`Get`/`Put`（`__nhVars`）、
   规则 `@put`（引擎 `_variables`）互不相通，而 Legado 只有一个 ruleData 存储 ——
   所以「规则里 `@put`、脚本里 `java.get` 取」这条链是断的。独立规模，见同文档 §6.3。
