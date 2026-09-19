@@ -1007,4 +1007,54 @@ JS 空结果不再说「环境无法执行」），后端 **702 passed**；线�
 - `services/backup.py`、`services/jwt.py`、`core/events.py` 的 UTC 用法是**刻意保留**的
   （外部文件规范 / RFC 7519 / 不落库的内存排序），见第 32 节的判定口径。
 
+## 33. 2026-09-19：按 Legado 规范查漏补缺（规则引擎 + JS 侧）
+
+**背景**：以 `yuedu/` 里 Legado 的权威实现为规范，对规则引擎与 JS shim 做了一次系统对照，
+产出 [legado-rule-spec-diff.md](legado-rule-spec-diff.md)（97 条逐条差异 + API 面覆盖表），
+然后按「无争议的先修」推进。**细节都在那两份文档里，本节只留结论与索引。**
+
+**修掉的真 bug**（都是"规则被切碎或取空"，两条直击 `bookList`/`chapterList`）：
+
+| 编号 | 现象 | 根因 | 提交 |
+|---|---|---|---|
+| A-3 | `a\|\|b[x]\|\|c` 这类规则**丢掉中间片段**（`['a','','c']`） | `_split_tail` 把"片段起点"和"搜索游标"混成一个 `pos`，跳过括号组时起点也被推走；Legado 是两个变量 | `2df97cf` |
+| A-5 | `chapterList=".list li##\s+\|\s+"` 返回 0 元素 | 未在切分前剥 `##` 后缀（Legado `AnalyzeRule.kt:707-709` 就是 `ruleStrS[0].trim()`），而 `SEPARATORS` 含裸 `\|` | `dac5e64` |
+| A-4 | XPath 回退规则 `A\|\|B` 取不到值 | 整条含 `\|\|` 的规则被喂给 lxml → `XPathEvalError` → CSS 兜底也抛错 → None | `da0f94b` |
+| M-1 | JSON 书源的 `{$.字段}` 跨字段引用解析为空 | 只实现了"当 JSONPath 直读"这一层，缺"先替换内嵌规则、失败再回退"这一层 | `7e17f78` |
+| chapter 泄漏 | 无章节上下文的求值会**读到上一章的 title/url** | Node 子进程常驻 + `__nhSetVars` 是合并语义；与第 9 节「上下文串味」同类 | `a4be164` |
+
+**补的能力**（纯新增，`java.*` 缺失的 API）：摘要/HMAC/`htmlFormat`（`8437b31`）、
+byte/charset/URL 辅助（`203c98f`）、对称加密 `createSymmetricCrypto`+AES/DES/3DES 19 个（`d8ef160`）、
+`toNumChapter` 及中文数字工具（`bfabd75`）、`timeFormat`/`timeFormatUTC`（`6dc568a`）、
+JS 上下文 `source.*` 身份键（`13542b2`）、`java.*` 请求的 Referer 默认值（`a75158e`）。
+
+**验证**：全量 `pytest` **802 passed**（起点 746）。每条修复/新增都有**变异验证**——
+撤掉改动后判伪测试必须失败；其中 4 条还钉住了 Legado 的"怪但真实"行为
+（`aesEncodeToString` 实际在解密、`toNumChapter` 丢弃匹配外文本、`span@text` 去重、
+`sh` 单位是毫秒），防止被后人"顺手改好"。
+
+**硬约束审计**（`b52e816..HEAD`）：未改 `yuedu/`；未改 `models/`、`alembic/`（数据库语义不变）；
+未改 routes/schemas 的签名与响应模型（`source_changes.py` 只改了时间戳取值）；未提交凭据。
+
+**刻意未做（都写明了理由，别反复重问）**：
+
+- **5 条行为差异**（D-13 `@class` 多值属性、M-9 `@ownText` 与 `@textNodes` 雷同、
+  M-10 去重范围过宽、M-8 `@html` 内层/外层、M-7 `@text` 换行）——
+  属"哪种更好"的取舍，**等用户裁决**；建议见 legado-rule-spec-diff.md 第 1 节。
+- **请求侧 `header` 注入**：会让 JS 请求的 UA 全面改变，且求值 `header` 可能嵌套进入同一个
+  JS 求值（递归风险），需先解决再动。方案见 [js-http-request-side.md](js-http-request-side.md) 第 2 级。
+- **请求侧 Cookie 注入 / JS 侧限速**：同文档第 3 级。限速的代价是"每次 JS 请求在 Node 内阻塞"，
+  需先实测对并发同步的影响。
+- **三处变量存储收敛**：`java.get/put`（`__nhCache`）、`source.get/put`/`Get`/`Put`（`__nhVars`）、
+  规则 `@put`（引擎 `_variables`）互不相通，而 Legado 只有一个 ruleData 存储 ——
+  所以「规则里 `@put`、脚本里 `java.get` 取」这条链是断的。独立规模，见同文档 §6.3。
+- **`t2s`/`s2t`**：依赖第三方 JVM 词典（`com.github.liuyueyi.quick.transfer`），不实现。
+- **RSA**（`createAsymmetricCrypto`/`createSign`）：hutool 的密钥解析回退链源码不在仓库，
+  parity 无法核实；且 `decrypt` 默认用**公钥**语义反直觉。
+
+**新发现的运行时限制**（与 Android 无关，别当 bug 查）：**单 DES 在 Node 17+ 不可用**
+（OpenSSL 3 legacy provider，`des-ecb`/`des-cbc` 不在 `crypto.getCiphers()` 里）。
+实现选择报出带原因的清晰错误而非静默返回 null。3DES 不受影响。
+另：**GBK/GB2312/Big5 等 charset 在 Node 侧无内建支持**（需 iconv），同样报清晰错误。
+
 

@@ -104,6 +104,10 @@
 - **点开书籍/漫画要等很久、点进章节正文或图片也要等很久** →
   [reading-performance.md](reading-performance.md) + [codex-handoff.md](codex-handoff.md) 第 22 节
 - 想连服务器看真实任务与日志 → [codex-handoff.md](codex-handoff.md) 第 1、5 节
+- **书源规则被"切碎"/取空（整源 0 本、书页 0 章、`{$.x}` 取不到值）** →
+  [codex-handoff.md](codex-handoff.md) 第 33 节 + [legado-rule-spec-diff.md](legado-rule-spec-diff.md)
+- **JS 书源拿不到内容（书源 header / Cookie / Referer 不生效）** →
+  [js-http-request-side.md](js-http-request-side.md)（现状、分级方案与已修部分）
 - **要改书源插件的代码、找不到某个方法在哪个文件** →
   [NovelHub-AI-Development-Context.md](NovelHub-AI-Development-Context.md) §2 +
   [codex-handoff.md](codex-handoff.md) 第 32 节（插件已按职责拆成 18 个模块）
