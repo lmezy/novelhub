@@ -69,7 +69,8 @@
 | **C-23 对称加密族**（`createSymmetricCrypto` + AES 10 / DES 4 / 3DES 4 = 19 个） | ✅ 已补 | `d8ef160` | 密文用 **FIPS-197 / NIST SP 800-38A** 向量验证（AES-128-ECB `69c4e0d8…c55a` 精确匹配）+ PKCS5/CBC/3DES 往返 + hex/Base64 自动判别；撤掉改动 7 条全失败；766 → 773 |
 | **C-22 第二批 8 个**（`strToBytes`/`bytesToStr`/`base64DecodeToByteArray`/`hexDecodeToByteArray`/`hexEncodeToString`/`randomUUID`/`toURL` ×2） | ✅ 已补 | `203c98f` | 8 条新测试；撤掉改动 8 条全失败；773 → 781。`toURL` 复现了 `java.net.URL` 的两处 WHATWG 差异（显式默认端口、`+`→空格） |
 | C-23 非对称加密与签名（`createAsymmetricCrypto`、`createSign`） | ⏳ 待补 | — | 需 RSA；Node 有 `crypto` 支持，但 hutool 的封装语义需先读 `help/crypto/AsymmetricCrypto.kt`（86 行）与 `Sign.kt`（26 行） |
-| C-22 剩余（`toNumChapter`、`timeFormat`/`timeFormatUTC`） | ⏳ 待补 | — | `toNumChapter` 还依赖 `fullToHalf` + `chineseNumToInt`；`timeFormatUTC` 的 `SimpleTimeZone(sh)` 单位可疑（`sh` 按 JDK 是毫秒，但书源多半当小时传），需先找到真实调用例再定 |
+| **C-22 第三批**（`toNumChapter` + `fullToHalf`/`chineseNumToInt`/`stringToInt`） | ✅ 已补 | `bfabd75` | 6 条新测试；撤掉改动 6 条全失败；781 → 787。复刻了 Kotlin Int 整除、`Integer.parseInt` 严格性；**未复刻**其不可达的"一零二五"分支（守卫条件自相矛盾，属死代码） |
+| C-22 剩余（`timeFormat`、`timeFormatUTC`） | ⏳ **待定，需真实调用例** | — | `timeFormatUTC` 的 `SimpleTimeZone(sh)` 单位可疑：`sh` 按 JDK 是**毫秒**，但书源几乎肯定按**小时**传。照一个可能本身就是 bug 的签名实现，不如先找到用例 |
 | C-22 中 `t2s`/`s2t` | ❌ 不实现 | — | 依赖第三方 JVM 词典，见第 6 节更正 |
 | C-18/C-19/C-20 请求侧（书源 `header` / 已导入 Cookie / 限速进 JS HTTP） | ⏳ 待补（改动现有行为，风险较高） | — | — |
 | M-5（XPath 静默降级）、C-1（两套 `java.*` stub） | ⏳ 待评估（架构级，需差分 oracle） | — | — |
