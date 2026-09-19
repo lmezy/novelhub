@@ -1528,11 +1528,12 @@ function __nhNodeKeyType(algorithm) {
  * `KeyFactory.getInstance(alg)`) and its public-key twin.
  *
  * Node infers the key type from the DER, while Java's KeyFactory is pinned to
- * the transformation's algorithm, so the parsed type is checked against
- * `__nhKeyFactoryAlgorithm` -- otherwise an EC key would be accepted where
- * Legado throws InvalidKeySpecException.
+ * the algorithm hutool derives from the rule -- the `Cipher` transformation for
+ * AsymmetricCrypto, the `Signature` algorithm for Sign -- so the parsed type is
+ * checked against it.  Otherwise an EC key would be accepted where Legado throws
+ * InvalidKeySpecException.
  */
-function __nhAsymParseKey(der, type, kind, transformation) {
+function __nhAsymParseKey(der, type, kind, algorithm) {
   var parsed;
   try {
     parsed = type === 'pkcs8'
@@ -1545,7 +1546,7 @@ function __nhAsymParseKey(der, type, kind, transformation) {
       + der.length + ' 字节）: ' + (e && e.message ? e.message : String(e))
     );
   }
-  var factoryAlg = __nhKeyFactoryAlgorithm(transformation);
+  var factoryAlg = __nhKeyFactoryAlgorithm(algorithm);
   var expected = __nhNodeKeyType(factoryAlg);
   if (parsed.asymmetricKeyType !== expected) {
     throw new Error(
@@ -1811,6 +1812,184 @@ function __nhAsymmetricCrypto(transformation) {
       // Kotlin `is ByteArray -> String(decrypt(data, keyType))` is UTF-8, and
       // `is String -> decryptStr(data, keyType)` ends in StrUtil.str(..., UTF-8).
       return doFinal(false, usePublic, inputBytes(data, false)).toString('utf-8');
+    },
+  };
+  return api;
+}
+
+// ---------------------------------------------------------------------------
+// Signature (hutool Sign, 5.8.22)
+//
+// Legado's help/crypto/Sign.kt is 26 lines and adds only the four ByteArray /
+// String `setXxxKey` overloads on top of hutool's `Sign`, whose surface is
+// inherited: `sign(byte[])`, `sign(String)`, `signHex(...)` and
+// `verify(byte[], byte[])`.  JsHelp.md documents only `sign`/`signHex`.
+//
+// `Sign.init` creates the `Signature` **before** `super.init()`, so an unknown
+// algorithm fails at construction, and `BaseAsymmetric.init` then generates a
+// key pair when both keys are null -- exactly as for AsymmetricCrypto above.
+// ---------------------------------------------------------------------------
+
+/** JCE `Signature` digest prefix -> the name Node's `createSign` wants. */
+var __nhSignDigests = {
+  'md5': 'md5',
+  'sha1': 'sha1',
+  'sha224': 'sha224',
+  'sha256': 'sha256',
+  'sha384': 'sha384',
+  'sha512': 'sha512',
+  'sha512/224': 'sha512-224',
+  'sha512/256': 'sha512-256',
+  'sha3-224': 'sha3-224',
+  'sha3-256': 'sha3-256',
+  'sha3-384': 'sha3-384',
+  'sha3-512': 'sha3-512',
+  'ripemd160': 'ripemd160',
+};
+
+/**
+ * Parse a JCE `Signature` algorithm name into `{ digest, keyType }`.
+ *
+ * hutool passes the string straight to `Signature.getInstance`
+ * (`SecureUtil.createSignature`), so the JCE names are the spec and they are
+ * case-insensitive.  Like `KeyUtil.getAlgorithmAfterWith`, everything after the
+ * **last** "with" is the key algorithm.
+ *
+ * Three families are deliberately unsupported, each with its own message rather
+ * than a silent difference:
+ *   * `NONEwithRSA` -- raw PKCS#1 v1.5 with no digest.  Node can express it
+ *     (`crypto.sign(null, ...)`) but the parity could not be checked here.
+ *   * PSS (`SHA256withRSAandMGF1`, `RSASSA-PSS`) -- JCE chooses the salt length
+ *     itself, so the bytes would differ.
+ *   * `Ed25519` -- no digest at all, and Node needs the one-shot API instead of
+ *     `createSign`.
+ */
+function __nhSignSpec(algorithm) {
+  var a = String(algorithm === undefined || algorithm === null ? '' : algorithm).trim();
+  var withIndex = a.toLowerCase().lastIndexOf('with');
+  if (withIndex <= 0) {
+    throw new Error(
+      'createSign(' + a + ') 失败: 需要形如 "<摘要>with<RSA|ECDSA|DSA>" 的 JCE 算法名'
+      + '（Legado 把它原样交给 Signature.getInstance；Ed25519 这类无摘要算法本实现未支持）'
+    );
+  }
+  var digestName = a.substring(0, withIndex).toLowerCase();
+  var keyName = a.substring(withIndex + 4).toUpperCase();
+  var digest = __nhSignDigests[digestName];
+  if (!digest) {
+    throw new Error(
+      'createSign(' + a + ') 失败: 摘要 "' + a.substring(0, withIndex)
+      + '" 在本运行时（Node / OpenSSL 3）不可用'
+    );
+  }
+  if (keyName === 'RSA') return { digest: digest, keyType: 'rsa' };
+  if (keyName === 'ECDSA') return { digest: digest, keyType: 'ec' };
+  if (keyName === 'DSA') return { digest: digest, keyType: 'dsa' };
+  if (keyName === 'RSAANDMGF1') {
+    throw new Error(
+      'createSign(' + a + ') 失败: PSS 签名（RSAandMGF1）未支持 —— JCE 自己决定盐长度与 '
+      + 'MGF1 摘要，hutool 也没有钉住它们，这里无法保证字节一致'
+    );
+  }
+  throw new Error(
+    'createSign(' + a + ') 失败: 不支持密钥算法 "' + keyName + '"'
+    + (/PSS/.test(keyName)
+      // SignAlgorithm 里那三个 PSS 常量用的就是这组名字，注释写着"需要BC库加入支持"。
+      ? '（hutool 的 SignAlgorithm 就写着 PSS"需要 BC 库加入支持"，而 Legado 未打包 '
+        + 'BouncyCastle，Signature.getInstance 在那里同样会抛 NoSuchAlgorithmException）'
+      : '（Legado 未打包 BouncyCastle，非 RSA/ECDSA/DSA 的 Signature 在那里也会抛 '
+        + 'NoSuchAlgorithmException）')
+  );
+}
+
+/** `KeyUtil.generateKeyPair(algorithm)` with hutool's `DEFAULT_KEY_SIZE` 1024. */
+function __nhSignKeyPair(keyType) {
+  var crypto = require('crypto');
+  if (keyType === 'rsa') return crypto.generateKeyPairSync('rsa', { modulusLength: 1024 });
+  if (keyType === 'dsa') {
+    // For L = 1024 the standard fixes N = 160, so there is nothing to guess.
+    return crypto.generateKeyPairSync('dsa', { modulusLength: 1024, divisorLength: 160 });
+  }
+  // EC: `KeyPairGenerator.getInstance("EC").initialize(256, random)`.  Java picks
+  // a curve of that field size and Android lands on secp256r1; Node needs the
+  // name.  A Sign built without keys can only produce signatures nobody can
+  // verify, so which 256-bit curve is used is unobservable either way.
+  return crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+}
+
+/**
+ * Port of `java.createSign(algorithm)`.
+ *
+ * Only `sign`/`signHex` are documented for book sources (`JsHelp.md`); `verify`
+ * is hutool's own method and is provided as well.  Note that `verify` returns
+ * Node's boolean: Java's SunJCE throws `SignatureException` for a signature of
+ * the wrong length where OpenSSL answers `false`.
+ */
+function __nhSign(algorithm) {
+  var spec = __nhSignSpec(algorithm);
+  var crypto = require('crypto');
+
+  var generated = __nhSignKeyPair(spec.keyType);
+  var publicKey = generated.publicKey;
+  var privateKey = generated.privateKey;
+
+  function keyFor(signing) {
+    var key = signing ? privateKey : publicKey;
+    if (key === null) {
+      // BaseAsymmetric.getKeyByType, message verbatim.
+      throw new Error(signing
+        ? 'Private key must not null when use it !'
+        : 'Public key must not null when use it !');
+    }
+    return key;
+  }
+
+  /**
+   * hutool's `Sign.sign(byte[])` takes an InputStream and an int buffer length,
+   * so a ByteArray is the raw data and `sign(String)` is its UTF-8 bytes.
+   * `verify` only has the `(byte[], byte[])` overload.
+   */
+  function dataBytes(data) {
+    if (Buffer.isBuffer(data)) return data;
+    if (typeof data === 'string') return Buffer.from(data, 'utf-8');
+    throw new Error('Unexpected input type');
+  }
+
+  var api = {
+    setPrivateKey: function (key) {
+      privateKey = key === null || key === undefined
+        ? null
+        : __nhAsymParseKey(__nhAsymKeyBytes(key, 'Private'), 'pkcs8', 'Private', algorithm);
+      return api;
+    },
+    setPublicKey: function (key) {
+      publicKey = key === null || key === undefined
+        ? null
+        : __nhAsymParseKey(__nhAsymKeyBytes(key, 'Public'), 'spki', 'Public', algorithm);
+      return api;
+    },
+    getPrivateKeyBase64: function () {
+      return privateKey === null
+        ? null
+        : privateKey.export({ format: 'der', type: 'pkcs8' }).toString('base64');
+    },
+    getPublicKeyBase64: function () {
+      return publicKey === null
+        ? null
+        : publicKey.export({ format: 'der', type: 'spki' }).toString('base64');
+    },
+    sign: function (data) {
+      var signer = crypto.createSign(spec.digest);
+      signer.update(dataBytes(data));
+      return signer.sign(keyFor(true));
+    },
+    signHex: function (data) {
+      return api.sign(data).toString('hex');
+    },
+    verify: function (data, signature) {
+      var verifier = crypto.createVerify(spec.digest);
+      verifier.update(dataBytes(data));
+      return verifier.verify(keyFor(false), dataBytes(signature));
     },
   };
   return api;
@@ -2282,6 +2461,10 @@ var java = {
   createAsymmetricCrypto: function (transformation) {
     // Same reasoning as createSymmetricCrypto above.
     return __nhAsymmetricCrypto(transformation);
+  },
+  createSign: function (algorithm) {
+    // Same reasoning again.
+    return __nhSign(algorithm);
   },
   // ---- AES family (JsEncodeUtils.kt:91-279) --------------------------------
   // These are faithful ports of Legado's own (deprecated) wrappers, including two

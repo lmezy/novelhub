@@ -1516,6 +1516,349 @@ def test_create_asymmetric_crypto_rejects_what_legado_rejects():
 
 
 # ---------------------------------------------------------------------------
+# Signature (docs/legado-rule-spec-diff.md, item E)
+#
+# `java.createSign` is Legado's `Sign(algorithm)`, i.e. hutool 5.8.22, whose
+# `help/crypto/Sign.kt` adds only the four ByteArray/String `setXxxKey` overloads
+# to hutool's `Sign` (surface: `sign`, `signHex`, `verify`).  Two facts from
+# hutool's source shape these expectations:
+#
+#   * `SecureUtil.createSignature` hands the string straight to
+#     `Signature.getInstance`, so the JCE names are the spec -- including
+#     `SHA256WithRSA/PSS`, which `SignAlgorithm` itself comments as "需要 BC 库
+#     加入支持", and Legado ships no BouncyCastle.
+#   * `Sign.init` builds the `Signature` *before* `super.init()`, and the latter
+#     generates a key pair when both keys are null.
+#
+# Oracles: pyca/cryptography for the RSA PKCS#1 v1.5 signatures (deterministic,
+# so the bytes can be compared for equality), for the ECDSA and DSA signatures,
+# and Wycheproof `rsa_signature_2048_sha256_test.json` for a **published** verify
+# vector plus an InvalidSignature one.
+# ---------------------------------------------------------------------------
+
+_SIG_MSG = "novelhub-signature"
+_SIG_RSA_SHA256_HEX = (
+    "aae8448e1f8931f96dac76b512a05e4b75423c478b02012fef79133ddf602947479a23d17a4ad"
+    "a60965fb0a88750696ae3efbbb99b08a161c1b7603a616e37382dc6bec6eb7b88761e35edc91"
+    "03dd124d5495dafcc2c787d962b2b0c62e1ad4260b0a70fff273e9775d8304e12458707cc9e1"
+    "f746a64b61b6be724233861b66a306612bac4603a355501d00b3041a6bc86363097f24aec016"
+    "760dc983f0c10ad38eca3107738a98957054e24b3c4ecc80c376a93ccf59294d79e92b47db62"
+    "c614285beb986b57d334dae353c3f13767ebe4104586beceb4a88b10b42c29935819b9dbab3c"
+    "41dd62ca05d9e2de009460d07ecfb7405f7328971134d3ab8e41db6"
+)
+_SIG_RSA_SHA1_HEX = (
+    "8bc9405b99ae888a51be884769a07c24c77c0459610067ec33e33591387c1b671e55bea9c8a8"
+    "4a3d922bd9f3a21bf34485e5cb7c8930278f38ec78a4dc5339a8f00f2a48058592199f90cb72"
+    "765b35c064ec145ccc12d4bb3f733de698764be72adc0a71830c696d2ceb6b79ec1adc70d873"
+    "75f76c4a5569d898ea83afc06b31657a593c2d2844508b5d522f61e3f097e2a28d88074d1c5b"
+    "c5d4b10bb3f28eb5c7461c65db08a88d4b384f51eb9ad0c868e0b66211198db53f710e2a41cb"
+    "f15da2c4dd687cd03446182784781268e8ae2d328262bcadbe782132464b849be170652565e3"
+    "a40f7d9c53d6bd5b12d4844d4cd3bd370ce06276c73096182f105c4c"
+)
+_SIG_RSA_MD5_HEX = (
+    "2dc74661a97d4d7fd5722e43c21848a6f15808452cb478dc06dc7364711de1b96ac3e7af8bb2"
+    "30816f4b7fa1dda920a27103a1e3a8162b7179a778ac0852415e355ff77a04394bc78f4d6f90"
+    "3c16193b395f5c2c73b53d0be65f1a44acf16d2aae9d6a57590092a37da74ca40cbac13dca8e"
+    "142f4887ca3cb79b7af35a7acb60d6bf2b2eb6ee4679ad145a928a60be123a8baaa88c6bd5b7"
+    "3560cb1ed9d4a348a651ff67f63bcc0eadeddd91f87d549003637039b90e2cd51caf64543cc9"
+    "6f628689dba16c4316e9aed61588c57a0afab9e216c7c501033e9da6e1512b6107ff45fdf4a8"
+    "97e33fb293a6b557121bedf19d6695e097257738deeaac86a9f6adfc"
+)
+# A P-256 key pair plus two ECDSA-SHA256 signatures over the same message (the
+# second over a different message, so it must be rejected).
+_EC_SPKI_B64 = (
+    "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAELWODuD4ho7rjlwdgXhciEwr4ERVsZQSZInse+CoA"
+    "Dtrd3dOUBVyRE2b33+Y39LFWiBX3aoDAzIulWoVC1OeQRA=="
+)
+_EC_PKCS8_B64 = (
+    "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg8PHODUGwByfgwVSYRYLiHD3I5tkb"
+    "jpsF7rxgxcmu3+WhRANCAAQtY4O4PiGjuuOXB2BeFyITCvgRFWxlBJkiex74KgAO2t3d05QFXJET"
+    "Zvff5jf0sVaIFfdqgMDMi6VahULU55BE"
+)
+_SIG_EC_SHA256_HEX = (
+    "3045022100baacd5d0784e7f4a50c63e55e8f32c68db9d69b5c040aff4e5ac84027498d94f"
+    "0220338ece5875e8bd1f42922e837e22f251f3e2f282ec73103190c21ae1544739c3"
+)
+_SIG_EC_SHA256_OTHER_HEX = (
+    "3046022100c5d7aa5fc6b8e2d219db7d0cba51f8c772d4ebc319b7028b4724a6265bd3c8ce"
+    "022100dc83fad4f806529109e8fb02edf79266582c3984618ebe42c643e73b1b6d53b2"
+)
+# A DSA-1024 key pair (q is fixed at 160 bits when L = 1024) and a SHA-1
+# signature over the same message.
+_DSA_PKCS8_B64 = (
+    "MIIBSwIBADCCASwGByqGSM44BAEwggEfAoGBAO4ZhSPO577xTsFDvJMEsM19DC+T2rdC/LEfKSfP"
+    "V51VI9vyD9U8IpW/535s2StRpJ9QhnoTIUVNktIJL9Wvv/2Yd38ChMLinB/cGzP5nz8qNJvu1vHF"
+    "R7US3Fz1IXvZmdCPmwWeL0N+hx2AK3oiGRxwTXsUoQRXKDSOH7qbkWJhAhUAj6mT3Fk7/EQaDWiP"
+    "e87wlLG8Ty8CgYEAjHCGDPn3CtieJF8N0Hb1oAQLF0q+H1uSg2BJFXn0IItYsI6RIbRQ6uUbnckd"
+    "x4dQsA4Tv+v8w9Wn8SWN4vNmD362JgJVtNLobcIj8SR+1azwMwIOjX8YbReD3sGg0BmO1wSEHrrr"
+    "i2jy4MwUKv+T1WYA/AM17cppAhpsOjLrf5kEFgIUPPZbCrHoc6c+STOZcfe8Bf3VOHs="
+)
+_DSA_SPKI_B64 = (
+    "MIIBtzCCASwGByqGSM44BAEwggEfAoGBAO4ZhSPO577xTsFDvJMEsM19DC+T2rdC/LEfKSfPV51V"
+    "I9vyD9U8IpW/535s2StRpJ9QhnoTIUVNktIJL9Wvv/2Yd38ChMLinB/cGzP5nz8qNJvu1vHFR7US"
+    "3Fz1IXvZmdCPmwWeL0N+hx2AK3oiGRxwTXsUoQRXKDSOH7qbkWJhAhUAj6mT3Fk7/EQaDWiPe87w"
+    "lLG8Ty8CgYEAjHCGDPn3CtieJF8N0Hb1oAQLF0q+H1uSg2BJFXn0IItYsI6RIbRQ6uUbnckdx4dQ"
+    "sA4Tv+v8w9Wn8SWN4vNmD362JgJVtNLobcIj8SR+1azwMwIOjX8YbReD3sGg0BmO1wSEHrrri2jy4"
+    "MwUKv+T1WYA/AM17cppAhpsOjLrf5kDgYQAAoGAWb+Gv7iBVvgWmL6xFL3o/N7oDsvN0SFKJ5JivWpS"
+    "G2M8/vPhaR5DCR0femfap404Gowt3VAZnYlGuK33KzYNlpqLERdj5dHQ6XxdcPLki7zdyvgI7Shm"
+    "vph6yTKfDytZ5nF1J+OE5Zg04xVtvoz4mJzecMIY4NsrPCPAh1tzL6I="
+)
+_SIG_DSA_SHA1_HEX = (
+    "302c021462f0b056a8dd63a7416b5f2bc0fadc934c757fb602141399f5c7d4e0cda7c504"
+    "dce0e6112b536e6b8e2d"
+)
+# Wycheproof rsa_signature_2048_sha256_test.json group 0: a published
+# RSASSA-PKCS1-v1_5 verify vector and an InvalidSignature one.
+_WY_SIG_SPKI_B64 = (
+    "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAorRRoH0KpfluRVZxUTVQUUqKW0YuvvcX"
+    "CU+h/ugiJOY3+XRtP3yv0xh42AMltu9aFwD2WQO0aUKeidbqyIRQl7WrOTGJ25JRLtincRoSU/rN"
+    "IPecFegkfz0+QuRuSMmOJUov6XZTE6A+/48X4aApOXofomqNzib0kO2BKZYV2YFMItphBCjgnH2W"
+    "WFlCZvXAIdD87KCNlFoSvoLeTR7Oa0wDFFtdNJXU7VQR64eNrwX9evw+Ca2g8RJkIvWQl1oZaYFvS"
+    "GmLy7obTZyuedRg2Pn4Xnl1AF2bwixOWsD3waRdElaaYoB9O5oC5aUw53MGb0U9H1tMLpz3ggKD9"
+    "0K51QIDAQAB"
+)
+_WY_SIG_VALID_MSG = "54657374"
+_WY_SIG_VALID_SIG = (
+    "264491e844c119f14e425c03282139a558dcdaeb82a4628173cd407fd319f9076eaebc0dd87a"
+    "1c22e4d17839096886d58a9d5b7f7aeb63efec56c45ac7bead4203b6886e1faa90e028ec0ae"
+    "094d46bf3f97efdd19045cfbc25a1abda2432639f9876405c0d68f8edbf047c12a454f7681d"
+    "5d5a2b54bd3723d193dbad4338baad753264006e2d08931c4b8bb79aa1c9cad10eb6605f87c"
+    "5831f6e2b08e002f9c6f21141f5841d92727dd3e1d99c36bc560da3c9067df99fcaf818941"
+    "f72588be33032bad22caf6704223bb114d575b6d02d9d222b580005d930e8f40cce9f672ee"
+    "bb634a20177d84351627964b83f2053d736a84ab1a005f63bd5ba943de6205c"
+)
+_WY_SIG_INVALID_MSG = "313233343030"
+_WY_SIG_INVALID_SIG = (
+    "a2b451a07d0aa5f96e455671513550514a8a5b462ebef717094fa1fee82224e637f9746d3f7c"
+    "afd31878d80325b6ef5a1700f65903b469429e89d6eac8845097b5ab393189db92512ed8a77"
+    "11a1253facd20f79c15e8247f3d3e42e46e48c98e254a2fe9765313a03eff8f17e1a029397a"
+    "1fa26a8dce26f490ed81299615d9814c22da610428e09c7d9658594266f5c021d0fceca08d9"
+    "45a12be82de4d1ece6b4c03145b5d3495d4ed5411eb878daf05fd7afc3e09ada0f1126422f5"
+    "90975a1969816f48698bcbba1b4d9cae79d460d8f9f85e7975005d9bc22c4e5ac0f7c1a45d"
+    "12569a62807d3b9a02e5a530e773066f453d1f5b4c2e9cf7820283f742b9d4"
+)
+
+
+def _flip_hex_nibble(value: str) -> str:
+    """Change the first hex digit, to corrupt a published signature."""
+    return format(int(value[0], 16) ^ 1, "x") + value[1:]
+
+
+def _signer(
+    algorithm: str,
+    private_b64: str | None = None,
+    public_b64: str | None = None,
+    name: str = "c",
+) -> str:
+    """A JS fragment building a Signer named `name`, with the given keys."""
+    js = "var " + name + " = java.createSign('" + algorithm + "');"
+    if private_b64:
+        js += name + ".setPrivateKey(java.base64DecodeToByteArray('" + private_b64 + "'));"
+    if public_b64:
+        js += name + ".setPublicKey(java.base64DecodeToByteArray('" + public_b64 + "'));"
+    return js
+
+
+def _sign_eval(body: str, algorithm: str = "SHA256withRSA") -> str:
+    return _engine()._try_eval_js(
+        _signer(algorithm, _RSA_PKCS8_B64, _RSA_SPKI_B64) + body, ""
+    )
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_sign_rsa_pkcs1_v1_5_matches_an_independent_implementation():
+    """RSASSA-PKCS1-v1_5 is deterministic, so the signature bytes can be
+    compared for equality with pyca/cryptography's, digest by digest."""
+    assert _sign_eval("c.signHex('" + _SIG_MSG + "');") == _SIG_RSA_SHA256_HEX
+    assert _sign_eval(
+        "c.signHex('" + _SIG_MSG + "');", "SHA1withRSA"
+    ) == _SIG_RSA_SHA1_HEX
+    assert _sign_eval(
+        "c.signHex('" + _SIG_MSG + "');", "MD5withRSA"
+    ) == _SIG_RSA_MD5_HEX
+    # JCE algorithm names are case-insensitive.
+    assert _sign_eval(
+        "c.signHex('" + _SIG_MSG + "');", "sha256withrsa"
+    ) == _SIG_RSA_SHA256_HEX
+    # `sign(byte[])` is the raw data, `sign(String)` its UTF-8 bytes.
+    assert _sign_eval(
+        "var hex = c.signHex('" + _SIG_MSG + "');"
+        "var buf = c.sign(Buffer.from('" + _SIG_MSG + "', 'utf-8')).toString('hex');"
+        "var wide = c.signHex('明文');"
+        "var wideBuf = c.signHex(java.strToBytes('明文', 'UTF-8'));"
+        "(hex === buf) + '/' + (wide === wideBuf);"
+    ) == "true/true"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_sign_verifies_the_published_wycheproof_vector():
+    """A published RSASSA-PKCS1-v1_5 vector verifies, and Wycheproof's
+    InvalidSignature case does not."""
+    value = _engine()._try_eval_js(
+        _signer("SHA256withRSA", None, _WY_SIG_SPKI_B64)
+        + "var ok = c.verify(java.hexDecodeToByteArray('" + _WY_SIG_VALID_MSG + "'),"
+          " java.hexDecodeToByteArray('" + _WY_SIG_VALID_SIG + "'));"
+        + "var publishedBad = c.verify(java.hexDecodeToByteArray('"
+        + _WY_SIG_INVALID_MSG + "'), java.hexDecodeToByteArray('" + _WY_SIG_INVALID_SIG + "'));"
+        # Corrupting one nibble of the good signature must stop it verifying.
+        + "var corrupted = c.verify(java.hexDecodeToByteArray('" + _WY_SIG_VALID_MSG + "'),"
+          " java.hexDecodeToByteArray('" + _flip_hex_nibble(_WY_SIG_VALID_SIG) + "'));"
+        # ... as must a signature of the wrong length.
+        + "var short_ = c.verify(java.hexDecodeToByteArray('" + _WY_SIG_VALID_MSG + "'),"
+          " java.hexDecodeToByteArray('00'));"
+        + "ok + '|' + publishedBad + '|' + corrupted + '|' + short_;",
+        "",
+    )
+
+    assert value == "true|false|false|false"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_sign_ecdsa_and_dsa_verify_a_foreign_signature():
+    """ECDSA and DSA signatures are randomised, so the check is that a signature
+    made by pyca/cryptography verifies here, that a signature over a different
+    message does not, and that our own signatures round-trip."""
+    value = _engine()._try_eval_js(
+        _signer("SHA256withECDSA", _EC_PKCS8_B64, _EC_SPKI_B64, "ec")
+        + _signer("SHA1withDSA", _DSA_PKCS8_B64, _DSA_SPKI_B64, "dsa")
+        + _signer("SHA256withDSA", _DSA_PKCS8_B64, _DSA_SPKI_B64, "dsa256")
+        + "var msg = Buffer.from('" + _SIG_MSG + "', 'utf-8');"
+        "var ecOk = ec.verify(msg, java.hexDecodeToByteArray('" + _SIG_EC_SHA256_HEX + "'));"
+        "var ecOther = ec.verify(msg, java.hexDecodeToByteArray('"
+        + _SIG_EC_SHA256_OTHER_HEX + "'));"
+        "var ecRound = ec.verify(msg, ec.sign(msg));"
+        "var dsaOk = dsa.verify(msg, java.hexDecodeToByteArray('" + _SIG_DSA_SHA1_HEX + "'));"
+        "var dsaRound = dsa.verify(msg, dsa.sign(msg));"
+        "var dsa256Round = dsa256.verify(msg, dsa256.sign(msg));"
+        "[ecOk, ecOther, ecRound, dsaOk, dsaRound, dsa256Round].join('|');",
+        "",
+    )
+
+    assert value == "true|false|true|true|true|true"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_create_sign_rejects_what_legado_rejects():
+    """The names hutool's `SignAlgorithm` cannot deliver, and the families that
+    need BouncyCastle -- which Legado does not ship."""
+    cases = {
+        # `SignAlgorithm.NONEwithRSA` -- no digest at all.
+        "NONEwithRSA": "摘要",
+        # MD2 is not in OpenSSL 3 either.
+        "MD2withRSA": "摘要",
+        # SignAlgorithm marks these three as "需要 BC 库加入支持".
+        "SHA256WithRSA/PSS": "BC",
+        # The JDK alias for PSS, whose salt length JCE picks for itself.  The
+        # needle has to be wording only this branch produces: the generic
+        # message echoes the algorithm name, which already contains "RSAandMGF1".
+        "SHA256withRSAandMGF1": "PSS 签名",
+        # No digest, and Node needs the one-shot API for it.
+        "Ed25519": "with",
+        "SM3withSM2": "摘要",
+        "totally-bogus": "with",
+    }
+    expressions = [
+        "(function () {"
+        "  try { java.createSign('" + name + "'); return 'no-error'; }"
+        "  catch (e) { return e.message; }"
+        "})()"
+        for name in cases
+    ]
+    value = _engine()._try_eval_js("[" + ",".join(expressions) + "].join('\\n');", "")
+
+    for (name, needle), message in zip(cases.items(), value.split("\n")):
+        assert message != "no-error", name
+        assert needle in message, name
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_sign_keys_and_the_constructed_key_pair():
+    """`Sign` inherits its key handling from `BaseAsymmetric`, so a Signer built
+    with no keys gets a fresh pair (`KeyUtil.DEFAULT_KEY_SIZE` again), and
+    `setXxxKey(null)` is the way a key really becomes absent."""
+    value = _engine()._try_eval_js(
+        _signer("SHA256withRSA", _RSA_PKCS8_B64, _RSA_SPKI_B64)
+        + "var why = function (fn) { try { fn(); return 'no-error'; }"
+          "  catch (e) { return e.message; } };"
+        "var out = [];"
+        "out.push(c.getPrivateKeyBase64() === '" + _RSA_PKCS8_B64 + "');"
+        "out.push(c.getPublicKeyBase64() === '" + _RSA_SPKI_B64 + "');"
+        "out.push(c.setPrivateKey(java.base64DecodeToByteArray('" + _RSA_PKCS8_B64 + "')) === c);"
+        "out.push(why(function () {"
+        "  java.createSign('SHA256withRSA').setPrivateKey('-----BEGIN PRIVATE KEY-----');"
+        "}));"
+        "out.push(why(function () {"
+        "  java.createSign('SHA256withRSA')"
+        "    .setPrivateKey(java.base64DecodeToByteArray('" + _EC_PKCS8_B64 + "'));"
+        "}));"
+        "out.push(why(function () {"
+        "  java.createSign('SHA256withECDSA')"
+        "    .setPrivateKey(java.base64DecodeToByteArray('" + _RSA_PKCS8_B64 + "'));"
+        "}));"
+        "out.push(why(function () {"
+        "  var s = java.createSign('SHA256withRSA');"
+        "  s.setPrivateKey(null);"
+        "  s.sign('x');"
+        "}));"
+        "out.push(why(function () {"
+        "  var s = java.createSign('SHA256withRSA');"
+        "  s.setPublicKey(null);"
+        "  s.verify(Buffer.from('x'), Buffer.from('y'));"
+        "}));"
+        "out.push(why(function () { java.createSign('SHA256withRSA').sign(123); }));"
+        "out.join('\\n');",
+        "",
+    )
+    (
+        priv_round,
+        pub_round,
+        chained,
+        pem,
+        ec_into_rsa,
+        rsa_into_ec,
+        no_priv,
+        no_pub,
+        bad_input,
+    ) = value.split("\n")
+
+    assert (priv_round, pub_round, chained) == ("true", "true", "true")
+    assert "PEM" in pem
+    assert "ec" in ec_into_rsa and "RSA" in ec_into_rsa
+    assert "rsa" in rsa_into_ec and "EC" in rsa_into_ec
+    # BaseAsymmetric.getKeyByType, messages verbatim.
+    assert no_priv == "Private key must not null when use it !"
+    assert no_pub == "Public key must not null when use it !"
+    assert bad_input == "Unexpected input type"
+
+    # With no keys at all, a 1024-bit pair is generated before anything is set.
+    generated = _engine()._try_eval_js(
+        "var out = [];"
+        "var algos = ['SHA256withRSA', 'SHA256withECDSA', 'SHA1withDSA'];"
+        "for (var i = 0; i < algos.length; i++) {"
+        "  var s = java.createSign(algos[i]);"
+        "  var pub = s.getPublicKeyBase64();"
+        "  var msg = Buffer.from('x');"
+        "  out.push((pub !== null && s.getPrivateKeyBase64() !== null)"
+        "    + ':' + java.base64DecodeToByteArray(pub).length"
+        "    + ':' + s.verify(msg, s.sign(msg)));"
+        "}"
+        # A 1024-bit RSA SubjectPublicKeyInfo is 162 DER bytes.
+        "out.join('|');",
+        "",
+    )
+
+    rsa_entry, ec_entry, dsa_entry = generated.split("|")
+
+    # 1024-bit RSA and P-256 SubjectPublicKeyInfo have a fixed DER size; a DSA one
+    # is a few bytes either side because DER integers gain a leading zero
+    # whenever their top bit is set.
+    assert rsa_entry == "true:162:true"
+    assert ec_entry == "true:91:true"
+    assert dsa_entry.startswith("true:") and dsa_entry.endswith(":true")
+    assert 440 <= int(dsa_entry.split(":")[1]) <= 446
+
+
+# ---------------------------------------------------------------------------
 # Legado byte / charset / URL helpers (C-22 remainder)
 #
 # `java.toURL` is the interesting one: Legado parses with `java.net.URL`, whose
