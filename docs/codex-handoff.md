@@ -1094,4 +1094,66 @@ JS 上下文 `source.*` 身份键（`13542b2`）、`java.*` 请求的 Referer �
 它**没有**验证 header/Cookie 注入在真实站点上的效果（那需要看请求头与站点响应），
 也没有覆盖反爬站点。这两点仍需在部署后对着 crawler 日志观察。
 
+## 35. 2026-09-19：`java.createAsymmetricCrypto`（C-23 非对称加密，RSA 族）
+
+**起点**：第 33 节的清单里，C-23 非对称那条被记为「**有不可核实缺口**」——
+理由是「`KeyUtil.generatePrivateKey` 的密钥解析回退链在 hutool 里，源码不在本仓库」，
+并且顺手把 `createSign` 也判成了「做不到」。
+
+**这个前提是错的，而且错得很关键。** hutool 是公开依赖，`gradle/libs.versions.toml:40`
+已经把版本钉死为 `hutool = "5.8.22"`，按 tag 取原文即可
+（用 `https://cdn.jsdelivr.net/gh/dromara/hutool@v5.8.22/<path>`；
+`raw.githubusercontent.com` 在本机 fetch 不到，jsdelivr 可以）。逐条核对之后：
+
+* **不存在什么「回退链」**：`KeyUtil.generatePrivateKey(alg, byte[])` 就是
+  `new PKCS8EncodedKeySpec(key)` 直接交给 `KeyFactory`，**不做 PEM 解析、不做 Base64 解码**。
+* `createSign` 也**可做**：`Sign.java` 的方法面是 `sign`/`signHex`/`verify` 加 Legado
+  自己的四个 `setXxxKey`；算法名是 JCE 的 `<摘要>with<RSA|ECDSA|DSA>`，Node 的
+  `crypto.createSign(<digest>)` 会按密钥类型自动选方案。
+
+**教训**：把「依赖的源码不在本仓库」当成「不可核实」，等于凭空给自己造了一个缺口。
+依赖的版本号一旦钉死，它的源码就是可核实的规范 —— 先去翻 `libs.versions.toml`。
+
+**本轮查出的、照直觉写就会错的四处**（细节见 `legado-rule-spec-diff.md` 第 1 节
+「C-23 非对称加密」小节）：
+
+1. **OpenSSL 的 PKCS#1 解密是隐式拒绝**：非法补码时返回一段伪随机数据而**不报错**，
+   Java 在这里抛 `BadPaddingException`。实测 Wycheproof 的 invalid 向量经
+   `privateDecrypt(RSA_PKCS1_PADDING)` 返回 126 字节垃圾。带 `try/catch` 回退的书源
+   会**静默拿到垃圾内容**。→ 改用 `RSA_NO_PADDING` 取回原始块，在 JS 里按
+   `RSAPadding.unpadV15` 自行校验（PS ≥ 8、`k - 11` 上限，block type 1/2 由持钥方决定）。
+2. **`decrypt(data)` 默认用公钥**：Kotlin 是 `usePublicKey: Boolean? = true` 加
+   `when(usePublicKey){ true -> PublicKey; else -> PrivateKey }`，`@JvmOverloads` 又生成了
+   单参重载 —— **省略参数**走公钥，**显式传 `null`** 才走私钥。按 `arguments.length` 复刻。
+3. **构造是急切的**：`BaseAsymmetric.init` 在两把 key 都为 `null` 时立刻生成一对
+   1024 位密钥。所以「只 `setPrivateKey` 然后 `decrypt(data)`」用的是那把随机公钥。
+4. **`OAEPWith…AndMGF1Padding` 在 Legado 里根本构造不出来**：`getAlgorithmAfterWith`
+   只保留最后一个 `"with"` 之后的内容 → `"SHA-1AndMGF1Padding"` →
+   `KeyPairGenerator.getInstance` 直接抛错。所以只有不含 `with` 的 `RSA/ECB/OAEPPadding`
+   可用（默认 SHA-1/MGF1-SHA1），**这也顺带消掉了「MGF1 用哪个 hash」这个原本只能靠
+   假设的分歧**。
+
+**「只支持 RSA」是对齐不是缩水**：Legado 全仓库 grep `bcprov`/`bouncycastle` 命中 0，
+`GlobalBouncyCastleProvider` 在类缺失时 `provider` 保持 `null`，且 Legado 从未调用
+`setUseBouncyCastle`；所以 `Cipher.getInstance("EC"/"ECIES"/"SM2")` 在 Legado 里同样在
+**构造阶段**抛 `NoSuchAlgorithmException`。
+
+**验证**（`0a4089a`，13 条新测试，821 → 834 passed）：
+
+* Wycheproof `rsa_pkcs1_2048_test.json` **全量** 33 组 67 条（42 valid / 25 invalid，
+  覆盖 `InvalidPkcs1Padding`、`Sslv23Padding`、`InvalidCiphertextFormat`、CVE-2021-3580）
+  逐条比对，**67/67 一致**：valid 解出原文，invalid 全部抛错。
+* NoPadding 与**全部手工构造的补码块**都用**纯 Python `pow()`** 生成（完全不经过
+  OpenSSL），所以那些断言考的是本实现自己的补码校验逻辑。
+* OAEP 密文由 pyca/cryptography 生成。
+* 13 处变异逐一施加，**13/13 被杀**。其中「去掉 `getAlgorithmAfterWith` 的截断」那一次
+  一开始**活了下来** —— 因为 OAEP 那条断言只查消息里有没有 `AndMGF1Padding`，
+  而被变异之后的「不支持的补码方式」错误消息恰好也含这个子串。改成必须出现
+  `解析为 "SHA-1AndMGF1Padding"` 才被杀。**这正是变异测试的价值**：
+  断言写松了，只有变异能发现。
+
+**下一步**：`createSign`（已确认可做，顺带能覆盖 EC/DSA），以及第 33 节清单里剩下的
+D（三处变量存储收敛）。本轮**未部署、未推送**。
+
+
 

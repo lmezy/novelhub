@@ -69,7 +69,8 @@ M-7（`@text` 换行）**有意保留**，已在代码与测试里注明。细�
 | M-7 / M-8 / M-9 / M-10、D-13 | ✅ **已裁决并落地**（`5922136`） | `5922136` | 对齐 4 条（M-8 外层 `@html`、M-9 `@ownText` 空格连接、M-10 去重只作用于属性分支、D-13 多值属性返回完整串）；**保留** M-7（`@text` 保持 `\n`，已注明是有意偏差）。先以特征化测试固化当前行为（`3d4de73`），改动后 4 条测试如预期失败并被更新为 Legado 值，另加 2 条边界测试。807 → 809 passed |
 | **C-23 对称加密族**（`createSymmetricCrypto` + AES 10 / DES 4 / 3DES 4 = 19 个） | ✅ 已补 | `d8ef160` | 密文用 **FIPS-197 / NIST SP 800-38A** 向量验证（AES-128-ECB `69c4e0d8…c55a` 精确匹配）+ PKCS5/CBC/3DES 往返 + hex/Base64 自动判别；撤掉改动 7 条全失败；766 → 773 |
 | **C-22 第二批 8 个**（`strToBytes`/`bytesToStr`/`base64DecodeToByteArray`/`hexDecodeToByteArray`/`hexEncodeToString`/`randomUUID`/`toURL` ×2） | ✅ 已补 | `203c98f` | 8 条新测试；撤掉改动 8 条全失败；773 → 781。`toURL` 复现了 `java.net.URL` 的两处 WHATWG 差异（显式默认端口、`+`→空格） |
-| C-23 非对称加密与签名（`createAsymmetricCrypto`、`createSign`） | ⏳ 待补，**有不可核实缺口** | — | `KeyUtil.generatePrivateKey(algorithm, bytes)` 的密钥解析回退链（PEM / PKCS#8 / 裸 Base64）在 hutool 里，源码不在本仓库；且 `decrypt` 默认用**公钥**（`usePublicKey=true`）语义反直觉。建议先明确用途再投入 |
+| **C-23 非对称加密**（`createAsymmetricCrypto`，RSA 族） | ✅ 已补 | `0a4089a` | 13 条新测试；Wycheproof `rsa_pkcs1_2048_test.json` 全量 **67/67 一致**；13 处变异 **13/13 被杀**；821 → 834。原文对照与四处「照直觉写就会错」见下节 |
+| C-23 `createSign` | ⏳ **上一版判定有误**：实为可实现 | — | 上一版说「方法名来自 hutool，源码不在仓库」，但 hutool 是公开依赖（`libs.versions.toml:40` 已钉 `hutool = "5.8.22"`），`Sign.java` 可取原文。方法面就是 `sign`/`signHex`/`verify` 加 Legado 自己的四个 `setXxxKey`。本次未做，理由见该节末 |
 | **C-22 第三批**（`toNumChapter` + `fullToHalf`/`chineseNumToInt`/`stringToInt`） | ✅ 已补 | `bfabd75` | 6 条新测试；撤掉改动 6 条全失败；781 → 787。复刻了 Kotlin Int 整除、`Integer.parseInt` 严格性；**未复刻**其不可达的"一零二五"分支（守卫条件自相矛盾，属死代码） |
 | **C-22 第四批**（`timeFormat`、`timeFormatUTC`） | ✅ 已补 | `6dc568a` | 5 条新测试；撤掉改动 5 条全失败；787 → 792。`dateFormat` 是固定模式 `yyyy/MM/dd HH:mm`；`sh` 按 `SimpleTimeZone` 语义为**毫秒**（已钉住）；依赖区域设置的 `MMM`/`E` 抛可读错误而非静默输出数字 |
 | C-22 中 `t2s`/`s2t` | ❌ 不实现 | — | 依赖第三方 JVM 词典，见第 6 节更正 |
@@ -80,6 +81,75 @@ M-7（`@text` 换行）**有意保留**，已在代码与测试里注明。细�
 > （前者丢数据、后两者取空值），不涉及「哪种更好」的判断。
 > 凡涉及判断的条目（`@text` 换行、`@html` 内层/外层、去重范围）一律**未动**，
 > 等裁决后再改。
+
+### C-23 非对称加密：与 hutool 5.8.22 原文的逐条对照（`0a4089a`）
+
+上一版把这条记为「**有不可核实缺口**」，前提是「hutool 源码不在本仓库」。**这个前提是错的**：
+hutool 是公开依赖，`gradle/libs.versions.toml:40` 已经把版本钉死为 `hutool = "5.8.22"`，
+按 tag 取原文即可。核对之后缺口基本消失，反而是查出了四处「照直觉写就会错」的地方。
+
+**从原文核实的语义**（括号内为 hutool 5.8.22 的文件）
+
+| 行为 | 原文 | 含义 |
+|---|---|---|
+| 私钥解析（`KeyUtil.generatePrivateKey`） | `new PKCS8EncodedKeySpec(key)` → `KeyFactory.getInstance(getMainAlgorithm(getAlgorithmAfterWith(alg))).generatePrivate(...)` | **不做 PEM 解析、不做 Base64 解码**。而 Legado 的 `setPrivateKey(String)` 是 `key.encodeToByteArray()`（UTF-8 字节），所以**传 PEM 字符串在 Legado 里同样失败** |
+| 公钥解析（`KeyUtil.generatePublicKey`） | 同理，`X509EncodedKeySpec`（SPKI DER） | 同上 |
+| 构造（`BaseAsymmetric.init`） | 两把 key 都为 `null` 时**立即** `initKeys()` → `generateKeyPair`（`DEFAULT_KEY_SIZE = 1024`） | 每次 `createAsymmetricCrypto` 都先凭空生成一对 1024 位密钥；只 `setPrivateKey` 时，公钥是那把随机公钥 |
+| 缺钥（`BaseAsymmetric.getKeyByType`） | 抛 `NullPointerException("Public key must not null when use it !")` | 只有显式 `setPublicKey(null)` 才走得到 |
+| 算法名（`getAlgorithmAfterWith`） | 取**最后一个** `"with"` **之后**的内容；`ECDSA`/`SM2`/`ECIES` → `EC` | `"RSA/ECB/OAEPWithSHA-1AndMGF1Padding"` → `"SHA-1AndMGF1Padding"` |
+| 变换名（`SecureUtil.createCipher`） | `Cipher.getInstance(transformation)`，**原样透传** | JCE 自己的变换名解析就是规范；裸 `"RSA"` 的默认补码是 PKCS1Padding |
+| 补码块类型（`RSACipher.engineInit`） | 类型 2（`00 02 PS 00 M`）用于「公钥加密 / 私钥解密」；类型 1（`00 01 FF…FF 00 M`）用于「私钥加密 / 公钥解密」 | block type 由**持钥方**决定，与方向无关 |
+| 解补码（`RSAPadding.unpadV15`） | PS 至少 8 字节（`if (ofs < 10) ok = false`）；`padV15` 明文上限 `k - 11` | 越界分别是 `BadPaddingException` / `IllegalBlockSizeException` |
+| 字符串入参（`AsymmetricEncryptor`/`Decryptor`） | 加密侧 `StrUtil.utf8Bytes(data)`；解密侧先 `SecureUtil.decode(data)`（全十六进制字符走 hex，否则 Base64） | 加解密两侧的字符串语义**不对称** |
+
+**因此「只支持 RSA」是对齐，不是缩水。** Legado 没打包 BouncyCastle ——
+全仓库 grep `bcprov` / `bouncycastle` 命中 **0**，`GlobalBouncyCastleProvider` 在类缺失时
+`provider` 保持 `null`，且 Legado 从未调用 `setUseBouncyCastle` —— 所以
+`Cipher.getInstance("EC")`、`("ECIES")`、`("SM2")` 在 Legado 里**也会**抛
+`NoSuchAlgorithmException`，而且是在 `AsymmetricCrypto.init` 里**构造阶段**就抛
+（`super.init()` 的 `initKeys()` 先跑，`initCipher()` 后跑）。本实现在构造时报同样的错。
+
+**四处「照直觉写就会错」**
+
+1. **OpenSSL 的 PKCS#1 解密不会失败，只会返回随机数据。**
+   Node 的 `privateDecrypt(RSA_PKCS1_PADDING)` 对非法补码实现隐式拒绝（implicit rejection），
+   返回一段伪随机缓冲；Java 在这里抛 `BadPaddingException`。
+   实测：Wycheproof 的 invalid 向量经 OpenSSL 返回 126 字节垃圾而不是报错。
+   若把补码交给 OpenSSL，带 `try/catch` 回退的书源会**静默拿到垃圾内容**。
+   故改用 `RSA_NO_PADDING` 取回原始 `k` 字节块，在 JS 里按 `unpadV15` 自行校验。
+2. **`decrypt(data)` 默认用公钥。** Kotlin 是 `usePublicKey: Boolean? = true` 加
+   `when (usePublicKey) { true -> PublicKey; else -> PrivateKey }`，而 `@JvmOverloads`
+   又生成了一个单参重载 —— 于是**省略参数**走公钥，**显式传 `null`** 才走私钥。
+   只设了私钥就调 `decrypt(data)` 的书源拿到的是那把随机公钥。按 `arguments.length` 精确复刻。
+3. **PEM 在 Legado 里也不会被接受。** 见上表第一行。本实现遇到 PEM 时**报错并给出转换方法**，
+   而不是"好心"自动转换 —— 自动转换会让一个在 Legado 里本来就坏的书源看起来正常，
+   把问题藏起来。
+4. **`OAEPWith…AndMGF1Padding` 在 Legado 里根本构造不出来。** 见上表第 5 行：
+   `KeyPairGenerator.getInstance("SHA-1AndMGF1Padding")` 直接抛错。
+   所以**只有不含 `with` 的 `RSA/ECB/OAEPPadding` 这一种 OAEP 写法可用**，
+   而它默认就是 SHA-1/MGF1-SHA1。**这条顺带消掉了一个原本只能"假设"的东西**：
+   因为 OAEP-SHA256 无法构造，分歧中的「MGF1 用哪个 hash」不再影响兼容性。
+
+**已实现**：`RSA`、`RSA/ECB/PKCS1Padding`、`RSA/ECB/NoPadding`、`RSA/ECB/OAEPPadding`；
+`setPrivateKey`/`setPublicKey`（ByteArray｜String，须为 PKCS#8 / SPKI DER）；
+`encrypt`/`encryptHex`/`encryptBase64`/`decrypt`/`decryptStr`；
+`getPrivateKeyBase64`/`getPublicKeyBase64`；
+`get`/`setEncryptBlockSize`、`get`/`setDecryptBlockSize`（默认 `-1`，即**不分段** ——
+Legado 无 BC，`Cipher.getBlockSize()` 对 RSA 返回 0；显式设成 0 时本实现退回单次，
+而 Java 那边会死循环）。
+
+**验证**：13 条新测试，四个相互独立的来源 —— Wycheproof（**已发布**向量）、
+pyca/cryptography、**纯 Python `pow()`**（NoPadding 与全部手工构造的补码块，
+完全不经过 OpenSSL）、以及 hutool 原文。13 处变异逐一施加，**13/13 被杀**
+（其中一次变异还暴露出 OAEP 那条断言写得太松、被"错的原因"通过，已收紧）。
+
+**`createSign`：上一版的「做不到」同样要更正。** hutool `Sign.java` 是公开源码，
+方法面是继承来的 `sign(byte[])` / `sign(String)` / `signHex(...)` / `verify(byte[], byte[])`
+加上 Legado 自己的四个 `setXxxKey` 重载；算法名是 JCE 的 `<摘要>with<RSA|ECDSA|DSA>`，
+Node 的 `crypto.createSign(<digest>)` 会按密钥类型自动选签名方案（RSA 默认 PKCS#1 v1.5、
+ECDSA 输出 ASN.1 DER，都与 JCE 一致）—— **可做**，还能顺带覆盖 EC/DSA。
+本次不做，是为了把非对称加密本身做扎实（补码语义是这里风险最高的一环），
+留作独立的一步。
 
 ### 附：实测复核记录（真实引擎，非静态阅读）
 
@@ -348,6 +418,12 @@ M-7（`@text` 换行）**有意保留**，已在代码与测试里注明。细�
 > 这与 Android 无关，是运行时的限制。实现选择**报出带原因的清晰错误**（而非静默返回 `null`），
 > 让书源自身的 `try/catch` 与爬虫日志都能看到原因。**3DES 不受影响**（`des-ede3-*` 存在）。
 > 另外 `createSymmetricCrypto` 是**惰性**的：只在真正加解密时才建 cipher，构造对象本身不报错。
+
+> **非对称侧正好相反（`0a4089a`）**：`createAsymmetricCrypto` 是**急切**的 ——
+> 构造时就先 `initKeys()` 生成一对 1024 位密钥，再 `Cipher.getInstance(transformation)`，
+> 所以变换名非法时**构造阶段就失败**（Legado 同样如此）。此外 OpenSSL 的 PKCS#1 解密是
+> **隐式拒绝**：非法补码返回一段伪随机数据而**不报错**，与 Java 抛 `BadPaddingException`
+> 不同，因此补码必须自行校验。详见第 1 节「C-23 非对称加密」小节。
 
 **缺失名称全表（69）**
 
