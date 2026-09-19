@@ -1,8 +1,8 @@
 # JS 侧 HTTP 的请求上下文：改造方案（C-18 / C-19 / C-20 / C-17）
 
 > 状态：**第 1 级已实现**（`13542b2`）；**第 2 级已完成** —— 注入已求值的 `header`
-> （`47f66ca`）与 `java.*` 的 Referer 默认值（`a75158e`）；第 3 级仍是**方案**。
-> 本文件保留当时的分析，实施结果在各节标注。
+> （`47f66ca`）与 `java.*` 的 Referer 默认值（`a75158e`）；**第 3a 级（Cookie 注入）已完成**
+> （`3faabd2`）；**第 3b 级（JS 侧限速）仍未做**。本文件保留当时的分析，实施结果在各节标注。
 
 > **实施第 1 级时新发现两处问题**（见 §6），其中 6.1 已补、6.2 已修、6.3 待评估。
 > 背景条目见 [legado-rule-spec-diff.md](legado-rule-spec-diff.md) 附录 C 的 C-17～C-20。
@@ -68,20 +68,24 @@ Node 侧 shim 的 `curl`（`jsoup_shim.js` 的 `__nhCurlRaw`），而 shim 手�
 
 ### 第 3 级：Cookie 注入 + JS 侧限速（**高风险，建议单独一批**）
 
-**3a Cookie 注入**
+**3a Cookie 注入 —— ✅ 已实现（`3faabd2`）**
 
-- **改动点**：shim 增加 `__nhSetConfiguredCookie(value)`（**替换**语义）与
-  `__nhSetSessionCookies`（追加语义）两个入口；`_build_js_context` 传
-  `_configured_cookie`。发起请求时按"配置 Cookie + 会话 Cookie"拼接。
-- **风险**：JS 请求开始带 Cookie —— 这正是它该做的，但会改变现有请求特征。
-- **顺带修**：`getCookie(tag)` 目前**无参数**（`jsoup_shim.js:1568`），
-  Legado 是 `getCookie(tag[, key])` 查命名存储。要不要支持 `tag` 需先确认书源用法。
-- **验证**：stub `__nhCurlRaw` 断请求带上了 Cookie；断言 `java.getCookie()` 非空；
-  回归全量。
+- Cookie 不在书源 JSON 里（Legado schema 无此字段，这也是第 27 节 AI 诊断漏判的原因），
+  所以引擎拿不到，由插件显式推送：`YueduRuleEngine.set_configured_cookie`，
+  在 `AuthMixin.set_cookie` 与 `configure` 里同步。
+- 注入用**保留键 `__nhCookie`** —— 不能叫 `cookie`，那会覆盖 shim 自己的 `cookie` 对象。
+- shim 新增 `__nhCookieHeader()`（已配置 Cookie + `java.setCookie` 写的会话 Cookie），
+  `__nhFinalHeaders` 在调用方没给 `Cookie` 时补上；三处 `getCookie()` 改用它。
+  调用方自己传的 Cookie 优先。
+- **顺带修掉一个真实的跨源泄漏**：`__nhCookieJar` 是模块级而 `JsRuntime` 是单例，
+  所有源共用一个子进程，于是源 A 用 `java.setCookie` 写的会话 Cookie 会被发到
+  **源 B** 的请求上。现在 `__nhSetSourceConfig` 在 `bookSourceUrl` 变化时清空该 jar
+  （同一源内保留会话）。这个是**测试污染暴露的**：两条断言单跑通过、全量跑失败。
+- `getCookie(tag)` 的 `tag` 参数仍未支持（Legado 是 `getCookie(tag[,key])` 查命名存储）；
+  需要先确认书源里的实际用法再定。
 
-**3b JS 侧限速**
+**3b JS 侧限速 —— 仍未做**
 
-- **改动点**：`_build_js_context` 传 `requestDelayMs`；`__nhCurlRaw` 在发请求前等待。
 - **⚠️ 主要代价（必须知情）**：shim 是**同步**的，等待只能阻塞在 Node 子进程里。
   给搬山人那种配了 60s 间隔的源，**每一次 JS 发起的请求都要在 Node 里阻塞 60s**，
   而 Python 侧 `eval_js_sync` 会一直等它。需要先确认这不会拖住其它并发同步
