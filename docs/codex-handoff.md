@@ -19,8 +19,9 @@
 密钥登录被服务器拒绝，需用密码 + paramiko。部署目录
 `/volume1/docker/NovelHub/novelhub`，`docker-compose.yaml` 使用主机网络与预构建镜像
 `lonezy/novelhub-{backend,crawler,scheduler,frontend}`。
-**最近一次部署：2026-09-19 20:31**（backend/crawler/scheduler/frontend 重建，代码 = `ad166b1`，
-即第 36 节为止；**缺 `1b590b0`（第 37 节变量存储）和 `f0615b6`（第 38 节连接池预算）**）。
+**最近一次部署：2026-09-19 21:53**（四个镜像重建，代码 = `91b444f`；三个镜像自检
+`grep -c task_concurrency_limit` = 3，`max_connections` = 200 已生效）。
+**第 39 节又改了 backend 与 frontend，需要再次重建四个镜像。**
 
 **线上数据库**（注意不是默认端口，`psql` 要带 `-h 127.0.0.1 -p 15432`，密码见 `.env`）：
 
@@ -1324,4 +1325,58 @@ docker run --rm --entrypoint sh lonezy/novelhub-crawler:latest \
   -c "grep -c task_concurrency_limit /app/backend/app/services/crawl_runner.py"   # 必须 >= 1
 ```
 
-**尚未做的**：代码未重新构建进镜像（`lonezy/novelhub-{backend,crawler,scheduler}`）、postgres 未重建（仍是 50）。提交已推送：`827a684` = `origin/develop`。
+**后续（已完成）**：2026-09-19 21:53 镜像重建并重新部署，postgres 同时重建，`SHOW max_connections` = 200。提交已推送。
+---
+
+## 39. 同步页三个现象 + 队列静默停摆 12 小时（2026-09-20）
+
+**现象**（用户报）：①点同步后任务不显示；②点暂停任务直接从页面消失；③历史任务显示 100 条但无法清理删除。
+
+**根因 1（①②，列表被饿死）**：`CrawlTaskRepository.list_recent` 用 `STATUS_RANK={running:0, failed:1}`
+再按 `created_at desc` 排，前端要 `limit=100`。线上 `failed=137`，实测 TOP100 **全是 failed**：
+新建的 `pending` 和刚暂停的 `paused` 都是 rank 2，被挤到 100 行之外。任务没丢，只是"排不上"；
+`loadTasks()` 找不到活跃任务还会 `crawlStore.clear()`，选中面板一起空掉。
+
+**根因 2（③，功能缺失）**：`/crawl/tasks` **从来没有 delete / clear 接口**，前端也没有按钮；
+`crawl_logs` 还没有外键，删任务会留孤儿日志。
+
+**根因 3（真正严重：worker 12 小时不消费）**：`_worker_loop` 把启动过的任务全放进 `active`，
+只有协程返回才释放槽位、`running_sources`（同源互斥）和会话。暂停/取消只在 sync 的
+checkpoint（`before_step` / `checkpoint_cb`）里被发现；源站被反爬/代理拖住时协程长期到不了
+checkpoint，**槽位就被用户早已暂停的任务永久占住**。线上证据：15 paused / 24 cancelled /
+**0 running**，9 个 `09:36:02` 新建的任务一直 pending，且这 9 个源与 paused 的源完全重合
+（`pending_shadowed=9`），于是永远排不上。
+
+判定"循环根本没跑到调度"的方法（可复用）：`_next_pending_tasks` 的 `WHERE status='pending'`
+没有索引 → 必然 seq scan，所以 **`pg_stat_user_tables.seq_scan` 冻结 = 该查询没执行**。
+实测 `crawl_tasks.seq_scan` 60 秒零增长，同期 `idx_scan` 每分钟恰好 +30（= 前端每 2 秒轮询
+`GET /crawl/tasks/{id}` 走主键那一次）。能跳过 `_next_pending_tasks` 的代码路径只有
+`len(active) >= limit`（= 26）—— 即 26 个协程全部卡死。worker 进程本身健康：
+PID 7 在 `do_epoll_wait`、CPU 不增长、池 12/30 没满，所以不是连接池问题。
+
+**改动**：
+- `backend/app/services/crawl_runner.py` 新增监督器：`_ActiveTask` 保存每个在跑任务的监督状态；
+  `_read_active_task_states()` 一次查询批量读 `status/progress`；纯函数 `_abandoned_tasks()`
+  判定谁该放弃（行状态离开 running/pending 超过 `SYNC_TASK_STOP_GRACE_SECONDS`，或 running 但
+  progress 心跳 `SYNC_TASK_STALL_SECONDS` 未变）；`_supervise_active()` 取消协程（stalled 的先用
+  `status='running'` 守卫写成 failed）；`_release_abandoned()` 回收"连取消都不理"的僵尸槽位
+  （`released=True` 让它的 finally 不再去抢新任务的源）。`_worker_loop` 每次监督共用同一个 `now`，
+  且监督清空 `active` 后要 `continue`（`asyncio.wait([])` 会抛 ValueError）。
+- `backend/app/core/config.py`：`SYNC_TASK_STOP_GRACE_SECONDS=120`、
+  `SYNC_TASK_SUPERVISE_INTERVAL_SECONDS=15`、`SYNC_TASK_STALL_SECONDS=3600`（0 = 关看门狗）+ `_seconds_setting()`。
+- `backend/app/repositories/crawl_task.py`：`STATUS_RANK = {running:0, pending:1, paused:2}`，
+  **failed 不再参与排名**（落进 CASE 的 ELSE，永远排在活跃任务之后）。
+- `backend/app/api/routes/crawl.py`：`DELETE /crawl/tasks/{id}`（先删 `crawl_logs` 再删任务，
+  pending/running 要求先取消）、`POST /crawl/tasks/clear-history`（只删四种终态；非管理员只删自己的，
+  与列表同规则）。
+- 前端：`SyncPage.vue`（排序与服务端一致、行内删除、清理历史按钮）、`stores/crawl.ts`
+  （`POLLABLE=[pending,running]`，paused 不再每 2 秒轮询 —— 那正是这 12 小时里唯一的数据库活动）、
+  `stores/i18n.ts`（zh/en 各 6 个新键）。
+
+**验证**：851 → 862 passed；11 处变异逐一施加 **11/11 被杀**（改回 failed 排名、暂停不回收、
+看门狗不触发、pending 也当过期、`0.0` 当未设置、僵尸保留源、循环不监督、设置不读环境、
+删除不删日志、running 可删、清理历史连 pending 一起删）；`npm run typecheck` 与 `npm run build` 通过。
+
+**待用户处理**：重建 **四个**镜像（本次含 frontend，上次只重建了三个），重新部署即可 ——
+crawler 重启会自然清掉当前僵尸槽位，那 9 个 pending 任务会立刻开跑（源站仍在反爬，失败是源站问题）。
+postgres 不用再动。
