@@ -1,0 +1,6 @@
+# The frontend context is ./frontend, so this file (not the repo-root one)
+# applies.  ``COPY . .`` would otherwise copy a host-built node_modules into the
+# image, where its esbuild/rollup binaries are the wrong platform for alpine and
+# shadow the ones ``npm install`` just built.
+node_modules
+dist
