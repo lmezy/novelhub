@@ -39,6 +39,8 @@ interface CookieItem {
   source: string
   cookie_data: string
   expired_at: string | null
+  created_at?: string | null
+  updated_at?: string | null
 }
 
 const tab = ref<"sources" | "cookies" | "sync" | "logs" | "tokens" | "index" | "status" | "yuedu" | "add" | "creds" | "users" | "approvals" | "proxy" | "ai" | "prefs">("yuedu")
@@ -291,6 +293,17 @@ function cookieExpired(c: CookieItem) {
   return !!c.expired_at && new Date(c.expired_at) < new Date()
 }
 
+/** When the stored Cookie was last written; ``created_at`` is only the fallback
+ *  for rows that predate the ``updated_at`` column. */
+function cookieWrittenAt(c: CookieItem) {
+  return c.updated_at || c.created_at || ""
+}
+
+/** ``datetime-local`` wants ``YYYY-MM-DDTHH:mm``. */
+function toDateTimeLocal(value: string | null | undefined) {
+  return value ? String(value).slice(0, 16) : ""
+}
+
 function sourceCreds(sourceId: string) {
   return creds.value.filter((c) => c.source === sourceId)
 }
@@ -301,7 +314,15 @@ function toggleSourceDetails(s: Source) {
     return
   }
   expandedSourceId.value = s.id
-  cookieForm.value = { source: s.id, cookie_data: "", expired_at: "" }
+  // Prefill from the stored Cookie: the panel sat next to an existing Cookie
+  // while showing an empty expiry field, so saving replaced the value *and*
+  // silently nulled ``expired_at`` nobody had touched.
+  const existing = sourceCookies(s.id)[0]
+  cookieForm.value = {
+    source: s.id,
+    cookie_data: "",
+    expired_at: toDateTimeLocal(existing?.expired_at),
+  }
   cookieEditingId.value = ""
   cookieError.value = ""
   cookieTestResult.value = null
@@ -386,7 +407,7 @@ function editCookie(c: CookieItem) {
   cookieForm.value = {
     source: c.source,
     cookie_data: "",
-    expired_at: c.expired_at || "",
+    expired_at: toDateTimeLocal(c.expired_at),
   }
   window.scrollTo({ top: 0, behavior: "smooth" })
 }
@@ -1691,7 +1712,12 @@ onUnmounted(() => {
                     :key="c.id"
                     class="flex items-center justify-between gap-2 text-xs"
                   >
-                    <span>{{ c.source }}</span>
+                    <div class="min-w-0">
+                      <div class="truncate">{{ c.source }}</div>
+                      <div v-if="cookieWrittenAt(c)" class="text-muted dark:text-gray-400 text-[11px]">
+                        {{ i18n.t('admin_cookie_written_at') }} {{ new Date(cookieWrittenAt(c)).toLocaleString() }}
+                      </div>
+                    </div>
                     <div class="flex items-center gap-2">
                       <button @click="editCookie(c)" class="text-accent hover:underline">{{ i18n.t('admin_edit') }}</button>
                       <button @click="deleteCookie(c.id)" class="text-red-500 hover:underline">{{ i18n.t('admin_delete') }}</button>

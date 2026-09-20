@@ -116,6 +116,13 @@ async def update_cookie(
     await db.flush()
     await db.commit()
     await db.refresh(cookie)
+    logger.info(
+        "Cookie updated for source=%s id=%s (cookie_data replaced=%s, expired_at=%s)",
+        cookie.source,
+        cookie.id,
+        "cookie_data" in data and data["cookie_data"] is not None,
+        cookie.expired_at,
+    )
     return cookie
 
 

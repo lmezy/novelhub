@@ -198,6 +198,7 @@ async def collect_login_state(db: AsyncSession, source_id: str | None) -> dict[s
         "names": [],
         "decrypted": False,
         "created_at": None,
+        "updated_at": None,
         "expired_at": None,
         "expired": False,
         "credentials_saved": False,
@@ -207,9 +208,13 @@ async def collect_login_state(db: AsyncSession, source_id: str | None) -> dict[s
 
     rows = list(await db.scalars(select(Cookie).where(Cookie.source == source_id)))
     if rows:
+        # ``updated_at`` is when the stored value was last written; a source
+        # whose Cookie was replaced today must win over one whose row merely
+        # appeared first.
         newest = max(
             rows,
-            key=lambda row: getattr(row, "created_at", None)
+            key=lambda row: getattr(row, "updated_at", None)
+            or getattr(row, "created_at", None)
             or datetime.min.replace(tzinfo=None),
         )
         plaintext, decrypted = _cookie_plaintext(newest.cookie_data or "")
@@ -220,6 +225,7 @@ async def collect_login_state(db: AsyncSession, source_id: str | None) -> dict[s
             "names": cookie_names(plaintext),
             "decrypted": decrypted,
             "created_at": _iso(getattr(newest, "created_at", None)),
+            "updated_at": _iso(getattr(newest, "updated_at", None)),
             "expired_at": _iso(getattr(newest, "expired_at", None)),
             "expired": bool(
                 getattr(newest, "expired_at", None)
@@ -422,7 +428,8 @@ def render_login_state(source: dict[str, Any] | None) -> list[str]:
             )
         lines = [
             head,
-            "- Cookie 保存时间：{}；过期时间：{}{}".format(
+            "- Cookie 最近写入：{}；首次保存：{}；过期时间：{}{}".format(
+                state.get("updated_at") or state.get("created_at") or "未知",
                 state.get("created_at") or "未知",
                 state.get("expired_at") or "未设置",
                 "（**已过期**）" if state.get("expired") else "",
@@ -436,7 +443,8 @@ def render_login_state(source: dict[str, Any] | None) -> list[str]:
     lines.append(
         "- 口径：以本节为准。规则 JSON 的 header 里看不到 cookie 字段**不代表**没配置 Cookie；"
         "「已保存 Cookie」也不代表它仍然有效——被拦/403/要登录时应说 Cookie 可能已过期，"
-        "而不是说「书源未配置 Cookie」。"
+        "而不是说「书源未配置 Cookie」。判断 Cookie 新旧一律以「最近写入」为准：更新 Cookie 只改写"
+        "「最近写入」，「首次保存」仍是这条记录最早入库的时间，用它与任务时间算间隔会得出错误的结论。"
     )
     return lines
 

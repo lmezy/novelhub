@@ -1417,3 +1417,52 @@ backend 容器跑真实索引）：单条件正文的 ids 与 total **完全一�
 
 **排错入口**：`snippet` 字段可由正文扫描窗口缓存，所以改了 `_snippet` 的窗口参数后页码缓存键不含它
 （`PAGE_CACHE_TTL_SECONDS=120`，两分钟内新参数不会立刻生效，属正常）。
+
+## 41. Cookie 更新不改时间戳 /「自动 AI 分析」关不掉（2026-09-20）
+
+**现象**（用户报）：
+1. 失败的 AI 分析说 Cookie 是"很久以前"保存的，但用户确信自己更新过 Cookie。
+2. AI 页面的「同步失败后自动 AI 分析」开关关不掉，刷新后又自己打开。
+
+**根因 1（Cookie 的值换了，时间戳没换）**：`cookies` 表只有 `created_at`（首次入库），
+`PUT /cookies/{id}` 只重写 `cookie_data`。AI 诊断把 `created_at` 渲染成「Cookie 保存时间」，
+于是当天刚粘贴的 Cookie 被算成「间隔约 40 天」，模型据此判定 Cookie 已过期、让用户再导出一次。
+线上实测（`sync_diagnoses` 对照 nginx 访问日志）：
+- 爱丽丝书屋 `e3d1369d…`（`yuedu_31a56dc1e2a9`）：创建 2026-08-11 20:52:52；诊断 2026-09-20 17:24:01
+  写「Cookie 保存于 2026-08-11、本次任务在 2026-09-20，间隔约 40 天」；而同一行在 **2026-09-20
+  12:21:58** 刚被 PUT 更新过（200）。值是最新的，被算成 40 天前。
+- 搬山人小说网 `4c7525f6…`（`yuedu_fc5c098852e0`）：创建 2026-08-13 16:35:00；诊断 2026-09-20 11:53:30
+  写「Cookie 是 2026-08-13 写入的、距今已一个多月」；而该行在 2026-09-16 14:32:20 与 **2026-09-18
+  12:52:43** 都被 PUT 更新过，距诊断只有两天。
+所以**新 Cookie 确实替换了旧值**（用户问的就是这个）；坏的是"保存时间"这个字段。
+
+**根因 2（开关被 Pydantic 静默丢掉）**：`AIConfigUpdate` 没声明 `auto_diagnose`。Pydantic 默认丢弃
+未声明字段，`model_dump(exclude_unset=True)` 里就没有它，`set_ai_config` 永远写不到；线上
+`app_settings` 里**根本没有 `ai_auto_diagnose` 这一行**。前端 `loadAIConfig` 用
+`res.auto_diagnose !== false` 兜底成 true，所以开关每次都弹回打开；接口还返回 200、UI 显示「已保存」。
+存储层 `FIELD_TO_KEY` 早就备好了 `auto_diagnose → ai_auto_diagnose`（`set_ai_config` 也认这个 bool），
+断的只有请求模型这一环。
+
+**改动**：
+- `models/cookie.py` 加 `updated_at`（`server_default=func.now(), onupdate=func.now()`）。用 `onupdate`
+  而不是只在路由里赋值：写 `cookie_data` 的入口有四个（`routes/cookies.py`、凭据自动登录
+  `routes/credentials.py`、`cookie_health._try_refresh`、手动登录），ORM UPDATE 会自动带上时间戳。
+- 新迁移 `0035_cookie_updated_at`：加列 → **用 `created_at` 回填** → 补 `DEFAULT now()`。回填绝不能用
+  `now()`，否则所有老 Cookie 会一起变成"刚更新"，比原来的错更危险。`test_migrations` 的 head 断言同步改。
+- `services/ai_diagnosis.py`：证据同时给「最近写入」与「首次保存」，口径里写明**判断新旧只看最近写入**；
+  选行也从 `created_at` 改成 `updated_at or created_at`（就地更新的行不该被"先入库"顺序挑中）。
+- `routes/admin.py`：`AIConfigUpdate` 补 `auto_diagnose: bool | None = None`。
+- `routes/cookies.py`：更新落一条 info 日志（原来更新路径**完全没有日志**，排障只能翻 nginx）。
+- 前端：书源面板的 Cookie 行显示「最近更新」；展开书源时把已存的 `expired_at` 回填进 `datetime-local`
+  —— 原来面板对着一个已有 Cookie 却显示空日期，点「更新 Cookie」会把用户没碰过的 `expired_at`
+  静默清成 null（既有 14 行数据的 `expired_at` 本来就都是空，属潜在坑）。
+
+**验证**：866 → 873 passed（+7）。把 5 个源码文件 `git stash` 掉跑新测试 **6/6 失败**（另一个是
+"新值确实替换旧值"的守卫测试，两边都过），`git stash pop` 后全绿；`npm run typecheck`、`npm run build`
+通过。`alembic upgrade 0034_source_sync_interval:0035_cookie_updated_at --sql` 产出：
+`ALTER TABLE cookies ADD COLUMN updated_at TIMESTAMP WITHOUT TIME ZONE` →
+`UPDATE cookies SET updated_at = created_at` → `ALTER TABLE cookies ALTER COLUMN updated_at SET DEFAULT now()`。
+
+**待用户处理**：重建 `lonezy/novelhub-backend` 与 `lonezy/novelhub-frontend` **两个**镜像并重新部署。
+backend 的启动命令自带 `alembic upgrade head`，迁移会自动执行。部署后老 Cookie 的「最近写入」等于
+它的首次保存时间（故意如此），再更新一次就会看到时间跳到当下。

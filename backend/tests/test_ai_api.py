@@ -303,6 +303,33 @@ async def test_admin_update_ai_encrypts_the_key():
 
 
 @pytest.mark.asyncio
+async def test_admin_update_ai_persists_the_auto_diagnose_toggle():
+    """The switch the UI sends has to survive the request model.
+
+    ``AIConfigUpdate`` never declared ``auto_diagnose``, so Pydantic dropped it:
+    ``PUT /admin/ai`` answered 200, ``app_settings`` got no ``ai_auto_diagnose``
+    row, and the toggle came back on after a reload.
+    """
+    db = fake_db()
+
+    resp = await call("PUT", "/api/admin/ai", db, json={"auto_diagnose": False})
+
+    assert resp.status_code == 200
+    stored = {entry.args[0].key: entry.args[0].value for entry in db.add.call_args_list}
+    assert stored["ai_auto_diagnose"] == "false"
+
+
+def test_the_request_model_declares_every_storable_ai_setting():
+    """``FIELD_TO_KEY`` is the set of settings this API owns; the Pydantic
+    request model is the only gate between the UI payload and storage, so a
+    setting missing from it can never be saved."""
+    from app.api.routes.admin import AIConfigUpdate
+    from app.services.ai_config import FIELD_TO_KEY
+
+    assert set(FIELD_TO_KEY) <= set(AIConfigUpdate.model_fields)
+
+
+@pytest.mark.asyncio
 async def test_admin_update_ai_keeps_an_unchanged_key():
     db = fake_db()
 

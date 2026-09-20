@@ -319,6 +319,10 @@ class AIConfigUpdate(BaseModel):
     embedding_base_url: str | None = None
     embedding_api_key: str | None = None
     embedding_model: str | None = None
+    #: Pydantic drops unknown fields from ``model_dump``, so a setting the UI
+    #: sends but this model does not declare is silently never persisted -- the
+    #: toggle moved on screen and came back on after a reload.
+    auto_diagnose: bool | None = None
 
 
 def _config_payload(payload: BaseModel) -> dict:

@@ -19,6 +19,7 @@ class CookieOut(BaseModel):
     cookie_data: str
     expired_at: datetime | None = None
     created_at: datetime | None = None
+    updated_at: datetime | None = None
 
     class Config:
         from_attributes = True

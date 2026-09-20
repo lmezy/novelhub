@@ -278,6 +278,7 @@ def make_cookie_row(**overrides):
         "cookie_data": "ss_userid=283; cf_clearance=abc123; fontsize=16px",
         "expired_at": None,
         "created_at": datetime(2026, 9, 18, 21, 39, 29),
+        "updated_at": None,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -357,6 +358,33 @@ async def test_collect_evidence_marks_an_expired_cookie_and_saved_credentials():
 
 
 @pytest.mark.asyncio
+async def test_collect_evidence_reads_the_most_recently_written_cookie():
+    """The row written last describes the live login, whatever it was created.
+
+    Updating a Cookie replaces ``cookie_data`` in place, so ordering by
+    ``created_at`` alone can hand the model a value that was replaced since.
+    """
+    db = FakeDB(
+        task=make_task(),
+        source=make_source(),
+        cookie_rows=[
+            make_cookie_row(id="c-old", created_at=datetime(2026, 9, 18, 9, 0),
+                            updated_at=datetime(2026, 9, 18, 9, 0),
+                            cookie_data="fontsize=16px"),
+            make_cookie_row(id="c-new", created_at=datetime(2026, 8, 11, 20, 52, 52),
+                            updated_at=datetime(2026, 9, 20, 12, 21),
+                            cookie_data="cf_clearance=fresh; fontsize=16px"),
+        ],
+    )
+
+    state = (await collect_evidence(db, db.task)).source["cookies"]
+
+    assert state["names"] == ["cf_clearance", "fontsize"]
+    assert state["created_at"] == "2026-08-11T20:52:52"
+    assert state["updated_at"] == "2026-09-20T12:21:00"
+
+
+@pytest.mark.asyncio
 async def test_collect_evidence_without_a_cookie_says_so():
     db = FakeDB(task=make_task(), source=make_source())
 
@@ -393,6 +421,35 @@ def test_render_evidence_tells_the_model_a_cookie_is_configured():
     # The prompt has to say out loud that the rules JSON is not the source of
     # truth for cookies, otherwise the model repeats the wrong conclusion.
     assert "不代表" in text
+
+
+def test_render_login_state_separates_first_save_from_the_last_write():
+    """Live ``sync_diagnoses`` blamed a Cookie that had been refreshed that day.
+
+    The prompt carried only ``created_at``, so the model computed「间隔约 40 天」
+    from the row's first import and told the user to go export a fresh Cookie.
+    """
+    lines = render_login_state({"cookies": {
+        "configured": True, "count": 1, "names": ["cf_clearance"],
+        "created_at": "2026-08-11T20:52:52",
+        "updated_at": "2026-09-20T12:21:58",
+        "expired_at": None, "expired": False, "credentials_saved": False,
+    }})
+
+    text = "\n".join(lines)
+    assert "最近写入：2026-09-20T12:21:58" in text
+    assert "首次保存：2026-08-11T20:52:52" in text
+    assert "以「最近写入」为准" in text
+
+
+def test_render_login_state_falls_back_to_created_at_without_a_write_time():
+    lines = render_login_state({"cookies": {
+        "configured": True, "count": 1, "names": ["cf_clearance"],
+        "created_at": "2026-08-11T20:52:52", "expired_at": None,
+        "expired": False, "credentials_saved": False,
+    }})
+
+    assert "最近写入：2026-08-11T20:52:52" in "\n".join(lines)
 
 
 def test_render_login_state_says_no_cookie_only_when_the_store_is_empty():
