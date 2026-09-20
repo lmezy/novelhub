@@ -1503,6 +1503,188 @@ async def test_get_falls_back_to_direct_when_proxy_unreachable():
 
 
 @pytest.mark.asyncio
+async def test_proxy_failure_warning_names_the_url(caplog):
+    """The fallback warning must say *what* failed, not just that the proxy did.
+
+    2026-09-20: the crawler logged 36 of these in 40 minutes and there was no
+    way to tell which of the ~14 sources produced them.  A single origin that
+    held its first byte for ~25s (against the 25s read timeout) therefore read
+    like a broken proxy, and finding it took a per-site probe of every source.
+    """
+    YueduPlugin._clients.clear()
+    YueduPlugin._transport_bad_until.clear()
+    YueduPlugin._transport_preferred.clear()
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://warn.example.com",
+        "concurrentRate": "0",
+    })
+    request = httpx.Request("GET", "https://warn.example.com/book/1")
+    proxy_calls: list[str | None] = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            proxy_calls.append(self.kwargs.get("proxy"))
+
+        async def get(self, url, headers=None):
+            if self.kwargs.get("proxy"):
+                raise httpx.ReadTimeout("", request=request)
+            return SimpleNamespace(
+                status_code=200,
+                headers={},
+                text="<html>ok</html>",
+                raise_for_status=lambda: None,
+            )
+
+    try:
+        with (
+            patch("httpx.AsyncClient", FakeClient),
+            patch("asyncio.sleep", AsyncMock()),
+            patch(
+                "app.services.proxy_config.get_proxy_config",
+                return_value=ProxyConfig(
+                    enabled=True,
+                    https_proxy="http://127.0.0.1:27890",
+                    http_proxy="http://127.0.0.1:27890",
+                ),
+            ),
+            caplog.at_level("WARNING"),
+        ):
+            html = await plugin._get("https://warn.example.com/book/1")
+    finally:
+        YueduPlugin._clients.clear()
+        YueduPlugin._transport_bad_until.clear()
+        YueduPlugin._transport_preferred.clear()
+
+    assert html == "<html>ok</html>"
+    assert proxy_calls[0] == "http://127.0.0.1:27890"
+    proxy_warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "Configured proxy" in record.getMessage()
+    ]
+    assert proxy_warnings, [record.getMessage() for record in caplog.records]
+    assert all(
+        "https://warn.example.com/book/1" in message for message in proxy_warnings
+    ), proxy_warnings
+    assert all("ReadTimeout" in message for message in proxy_warnings), proxy_warnings
+
+
+@pytest.mark.asyncio
+async def test_get_still_tries_the_proxy_when_direct_is_ranked_first():
+    """A direct-first ordering must not skip the proxy candidate.
+
+    ``_ordered_transports`` ranks direct first while the proxy is in cooldown
+    (and after any direct success).  The loop used to raise as soon as the
+    *direct* attempt failed -- guaranteed for a source that is only reachable
+    through the proxy -- so one proxy hiccup became a full 60s cooldown window
+    of failures in which the working proxy was never tried again.
+    """
+    YueduPlugin._clients.clear()
+    YueduPlugin._transport_bad_until.clear()
+    YueduPlugin._transport_preferred.clear()
+    proxy = "http://127.0.0.1:27890"
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://direct-first.example.com",
+        "concurrentRate": "0",
+    })
+    plugin._mark_transport_failure(proxy)  # proxy cooling down -> direct first
+    assert plugin._ordered_transports(proxy)[0] is None
+
+    proxy_calls: list[str | None] = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.proxy = kwargs.get("proxy")
+            proxy_calls.append(self.proxy)
+
+        async def get(self, url, headers=None):
+            if self.proxy is None:
+                raise httpx.ConnectError("direct is blocked", request=None)
+            return SimpleNamespace(
+                status_code=200,
+                headers={},
+                text="<html>via-proxy</html>",
+                raise_for_status=lambda: None,
+            )
+
+    try:
+        with (
+            patch("httpx.AsyncClient", FakeClient),
+            patch.object(YueduPlugin, "_looks_polluted", return_value=False),
+            patch("asyncio.sleep", AsyncMock()),
+            patch(
+                "app.services.proxy_config.get_proxy_config",
+                return_value=ProxyConfig(
+                    enabled=True,
+                    https_proxy=proxy,
+                    http_proxy=proxy,
+                ),
+            ),
+        ):
+            html = await plugin._get("https://direct-first.example.com/book/1")
+    finally:
+        YueduPlugin._clients.clear()
+        YueduPlugin._transport_bad_until.clear()
+        YueduPlugin._transport_preferred.clear()
+
+    assert html == "<html>via-proxy</html>"
+    assert proxy_calls[0] is None, proxy_calls
+    assert proxy_calls[-1] == proxy, proxy_calls
+
+
+@pytest.mark.asyncio
+async def test_get_raises_only_after_the_last_candidate_fails():
+    """Every candidate gets its turn; the *last* failure is what propagates."""
+    YueduPlugin._clients.clear()
+    YueduPlugin._transport_bad_until.clear()
+    YueduPlugin._transport_preferred.clear()
+    proxy = "http://127.0.0.1:27890"
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://all-dead.example.com",
+        "concurrentRate": "0",
+    })
+    plugin._mark_transport_failure(proxy)
+    request = httpx.Request("GET", "https://all-dead.example.com/book/1")
+
+    proxy_calls: list[str | None] = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.proxy = kwargs.get("proxy")
+            proxy_calls.append(self.proxy)
+
+        async def get(self, url, headers=None):
+            if self.proxy is None:
+                raise httpx.ConnectError("direct is blocked", request=None)
+            raise httpx.ReadTimeout("", request=request)
+
+    try:
+        with (
+            patch("httpx.AsyncClient", FakeClient),
+            patch.object(YueduPlugin, "_looks_polluted", return_value=False),
+            patch("asyncio.sleep", AsyncMock()),
+            patch(
+                "app.services.proxy_config.get_proxy_config",
+                return_value=ProxyConfig(
+                    enabled=True,
+                    https_proxy=proxy,
+                    http_proxy=proxy,
+                ),
+            ),
+        ):
+            with pytest.raises(httpx.ReadTimeout):
+                await plugin._get("https://all-dead.example.com/book/1")
+    finally:
+        YueduPlugin._clients.clear()
+        YueduPlugin._transport_bad_until.clear()
+        YueduPlugin._transport_preferred.clear()
+
+    assert proxy_calls[0] is None, proxy_calls
+    assert proxy_calls[-1] == proxy, proxy_calls
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "stale_error",
     [httpx.ReadTimeout("read timed out"), httpx.ReadError("connection reset")],

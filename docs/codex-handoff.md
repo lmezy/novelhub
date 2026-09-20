@@ -1508,3 +1508,63 @@ crawler 镜像内嵌了 `backend/` 这份代码（`COPY backend/ ./backend/`）�
 **已发现但未改（同类，等确认）**：`backend/app/api/routes/crawl.py::retry_task` 第 291-294 行
 在自己的请求会话（长事务）上读 Cookie，而那个 `plugin` 变量**后面根本没被使用**——`svc.sync_bookshelf()`
 会自建 plugin 并自己设置 Cookie。也就是说这 4 行的唯一可观察效果就是压住 `cookies` 的读锁，直接删掉即可。
+
+## 43. 「容器一直报 Configured proxy … ReadTimeout」：代理没坏，是 Icu 源站首字节撞上读超时（2026-09-20）
+
+**现象**（用户报）：metacube(xd) 代理本身正常可用，但 crawler 日志持续出现
+`Configured proxy http://…:27890 request failed (ReadTimeout); retrying direct`，且日志里的地址从
+`192.168.1.17:27890` 变成 `127.0.0.1:27890` 后依旧。
+
+**先证伪「代理/网络不可达」**（全部在 NAS 上实测，非推断）：
+
+| 检查 | 结果 |
+|---|---|
+| 容器网络模式 | 全部 `network_mode: host`；27890 是 metacubexd 里 mihomo 的 `MIXED_PORT`，`*:27890` 在听 |
+| 容器内裸 `CONNECT` 握手 | `HTTP/1.1 200 Connection established` 耗时 **0.00s**（127.0.0.1 与 192.168.1.17 都是） |
+| mihomo 自身日志 | 每个连接一行 `match Match using 节点选择[日本JP-HY2]`，无错误、瞬时 |
+| 同一代理同一节点并发测 6 个源站 | h528 0.35s、cool18 1.16s、yswhub 1.62s、alicesw 0.64s、yaoluku 0.32s **全部 200** |
+| 同批直连 | **6/6 全挂**（ConnectTimeout / ConnectError）——这些站本来就只能走代理 |
+
+**根因**：唯一失败的是 `Icu`（源 id `yuedu_963f7dd31df3`，`ztopaq7zrz.hq555.icu:1678`）。实测它
+**首字节（TTFB）22.92s / 25.32s / 28.68s**（三次都是 HTTP 200、73901 字节），而爬虫的读超时是
+`YUEDU_HTTP_READ_TIMEOUT` 默认 **25s**（容器内没有任何 `YUEDU_*` 覆盖）。也就是说这台源站**正好骑在
+超时线上**：过线就 ReadTimeout → 打 warning → 转直连 → 直连必然 ConnectError → 该书同步失败。
+代理只是被动转发那个 25s 的首字节，**它没坏**。
+
+量化（容器 22:08 重启后约 40 分钟）：`Sync complete` 1152 次 / `Failed to sync` 12 次，**其中 11 次是
+hq555**；代理告警 36 条 = ReadTimeout 24 + ReadError 4 + ConnectTimeout 4 + ConnectError 3。
+
+**顺带查出的真 bug（owner: `_get`/`_post` 的候选循环）**：`_mark_transport_failure` 把代理拉黑
+`YUEDU_TRANSPORT_COOLDOWN_SECONDS`（默认 60s）后，`_ordered_transports` 会把**直连排到第一位**；此时
+直连一失败，循环里的 `if proxy is None: raise` 就**直接抛出**，后面的代理候选根本没被试。对「代理慢但
+能成、直连必挂」的源，一次超时 = 整个冷却窗内该源全部失败。日志证据：22:47:58 三本书失败报
+`ConnectTimeout`，而同一时段**没有任何代理告警**——正是「直连优先 → 直接放弃」这条路径。
+
+**改动（按用户指定顺序 C → B → A）**：
+
+- **C（可观测性）**：`transport.py` 四处 fallback 告警补上 URL 与「下一跳是谁」。
+  原来只说「代理失败了」，不说目标地址——这正是这次要翻 mihomo 日志、逐站实测才能定位的原因。
+- **B（正确性）**：两个候选循环改为按 `enumerate` 判断 `is_last`，**只有最后一个候选失败才 raise**；
+  失败方是直连时也照实说（`Direct connection request failed for …; retrying proxy …`），
+  不再用「Configured proxy」误标。HTTP 状态那一支同样改为 `is_last or status not in (…)`。
+- **A（部署旋钮，已上线）**：NAS `.env` 加 `YUEDU_HTTP_READ_TIMEOUT=45` +
+  `YUEDU_HTTP_RETIRE_SECONDS=65`。**这两个必须成对**：`_retire_grace_seconds()` 默认 45 是照着
+  「读超时 25s」写的，读超时提到 45 而不管 retire，就会在请求还在飞的时候关掉退役连接池。
+
+**验证**：`877 passed`（874 + 3 个新用例）。三个新用例在改动前的旧文件上**全部失败**
+（`git stash` 掉 transport.py 复跑：除 4 处告警不报 URL 外，`test_get_still_tries_the_proxy_when_direct_is_ranked_first`
+与 `test_get_raises_only_after_the_last_candidate_fails` 报 `ConnectError`——直连的错误直接抛出、代理没被试）。
+新用例：`test_proxy_failure_warning_names_the_url`、`..._direct_is_ranked_first`、`..._last_candidate_fails`。
+
+**A 的线上验证**：recreate 后 `novelhub-backend` / `novelhub-crawler` 的 `printenv` 均为 `45` `65`，
+backend `{"status":"ok"}`、nginx `GET /` 200。重启前 `pg_stat_activity` 曾瞬时出现 24 个
+`idle in transaction`（活跃同步并发数），重启后稳定回到 1——即第 42 节那个「读锁压住迁移」的机制是
+**并发同步数**决定的，不是连接泄漏。
+
+**待用户处理**：重建 `lonezy/novelhub-backend` **和 `lonezy/novelhub-crawler`** 两个镜像并重新部署，
+C 和 B 才会生效（NAS 不 build，镜像是从 Docker Hub 拉的）。A 已在线上生效，且**单独就能让 Icu 那
+462 本书过线**。
+
+**同型未改（等确认）**：`images.py:130` 与 `book.py:534` 也是 `if proxy is None: break`——直连优先时
+同样会跳过代理，只是这两处是「尽力而为」的封面/正文图（失败只返回 None），且它们已经有带 URL 的收尾
+告警，所以影响小得多。

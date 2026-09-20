@@ -152,6 +152,14 @@ class TransportMixin:
             return 4
     def _transport_key(self, proxy: str | None) -> str:
         return f"{self.base_url or 'default'}::{'proxy' if proxy else 'direct'}"
+    @staticmethod
+    def _transport_label(proxy: str | None) -> str:
+        """Name the transport that failed, for the fallback warning."""
+        return f"Configured proxy {proxy}" if proxy else "Direct connection"
+    @staticmethod
+    def _retry_transport_label(proxy: str | None) -> str:
+        """Name the transport about to be tried, for the fallback warning."""
+        return f"proxy {proxy}" if proxy else "direct"
     def _transport_in_cooldown(self, proxy: str | None) -> bool:
         until = self.__class__._transport_bad_until.get(
             self._transport_key(proxy),
@@ -814,20 +822,29 @@ class TransportMixin:
                 + (f" (HTTP {last_status})" if last_status else "")
             )
 
+        transports = self._ordered_transports(proxy_url)
         last_error: httpx.HTTPError | None = None
-        for proxy in self._ordered_transports(proxy_url):
+        for index, proxy in enumerate(transports):
+            # Only give up once *every* candidate failed.  ``_ordered_transports``
+            # ranks direct first while the proxy is in cooldown (or after a direct
+            # success), so a failing direct attempt does not mean there is nothing
+            # left to try: raising here skipped the proxy and failed every request
+            # for the whole cooldown window even though the proxy worked.
+            is_last = index == len(transports) - 1
             try:
                 html = await _request(proxy)
             except httpx.RequestError as exc:
                 last_error = exc
                 self._mark_transport_failure(proxy)
-                if proxy is None:
+                if is_last:
                     raise
                 logger.warning(
-                    "Configured proxy %s request failed (%s%s); retrying direct",
-                    proxy_url,
+                    "%s request failed for %s (%s%s); retrying %s",
+                    self._transport_label(proxy),
+                    url,
                     type(exc).__name__,
                     f": {exc}" if str(exc) else "",
+                    self._retry_transport_label(transports[index + 1]),
                 )
                 continue
             except httpx.HTTPStatusError as exc:
@@ -841,13 +858,16 @@ class TransportMixin:
                 # specific to this exit node / IP.  A 404 from the proxy is a
                 # definitive answer; falling back to direct just burned the
                 # 3x connect timeout before failing anyway.
-                if proxy is None or status not in (
+                if is_last or status not in (
                     403, 408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524,
                 ):
                     raise
                 logger.warning(
-                    "Configured proxy returned HTTP %s; retrying direct",
+                    "%s returned HTTP %s for %s; retrying %s",
+                    self._transport_label(proxy),
                     status if status is not None else "error",
+                    url,
+                    self._retry_transport_label(transports[index + 1]),
                 )
                 continue
             self._mark_transport_success(proxy)
@@ -1068,20 +1088,25 @@ class TransportMixin:
                 + (f" (HTTP {last_status})" if last_status else "")
             )
 
+        transports = self._ordered_transports(proxy_url)
         last_error: httpx.HTTPError | None = None
-        for proxy in self._ordered_transports(proxy_url):
+        for index, proxy in enumerate(transports):
+            # See ``_get``: a direct-first ordering must not skip the proxy.
+            is_last = index == len(transports) - 1
             try:
                 html = await _request(proxy)
             except httpx.RequestError as exc:
                 last_error = exc
                 self._mark_transport_failure(proxy)
-                if proxy is None:
+                if is_last:
                     raise
                 logger.warning(
-                    "Configured proxy %s request failed (%s%s); retrying direct",
-                    proxy_url,
+                    "%s request failed for %s (%s%s); retrying %s",
+                    self._transport_label(proxy),
+                    url,
                     type(exc).__name__,
                     f": {exc}" if str(exc) else "",
+                    self._retry_transport_label(transports[index + 1]),
                 )
                 continue
             except httpx.HTTPStatusError as exc:
@@ -1091,13 +1116,16 @@ class TransportMixin:
                     if exc.response is not None
                     else None
                 )
-                if proxy is None or status not in (
+                if is_last or status not in (
                     403, 408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524,
                 ):
                     raise
                 logger.warning(
-                    "Configured proxy returned HTTP %s; retrying direct",
+                    "%s returned HTTP %s for %s; retrying %s",
+                    self._transport_label(proxy),
                     status if status is not None else "error",
+                    url,
+                    self._retry_transport_label(transports[index + 1]),
                 )
                 continue
             self._mark_transport_success(proxy)
