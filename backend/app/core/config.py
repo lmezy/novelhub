@@ -86,6 +86,23 @@ class Settings(BaseSettings):
     SYNC_WORKER_CONCURRENCY:int=0
     SYNC_PAGE_BATCH_SIZE:int=0
     SYNC_BATCH_INTERVAL_MS:int=5000
+    # A paused/cancelled task only stops at the next checkpoint inside the sync,
+    # and until it reaches one it still owns a worker slot, its source and its
+    # pooled connection.  A source stuck behind a dead proxy or an anti-bot gate
+    # can go a very long time without reaching a checkpoint, which is how a
+    # queue whose every slot is "busy" stops consuming new tasks for good.
+    # After this many seconds the worker stops waiting and cancels the task's
+    # coroutine: the row already holds the state the user asked for, and the
+    # next resume continues from the last checkpointed page.
+    SYNC_TASK_STOP_GRACE_SECONDS:int=120
+    # How often the worker re-reads the state of the tasks it is running.
+    SYNC_TASK_SUPERVISE_INTERVAL_SECONDS:int=15
+    # A running task that reports no progress at all for this long is treated as
+    # hung: it is failed with an explicit message and taken off the queue so its
+    # slot comes back.  0 disables the watchdog.  The default is deliberately
+    # generous, because a source throttled to one request per minute can
+    # legitimately report a page only every few minutes.
+    SYNC_TASK_STALL_SECONDS:int=3600
 
 
 settings=Settings()
@@ -127,4 +144,36 @@ def sync_source_concurrency() -> int:
     except (TypeError, ValueError):
         return 0
     return value if value > 0 else 0
+
+
+def _seconds_setting(name: str, default: int) -> float:
+    """Read a non-negative seconds setting, falling back to ``default``.
+
+    Junk (``None``, ``"abc"``) and negatives must not be able to switch a safety
+    net off in a way nobody notices, so both mean "use the default".
+    """
+    try:
+        value = int(getattr(settings, name, default))
+    except (TypeError, ValueError):
+        value = default
+    return float(value if value >= 0 else default)
+
+
+def task_stop_grace_seconds() -> float:
+    """How long a task that must stop may take to reach its own checkpoint."""
+    return _seconds_setting("SYNC_TASK_STOP_GRACE_SECONDS", 120)
+
+
+def task_supervise_interval_seconds() -> float:
+    """How often the worker re-reads the state of the tasks it runs."""
+    return max(1.0, _seconds_setting("SYNC_TASK_SUPERVISE_INTERVAL_SECONDS", 15))
+
+
+def task_stall_seconds() -> float:
+    """How long a running task may report no progress before it is hung.
+
+    ``0`` disables the watchdog, which is the only way to keep a task that never
+    reaches a checkpoint from holding its slot forever.
+    """
+    return _seconds_setting("SYNC_TASK_STALL_SECONDS", 3600)
 

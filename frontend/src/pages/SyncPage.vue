@@ -24,6 +24,7 @@ const autoSyncError = ref("")
 const syncMaxPages = ref(20)
 const bookshelfSyncing = ref(false)
 const bookshelfResults = ref<any[]>([])
+const historyNotice = ref("")
 
 const activeTask = computed(() => crawlStore.activeTask)
 const enabledSources = computed(() => sources.value.filter((s: any) => s.enabled))
@@ -48,10 +49,11 @@ const activeProgress = computed(() => {
   return Math.min(100, Math.round((pages / max) * 100))
 })
 
-// Recent tasks: what is running now on top, failed tasks directly below it,
-// everything else keeps the newest-first order. Sorted again on the client so
-// a task that changes status in place (pause/cancel/finish) stays in place.
-const taskStatusRank: Record<string, number> = { running: 0, failed: 1 }
+// Recent tasks: what is running now on top, then what is queued, then what the
+// user paused -- the same ranking the API sorts by.  Sorting again on the client
+// keeps a task that changes status in place, and because no finished task is
+// ranked, an active one can never be pushed out of the list.
+const taskStatusRank: Record<string, number> = { running: 0, pending: 1, paused: 2 }
 const orderedTasks = computed(() =>
   [...tasks.value].sort((a: any, b: any) => {
     const rankDiff = (taskStatusRank[a.status] ?? 2) - (taskStatusRank[b.status] ?? 2)
@@ -61,6 +63,11 @@ const orderedTasks = computed(() =>
 )
 
 const terminal = ["completed", "failed", "cancelled", "completed_with_errors"]
+// Polling only tells us something new while the worker can still move the task.
+const pollable = ["pending", "running"]
+// What the server lets us delete: anything that is not waiting for, or
+// occupying, a place in the queue.
+const deletable = ["paused", ...terminal]
 
 function sourceName(task: any) {
   return sources.value.find((s) => s.id === task.source)?.name || task.source
@@ -347,11 +354,37 @@ async function cancelTask() {
   if (activeTask.value) await cancelTaskById(activeTask.value)
 }
 
+async function deleteTask(task: any) {
+  if (!confirm(i18n.t('sync_delete_confirm'))) return
+  pageError.value = ""
+  historyNotice.value = ""
+  try {
+    await api.delete<any>(`/crawl/tasks/${task.id}`)
+    tasks.value = tasks.value.filter((t) => t.id !== task.id)
+    if (crawlStore.activeTask?.id === task.id) crawlStore.clear()
+  } catch (e) {
+    pageError.value = e instanceof Error ? e.message : i18n.t('sync_delete_failed')
+  }
+}
+
+async function clearHistory() {
+  if (!confirm(i18n.t('sync_clear_history_confirm'))) return
+  pageError.value = ""
+  historyNotice.value = ""
+  try {
+    const res = await api.post<any>("/crawl/tasks/clear-history")
+    historyNotice.value = i18n.t('sync_clear_history_done', { n: res.deleted ?? 0 })
+    await loadTasks()
+  } catch (e) {
+    pageError.value = e instanceof Error ? e.message : i18n.t('sync_clear_history_failed')
+  }
+}
+
 onMounted(async () => {
   await loadSources()
   await loadAutoSyncSettings()
   await loadTasks()
-  if (crawlStore.activeTask?.id && !terminal.includes(crawlStore.activeTask.status)) {
+  if (crawlStore.activeTask?.id && pollable.includes(crawlStore.activeTask.status)) {
     crawlStore.startPolling(crawlStore.activeTask.id)
   }
 })
@@ -507,6 +540,7 @@ onMounted(async () => {
           <button v-if="activeTask.status === 'paused'" @click="resumeTask" class="px-3 py-1.5 text-xs rounded border border-green-600 text-green-700 dark:text-green-400 hover:bg-green-50 dark:hover:bg-green-950">{{ i18n.t('sync_resume') }}</button>
           <button v-if="activeTask.status === 'pending' || activeTask.status === 'paused'" @click="moveTaskFront(activeTask)" class="px-3 py-1.5 text-xs rounded border border-accent text-accent hover:bg-accent/10">{{ i18n.t('sync_top') }}</button>
           <button v-if="!terminal.includes(activeTask.status)" @click="cancelTask" class="px-3 py-1.5 text-xs rounded border border-red-500 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950">{{ i18n.t('sync_cancel') }}</button>
+          <button v-if="deletable.includes(activeTask.status)" @click="deleteTask(activeTask)" class="px-3 py-1.5 text-xs rounded border border-red-300 text-red-500 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950">{{ i18n.t('sync_delete') }}</button>
         </div>
         <p v-if="activeTask.error" class="text-xs text-red-600 mt-3">{{ activeTask.error }}</p>
         <p v-if="activeTask.result" class="text-xs text-muted dark:text-gray-400 mt-3">
@@ -603,8 +637,16 @@ onMounted(async () => {
       <section class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
         <div class="flex items-center justify-between mb-3">
           <h2 class="text-sm font-semibold">{{ i18n.t('sync_recent_tasks') }}</h2>
-          <span class="text-xs text-muted dark:text-gray-400">{{ i18n.t('sync_tasks_count', { n: tasks.length }) }}</span>
+          <div class="flex items-center gap-2">
+            <span class="text-xs text-muted dark:text-gray-400">{{ i18n.t('sync_tasks_count', { n: tasks.length }) }}</span>
+            <button
+              v-if="tasks.some((t) => deletable.includes(t.status))"
+              @click="clearHistory"
+              class="text-xs px-2 py-1 rounded border border-red-300 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950"
+            >{{ i18n.t('sync_clear_history') }}</button>
+          </div>
         </div>
+        <p v-if="historyNotice" class="text-xs text-green-600 dark:text-green-400 mb-3">{{ historyNotice }}</p>
         <p v-if="loadingTasks" class="text-sm text-muted">{{ i18n.t('sync_loading') }}</p>
         <p v-else-if="tasks.length === 0" class="text-sm text-muted">{{ i18n.t('sync_no_tasks') }}</p>
         <div v-else class="divide-y divide-border">
@@ -622,6 +664,7 @@ onMounted(async () => {
                 <button v-if="task.status === 'paused'" @click.stop="taskAction(task, 'resume')" class="text-xs px-2 py-1 rounded border border-green-600 text-green-700 dark:text-green-400 hover:bg-green-50 dark:hover:bg-green-950">{{ i18n.t('sync_resume') }}</button>
                 <button v-if="task.status === 'pending' || task.status === 'paused'" @click.stop="moveTaskFront(task)" class="text-xs px-2 py-1 rounded border border-accent text-accent hover:bg-accent/10">{{ i18n.t('sync_top') }}</button>
                 <button v-if="!terminal.includes(task.status)" @click.stop="cancelTaskById(task)" class="text-xs px-2 py-1 rounded border border-red-500 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950">{{ i18n.t('sync_cancel') }}</button>
+                <button v-if="deletable.includes(task.status)" @click.stop="deleteTask(task)" class="text-xs px-2 py-1 rounded border border-red-300 text-red-500 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950">{{ i18n.t('sync_delete') }}</button>
               </div>
             </div>
             <div class="flex items-center gap-3 text-xs text-muted dark:text-gray-400">

@@ -8,7 +8,10 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.exc import MissingGreenlet
 
 from app.services.crawl_runner import (
+    _ActiveTask,
+    _abandoned_tasks,
     _next_pending_tasks,
+    _release_abandoned,
     _task_slot_budget,
     _worker_loop,
     run_crawl_task_async,
@@ -21,9 +24,41 @@ from app.services.sync import SyncPaused
 from app.core.config import db_pool_capacity, settings
 
 
+@pytest.fixture(autouse=True)
+def _supervision_without_a_database():
+    """Keep the worker loop's supervision out of the unit tests.
+
+    ``_worker_loop`` re-reads the state of the tasks it runs every interval; in
+    a unit test that would dial a database that is not there.  The supervisor's
+    own behaviour is covered by the dedicated tests below.
+    """
+    with patch(
+        "app.services.crawl_runner._read_active_task_states",
+        new=AsyncMock(return_value={}),
+    ):
+        yield
+
+
+def _bound_values(query) -> set:
+    """Every bound value of a compiled query, flattening ``IN`` expansions."""
+    values: set = set()
+    for value in query.compile().params.values():
+        if isinstance(value, (list, tuple, set)):
+            values.update(value)
+        else:
+            values.add(value)
+    return values
+
+
 @pytest.mark.asyncio
-async def test_recent_tasks_put_running_first_then_failed():
-    """The sync page shows what is running now, then what broke."""
+async def test_recent_tasks_rank_every_active_task_above_finished_ones():
+    """Active tasks own the top of the list, whatever else is in the table.
+
+    The sync page asks for 100 rows.  Ranking failures just below running ones
+    meant 137 failed tasks filled the entire window: a task created by the sync
+    button was invisible, and pausing a running task dropped it out of the list
+    (online, 2026-09-20).
+    """
     from app.repositories.crawl_task import CrawlTaskRepository
 
     captured: dict[str, object] = {}
@@ -46,9 +81,16 @@ async def test_recent_tasks_put_running_first_then_failed():
     sql = str(compiled)
     params = set(compiled.params.values())
 
-    assert {"running", "failed"} <= params
+    assert {"running", "pending", "paused"} <= params
+    # A finished task is not ranked at all: it falls into the CASE's ELSE
+    # branch, which sorts below every active status.
+    assert "failed" not in params
     assert "CASE" in sql
     assert sql.index("CASE") < sql.index("crawl_tasks.created_at DESC")
+
+    rank = CrawlTaskRepository.STATUS_RANK
+    assert set(rank) == {"running", "pending", "paused"}
+    assert max(rank.values()) < len(rank)
 
 
 def _task(**overrides):
@@ -767,4 +809,317 @@ async def test_worker_loop_starts_no_more_tasks_than_the_pool_can_serve():
                     pass
 
     assert len(started) == budget
+
+
+# ---------------------------------------------------------------------------
+# Supervision: a slot must never be held by a task that is not running any more.
+#
+# Online on 2026-09-20 the queue stopped consuming anything for 12 hours: every
+# slot was held by a task the user had already paused or cancelled, whose sync
+# never reached a checkpoint to notice, so nine freshly created tasks stayed
+# ``pending`` while the worker sat idle in epoll_wait.
+# ---------------------------------------------------------------------------
+
+
+def _entry(task_id="task-a", source="yuedu_a", now=0.0) -> _ActiveTask:
+    return _ActiveTask(task_id, source, now)
+
+
+def _states(task_id, status, *, progress=None, extra=None):
+    states = {task_id: {"status": status, "progress": progress or {}}}
+    states.update(extra or {})
+    return states
+
+
+def test_abandoned_tasks_gives_a_paused_task_its_grace_then_takes_it_back():
+    entry = _entry()
+    active = {"slot": entry}
+
+    # First sighting: the row says paused, so the sync gets its grace period to
+    # reach its own checkpoint (which is where it saves ``next_page``).
+    assert _abandoned_tasks(
+        active, _states("task-a", "paused"), now=100.0, stop_grace=120.0,
+        stall_seconds=0,
+    ) == []
+    assert entry.stop_seen_at == 100.0
+
+    assert _abandoned_tasks(
+        active, _states("task-a", "paused"), now=219.0, stop_grace=120.0,
+        stall_seconds=0,
+    ) == []
+
+    abandoned = _abandoned_tasks(
+        active, _states("task-a", "paused"), now=220.0, stop_grace=120.0,
+        stall_seconds=0,
+    )
+    assert [(e.task_id, reason) for _, e, reason in abandoned] == [("task-a", "paused")]
+
+
+def test_abandoned_tasks_never_touches_a_running_task_that_reports_progress():
+    """A healthy task's changing progress must keep resetting the watchdog."""
+    entry = _entry()
+    active = {"slot": entry}
+
+    for step in range(6):
+        now = 1000.0 * step
+        abandoned = _abandoned_tasks(
+            active,
+            _states("task-a", "running", progress={"pages_checked": step}),
+            now=now,
+            stop_grace=0.0,
+            stall_seconds=600.0,
+        )
+        assert abandoned == []
+        assert entry.marker == (step, None, None, None, None, None)
+    assert entry.stop_seen_at is None
+
+
+def test_abandoned_tasks_fails_a_task_that_stopped_reporting_progress():
+    entry = _entry(now=0.0)
+    active = {"slot": entry}
+    frozen = {"status": "running", "progress": {"pages_checked": 3}}
+
+    # The first look records the heartbeat; the clock starts from there.
+    assert _abandoned_tasks(
+        active, {"task-a": frozen}, now=100.0, stop_grace=0.0, stall_seconds=3600.0
+    ) == []
+    assert _abandoned_tasks(
+        active, {"task-a": frozen}, now=3699.0, stop_grace=0.0, stall_seconds=3600.0
+    ) == []
+    abandoned = _abandoned_tasks(
+        active, {"task-a": frozen}, now=3700.0, stop_grace=0.0, stall_seconds=3600.0
+    )
+    assert [(e.task_id, reason) for _, e, reason in abandoned] == [("task-a", "stalled")]
+
+    # ``0`` disables the watchdog: a deliberately unlimited full-site sync is
+    # then allowed to report nothing for as long as the operator wants.
+    assert _abandoned_tasks(
+        active, {"task-a": frozen}, now=10**9, stop_grace=0.0, stall_seconds=0.0
+    ) == []
+
+
+def test_abandoned_tasks_leaves_a_pending_row_alone():
+    """A batch-mode task re-queues itself as ``pending`` before it returns.
+
+    A task that has just been started looks the same for the moment before it
+    commits ``running``, so neither may be cancelled -- even long after the
+    stall timeout would have fired for a task that had really gone quiet.
+    """
+    entry = _entry(now=0.0)
+    active = {"slot": entry}
+    pending = {"status": "pending", "progress": {}}
+
+    assert _abandoned_tasks(
+        active, {"task-a": pending}, now=10.0, stop_grace=0.0, stall_seconds=5.0
+    ) == []
+    assert _abandoned_tasks(
+        active, {"task-a": pending}, now=10**6, stop_grace=0.0, stall_seconds=5.0
+    ) == []
+
+
+def test_abandoned_tasks_reclaims_a_deleted_task():
+    entry = _entry()
+    assert _abandoned_tasks(
+        {"slot": entry}, {}, now=0.0, stop_grace=120.0, stall_seconds=0.0
+    ) == []
+    abandoned = _abandoned_tasks(
+        {"slot": entry}, {}, now=120.0, stop_grace=120.0, stall_seconds=0.0
+    )
+    assert [(e.task_id, reason) for _, e, reason in abandoned] == [("task-a", "deleted")]
+
+
+def test_release_abandoned_hands_back_the_slot_source_and_claim():
+    entry = _entry()
+    entry.abandoned_at = 100.0
+    active = {"slot": entry}
+    running_sources = {"yuedu_a"}
+    claimed = {"task-a"}
+
+    assert _release_abandoned(
+        active, running_sources, claimed, now=219.0, grace=120.0
+    ) == []
+    assert set(active) == {"slot"}
+
+    released = _release_abandoned(
+        active, running_sources, claimed, now=220.0, grace=120.0
+    )
+    assert released == ["task-a"]
+    assert active == {}
+    assert running_sources == set()
+    assert claimed == set()
+    # The zombie's own cleanup must not discard a source a new task now owns.
+    assert entry.released is True
+
+
+@pytest.mark.asyncio
+async def test_worker_loop_stops_a_paused_task_and_lets_its_source_run_again():
+    """The online deadlock, end to end: pause must free the source it holds.
+
+    The task is stuck in a network wait, exactly like the 15 paused full-site
+    tasks whose sync never reached a checkpoint: nothing in the sync itself will
+    ever notice the pause, so only the supervisor can take the source back.
+    """
+    started: list[str] = []
+    excluded: list[set[str]] = []
+    served: list[str] = []
+    second_started = asyncio.Event()
+    stuck = asyncio.Event()
+
+    async def fake_next(limit, exclude_sources=None):
+        excluded.append(set(exclude_sources or ()))
+        if "yuedu_a" in (exclude_sources or set()):
+            # The first task still owns the source: this is exactly what used
+            # to leave newly created tasks queued forever.
+            return []
+        if not served:
+            served.append("task-a")
+            return [("task-a", "yuedu_a")]
+        return [("task-b", "yuedu_a")]
+
+    async def fake_run(task_id: str) -> dict:
+        started.append(task_id)
+        if task_id == "task-b":
+            second_started.set()
+            return {"status": "completed", "task_id": task_id}
+        await stuck.wait()
+        return {"status": "paused", "task_id": task_id}
+
+    async def fake_states(task_ids):
+        return {
+            task_id: {
+                "status": "paused" if task_id == "task-a" else "running",
+                "progress": {},
+            }
+            for task_id in task_ids
+        }
+
+    with (
+        patch.object(settings, "SYNC_WORKER_CONCURRENCY", 0),
+        patch.object(settings, "SYNC_TASK_SUPERVISE_INTERVAL_SECONDS", 1),
+        patch.object(settings, "SYNC_TASK_STOP_GRACE_SECONDS", 1),
+        patch(
+            "app.services.crawl_runner._next_pending_tasks", side_effect=fake_next
+        ),
+        patch(
+            "app.services.crawl_runner.run_crawl_task_async", side_effect=fake_run
+        ),
+        patch(
+            "app.services.crawl_runner._read_active_task_states",
+            side_effect=fake_states,
+        ),
+    ):
+        worker = asyncio.create_task(_worker_loop())
+        try:
+            await asyncio.wait_for(second_started.wait(), timeout=8)
+        finally:
+            stuck.set()
+            worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
+
+    assert started[:2] == ["task-a", "task-b"]
+    # After the pause took the first task off the queue the source is offered
+    # again instead of being filtered out forever.
+    assert set() in excluded
+
+
+# ---------------------------------------------------------------------------
+# Deleting tasks: finished ones used to pile up with no way to remove them.
+# ---------------------------------------------------------------------------
+
+
+async def _delete_request(task, path="/api/crawl/tasks/task-1", role="admin",
+                          user_id="admin", rowcount=1):
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=task)
+    executed: list = []
+
+    async def fake_execute(statement):
+        executed.append(statement)
+        return SimpleNamespace(rowcount=rowcount)
+
+    db.execute = AsyncMock(side_effect=fake_execute)
+    db.commit = AsyncMock()
+
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        id=user_id, role=role
+    )
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.delete(path)
+    finally:
+        app.dependency_overrides.clear()
+    return resp, executed
+
+
+@pytest.mark.asyncio
+async def test_delete_task_removes_the_task_and_its_logs():
+    resp, executed = await _delete_request(_task(status="failed"))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"deleted": 1}
+    # ``crawl_logs`` has no foreign key, so its rows have to go first or they
+    # are orphaned forever.
+    assert [statement.table.name for statement in executed] == [
+        "crawl_logs",
+        "crawl_tasks",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_delete_task_is_refused_while_it_is_still_queued():
+    for status in ("pending", "running"):
+        resp, executed = await _delete_request(_task(status=status))
+        assert resp.status_code == 400
+        assert "Cancel the task" in resp.json()["detail"]
+        assert executed == []
+
+
+@pytest.mark.asyncio
+async def test_delete_task_404s_for_another_users_task():
+    task = _task(status="failed", user_id="someone-else")
+    resp, executed = await _delete_request(task, role="user", user_id="u1")
+    assert resp.status_code == 404
+    assert executed == []
+
+
+@pytest.mark.asyncio
+async def test_clear_history_only_ever_touches_finished_tasks():
+    db = AsyncMock()
+    captured: dict = {}
+
+    async def fake_scalars(query):
+        captured["query"] = query
+        return SimpleNamespace(all=lambda: ["t1", "t2", "t3"])
+
+    db.scalars = fake_scalars
+    db.execute = AsyncMock(return_value=SimpleNamespace(rowcount=3))
+    db.commit = AsyncMock()
+
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        id="u1", role="user"
+    )
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/api/crawl/tasks/clear-history")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    assert resp.json() == {"deleted": 3}
+
+    compiled = captured["query"].compile()
+    params = _bound_values(captured["query"])
+    assert {"completed", "failed", "cancelled", "completed_with_errors"} <= params
+    # A task that is still queued, running or parked for later is not history.
+    assert not {"pending", "running", "paused"} & params
+    # A non-admin clears their own history only, exactly like the list they see.
+    assert "crawl_tasks.user_id" in str(compiled)
+
 

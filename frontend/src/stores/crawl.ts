@@ -2,7 +2,11 @@ import { defineStore } from "pinia"
 import { ref } from "vue"
 import { api } from "../api/client"
 
-const TERMINAL = ["completed", "failed", "cancelled", "completed_with_errors"]
+// Polling can only learn something new while the worker is still moving the
+// task.  A paused task changes when the user resumes it, which updates this
+// store directly, so polling it forever only kept the API -- and one pooled
+// database connection every two seconds -- busy for nothing.
+const POLLABLE = ["pending", "running"]
 
 export const useCrawlStore = defineStore("crawl", () => {
   const activeTask = ref<any | null>(null)
@@ -13,7 +17,7 @@ export const useCrawlStore = defineStore("crawl", () => {
   async function refresh(taskId: string) {
     try {
       activeTask.value = await api.get<any>(`/crawl/tasks/${taskId}`)
-      if (TERMINAL.includes(activeTask.value.status)) {
+      if (!POLLABLE.includes(activeTask.value.status)) {
         stopPolling()
       }
     } catch (e) {
@@ -25,7 +29,7 @@ export const useCrawlStore = defineStore("crawl", () => {
   async function startPolling(taskId: string) {
     if (timer !== null) return
     await refresh(taskId)
-    if (!activeTask.value || TERMINAL.includes(activeTask.value.status)) {
+    if (!activeTask.value || !POLLABLE.includes(activeTask.value.status)) {
       return
     }
     timer = window.setInterval(() => refresh(taskId), 2000)
@@ -44,7 +48,7 @@ export const useCrawlStore = defineStore("crawl", () => {
     }
     activeTask.value = task
     error.value = ""
-    if (task?.id && !TERMINAL.includes(task.status)) {
+    if (task?.id && POLLABLE.includes(task.status)) {
       await startPolling(task.id)
     }
   }

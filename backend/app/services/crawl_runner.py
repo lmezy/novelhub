@@ -7,6 +7,7 @@ a specific source to the front without waiting for every earlier task.
 
 import asyncio
 import os
+import time
 from typing import Any
 from datetime import timedelta
 
@@ -14,7 +15,14 @@ from loguru import logger
 from sqlalchemy import select, update
 
 from app.core.clock import naive_now
-from app.core.config import db_pool_capacity, settings, sync_source_concurrency
+from app.core.config import (
+    db_pool_capacity,
+    settings,
+    sync_source_concurrency,
+    task_stall_seconds,
+    task_stop_grace_seconds,
+    task_supervise_interval_seconds,
+)
 from app.core.database import SessionLocal
 from app.models import CrawlTask
 
@@ -531,6 +539,251 @@ def task_concurrency_limit() -> int:
     return budget if configured <= 0 else min(configured, budget)
 
 
+#: Row statuses a running task may still legitimately hold.
+_RUNNING_STATUSES = ("running", "pending")
+
+#: Why the worker gave up on a coroutine.
+_STALLED = "stalled"
+
+_STALL_ERROR = (
+    "任务已连续 {minutes} 分钟没有任何进度，为避免它一直占用同步队列，"
+    "已被强制结束。请检查代理、网络或书源状态后重试。"
+)
+
+
+class _ActiveTask:
+    """One crawl task this worker is running, plus its supervision state."""
+
+    __slots__ = (
+        "task_id",
+        "source",
+        "started_at",
+        "stop_seen_at",
+        "marker",
+        "marker_at",
+        "abandoned_at",
+        "released",
+    )
+
+    def __init__(self, task_id: str, source: str, now: float) -> None:
+        self.task_id = task_id
+        self.source = source
+        self.started_at = now
+        #: When the row first said "this must not run any more", so the task
+        #: keeps a grace period to stop at its own checkpoint.
+        self.stop_seen_at: float | None = None
+        #: Last progress heartbeat of this task, and when it last changed.
+        self.marker: tuple | None = None
+        self.marker_at = now
+        #: When the supervisor cancelled this coroutine.
+        self.abandoned_at: float | None = None
+        #: True once its queue slot was handed back without the coroutine
+        #: ending, so its own cleanup no longer owns the source claim.
+        self.released = False
+
+
+def _progress_marker(progress: Any) -> tuple:
+    """Cheap heartbeat read out of a task's ``progress`` blob.
+
+    The sync writes one of these fields at every checkpoint, so an unchanged
+    marker over a long period is the worker's only evidence that a coroutine
+    parked on a dead connection is not coming back.
+    """
+    if not isinstance(progress, dict):
+        progress = {}
+    return (
+        progress.get("pages_checked"),
+        progress.get("books_found"),
+        progress.get("books_synced"),
+        progress.get("current_book"),
+        progress.get("current_chapter"),
+        progress.get("current_chapters_created"),
+    )
+
+
+async def _read_active_task_states(task_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """``status``/``progress`` of the tasks this worker is running right now.
+
+    One query for the whole batch, so supervising a full queue costs a single
+    round trip per interval.  Pause, cancel and delete are written by the API in
+    another process, so the row is the only place the worker can learn them.
+    """
+    if not task_ids:
+        return {}
+    async with SessionLocal() as db:
+        rows = await db.execute(
+            select(CrawlTask.id, CrawlTask.status, CrawlTask.progress).where(
+                CrawlTask.id.in_(task_ids)
+            )
+        )
+        return {
+            row[0]: {"status": row[1], "progress": row[2]}
+            for row in rows.all()
+        }
+
+
+def _abandoned_tasks(
+    active: dict[asyncio.Task, _ActiveTask],
+    states: dict[str, dict[str, Any]],
+    *,
+    now: float,
+    stop_grace: float,
+    stall_seconds: float,
+) -> list[tuple[asyncio.Task, _ActiveTask, str]]:
+    """Which running coroutines to give up on, and why.
+
+    A task can hold a slot it no longer deserves in two ways:
+
+    * its row says it must not run any more (paused / cancelled / already
+      finished / deleted) but its coroutine never reached a checkpoint to
+      notice.  After ``stop_grace`` the slot, the source and the pooled
+      connection are taken back -- this is what used to wedge the whole queue:
+      every slot was held by a task the user had already paused, so newly
+      created tasks could never start;
+    * it is still ``running`` but has reported no progress at all for
+      ``stall_seconds``, the only way a coroutine parked forever on a dead
+      proxy or browser driver is ever reclaimed.
+
+    Pure, so the decision can be tested without a database or an event loop.
+    """
+    abandoned: list[tuple[asyncio.Task, _ActiveTask, str]] = []
+    for task, entry in list(active.items()):
+        state = states.get(entry.task_id) or {}
+        status = state.get("status")
+        if status in _RUNNING_STATUSES:
+            entry.stop_seen_at = None
+            if status == "pending":
+                # Batch mode re-queues a task with ``resume_at`` set and returns,
+                # so the row is briefly ``pending`` again while the coroutine is
+                # still finishing.  A task that has not committed ``running``
+                # yet looks the same.  Nothing to reclaim either way.
+                continue
+            marker = _progress_marker(state.get("progress"))
+            if marker != entry.marker:
+                entry.marker = marker
+                entry.marker_at = now
+            elif stall_seconds > 0 and now - entry.marker_at >= stall_seconds:
+                abandoned.append((task, entry, _STALLED))
+            continue
+        entry.stop_seen_at = (
+            now if entry.stop_seen_at is None else entry.stop_seen_at
+        )
+        if now - entry.stop_seen_at >= stop_grace:
+            abandoned.append((task, entry, status or "deleted"))
+    return abandoned
+
+
+async def _fail_stalled_task(task_id: str, stalled_seconds: float) -> None:
+    """Persist ``failed`` for a task the worker walked away from as hung.
+
+    Guarded by ``status == 'running'``, so a task that paused, was cancelled or
+    finished on its own between the decision and this write is never
+    overwritten.
+    """
+    try:
+        async with SessionLocal() as db:
+            await db.execute(
+                update(CrawlTask)
+                .where(CrawlTask.id == task_id, CrawlTask.status == "running")
+                .values(
+                    status="failed",
+                    error=_STALL_ERROR.format(
+                        minutes=max(1, int(stalled_seconds // 60))
+                    ),
+                    finished_at=naive_now(),
+                )
+            )
+            await db.commit()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Could not fail stalled crawl task {}: {}", task_id, exc)
+
+
+async def _supervise_active(
+    active: dict[asyncio.Task, _ActiveTask],
+    *,
+    now: float | None = None,
+) -> None:
+    """Cancel the coroutines of tasks that must not be running any more.
+
+    Never raises: a supervisor that dies takes the whole queue with it.
+    ``now`` is passed in by the loop so that the grace periods measured here and
+    by ``_release_abandoned`` share one clock reading.
+    """
+    if not active:
+        return
+    if now is None:
+        now = time.monotonic()
+    stall_seconds = task_stall_seconds()
+    try:
+        states = await _read_active_task_states(
+            [entry.task_id for entry in active.values()]
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Crawl task supervision skipped: {}", exc)
+        return
+
+    for task, entry, reason in _abandoned_tasks(
+        active,
+        states,
+        now=now,
+        stop_grace=task_stop_grace_seconds(),
+        stall_seconds=stall_seconds,
+    ):
+        entry.abandoned_at = now
+        # Cancel before writing, so the task stops doing work as soon as
+        # possible; the write below only has to beat a cooperating coroutine.
+        task.cancel()
+        if reason == _STALLED:
+            logger.warning(
+                "Crawl task {} reported no progress for {}s; failing it and "
+                "freeing its queue slot",
+                entry.task_id,
+                int(stall_seconds),
+            )
+            await _fail_stalled_task(entry.task_id, stall_seconds)
+        else:
+            logger.info(
+                "Crawl task {} is {} but still running; cancelling its worker",
+                entry.task_id,
+                reason,
+            )
+
+
+def _release_abandoned(
+    active: dict[asyncio.Task, _ActiveTask],
+    running_sources: set[str],
+    claimed: set[str],
+    *,
+    now: float,
+    grace: float,
+) -> list[str]:
+    """Hand back the slots of coroutines that ignored their cancellation.
+
+    A cancelled coroutine ends at its next ``await``.  One that does not -- a
+    stuck browser driver, a long synchronous call inside a thread -- would
+    otherwise keep its slot, its source and its connection forever, which is
+    the very deadlock the supervision exists to prevent.  Its own cleanup no
+    longer owns the source claim (``released``), so a fresh task for that source
+    cannot be cancelled out by the zombie waking up later.
+    """
+    released: list[str] = []
+    for task, entry in list(active.items()):
+        if entry.abandoned_at is None or now - entry.abandoned_at < grace:
+            continue
+        active.pop(task)
+        entry.released = True
+        claimed.discard(entry.task_id)
+        running_sources.discard(entry.source)
+        released.append(entry.task_id)
+        logger.error(
+            "Crawl task {} ignored its cancellation for {}s; releasing its "
+            "queue slot anyway",
+            entry.task_id,
+            int(now - entry.abandoned_at),
+        )
+    return released
+
+
 async def _worker_loop() -> None:
     """Run every book source in its own worker, in parallel.
 
@@ -545,22 +798,34 @@ async def _worker_loop() -> None:
     size -- see ``task_concurrency_limit``.  A positive value keeps a global
     ceiling for small hosts, still bounded by that same budget.  A single source
     never runs two tasks at once.
+
+    Every running task is supervised (see ``_supervise_active``): a task the row
+    says must not run any more -- paused, cancelled, deleted -- is cancelled
+    once its grace period is over, and so is one that has stopped reporting
+    progress.  Without that, a slot could be held forever by a task whose sync
+    never reached a checkpoint, and once every slot was held that way the queue
+    stopped consuming new tasks for good (seen online on 2026-09-20: nine
+    freshly created tasks sat ``pending`` for 12h while the worker stayed idle).
     """
     limit = task_concurrency_limit()
+    supervise_interval = task_supervise_interval_seconds()
+    stop_grace = task_stop_grace_seconds()
     claimed: set[str] = set()
-    active: dict[asyncio.Task, tuple[str, str]] = {}
+    active: dict[asyncio.Task, _ActiveTask] = {}
     running_sources: set[str] = set()
+    next_supervise_at = 0.0
 
-    async def _run_guarded(task_id: str, source: str) -> None:
+    async def _run_guarded(entry: _ActiveTask) -> None:
         try:
-            await run_crawl_task_async(task_id)
+            await run_crawl_task_async(entry.task_id)
         except Exception as exc:
-            logger.error("Crawl task {} stopped: {}", task_id, exc)
+            logger.error("Crawl task {} stopped: {}", entry.task_id, exc)
         finally:
-            running_sources.discard(source)
+            if not entry.released:
+                running_sources.discard(entry.source)
             # Explain what just failed, if the feature is on.  Fire-and-forget:
             # a slow model call must never hold up the queue for this source.
-            _spawn_auto_diagnosis(task_id)
+            _spawn_auto_diagnosis(entry.task_id)
 
     def _free_slots() -> int:
         # Bounded batch: enough to fill every free slot without loading an
@@ -581,8 +846,9 @@ async def _worker_loop() -> None:
                     continue
                 claimed.add(task_id)
                 running_sources.add(source)
-                task = asyncio.create_task(_run_guarded(task_id, source))
-                active[task] = (task_id, source)
+                entry = _ActiveTask(task_id, source, time.monotonic())
+                task = asyncio.create_task(_run_guarded(entry))
+                active[task] = entry
                 started_any = True
             if not started_any:
                 # All candidates are already claimed but not yet running.
@@ -591,6 +857,19 @@ async def _worker_loop() -> None:
         if not active:
             await asyncio.sleep(2)
             continue
+
+        now = time.monotonic()
+        if now >= next_supervise_at:
+            next_supervise_at = now + supervise_interval
+            await _supervise_active(active, now=now)
+            _release_abandoned(
+                active, running_sources, claimed, now=now, grace=stop_grace
+            )
+            if not active:
+                # Supervision just handed back the last slot, so there is
+                # nothing left to wait on (``asyncio.wait`` refuses an empty
+                # set).
+                continue
 
         # Poll for newly created tasks even while existing tasks are running.
         # Without the timeout, a source created right after the initial fill
@@ -601,15 +880,15 @@ async def _worker_loop() -> None:
             timeout=1.0,
         )
         for finished in done:
-            task_id, source = active.pop(finished)
-            claimed.discard(task_id)
-            running_sources.discard(source)
+            entry = active.pop(finished)
+            claimed.discard(entry.task_id)
+            running_sources.discard(entry.source)
             if finished.cancelled():
-                logger.warning("Crawl task {} cancelled", task_id)
+                logger.warning("Crawl task {} cancelled", entry.task_id)
                 continue
             exc = finished.exception()
             if exc is not None:
-                logger.error("Crawl task {} stopped: {}", task_id, exc)
+                logger.error("Crawl task {} stopped: {}", entry.task_id, exc)
         await asyncio.sleep(0.2)
 
 

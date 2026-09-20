@@ -1,4 +1,4 @@
-﻿from sqlalchemy import select
+from sqlalchemy import select
 from sqlalchemy import case
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -9,9 +9,13 @@ from app.repositories.base import BaseRepository
 class CrawlTaskRepository(BaseRepository[CrawlTask]):
     model = CrawlTask
 
-    #: Order of the "recent tasks" list: what is running now, then what broke.
-    #: Every other status keeps the plain newest-first order below.
-    STATUS_RANK = {"running": 0, "failed": 1}
+    #: Order of the "recent tasks" list: what is running now, then what is about
+    #: to be picked up, then what the user parked.  Everything finished shares
+    #: the plain newest-first order below and never outranks an active task:
+    #: with 137 failed tasks ranked second, the whole 100-row window the sync
+    #: page asks for was failed tasks, so a task the user had just created --
+    #: and any task they paused -- could not appear at all (2026-09-20).
+    STATUS_RANK = {"running": 0, "pending": 1, "paused": 2}
 
     def __init__(self, db: AsyncSession):
         super().__init__(db)
