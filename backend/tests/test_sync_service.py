@@ -7,7 +7,7 @@ from sqlalchemy.exc import MissingGreenlet, SQLAlchemyError
 
 from app.crawler.base import EmptyTocError, RemoteBook, RemoteChapter, RemoteShelfBook
 from app.models import Book, Chapter, Cookie, Source
-from app.services.sync import SyncPaused, SyncService
+from app.services.sync import SyncPaused, SyncService, load_source_cookie
 
 
 
@@ -27,6 +27,48 @@ def _source(source_id: str = "src1") -> Source:
         enabled=True,
         config={},
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_stored_cookie():
+    """Default every sync test to "this source has no stored Cookie".
+
+    The Cookie is read through ``app.services.sync.load_source_cookie``, which
+    opens its own session on the real ``SessionLocal`` -- deliberately, so the
+    read does not inherit the caller's long crawl transaction.  Stubbing it
+    keeps the tests off a database; the tests that need a Cookie patch it
+    themselves inside their own ``with`` block.
+    """
+    with patch(
+        "app.services.sync.load_source_cookie",
+        AsyncMock(return_value=None),
+    ):
+        yield
+
+
+@pytest.mark.asyncio
+async def test_stored_cookie_is_read_on_its_own_session():
+    """The Cookie must not be read on the caller's long crawl transaction.
+
+    Reading it on ``self.db`` kept Postgres' ACCESS SHARE lock on ``cookies``
+    for the whole book crawl -- pg_stat_activity showed the transaction parked
+    at ``idle in transaction`` with the lock granted.  A deploy's
+    ``ALTER TABLE cookies`` then queued for ACCESS EXCLUSIVE behind it and,
+    because the container starts with ``alembic upgrade head && uvicorn``, the
+    server never came up: nginx answered 502 to every request for nine minutes.
+    """
+    read_db = _mock_db()
+    read_db.scalar = AsyncMock(return_value="plain-cookie")
+    session = MagicMock()
+    session.__aenter__ = AsyncMock(return_value=read_db)
+    session.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("app.services.sync.SessionLocal", return_value=session):
+        assert await load_source_cookie("src1") == "plain-cookie"
+
+    # Its own session, and it is closed again before the caller starts crawling.
+    session.__aenter__.assert_awaited_once()
+    session.__aexit__.assert_awaited_once()
 
 
 def test_normalize_title_for_match():
@@ -1460,11 +1502,6 @@ async def test_resync_chapter_matches_legacy_id_by_number():
 async def test_sync_bookshelf_rolls_back_and_continues_after_failure():
     db = _mock_db()
     db.get.return_value = _source()
-    db.scalar.return_value = Cookie(
-        id="cookie-1",
-        source="src1",
-        cookie_data="plain-cookie",
-    )
     db.rollback = AsyncMock()
 
     plugin = AsyncMock()
@@ -1486,6 +1523,7 @@ async def test_sync_bookshelf_rolls_back_and_continues_after_failure():
 
     with (
         patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.load_source_cookie", AsyncMock(return_value="plain-cookie")),
         patch("app.services.sync.safe_decrypt_cookie", return_value="cookie"),
     ):
         service = SyncService(db)
@@ -1515,11 +1553,6 @@ async def test_sync_bookshelf_rolls_back_and_continues_after_failure():
 async def test_sync_bookshelf_skips_non_http_urls():
     db = _mock_db()
     db.get.return_value = _source()
-    db.scalar.return_value = Cookie(
-        id="cookie-1",
-        source="src1",
-        cookie_data="plain-cookie",
-    )
 
     plugin = AsyncMock()
     plugin.fetch_bookshelf.return_value = [
@@ -1540,6 +1573,7 @@ async def test_sync_bookshelf_skips_non_http_urls():
 
     with (
         patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.load_source_cookie", AsyncMock(return_value="plain-cookie")),
         patch("app.services.sync.safe_decrypt_cookie", return_value="cookie"),
     ):
         service = SyncService(db)
@@ -1629,8 +1663,9 @@ async def test_discover_and_sync_all_empty_catalog_with_known_books_is_retryable
     """
     db = _mock_db()
     db.get.return_value = _source()
-    # 1st scalar: stored cookie lookup, 2nd: "does this source have books?".
-    db.scalar.side_effect = [None, "book-id"]
+    # Only "does this source already have books?" reaches ``db.scalar`` now --
+    # the stored Cookie is read by ``load_source_cookie`` on its own session.
+    db.scalar.return_value = "book-id"
 
     plugin = AsyncMock()
     plugin.set_cookie = MagicMock()
@@ -1651,7 +1686,6 @@ async def test_discover_and_sync_all_empty_catalog_without_books_still_fails():
     """A brand new source with an empty catalog keeps the actionable error."""
     db = _mock_db()
     db.get.return_value = _source()
-    db.scalar.side_effect = [None, None]
 
     plugin = AsyncMock()
     plugin.set_cookie = MagicMock()
@@ -1722,7 +1756,9 @@ async def test_discover_and_sync_all_first_page_break_with_library_is_not_a_fail
     db = _mock_db()
     db.get.return_value = _source()
     db.rollback = AsyncMock()
-    db.scalar.side_effect = [None, "book-id"]
+    # Only "does this source already have books?" reaches ``db.scalar`` now --
+    # the stored Cookie is read by ``load_source_cookie`` on its own session.
+    db.scalar.return_value = "book-id"
 
     plugin = AsyncMock()
     plugin.set_cookie = MagicMock()
@@ -1741,7 +1777,6 @@ async def test_discover_and_sync_all_first_page_break_without_library_still_fail
     db = _mock_db()
     db.get.return_value = _source()
     db.rollback = AsyncMock()
-    db.scalar.side_effect = [None, None]
 
     plugin = AsyncMock()
     plugin.set_cookie = MagicMock()
@@ -1765,7 +1800,6 @@ async def test_js_explore_that_returns_nothing_no_longer_claims_it_cannot_run():
     db = _mock_db()
     db.get.return_value = source
     db.rollback = AsyncMock()
-    db.scalar.side_effect = [None, None]
 
     plugin = AsyncMock()
     plugin.set_cookie = MagicMock()

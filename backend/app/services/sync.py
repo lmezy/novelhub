@@ -231,6 +231,29 @@ def _last_explore_diagnosis(plugin) -> str:
     return f" 最近一次分类页：{url} → {summary}"
 
 
+async def load_source_cookie(source_id: str) -> str | None:
+    """Read a source's stored Cookie on its own short-lived session.
+
+    Every call site below used to read it on ``self.db`` -- the session that then
+    crawls the whole book.  Postgres holds the ``ACCESS SHARE`` lock taken by
+    that read until the transaction ends, so ``cookies`` stayed locked for
+    minutes (pg_stat_activity showed the transaction parked at ``idle in
+    transaction`` with the lock granted).  A deployment's ``ALTER TABLE
+    cookies`` then queued for ``ACCESS EXCLUSIVE`` behind it, and because the
+    container starts with ``alembic upgrade head && uvicorn`` the server never
+    came up: nginx answered 502 for every request, login included, until the
+    crawler's transaction happened to end.
+
+    Cookies are never written by a sync, so reading them in a transaction of
+    their own changes nothing but the lock's lifetime.  Returns the still
+    encrypted value; callers decrypt with ``safe_decrypt_cookie``.
+    """
+    async with SessionLocal() as db:
+        return await db.scalar(
+            select(Cookie.cookie_data).where(Cookie.source == source_id)
+        )
+
+
 class SyncService:
     def __init__(self, db: AsyncSession, storage: BookStorage | None = None):
         self.db = db
@@ -702,11 +725,9 @@ class SyncService:
 
         config = source.config if source.plugin_name == 'yuedu' else None
         plugin = self._source_plugin(source)
-        cookie_record = await self.db.scalar(
-            select(Cookie).where(Cookie.source == source_id)
-        )
-        if cookie_record:
-            plugin.set_cookie(safe_decrypt_cookie(cookie_record.cookie_data))
+        stored_cookie = await load_source_cookie(source_id)
+        if stored_cookie:
+            plugin.set_cookie(safe_decrypt_cookie(stored_cookie))
         # A single transient Cloudflare 5xx / browser timeout on the book page
         # should not fail the whole book.  Retry a few times with backoff for
         # transient upstream errors before giving up.
@@ -1501,15 +1522,13 @@ class SyncService:
         if source is None or not source.enabled:
             raise ValueError("Source not found or disabled")
 
-        cookie_record = await self.db.scalar(
-            select(Cookie).where(Cookie.source == source_id)
-        )
-        if cookie_record is None:
+        stored_cookie = await load_source_cookie(source_id)
+        if stored_cookie is None:
             raise ValueError(f"No cookie found for source '{source_id}'")
 
         config = source.config if source.plugin_name == 'yuedu' else None
         plugin = self._source_plugin(source)
-        cookie_data = safe_decrypt_cookie(cookie_record.cookie_data)
+        cookie_data = safe_decrypt_cookie(stored_cookie)
         plugin.set_cookie(cookie_data)
 
         shelf_books = await plugin.fetch_bookshelf(cookie_data)
@@ -1689,11 +1708,9 @@ class SyncService:
         if not source.enabled:
             raise ValueError("Source disabled")
         plugin = self._source_plugin(source)
-        cookie_record = await self.db.scalar(
-            select(Cookie).where(Cookie.source == book.source_id)
-        )
-        if cookie_record:
-            plugin.set_cookie(safe_decrypt_cookie(cookie_record.cookie_data))
+        stored_cookie = await load_source_cookie(book.source_id)
+        if stored_cookie:
+            plugin.set_cookie(safe_decrypt_cookie(stored_cookie))
         return source, plugin
 
     @staticmethod
@@ -1752,11 +1769,9 @@ class SyncService:
         config = source.config if source.plugin_name == "yuedu" else None
         plugin = self._source_plugin(source)
 
-        cookie_record = await self.db.scalar(
-            select(Cookie).where(Cookie.source == source_id)
-        )
-        if cookie_record:
-            plugin.set_cookie(safe_decrypt_cookie(cookie_record.cookie_data))
+        stored_cookie = await load_source_cookie(source_id)
+        if stored_cookie:
+            plugin.set_cookie(safe_decrypt_cookie(stored_cookie))
 
         if not hasattr(plugin, "discover_books"):
             return {
@@ -1844,11 +1859,9 @@ class SyncService:
         config = source.config if source.plugin_name == "yuedu" else None
         plugin = self._source_plugin(source)
 
-        cookie_record = await self.db.scalar(
-            select(Cookie).where(Cookie.source == source_id)
-        )
-        if cookie_record:
-            plugin.set_cookie(safe_decrypt_cookie(cookie_record.cookie_data))
+        stored_cookie = await load_source_cookie(source_id)
+        if stored_cookie:
+            plugin.set_cookie(safe_decrypt_cookie(stored_cookie))
 
         if not hasattr(plugin, "discover_books"):
             raise ValueError("当前书源不支持发现书籍，无法执行全站同步。")

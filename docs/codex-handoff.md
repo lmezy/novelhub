@@ -1466,3 +1466,45 @@ backend 容器跑真实索引）：单条件正文的 ids 与 total **完全一�
 **待用户处理**：重建 `lonezy/novelhub-backend` 与 `lonezy/novelhub-frontend` **两个**镜像并重新部署。
 backend 的启动命令自带 `alembic upgrade head`，迁移会自动执行。部署后老 Cookie 的「最近写入」等于
 它的首次保存时间（故意如此），再更新一次就会看到时间跳到当下。
+
+## 42. 部署第 41 节后登录 502 九分钟：迁移在等 cookies 的表锁（2026-09-20）
+
+**现象**（用户报）：重建 backend + frontend 镜像并重新部署后，登录 502，约 9 分钟后自己好了。
+
+**直接原因**：后端的启动命令是 `alembic upgrade head && uvicorn ...`（`&&` 串联）。迁移卡在等表锁上，
+**uvicorn 就一直没启动**，nginx 没有上游 → 任何请求（含登录）都是 502。与登录逻辑无关。
+
+**现场证据**（pg_locks / pg_stat_activity，`cookies` 上共 19 条锁）：
+
+| 进程 | 在做什么 | cookies 上的锁 | granted |
+|---|---|---|---|
+| 66654、66771、68782 | `idle in transaction`（读过 cookies 后事务一直没结束） | AccessShareLock | ✅ 已持有 |
+| 68820（alembic） | `ALTER TABLE cookies ADD COLUMN updated_at` | AccessExclusiveLock | ❌ 排队 |
+| 67718、67399 等 15 个 | `SELECT cookies …` | AccessShareLock | ❌ 被 ALTER 挡住 |
+
+时间线：21:09:06 三个长事务拿到读锁 → 21:09:47 ALTER 开始排队 → 21:18:16 持锁事务结束、ALTER 立刻
+完成、uvicorn 拉起、healthy。
+
+**根因 owner（不是第 41 节的改动有错）**：`ALTER TABLE` 必须拿 `ACCESS EXCLUSIVE`，这是 Postgres 的
+规定；真正的毛病是 **`services/sync.py` 把「读 Cookie」和「爬完整本书」放在同一个事务里**。5 处
+`select(Cookie)` 都写在 `self.db`（爬取会话）上，Postgres 会把那次读拿到的 `ACCESS SHARE` 一直持有到
+事务结束，于是 `cookies` 被锁几分钟。`ALTER TABLE` 只是把这件事暴露出来——**任何将来动 `cookies`
+（或其它热表）的迁移都会再触发一次同样的 502**。
+
+**改动**：`services/sync.py` 新增模块级 `load_source_cookie(source_id)`，用**自己的短会话**
+（`async with SessionLocal() as db`）读 Cookie 并立即关闭；5 处调用点全部换用它。Cookie 从不被 sync
+写入，所以唯一变化就是锁的生命周期。`routes/crawl.py::retry_task` 里还有一处同类写法（见下）。
+
+**验证**：866/873 → **874 passed**。改动后未加 fixture 时 **23 个 sync 测试立刻失败**
+（`ConnectionRefusedError`：新路径不再走 mock 的 `db`，而是去连真实 `SessionLocal`）——
+这 23 个失败本身就是「5 处调用点确实全部走新路径」的证据。`test_sync_service.py` 加 autouse fixture
+`_no_stored_cookie` 默认「该源没有 Cookie」，需要 Cookie 的两个用例显式 patch；新增
+`test_stored_cookie_is_read_on_its_own_session` 断言独立会话被打开**并且被关闭**（锁就是在关闭时释放的）。
+
+**待用户处理**：重建 `lonezy/novelhub-backend` **和 `lonezy/novelhub-crawler`** 两个镜像——
+crawler 镜像内嵌了 `backend/` 这份代码（`COPY backend/ ./backend/`），它是真正压着锁的那一方，
+只重建 backend 不解决问题。
+
+**已发现但未改（同类，等确认）**：`backend/app/api/routes/crawl.py::retry_task` 第 291-294 行
+在自己的请求会话（长事务）上读 Cookie，而那个 `plugin` 变量**后面根本没被使用**——`svc.sync_bookshelf()`
+会自建 plugin 并自己设置 Cookie。也就是说这 4 行的唯一可观察效果就是压住 `cookies` 的读锁，直接删掉即可。
