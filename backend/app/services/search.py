@@ -44,8 +44,9 @@ class SearchService:
     # and chapters keep flowing in while a user pages, so this is deliberately
     # short; the cost of a miss is one scan.
     PAGE_CACHE_TTL_SECONDS = 120
-    # One entry is at most ~10 000 ``(score, id)`` pairs (~1.5 MB), so 16 keeps
-    # the worst case around 24 MB per process.
+    # One entry is at most ~10 000 ``(score, id, snippet)`` pairs (~1.5 MB), so 16
+    # keeps the worst case around 24 MB per process.  Only a 正文 scan carries a
+    # snippet (its window is 300 rows, ~60 KB), so the ids still dominate.
     PAGE_CACHE_MAX_ENTRIES = 16
     # Multi-condition (AND/OR) searches used to score every condition on its own
     # candidate window and intersect the ids in Python.  For two conditions on
@@ -65,6 +66,17 @@ class SearchService:
     CONJUNCTION_VERIFY_MAX_HITS = 200
     # Words returned around the match when a chapter body is used as a snippet.
     SNIPPET_CROP_WORDS = 60
+    # A served snippet is a window anchored *at* the match rather than centred on
+    # it.  The result list clamps a snippet to two lines, and a phone line holds
+    # roughly a third of a desktop line's glyphs (a 320 px viewport fits ~21 CJK
+    # glyphs per line at ``text-xs``), so a window that merely *contains* the
+    # match -- Meilisearch's own crop puts it around the midpoint -- shows the
+    # searched word on the desktop and hides it on the phone.  That asymmetry is
+    # the "the result does not contain what I searched for" report.  The lead
+    # below plus the ``...`` marker stay inside the first phone line; the tail is
+    # the part the clamp trims first, so it can be generous.
+    SNIPPET_LEAD_CHARS = 12
+    SNIPPET_TAIL_CHARS = 160
     CONTENT_INDEX_LIMIT = 100_000
     DESCRIPTION_INDEX_LIMIT = 2000
 
@@ -151,7 +163,7 @@ class SearchService:
         self.client = meilisearch.Client(settings.MEILI_HOST, settings.MEILI_KEY)
         self._chapter_buffer: list[dict] = []
         self._ensured: set[str] = set()
-        self._page_cache: dict[str, tuple[float, list[tuple[int, str]]]] = {}
+        self._page_cache: dict[str, tuple[float, list[tuple[int, str, str]]]] = {}
         # The engine's own hit count for a conjunction query.  It has to be kept
         # with the cached ranking, otherwise page 1 would report the engine's
         # count and page 2 the window's -- the result list would "change" as the
@@ -513,11 +525,36 @@ class SearchService:
                 candidates[str(hit.get("id"))] = (score, hit)
         return candidates
 
-    @staticmethod
-    def _snippet(text: str, values: list[str], radius: int = 80) -> str:
+    @classmethod
+    def _snippet(
+        cls,
+        text: str,
+        values: list[str],
+        lead: int | None = None,
+        trail: int | None = None,
+    ) -> str:
+        """The excerpt served for one hit: a window anchored at the match.
+
+        ``lead`` characters of context are kept before the first occurrence of
+        any of ``values``, then up to ``trail`` after it, with a ``...`` marker on
+        whichever side was cut.  Anchoring is what keeps the searched word on
+        screen at every viewport width (see ``SNIPPET_LEAD_CHARS``); a value that
+        is not in the text at all falls back to the first matching character and
+        finally to the head of the text.
+        """
+        lead = cls.SNIPPET_LEAD_CHARS if lead is None else lead
+        trail = cls.SNIPPET_TAIL_CHARS if trail is None else trail
         clean = re.sub(r"\s+", " ", text or "").strip()
         if not clean:
             return ""
+
+        def window(start: int, end: int) -> str:
+            start = max(0, start)
+            end = min(len(clean), end)
+            prefix = "..." if start > 0 else ""
+            suffix = "..." if end < len(clean) else ""
+            return f"{prefix}{clean[start:end]}{suffix}"
+
         lowered = clean.lower()
         for value in values:
             needle = value.strip().lower()
@@ -525,22 +562,14 @@ class SearchService:
                 continue
             idx = lowered.find(needle)
             if idx >= 0:
-                start = max(0, idx - radius)
-                end = min(len(clean), idx + len(needle) + radius)
-                prefix = "..." if start > 0 else ""
-                suffix = "..." if end < len(clean) else ""
-                return f"{prefix}{clean[start:end]}{suffix}"
+                return window(idx - lead, idx + len(needle) + trail)
         for value in values:
             for ch in value:
                 if not ch.isspace():
                     idx = lowered.find(ch.lower())
                     if idx >= 0:
-                        start = max(0, idx - radius)
-                        end = min(len(clean), idx + 1 + radius)
-                        prefix = "..." if start > 0 else ""
-                        suffix = "..." if end < len(clean) else ""
-                        return f"{prefix}{clean[start:end]}{suffix}"
-        return clean[: radius * 2]
+                        return window(idx - lead, idx + 1 + trail)
+        return clean[: lead + trail]
 
     def _build_chapter_entities(
         self,
@@ -808,14 +837,22 @@ class SearchService:
         filters: str | None,
         window: int,
         mode: str = "exact",
-    ) -> list[tuple[int, str]]:
+    ) -> list[tuple[int, str, str]]:
         """Rank the engine's candidates with the shared Python scorer.
 
         Only ``id``, the searched field and the cheapest display fields are
         retrieved, so a 10 000 document window costs 0.02-0.7 s instead of the
         96 MB / 18 s that pulling every chapter body used to cost.  The result is
-        a ranked ``(score, id)`` list -- tiny enough to cache, which is what
-        makes pages 2..N cheap.
+        a ranked ``(score, id, snippet)`` list -- tiny enough to cache, which is
+        what makes pages 2..N cheap.
+
+        The snippet is built here because this is the only place that holds the
+        stored text of every hit.  The page that is served is hydrated with an
+        *empty* query (``_hydrate``), and Meilisearch only crops around the query
+        terms, so the excerpt it returns for a 正文 search is the head of the
+        chapter -- the searched word is usually absent from it.  ``attr`` is only
+        the body for a 正文 condition; metadata fields keep ``""`` so the page
+        cache stays dominated by the ids.
         """
         retrieve = ["id", attr]
         if index_name == self.INDEX_BOOKS:
@@ -832,16 +869,21 @@ class SearchService:
         if filters:
             options["filter"] = filters
         result = self.client.index(index_name).search(value, options)
-        scored: list[tuple[int, str]] = []
+        scored: list[tuple[int, str, str]] = []
         for hit in result.get("hits", []) or []:
+            text = hit.get(attr) or ""
             score = self._condition_score(
                 value,
-                hit.get(attr) or "",
+                text,
                 mode,
                 hit.get("_rankingScore", 0),
             )
             if score > 0:
-                scored.append((score, str(hit.get("id"))))
+                scored.append((
+                    score,
+                    str(hit.get("id")),
+                    self._snippet(text, [value]) if attr == "content" else "",
+                ))
         scored.sort(key=lambda row: (-row[0], row[1]))
         return scored
 
@@ -917,6 +959,7 @@ class SearchService:
         hit: dict,
         field: str,
         scope: str,
+        snippet: str = "",
     ) -> dict:
         score = int(max(0.0, min(float(hit.get("_rankingScore") or 0.0), 1.0)) * 1000)
         if scope == "books":
@@ -939,7 +982,10 @@ class SearchService:
                 ),
                 "matched_chapter": None,
             }
-        content = self._cropped_content(hit)
+        # ``snippet`` is the anchored excerpt a 正文 scan already built; the
+        # engine crop is only a fallback for the searches that do not scan the
+        # body (metadata conditions) or for a page hydrated without one.
+        content = snippet or self._cropped_content(hit)
         return {
             "type": "chapter",
             "id": str(hit.get("id") or ""),
@@ -1000,13 +1046,17 @@ class SearchService:
         page_rows = ranked[offset : offset + limit]
         docs = self._hydrate(index_name, [row[1] for row in page_rows])
         hits = []
-        for _score, doc_id in page_rows:
+        for score, doc_id, snippet in page_rows:
             hit = docs.get(doc_id)
             if hit is None:
                 # Hydration unavailable (settings task still applying): keep the
                 # row with the little we know rather than dropping the result.
                 hit = {"id": doc_id}
-            hits.append(self._serialize_engine_hit(hit, cond["field"], scope))
+            hits.append(
+                self._serialize_engine_hit(
+                    hit, cond["field"], scope, snippet=snippet,
+                )
+            )
         return {
             "hits": hits,
             "total": len(ranked),
@@ -1014,7 +1064,7 @@ class SearchService:
             "limit": limit,
         }
 
-    def _page_cache_get(self, key: str) -> list[tuple[int, str]] | None:
+    def _page_cache_get(self, key: str) -> list[tuple[int, str, str]] | None:
         entry = self._page_cache.get(key)
         if entry is None:
             return None
@@ -1024,7 +1074,7 @@ class SearchService:
             return None
         return ranked
 
-    def _page_cache_put(self, key: str, ranked: list[tuple[int, str]]) -> None:
+    def _page_cache_put(self, key: str, ranked: list[tuple[int, str, str]]) -> None:
         now = time.monotonic()
         for stale in [
             cache_key
@@ -1087,7 +1137,7 @@ class SearchService:
         active: list[dict],
         filters: str | None,
         window: int,
-    ) -> tuple[list[tuple[int, str]], int | None]:
+    ) -> tuple[list[tuple[int, str, str]], int | None]:
         """Engine-ranked ids for ``cond1 AND cond2 AND …`` on one attribute.
 
         The query is the whitespace-joined values with ``matchingStrategy:
@@ -1100,8 +1150,8 @@ class SearchService:
         the real text anyway (``_conjunction_search``) -- the engine is only
         trusted to narrow tens of thousands of matches down to the window.
 
-        Returns the ranked ``(score, id)`` list and the engine's hit count; the
-        count is ``None`` when the engine does not report one.
+        Returns the ranked ``(score, id, "")`` list and the engine's hit count;
+        the count is ``None`` when the engine does not report one.
         """
         query = self._conjunction_query(active)
         if not query:
@@ -1127,8 +1177,13 @@ class SearchService:
             options.pop("attributesToSearchOn", None)
             result = index.search(query, options)
         # Every hit passed the engine's "all terms" gate, so they all satisfy
-        # the conjunction; the page-level gate decides what is displayed.
-        ranked = [(len(active), str(hit.get("id"))) for hit in result.get("hits", []) or []]
+        # the conjunction; the page-level gate decides what is displayed.  The
+        # snippet slot stays empty: the page is hydrated with its body cropped
+        # around the match instead (``_serialize_scored_hit``).
+        ranked = [
+            (len(active), str(hit.get("id")), "")
+            for hit in result.get("hits", []) or []
+        ]
         total = result.get("estimatedTotalHits")
         return ranked, (int(total) if isinstance(total, int) else None)
 
@@ -1219,7 +1274,7 @@ class SearchService:
         if page_ids and len(page_ids) <= self.CONJUNCTION_VERIFY_MAX_HITS:
             stored = self._conjunction_values(index_name, page_ids, attr)
         hits = []
-        for _score, doc_id in page_rows:
+        for _score, doc_id, _snippet in page_rows:
             hit = docs.get(doc_id) or {"id": doc_id}
             text = stored.get(doc_id)
             if text is None:
@@ -1238,7 +1293,11 @@ class SearchService:
                 continue
             hits.append(
                 self._serialize_scored_hit(
-                    hit, score, [cond["field"] for cond in active], scope,
+                    hit,
+                    score,
+                    [cond["field"] for cond in active],
+                    scope,
+                    values=[cond["value"] for cond in active],
                 )
             )
         # The engine's count is capped by the cached ranking: it may count
@@ -1258,6 +1317,7 @@ class SearchService:
         score: int,
         fields: list[str],
         scope: str,
+        values: list[str] | None = None,
     ) -> dict:
         """A hydrated page hit carrying the Python score of a conjunction."""
         if scope == "books":
@@ -1268,10 +1328,12 @@ class SearchService:
         payload = self._serialize_engine_hit(hit, fields[0], "chapters")
         payload["score"] = score
         payload["matched_fields"] = fields
-        # ``_hydrate`` crops the body around the match, so the served snippet is
-        # the engine's own excerpt; the raw ``content`` stays empty here because
-        # the full body is not retrieved for a page.
-        snippet = self._cropped_content(hit)
+        # ``_hydrate_around`` crops the body around the match, so the served
+        # snippet is the engine's own excerpt re-anchored at the hit (a centred
+        # crop puts the searched word around the middle of the window, which the
+        # two-line clamp hides on a phone); the raw ``content`` stays empty here
+        # because the full body is not retrieved for a page.
+        snippet = self._snippet(self._cropped_content(hit), values or [])
         if snippet:
             payload["snippet"] = snippet
         return payload

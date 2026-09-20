@@ -4,6 +4,7 @@ import { useRoute, useRouter } from "vue-router"
 import { api } from "../api/client"
 import BookCard from "../components/BookCard.vue"
 import NavBar from "../components/NavBar.vue"
+import SnippetText from "../components/SnippetText.vue"
 import { useAuthStore } from "../stores/auth"
 import type { Book } from "../stores/books"
 import { useBooksStore } from "../stores/books"
@@ -420,6 +421,13 @@ function activeConditions() {
     .map((c) => ({ field: c.field, mode: c.mode, value: c.value.trim() }))
 }
 
+// Words to mark inside a result excerpt.  Both lists are derived from what the
+// visible results were searched with -- the quick search from ``?q=`` and the
+// advanced list from the condition rows -- so a restored page (session cache)
+// marks its hits without re-running anything.
+const advancedTerms = computed(() => activeConditions().map((c) => c.value))
+const quickTerms = computed(() => (searchQuery.value.trim() ? [searchQuery.value.trim()] : []))
+
 function addCondition() {
   conditions.value.push({ enabled: true, field: "title", mode: "exact", value: "" })
 }
@@ -734,10 +742,10 @@ onMounted(async () => {
             </div>
             <p v-if="hit.type === 'chapter'" class="mt-1 text-xs font-medium">{{ hit.title }}</p>
             <p v-if="hit.author" class="mt-1 text-xs text-muted dark:text-gray-400">{{ hit.author }}</p>
-            <p v-if="hit.snippet" class="mt-1 line-clamp-2 text-xs text-muted dark:text-gray-400">{{ hit.snippet }}</p>
+            <p v-if="hit.snippet" class="mt-1 line-clamp-2 text-xs text-muted dark:text-gray-400"><SnippetText :text="hit.snippet" :terms="advancedTerms" /></p>
             <div v-if="hit.matched_chapter" class="mt-2 rounded bg-accent/5 px-2.5 py-2 border border-accent/10">
               <p class="text-xs font-medium">{{ hit.matched_chapter.title }}</p>
-              <p v-if="hit.matched_chapter.snippet" class="mt-0.5 line-clamp-2 text-xs text-muted dark:text-gray-400">{{ hit.matched_chapter.snippet }}</p>
+              <p v-if="hit.matched_chapter.snippet" class="mt-0.5 line-clamp-2 text-xs text-muted dark:text-gray-400"><SnippetText :text="hit.matched_chapter.snippet" :terms="advancedTerms" /></p>
             </div>
           </button>
         </div>
@@ -766,7 +774,7 @@ onMounted(async () => {
             </div>
             <p v-if="hit.type === 'chapter'" class="mt-1 text-xs font-medium">{{ hit.title }}</p>
             <p v-if="hit.author" class="mt-1 text-xs text-muted dark:text-gray-400">{{ hit.author }}</p>
-            <p v-if="hit.snippet" class="mt-1 line-clamp-2 text-xs text-muted dark:text-gray-400">{{ hit.snippet }}</p>
+            <p v-if="hit.snippet" class="mt-1 line-clamp-2 text-xs text-muted dark:text-gray-400"><SnippetText :text="hit.snippet" :terms="quickTerms" /></p>
           </button>
         </div>
         <div v-if="searchTotal > 40" class="mt-6 flex items-center justify-center gap-3 text-xs">

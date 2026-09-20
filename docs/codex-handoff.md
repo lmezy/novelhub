@@ -21,7 +21,7 @@
 `lonezy/novelhub-{backend,crawler,scheduler,frontend}`。
 **最近一次部署：2026-09-19 21:53**（四个镜像重建，代码 = `91b444f`；三个镜像自检
 `grep -c task_concurrency_limit` = 3，`max_connections` = 200 已生效）。
-**第 39 节又改了 backend 与 frontend，需要再次重建四个镜像。**
+**第 39、40 节都改了 backend 与 frontend（§40 = 正文搜索命中片段），重建这两个镜像即一并生效。**
 
 **线上数据库**（注意不是默认端口，`psql` 要带 `-h 127.0.0.1 -p 15432`，密码见 `.env`）：
 
@@ -1380,3 +1380,40 @@ PID 7 在 `do_epoll_wait`、CPU 不增长、池 12/30 没满，所以不是连�
 **待用户处理**：重建 **四个**镜像（本次含 frontend，上次只重建了三个），重新部署即可 ——
 crawler 重启会自然清掉当前僵尸槽位，那 9 个 pending 任务会立刻开跑（源站仍在反爬，失败是源站问题）。
 postgres 不用再动。
+
+## 40. 正文搜索命中片段：手机上"看不到命中词"（2026-09-20）
+
+**现象**（用户报）：正文搜索的结果，手机端和电脑端显示的内容不一致，手机端更少，而且**显示出来的
+内容里不一定有命中词**。
+
+**根因 1（后端，命中词压根不在片段里）**：单条件正文搜索走 `_single_condition_search` →
+`_hydrate()`，而 `_hydrate` 用**空 query** 取正文（`search("")`）。Meilisearch 只围绕 query 词做
+crop，空 query 下返回的就是**章节开头**，所以命中词通常根本不在片段中。线上实测（正文「老鸡婆」，
+4 条命中）：3 条 `snippet.find(词) == -1`，片段开头是书名/作者/发布日期/pixiv 字数，即章节头部。
+
+**根因 2（前端，两行截断是"按像素"不是"按字符"）**：两端都用 `line-clamp-2`，但一行能放多少字
+取决于视口：桌面一行约 70+ 字，手机（360px、`text-xs`）一行约 26 字，两行 ≈ 52 字。片段若以命中词
+为中心（旧 `_snippet(radius=80)`，或引擎 conjunction 的居中 crop，实测命中词落在 118 字窗口的第 73 字），
+桌面两行看得到、手机两行看不到 —— 这就是"手机端更少、且看不到命中条件"。
+
+**改动**：
+- `backend/app/services/search.py`：`SNIPPET_LEAD_CHARS=12` / `SNIPPET_TAIL_CHARS=160`，`_snippet()`
+  从"以命中词为中心"改为"以命中词为起点"（前留 12 字 + `...`，后留 160 字）；12 + `...` 保证命中词
+  落在**手机第一行**内（360px 一行约 26 字），尾巴才是截断吃掉的部分。
+- 正文片段改在 `_scan_condition()` 里生成 —— 那是唯一同时握着这批命中原文的地方（扫描窗口 300 行），
+  页码缓存行变成 `(score, id, snippet)`；只有 `attr == "content"` 才带片段，元数据行仍是 `""`，
+  缓存体积不变（正文 300 行 ≈ 60KB）。**不要再把正文片段交给 `_hydrate()` 的空 query crop。**
+- 多条件 AND（引擎 conjunction）用 `_hydrate_around()` 的居中 crop，改为再锚定一次
+  （`_serialize_scored_hit(..., values=...)`）。`_hydrate` 的空 query 语义保持不变（不会因 query
+  过滤而丢文档，`_hydrate_around` 做不到这点）。
+- 前端新增 `frontend/src/utils/snippet.ts`（`splitSnippet`）与 `components/SnippetText.vue`，
+  SearchPage / BooksPage 共五处片段用它把命中词包成 `<mark>`。
+
+**验证**：866 passed（原 862 + 4 新增）；6 处变异全部被 KILL（扫描不建片段、恢复对称窗口、lead 调大、
+serialize 丢片段、conjunction 不锚定、元数据行带片段）。线上 A/B（把修好的 `search.py` load 进
+backend 容器跑真实索引）：单条件正文的 ids 与 total **完全一致**，`snippet.find(词)` 由 -1 / 73
+变成 15（= 12 + `...`）或更小。headless Chrome 在 360px 渲染真实片段另确认两点：`<span>/<mark>`
+作为 `line-clamp-2` 的子元素**不会被块级化**；修复前手机首行是书名/作者，修复后首行就是高亮的命中词。
+
+**排错入口**：`snippet` 字段可由正文扫描窗口缓存，所以改了 `_snippet` 的窗口参数后页码缓存键不含它
+（`PAGE_CACHE_TTL_SECONDS=120`，两分钟内新参数不会立刻生效，属正常）。

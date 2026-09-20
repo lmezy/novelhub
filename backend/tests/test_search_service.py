@@ -272,8 +272,8 @@ def test_exact_metadata_search_uses_the_wide_window():
 
 def test_page_cache_expires():
     service, _ = _make_service()
-    service._page_cache_put("k", [(1, "a")])
-    assert service._page_cache_get("k") == [(1, "a")]
+    service._page_cache_put("k", [(1, "a", "")])
+    assert service._page_cache_get("k") == [(1, "a", "")]
 
     expires_at, ranked = service._page_cache["k"]
     service._page_cache["k"] = (expires_at - service.PAGE_CACHE_TTL_SECONDS * 2, ranked)
@@ -542,6 +542,78 @@ def test_advanced_search_content_scope_all_returns_chapters_only():
     assert result["total"] == 1
     assert result["hits"][0]["type"] == "chapter"
     assert result["hits"][0]["book_title"] == "1983"
+
+
+def test_content_search_serves_the_match_and_not_the_head_of_the_chapter():
+    """A 正文 hit must show the searched word, not the chapter's opening lines.
+
+    The page is hydrated with an *empty* query so that no hit is lost, and
+    Meilisearch only crops around the query terms -- so the excerpt it returns
+    for a body search is the head of the chapter.  Measured on the live index,
+    3 of 3 hits for 老鸡婆 served a snippet that did not contain 老鸡婆 at all,
+    which is the "the result does not show what I searched for" report.
+    """
+    service, _, chapters_index = _service_with_indexes()
+    body = "开" * 800 + "老鸡婆" + "尾" * 400
+    head = body[:120]
+
+    def _search(query, options):
+        if options.get("filter"):
+            # The engine's crop for an empty query: the head of the chapter.
+            return {"hits": [{
+                "id": "c1", "book_id": "b1", "title": "第1章", "book_title": "某书",
+                "_formatted": {"content": head},
+            }]}
+        return {"hits": [{"id": "c1", "content": body}]}
+
+    chapters_index.search.side_effect = _search
+
+    result = service.advanced_search(
+        [{"field": "content", "mode": "exact", "value": "老鸡婆"}],
+        match="and",
+        scope="all",
+    )
+
+    snippet = result["hits"][0]["snippet"]
+    assert "老鸡婆" in snippet
+    # The list clamps a snippet to two lines and a 320 px phone fits ~21 CJK
+    # glyphs per line at ``text-xs``, so the lead plus the marker must stay
+    # inside the first line, otherwise mobile hides a hit the desktop shows.
+    assert snippet.index("老鸡婆") <= SearchService.SNIPPET_LEAD_CHARS + len("...")
+    assert body[:50] not in snippet, "the chapter head is not the hit"
+    assert len(snippet) > SearchService.SNIPPET_TAIL_CHARS, "context after the match"
+
+
+def test_scan_condition_builds_snippets_for_the_body_only():
+    """Only a body scan carries an excerpt; metadata rows keep the cache small."""
+    service, _, chapters_index = _service_with_indexes()
+    body = "甲" * 300 + "铃"
+    chapters_index.search.return_value = {
+        "hits": [{"id": "c1", "title": "第一章", "content": body}]
+    }
+
+    content_rows = service._scan_condition("chapters", "content", "铃", None, 10)
+    title_rows = service._scan_condition("chapters", "title", "第一章", None, 10)
+
+    assert [(score > 0, doc_id) for score, doc_id, _ in content_rows] == [(True, "c1")]
+    assert content_rows[0][2].startswith("...") and content_rows[0][2].endswith("铃")
+    assert title_rows[0][2] == ""
+
+
+def test_snippet_is_anchored_at_the_match_and_marks_both_cuts():
+    body = "甲" * 500 + "老鸡婆" + "乙" * 500
+
+    snippet = SearchService._snippet(body, ["老鸡婆"])
+
+    assert snippet.startswith("...") and snippet.endswith("...")
+    assert snippet.count("老鸡婆") == 1
+    assert snippet.index("老鸡婆") <= SearchService.SNIPPET_LEAD_CHARS + len("...")
+    assert len(snippet) == (
+        len("...") * 2
+        + SearchService.SNIPPET_LEAD_CHARS
+        + len("老鸡婆")
+        + SearchService.SNIPPET_TAIL_CHARS
+    )
 
 
 def test_advanced_search_fuzzy_single_condition_is_scored_not_engine_paged():
@@ -915,6 +987,37 @@ def test_same_field_and_keeps_engine_hits_when_the_text_is_unavailable():
 
     assert result["total"] == 1
     assert [hit["id"] for hit in result["hits"]] == ["c1"]
+
+
+def test_same_field_and_serves_a_snippet_anchored_at_the_match():
+    """The engine crops *around* the terms, so the hit sits mid-window.
+
+    A centred crop puts the searched word ~70 characters in (measured live: 铃
+    at offset 73 of a 118-character crop), which the two-line clamp hides on a
+    phone while the desktop still shows it.  The served excerpt is re-anchored.
+    """
+    service, _, chapters_index = _service_with_indexes()
+    crop = "甲" * 70 + "铃" + "乙" * 40 + "仙" + "丙" * 40
+
+    def _search(query, options):
+        if options.get("matchingStrategy"):
+            return {"hits": [{"id": "c1"}], "estimatedTotalHits": 1}
+        if "content" in (options.get("attributesToRetrieve") or []):
+            return {"hits": [{"id": "c1", "content": crop}]}
+        return {"hits": [{
+            "id": "c1", "book_id": "b1", "title": "第1章", "book_title": "铃仙传",
+            "_formatted": {"content": crop},
+        }]}
+
+    chapters_index.search.side_effect = _search
+
+    result = service.advanced_search(
+        _conjunction_condition(), match="and", scope="chapters",
+    )
+
+    snippet = result["hits"][0]["snippet"]
+    assert "铃" in snippet and "仙" in snippet
+    assert snippet.index("铃") <= SearchService.SNIPPET_LEAD_CHARS + len("...")
 
 
 def test_same_field_and_reuses_the_ranking_for_later_pages():

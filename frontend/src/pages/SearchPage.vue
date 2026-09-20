@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { onMounted, ref, watch } from "vue"
+import { computed, onMounted, ref, watch } from "vue"
 import { api } from "../api/client"
 import NavBar from "../components/NavBar.vue"
+import SnippetText from "../components/SnippetText.vue"
 import { useRoute, useRouter } from "vue-router"
 import { useAuthStore } from "../stores/auth"
 import { useI18nStore } from "../stores/i18n"
@@ -72,6 +73,11 @@ function activeConditions() {
     .filter((c) => c.enabled && c.value.trim())
     .map((c) => ({ field: c.field, mode: c.mode, value: c.value.trim() }))
 }
+
+// The words to mark inside a snippet.  The API anchors the excerpt at the first
+// match, so this only has to make it obvious; a term that is not in an excerpt
+// simply marks nothing.
+const snippetTerms = computed(() => activeConditions().map((c) => c.value))
 
 async function loadTags() {
   try {
@@ -293,7 +299,7 @@ onMounted(async () => {
             </p>
             <p v-if="hit.author" class="text-xs text-muted dark:text-gray-400">{{ hit.author }}</p>
             <p v-if="hit.snippet" class="text-xs text-muted dark:text-gray-400 mt-1 line-clamp-2">
-              {{ hit.snippet }}
+              <SnippetText :text="hit.snippet" :terms="snippetTerms" />
             </p>
             <div
               v-if="hit.matched_chapter"
@@ -305,7 +311,7 @@ onMounted(async () => {
               </p>
               <p v-if="hit.matched_chapter.snippet" class="text-xs text-muted dark:text-gray-400 line-clamp-2">
                 <span class="text-muted dark:text-gray-400">{{ i18n.t('search_field_content') }}:</span>
-                {{ hit.matched_chapter.snippet }}
+                <SnippetText :text="hit.matched_chapter.snippet" :terms="snippetTerms" />
               </p>
             </div>
           </div>
