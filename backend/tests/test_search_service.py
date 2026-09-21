@@ -943,11 +943,12 @@ def test_same_field_and_asks_the_engine_for_the_intersection():
 
 
 def test_same_field_and_page_rechecks_the_real_text():
-    """The engine's CJK matching is per character, so the page is re-verified.
+    """Fuzzy conjunctions still scatter-match, so the page is re-verified.
 
-    ``matchingStrategy: "all"`` still resolves a multi-character condition into
-    its characters: a chapter holding either character but not the substring
-    must not be served.
+    The quoted phrase query only applies to exact values: a fuzzy condition
+    keeps its bare character tokens, and a chapter holding one fuzzy character
+    but not the substring must not be served.  (Exact values need no such
+    gate -- the engine already required the contiguous phrase.)
     """
     service, _, chapters_index = _service_with_indexes()
     chapters_index.search.side_effect = [
@@ -961,14 +962,14 @@ def test_same_field_and_page_rechecks_the_real_text():
 
     result = service.advanced_search(
         [
-            {"field": "content", "mode": "exact", "value": "铃铛"},
+            {"field": "content", "mode": "fuzzy", "value": "铃铛"},
             {"field": "content", "mode": "exact", "value": "仙"},
         ],
         match="and",
         scope="chapters",
     )
 
-    # c2 has 铛 and 仙 but never 铃铛, so the substring gate drops it.
+    # c2 has 铛 and 仙 but never 铃+铛, so the fuzzy gate drops it.
     assert [hit["id"] for hit in result["hits"]] == ["c1"]
 
 
@@ -1078,4 +1079,78 @@ def test_book_metadata_and_keeps_the_wide_window_path():
         "matchingStrategy" not in call.args[1]
         for call in books_index.search.call_args_list
     )
+
+
+def test_conjunction_query_quotes_exact_multi_character_values():
+    """Exact values must reach the engine as phrase queries.
+
+    Live index: bare ``师妹 乳环`` matched 3 094 chapters (any chapter holding
+    the four characters scattered), while only 20 hold both substrings.  The
+    page-level gate dropped every scattered hit, so total said thousands and
+    the list was empty.  Quoting makes the engine require the substrings.
+    """
+    assert (
+        SearchService._conjunction_query([
+            {"field": "content", "mode": "exact", "value": "师妹"},
+            {"field": "content", "mode": "exact", "value": "乳环"},
+        ])
+        == '"师妹" "乳环"'
+    )
+
+
+def test_conjunction_query_leaves_fuzzy_and_single_char_values_bare():
+    """Fuzzy values keep bare tokens: fuzzy only needs every char present."""
+    assert (
+        SearchService._conjunction_query([
+            {"field": "content", "mode": "fuzzy", "value": "铃铛"},
+            {"field": "content", "mode": "exact", "value": "仙"},
+        ])
+        == "铃铛 仙"
+    )
+    assert (
+        SearchService._conjunction_query([
+            {"field": "content", "mode": "exact", "value": "铃"},
+            {"field": "content", "mode": "exact", "value": "仙"},
+        ])
+        == "铃 仙"
+    )
+
+
+def test_same_field_exact_and_never_drops_a_ranked_page_row():
+    """An all-exact AND must serve every row the engine ranked.
+
+    Regression for 师妹 + 乳环: exact values are quoted, so the engine
+    already required the substrings; the page gate must not re-drop them,
+    otherwise total is non-zero while the list is empty.
+    """
+    service, _, chapters_index = _service_with_indexes()
+    chapters_index.search.side_effect = [
+        {"hits": [{"id": "c1"}, {"id": "c2"}], "estimatedTotalHits": 2},
+        {"hits": [
+            {"id": "c1", "book_id": "b1", "title": "第1章", "book_title": "师妹传",
+             "_formatted": {"content": "师妹…乳环"}},
+            {"id": "c2", "book_id": "b2", "title": "第2章", "book_title": "乳环录",
+             "_formatted": {"content": "乳环…师妹"}},
+        ]},
+        {"hits": [
+            {"id": "c1", "content": "这章只有师没有妹，更无乳环二字连写"},
+            {"id": "c2", "content": "同样散落的师与妹，以及乳与环"},
+        ]},
+    ]
+
+    result = service.advanced_search(
+        [
+            {"field": "content", "mode": "exact", "value": "师妹"},
+            {"field": "content", "mode": "exact", "value": "乳环"},
+        ],
+        match="and",
+        scope="chapters",
+    )
+
+    # The engine required both phrases; the page keeps both rows.
+    assert [hit["id"] for hit in result["hits"]] == ["c1", "c2"]
+    assert result["total"] == 2
+    scan = chapters_index.search.call_args_list[0]
+    assert scan.args[0] == '"师妹" "乳环"'
+    assert scan.args[1]["matchingStrategy"] == "all"
 

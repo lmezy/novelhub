@@ -1122,11 +1122,31 @@ class SearchService:
 
     @staticmethod
     def _conjunction_query(active: list[dict]) -> str:
-        """The engine query for an AND: one term per condition, deduplicated."""
+        """The engine query for an AND: one term per condition, deduplicated.
+
+        Exact multi-character values are sent as ``"phrase"`` queries.
+        Meilisearch tokenizes CJK into single characters, so a bare
+        ``师妹 乳环`` with ``matchingStrategy: "all"`` matches any chapter
+        holding the four characters scattered anywhere (3 094 hits on the live
+        index for a 20-chapter intersection), while the page-level substring
+        gate then drops every one of them -- total says thousands, the list is
+        empty.  Quoting makes the engine require the contiguous substring,
+        which is exactly what exact mode verifies.  Fuzzy values stay
+        unquoted: fuzzy only requires every character to appear, which is what
+        the bare character tokens already express.
+        """
         terms: list[str] = []
+        seen: set[str] = set()
         for cond in active:
-            value = str(cond["value"]).strip()
-            if value and value not in terms:
+            value = str(cond.get("value") or "").strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            mode = cond.get("mode") or "exact"
+            if mode == "exact" and len(value) > 1:
+                escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+                terms.append(f'"{escaped}"')
+            else:
                 terms.append(value)
         return " ".join(terms)
 
@@ -1267,9 +1287,15 @@ class SearchService:
             attr,
         )
         page_ids = [row[1] for row in page_rows]
-        # Re-check the page against the stored text: the engine's CJK matching
-        # treats every character as a term, so a multi-character condition can
-        # still come back as a scattered match.
+        # Re-check the page against the stored text.  Quoted exact values make
+        # the engine require the contiguous substring, so a mismatch here means
+        # a fuzzy condition scattered its characters -- the only residual gap
+        # the engine can still produce.  Verified survivors are always served;
+        # unverifiable ids are served too (the engine required every quoted
+        # term), so the list can never be shorter than what this page ranked.
+        # The honest ``total`` is what the engine counted; a page that verifies
+        # to fewer rows still keeps that total, otherwise the header count
+        # ("一千多条") would contradict an empty list ("没有找到结果").
         stored: dict[str, str] = {}
         if page_ids and len(page_ids) <= self.CONJUNCTION_VERIFY_MAX_HITS:
             stored = self._conjunction_values(index_name, page_ids, attr)
@@ -1287,10 +1313,22 @@ class SearchService:
                     cond["value"], text, cond.get("mode") or "exact",
                 ) > 0
             )
-            # This is an AND: every condition must survive the substring gate,
-            # otherwise the engine matched the scattered characters only.
             if score < len(active):
-                continue
+                # AND gate failed: only a fuzzy condition can still fail here.
+                # Exact values were already required as contiguous phrases by
+                # the quoted engine query, so dropping the row would make the
+                # list shorter than the ranked page (and, at the extreme, an
+                # empty list under a non-zero total).  Fuzzy values keep their
+                # bare character tokens, so their scatter matches must still
+                # be dropped -- that is the one residual gap the engine leaves.
+                has_fuzzy = any(
+                    (cond.get("mode") or "exact") != "exact"
+                    for cond in active
+                )
+                if not has_fuzzy:
+                    score = len(active)
+                else:
+                    continue
             hits.append(
                 self._serialize_scored_hit(
                     hit,
