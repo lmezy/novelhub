@@ -1,0 +1,42 @@
+{
+    "bookSourceComment": "第一版主/123小说网初稿(v0.1,2026-09-21):按云端可见结构编写,未用原始HTML核对,选择器均为待验证猜测,命中失败时通用解析兜底。bookSourceUrl用44444444线路(用户指定);同CMS还有33333333等线路,不通时整串替换域名即可。Cloudflare挑战:需与NovelHub同代理节点过验证后导入Cookie(见docs/cookie-guide.md,该站已有记录)。正文toimg单字图:规则只能拿到带缺字洞的文本+图片引用,全量还原需OCR(本版不做)。cover规则故意省略:全站共用占位图,留空走通用过滤。无searchUrl:站内搜索入口未观测到,先用发现+直链同步;找到搜索框form action后补searchUrl+ruleSearch。",
+    "bookSourceName": "第一版主",
+    "bookSourceGroup": "第一版主",
+    "bookSourceType": 0,
+    "bookSourceUrl": "https://www.banzhu44444444.net",
+    "bookUrlPattern": "https?://(www\\.)?banzhu\\d+\\.net/\\d+/\\d+/?$",
+    "charset": "gbk",
+    "header": "{\n    \"User-Agent\": \"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36\"\n  }",
+    "customOrder": 0,
+    "enabled": true,
+    "enabledCookieJar": true,
+    "enabledExplore": true,
+    "exploreUrl": "[\n  { \"title\": \"玄幻奇幻\", \"url\": \"https://www.banzhu44444444.net/shuku/1-lastupdate-0-{{page}}.html\" },\n  { \"title\": \"仙侠武侠\", \"url\": \"https://www.banzhu44444444.net/shuku/2-lastupdate-0-{{page}}.html\" },\n  { \"title\": \"都市言情\", \"url\": \"https://www.banzhu44444444.net/shuku/3-lastupdate-0-{{page}}.html\" },\n  { \"title\": \"穿越历史\", \"url\": \"https://www.banzhu44444444.net/shuku/4-lastupdate-0-{{page}}.html\" },\n  { \"title\": \"科幻灵异\", \"url\": \"https://www.banzhu44444444.net/shuku/5-lastupdate-0-{{page}}.html\" },\n  { \"title\": \"藏经阁\", \"url\": \"https://www.banzhu44444444.net/shuku/6-lastupdate-0-{{page}}.html\" },\n  { \"title\": \"其他类别\", \"url\": \"https://www.banzhu44444444.net/shuku/7-lastupdate-0-{{page}}.html\" }\n]",
+    "loginUrl": "https://www.banzhu44444444.net",
+    "respondTime": 180000,
+    "ruleBookInfo": {
+        "author": "a[href*='author']@text",
+        "intro": "meta[name='description']@content",
+        "kind": "a[href*='/fenlei/']@text",
+        "name": "h1@text"
+    },
+    "ruleContent": {
+        "content": "#content@textNodes",
+        "nextContentUrl": "a:contains(下一页)@href"
+    },
+    "ruleExplore": {
+        "author": "a[href*='author']@text",
+        "bookList": "ul li||div.book-item||div.common-bookele",
+        "bookUrl": "a@href",
+        "lastChapter": "a[href*='.html']@text",
+        "name": "a@text"
+    },
+    "ruleToc": {
+        "chapterList": "ul.chapterlist a||#list a||div.listmain a||.chapter-list a||#chapters a",
+        "chapterName": "@text",
+        "chapterUrl": "@href",
+        "nextTocUrl": "a:contains(下页)@href"
+    },
+    "weight": 0,
+    "lastUpdateTime": "1789948800000"
+}

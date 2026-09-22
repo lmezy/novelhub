@@ -1,0 +1,52 @@
+{
+    "bookSourceComment": "涩涩小说(seseclub.com,麦可CMS/maxgxs02模板)v0.1(2026-09-22):选择器全部用--resolve直连novel.seseclub.com(104.234.155.95)抓到的真实HTML+NovelHub本机规则引擎实测验证过,非猜测。DNS被污染(novel子域+sesebooks.com本地均ENOENT,8.8.8.8解出104.234.155.95),NovelHub侧若直连失败请走代理出口。book页/book/info/{slug}(书+目录同页,6章),章/book/read/{bid}/{cid}。列表ul.aglike li(搜索10条/分类20条,结构一致,搜索/发现共用):书名div.name,作者站方列表不展示(未知,详情页p.wt有),封面全站占位empty.png(coverUrl仅如实返回),简介div.decs,分类div.bnt span.1(第2个span)。详情:书名div.info h2,作者p.wt##作者：,分类p.fl##分类：,状态p.zt##状态：,简介div.necot,目录div.mltem a(6/6)。正文#source@text(单p,<br/>换行,本机@text转\\n,10650字)。分页/book/search/{key}/{n}与/book/category/.../page/{n}(page=1亦有效,共2页/14485页)。无Cloudflare,charset=utf-8(BOM)。bookUrlPattern覆盖novel.seseclub.com与sesebooks.com双域(站内canonical指向sesebooks.com)。",
+    "bookSourceName": "涩涩小说",
+    "bookSourceGroup": "涩涩小说",
+    "bookSourceType": 0,
+    "bookSourceUrl": "https://novel.seseclub.com",
+    "bookUrlPattern": "https?://(novel\\.seseclub\\.com|sesebooks\\.com)/book/info/[^/]+/?$",
+    "charset": "utf-8",
+    "header": "{\n    \"User-Agent\": \"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36\"\n  }",
+    "customOrder": 0,
+    "enabled": true,
+    "enabledCookieJar": true,
+    "enabledExplore": true,
+    "exploreUrl": "[\n  { \"title\": \"全库\", \"url\": \"https://novel.seseclub.com/book/category/\" },\n  { \"title\": \"笔趣阁\", \"url\": \"https://novel.seseclub.com/book/category/list/4\" },\n  { \"title\": \"藏经阁\", \"url\": \"https://novel.seseclub.com/book/category/list/3\" },\n  { \"title\": \"玄幻\", \"url\": \"https://novel.seseclub.com/book/category/list/4/tags/1\" },\n  { \"title\": \"武侠\", \"url\": \"https://novel.seseclub.com/book/category/list/4/tags/2\" },\n  { \"title\": \"仙侠\", \"url\": \"https://novel.seseclub.com/book/category/list/4/tags/3\" },\n  { \"title\": \"古言\", \"url\": \"https://novel.seseclub.com/book/category/list/4/tags/4\" },\n  { \"title\": \"都市\", \"url\": \"https://novel.seseclub.com/book/category/list/4/tags/5\" },\n  { \"title\": \"历史\", \"url\": \"https://novel.seseclub.com/book/category/list/4/tags/6\" },\n  { \"title\": \"网游\", \"url\": \"https://novel.seseclub.com/book/category/list/4/tags/7\" },\n  { \"title\": \"科幻\", \"url\": \"https://novel.seseclub.com/book/category/list/4/tags/8\" },\n  { \"title\": \"女生\", \"url\": \"https://novel.seseclub.com/book/category/list/4/tags/9\" },\n  { \"title\": \"同人\", \"url\": \"https://novel.seseclub.com/book/category/list/4/tags/10\" },\n  { \"title\": \"穿越\", \"url\": \"https://novel.seseclub.com/book/category/list/4/tags/12\" },\n  { \"title\": \"重生\", \"url\": \"https://novel.seseclub.com/book/category/list/4/tags/13\" },\n  { \"title\": \"系统\", \"url\": \"https://novel.seseclub.com/book/category/list/4/tags/14\" },\n  { \"title\": \"耽美\", \"url\": \"https://novel.seseclub.com/book/category/list/4/tags/17\" },\n  { \"title\": \"百合\", \"url\": \"https://novel.seseclub.com/book/category/list/4/tags/18\" },\n  { \"title\": \"NTR\", \"url\": \"https://novel.seseclub.com/book/category/list/4/tags/19\" },\n  { \"title\": \"足控\", \"url\": \"https://novel.seseclub.com/book/category/list/4/tags/20\" },\n  { \"title\": \"乱伦\", \"url\": \"https://novel.seseclub.com/book/category/list/4/tags/21\" },\n  { \"title\": \"SM\", \"url\": \"https://novel.seseclub.com/book/category/list/4/tags/22\" },\n  { \"title\": \"伪娘\", \"url\": \"https://novel.seseclub.com/book/category/list/4/tags/23\" },\n  { \"title\": \"综合\", \"url\": \"https://novel.seseclub.com/book/category/list/4/tags/25\" }\n]",
+    "searchUrl": "https://novel.seseclub.com/book/search/{{key}}",
+    "respondTime": 180000,
+    "ruleBookInfo": {
+        "author": "p.wt@text##作者：",
+        "coverUrl": "div.photo img@src",
+        "intro": "div.necot@text",
+        "kind": "p.fl@text##分类：",
+        "lastChapter": "div.mltem a.-1@text",
+        "name": "div.info h2@text",
+        "status": "p.zt@text##状态："
+    },
+    "ruleContent": {
+        "content": "#source@text"
+    },
+    "ruleExplore": {
+        "bookList": "ul.aglike li",
+        "bookUrl": "a@href",
+        "coverUrl": "img@src",
+        "intro": "div.decs@text",
+        "kind": "div.bnt span.1@text",
+        "name": "div.name@text"
+    },
+    "ruleSearch": {
+        "bookList": "ul.aglike li",
+        "bookUrl": "a@href",
+        "coverUrl": "img@src",
+        "intro": "div.decs@text",
+        "kind": "div.bnt span.1@text",
+        "name": "div.name@text"
+    },
+    "ruleToc": {
+        "chapterList": "div.mltem a",
+        "chapterName": "@text",
+        "chapterUrl": "@href"
+    },
+    "weight": 0,
+    "lastUpdateTime": "1789948800000"
+}

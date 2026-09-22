@@ -646,8 +646,17 @@ class SyncService:
         content: str,
         base_url: str,
         plugin,
+        image_progress_cb: Callable[[int, int], Awaitable[None]] | None = None,
     ) -> str:
-        """Download in-content images and rewrite references to local URLs."""
+        """Download in-content images and rewrite references to local URLs.
+
+        ``image_progress_cb`` is awaited with ``(handled, total)`` before each
+        image is fetched.  Images are downloaded one at a time and one album
+        chapter can hold hundreds of them, so on a slow or failing image host
+        this is the only progress a whole book produces for hours -- see
+        ``crawl_runner._progress_marker``, whose stall watchdog would otherwise
+        read a working task as hung.
+        """
         if not content:
             return content
         fetcher = getattr(plugin, "fetch_content_image", None)
@@ -668,7 +677,13 @@ class SyncService:
         refs = refs[:content_image_limit()]
 
         replaced: dict[str, str] = {}
-        for original, src, alt in refs:
+        total_images = len(refs)
+        for handled, (original, src, alt) in enumerate(refs, start=1):
+            # Reported before the fetch, so the counter advances for every image
+            # (including the inlined ``data:`` ones) and stops exactly when one
+            # really hangs.
+            if image_progress_cb is not None:
+                await image_progress_cb(handled, total_images)
             if src.startswith("data:"):
                 continue
             abs_url = urljoin(base_url or "", src).split("#", 1)[0]
@@ -928,7 +943,19 @@ class SyncService:
         total = len(remote_book.chapters)
         failed_chapters: list[dict] = []
 
-        async def _report_progress(remote_chapter) -> None:
+        async def _report_progress(
+            remote_chapter,
+            images_done: int = 0,
+            images_total: int = 0,
+        ) -> None:
+            """Publish this book's progress to the crawl task row.
+
+            ``images_done``/``images_total`` describe the image album of the
+            chapter being downloaded right now.  Between two chapter boundaries
+            they are the only fields that move (see
+            ``_process_content_images``), and the crawl queue's stall watchdog
+            reads exactly those.
+            """
             if progress_cb is not None:
                 await progress_cb({
                     "book_id": book_id,
@@ -939,6 +966,8 @@ class SyncService:
                     "skipped_chapters": skipped,
                     "failed_chapters": len(failed_chapters),
                     "total_chapters": total,
+                    "images_done": images_done,
+                    "images_total": images_total,
                 })
 
         existing_source_ids = await self._reconcile_chapter_ids(
@@ -967,6 +996,13 @@ class SyncService:
         results_queue = asyncio.Queue(maxsize=concurrency * 2)
 
         async def _producer(remote_chapter) -> None:
+            async def _report_images(handled: int, images_total: int) -> None:
+                await _report_progress(
+                    remote_chapter,
+                    images_done=handled,
+                    images_total=images_total,
+                )
+
             async with semaphore:
                 chapter_db_id = str(uuid4())
                 try:
@@ -980,6 +1016,7 @@ class SyncService:
                         content,
                         remote_chapter.url,
                         plugin,
+                        image_progress_cb=_report_images,
                     )
                     result = (remote_chapter, content, None, chapter_db_id)
                 except Exception as exc:

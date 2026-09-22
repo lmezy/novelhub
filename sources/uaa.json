@@ -1,0 +1,63 @@
+{
+    "bookSourceComment": "UAA有爱爱小说(uaa.com) v0.1(2026-09-22):改编自源仓库 Yan1949101 的 UAA小说·言璃版 v3.2(id/7713,2026-08-30),针对 NovelHub 本机 yuedu 规则引擎做过兼容改写,改写点全部用真实规则引擎实测验证过,非猜测:①bookList 用裸 $.model.data(本机 @json: 前缀会走文本模式把列表压成 Python repr 字符串,导致搜索/发现 0 结果,已实测);②bookUrl 不用 {{$.id}} 模板(本机 _substitute 只认 key/page 等少数变量,$. 模板只在 _substitute_inner_rules 里解,探索/搜索的 URL 字段不走该路径,已实测为空),改用 @js 模板字符串拼全 URL(反引号 ${result.id} 形式;注意单/双引号拼接会被 _try_eval_js_value 当 JSON 字符串直接返回 id 本体,已实测);③ruleToc chapterName 用 title、chapterUrl 用 href(列表项本身就是 <a>,本机子步骤 a@title 会往子元素找而落空,已实测);④kind/lastChapter 降级为单字段($.tags/$.latestUpdate),原版 {{result.finished == 1 ? }} 三元模板本机 _try_eval_js_value 解不出来(已实测为 None);⑤bookUrlPattern 只覆盖 intro(原版连 chapter 一起覆盖会导致本机 _is_chapter_url 把所有章节判成书页而整书 0 章,已实测);⑥isVip 保留 .ndc-acc@text##注册会员(文本能取到,是否映射由 book.py 按 true/1/yes 判定,此处仅如实返回);⑥正文 @js 规则原样保留(本机 Node shim 实测:广告段过滤与 478 限流提示分支均正常);⑦header 原样保留 Cookie novel=1(作者称可覆盖 viewId 追踪免疫 30 秒 10 章限流,本机 transport concurrentRate 3400 亦原样保留);⑧bookSourceUrl 用 https://m.uaa.com(与原版一致,API 与移动端 HTML 均挂 m 域;www 域走 SSR,结构不同)。注意:本地直连 www/m.uaa.com 均被 TCP RST(运营商层,与 UA/镜像域无关,备用域名 uaa001~同样 RST),云端可正常抓取;NovelHub 侧需走代理出口,按 transport 的 proxy/direct 双通道自动尝试。游客只能看免费章(目录标注册会员为残篇/预览),会员章需登录 Cookie,见 docs/cookie-guide.md。",
+    "bookSourceName": "UAA小说",
+    "bookSourceGroup": "UAA小说",
+    "bookSourceType": 0,
+    "bookSourceUrl": "https://m.uaa.com",
+    "bookUrlPattern": "https?://(www|m)\\.uaa\\.com/novel/intro\\?id=.*",
+    "charset": "utf-8",
+    "concurrentRate": "3400",
+    "customOrder": 0,
+    "enabled": true,
+    "enabledCookieJar": false,
+    "enabledExplore": true,
+    "exploreUrl": "[{\"title\": \"最新上架\", \"url\": \"https://m.uaa.com/api/novel/app/novel/search?page={{page}}&size=20&orderType=1\"}, {\"title\": \"最近更新\", \"url\": \"https://m.uaa.com/api/novel/app/novel/search?page={{page}}&size=20&orderType=2\"}, {\"title\": \"最多观看\", \"url\": \"https://m.uaa.com/api/novel/app/novel/search?page={{page}}&size=20&orderType=3\"}, {\"title\": \"最多收藏\", \"url\": \"https://m.uaa.com/api/novel/app/novel/search?page={{page}}&size=20&orderType=4\"}, {\"title\": \"都市\", \"url\": \"https://m.uaa.com/api/novel/app/novel/search?category=都市&page={{page}}&size=20\"}, {\"title\": \"校园\", \"url\": \"https://m.uaa.com/api/novel/app/novel/search?category=校园&page={{page}}&size=20\"}, {\"title\": \"乱伦\", \"url\": \"https://m.uaa.com/api/novel/app/novel/search?category=乱伦&page={{page}}&size=20\"}, {\"title\": \"玄幻\", \"url\": \"https://m.uaa.com/api/novel/app/novel/search?category=玄幻&page={{page}}&size=20\"}, {\"title\": \"系统\", \"url\": \"https://m.uaa.com/api/novel/app/novel/search?category=系统&page={{page}}&size=20\"}, {\"title\": \"穿越\", \"url\": \"https://m.uaa.com/api/novel/app/novel/search?category=穿越&page={{page}}&size=20\"}, {\"title\": \"武侠\", \"url\": \"https://m.uaa.com/api/novel/app/novel/search?category=武侠&page={{page}}&size=20\"}, {\"title\": \"奇幻\", \"url\": \"https://m.uaa.com/api/novel/app/novel/search?category=奇幻&page={{page}}&size=20\"}, {\"title\": \"乡村\", \"url\": \"https://m.uaa.com/api/novel/app/novel/search?category=乡村&page={{page}}&size=20\"}, {\"title\": \"历史\", \"url\": \"https://m.uaa.com/api/novel/app/novel/search?category=历史&page={{page}}&size=20\"}, {\"title\": \"明星\", \"url\": \"https://m.uaa.com/api/novel/app/novel/search?category=明星&page={{page}}&size=20\"}, {\"title\": \"科幻\", \"url\": \"https://m.uaa.com/api/novel/app/novel/search?category=科幻&page={{page}}&size=20\"}, {\"title\": \"同人\", \"url\": \"https://m.uaa.com/api/novel/app/novel/search?category=同人&page={{page}}&size=20\"}]",
+    "header": "{\"User-Agent\": \"Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36\", \"Accept-Language\": \"zh-CN,zh;q=0.9\", \"Cookie\": \"novel=1\"}",
+    "httpUserAgent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+    "lastUpdateTime": "1789948800000",
+    "loginUrl": "https://m.uaa.com/",
+    "respondTime": 180000,
+    "ruleBookInfo": {
+        "author": "@css:.nd-author__lk@text",
+        "coverUrl": "@css:.nd-cover img@src",
+        "intro": "@js:var doc=org.jsoup.Jsoup.parse(result);'评分：'+doc.select('.nd-score b').text()+'\\n\\n'+doc.select('.nd-synopsis').text()",
+        "kind": "@css:.nd-pill--cat@text&&@css:.nd-tag--live@text",
+        "lastChapter": "@css:.nd-latest@text",
+        "name": "@css:h1.nd-t1@text",
+        "tocUrl": "",
+        "wordCount": "@css:.nd-stat .n@text"
+    },
+    "ruleContent": {
+        "content": "@js:var html=result,out='';if(html.indexOf('code: 478')>=0){out='【UAA限流封禁】30秒内取章超过10次触发了反爬保护。\\n\\n【方式一·立即解封】\\n1.点书源右上角菜单→「登录」\\n2.浏览器打开UAA后，随便打开一本书的章节\\n3.页面会自动弹出验证码（算术题）\\n4.输入计算结果提交→解封成功\\n5.返回阅读App→刷新本章\\n\\n【方式二·等待】约10分钟后自动解除\\n\\n【预防】书源已内置自动限速，正常阅读不会再触发。';}else{var doc=org.jsoup.Jsoup.parse(html);var ps=doc.select('.reader-body p');var arr=[];var bad=['女儿骚','永久域名','最新热门色情视频','UAA热门板块','uaadizhi','最佳浏览','Chrome','Safari','VPN','电报','t.me','18禁','付费章节','以下正文内容已隐藏','立即登录','开通VIP','解锁全站'];for(var i=0;i<ps.size();i++){var t=ps.get(i).text().trim();if(!t)continue;var f=0;for(var j=0;j<bad.length;j++){if(t.indexOf(bad[j])>=0){f=1;break;}}if(!f)arr.push(t);}if(arr.length==0){out='正文提取为空：可能网络波动或页面变化，请刷新重试。';}else{if(html.indexOf('以下正文内容已隐藏')>=0){arr.unshift('【本章需登录会员后阅读，以下为游客预览】');}out=arr.join('\\n');}}out"
+    },
+    "ruleExplore": {
+        "author": "$.authors",
+        "bookList": "$.model.data",
+        "bookUrl": "@js:`https://m.uaa.com/novel/intro?id=${result.id}`",
+        "coverUrl": "$.coverUrl",
+        "intro": "$.brief",
+        "kind": "$.tags",
+        "lastChapter": "$.latestUpdate",
+        "name": "$.title",
+        "wordCount": "$.wordCountFormat"
+    },
+    "ruleSearch": {
+        "author": "$.authors",
+        "bookList": "$.model.data",
+        "bookUrl": "@js:`https://m.uaa.com/novel/intro?id=${result.id}`",
+        "coverUrl": "$.coverUrl",
+        "intro": "$.brief",
+        "kind": "$.tags",
+        "lastChapter": "$.latestUpdate",
+        "name": "$.title",
+        "wordCount": "$.wordCountFormat"
+    },
+    "ruleToc": {
+        "chapterList": "@css:#ndcBody a.ndc-row",
+        "chapterName": "title",
+        "chapterUrl": "href",
+        "isVip": ".ndc-acc@text##注册会员"
+    },
+    "searchUrl": "https://m.uaa.com/api/novel/app/novel/search?keyword={{key}}&page={{page}}&size=20",
+    "weight": 0
+}

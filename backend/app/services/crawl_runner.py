@@ -24,6 +24,7 @@ from app.core.config import (
     task_supervise_interval_seconds,
 )
 from app.core.database import SessionLocal
+from app.core.heartbeat import mark_alive
 from app.models import CrawlTask
 
 
@@ -237,6 +238,13 @@ async def _reset_stale_running_tasks() -> None:
         await db.commit()
 
 
+#: How often a chapter-level progress report is written to the task row while
+#: the tenth update is still far away.  That row is what the stall watchdog
+#: reads (``_progress_marker``), and an image album chapter is downloaded one
+#: image at a time over hours, so a time bound is what keeps the row moving.
+_CHAPTER_PROGRESS_COMMIT_SECONDS = 30.0
+
+
 async def run_crawl_task_async(task_id: str) -> dict:
     """Execute one pending crawl task with pause/cancel/progress support."""
     from app.services.sync import SyncPaused, SyncService
@@ -283,6 +291,7 @@ async def run_crawl_task_async(task_id: str) -> dict:
         progress_state["pages_checked"] = 0
         start_page = int(progress_state.get("next_page") or 1)
         chapter_progress_updates = 0
+        chapter_progress_committed_at = time.monotonic()
         db_lock = asyncio.Lock()
 
         async def _wait_if_paused() -> None:
@@ -314,7 +323,8 @@ async def run_crawl_task_async(task_id: str) -> dict:
                 await db.commit()
 
         async def _update_chapter_progress(info: dict) -> None:
-            nonlocal chapter_progress_updates, progress_state
+            nonlocal chapter_progress_updates, chapter_progress_committed_at
+            nonlocal progress_state
             async with db_lock:
                 progress_state.update({
                     "current_book": info.get("book_title") or "",
@@ -323,12 +333,29 @@ async def run_crawl_task_async(task_id: str) -> dict:
                     "current_chapters_skipped": info.get("skipped_chapters", 0),
                     "current_chapters_failed": info.get("failed_chapters", 0),
                     "current_chapters_total": info.get("total_chapters", 0),
+                    # Images of the chapter being downloaded right now.  A
+                    # gallery chapter is fetched one image at a time, so an hour
+                    # or more can pass between two chapter reports and this is
+                    # the only counter that moves inside it (see
+                    # ``_progress_marker``).
+                    "current_images_done": int(info.get("images_done", 0) or 0),
+                    "current_images_total": int(info.get("images_total", 0) or 0),
                 })
                 task_obj.progress = {
                     **progress_state,
                 }
                 chapter_progress_updates += 1
-                if chapter_progress_updates % 10 == 0:
+                now = time.monotonic()
+                # Waiting for the tenth report left the row untouched for the
+                # whole first album chapter: online on 2026-09-22 two gallery
+                # tasks were killed as "no progress for 60 minutes" while their
+                # logs showed images being fetched until minutes before.
+                if (
+                    chapter_progress_updates % 10 == 0
+                    or now - chapter_progress_committed_at
+                    >= _CHAPTER_PROGRESS_COMMIT_SECONDS
+                ):
+                    chapter_progress_committed_at = now
                     await db.commit()
 
         try:
@@ -588,6 +615,10 @@ def _progress_marker(progress: Any) -> tuple:
     The sync writes one of these fields at every checkpoint, so an unchanged
     marker over a long period is the worker's only evidence that a coroutine
     parked on a dead connection is not coming back.
+
+    Image progress belongs here because an album chapter is downloaded one image
+    at a time: without it a task that is fetching its 400th image looks exactly
+    like one that stopped an hour ago.
     """
     if not isinstance(progress, dict):
         progress = {}
@@ -598,6 +629,8 @@ def _progress_marker(progress: Any) -> tuple:
         progress.get("current_book"),
         progress.get("current_chapter"),
         progress.get("current_chapters_created"),
+        progress.get("current_images_done"),
+        progress.get("current_images_total"),
     )
 
 
@@ -784,6 +817,13 @@ def _release_abandoned(
     return released
 
 
+#: How long the loop waits after an unexpected error before polling again.  The
+#: queue is database-backed, so the error that matters in practice is the
+#: database going away for a few seconds; a short fixed delay rides that out
+#: without hammering a database that is still coming back.
+_LOOP_ERROR_BACKOFF_SECONDS = 5.0
+
+
 async def _worker_loop() -> None:
     """Run every book source in its own worker, in parallel.
 
@@ -806,6 +846,14 @@ async def _worker_loop() -> None:
     never reached a checkpoint, and once every slot was held that way the queue
     stopped consuming new tasks for good (seen online on 2026-09-20: nine
     freshly created tasks sat ``pending`` for 12h while the worker stayed idle).
+
+    The loop itself has to outlive its own mistakes as well: online on
+    2026-09-22 the database restarted, the very next poll raised out of this
+    coroutine, and -- because ``asyncio.run`` then hung in its own teardown --
+    the container stayed alive with a queue that consumed nothing for as long as
+    nobody restarted it.  Every iteration therefore logs and backs off instead
+    of ending the loop, and reports its liveness through ``app.core.heartbeat``
+    so the container supervisor can restart a worker that stops ticking.
     """
     limit = task_concurrency_limit()
     supervise_interval = task_supervise_interval_seconds()
@@ -834,62 +882,80 @@ async def _worker_loop() -> None:
         return max(1, limit - len(active))
 
     while True:
-        while len(active) < limit:
-            candidates = await _next_pending_tasks(_free_slots(), running_sources)
-            if not candidates:
-                break
-            started_any = False
-            for task_id, source in candidates:
-                if len(active) >= limit:
+        try:
+            # Liveness signal for the container's supervisor (see
+            # ``app.core.heartbeat``).  This loop iterates at least every two
+            # seconds, so a signal that stops moving is what tells a wedged
+            # worker -- alive, holding the queue, consuming nothing -- apart from
+            # a busy one.
+            mark_alive()
+
+            while len(active) < limit:
+                candidates = await _next_pending_tasks(_free_slots(), running_sources)
+                if not candidates:
                     break
-                if task_id in claimed or source in running_sources:
-                    continue
-                claimed.add(task_id)
-                running_sources.add(source)
-                entry = _ActiveTask(task_id, source, time.monotonic())
-                task = asyncio.create_task(_run_guarded(entry))
-                active[task] = entry
-                started_any = True
-            if not started_any:
-                # All candidates are already claimed but not yet running.
-                break
+                started_any = False
+                for task_id, source in candidates:
+                    if len(active) >= limit:
+                        break
+                    if task_id in claimed or source in running_sources:
+                        continue
+                    claimed.add(task_id)
+                    running_sources.add(source)
+                    entry = _ActiveTask(task_id, source, time.monotonic())
+                    task = asyncio.create_task(_run_guarded(entry))
+                    active[task] = entry
+                    started_any = True
+                if not started_any:
+                    # All candidates are already claimed but not yet running.
+                    break
 
-        if not active:
-            await asyncio.sleep(2)
-            continue
-
-        now = time.monotonic()
-        if now >= next_supervise_at:
-            next_supervise_at = now + supervise_interval
-            await _supervise_active(active, now=now)
-            _release_abandoned(
-                active, running_sources, claimed, now=now, grace=stop_grace
-            )
             if not active:
-                # Supervision just handed back the last slot, so there is
-                # nothing left to wait on (``asyncio.wait`` refuses an empty
-                # set).
+                await asyncio.sleep(2)
                 continue
 
-        # Poll for newly created tasks even while existing tasks are running.
-        # Without the timeout, a source created right after the initial fill
-        # waits until an active task finishes before being picked up.
-        done, _ = await asyncio.wait(
-            active.keys(),
-            return_when=asyncio.FIRST_COMPLETED,
-            timeout=1.0,
-        )
-        for finished in done:
-            entry = active.pop(finished)
-            claimed.discard(entry.task_id)
-            running_sources.discard(entry.source)
-            if finished.cancelled():
-                logger.warning("Crawl task {} cancelled", entry.task_id)
-                continue
-            exc = finished.exception()
-            if exc is not None:
-                logger.error("Crawl task {} stopped: {}", entry.task_id, exc)
-        await asyncio.sleep(0.2)
+            now = time.monotonic()
+            if now >= next_supervise_at:
+                next_supervise_at = now + supervise_interval
+                await _supervise_active(active, now=now)
+                _release_abandoned(
+                    active, running_sources, claimed, now=now, grace=stop_grace
+                )
+                if not active:
+                    # Supervision just handed back the last slot, so there is
+                    # nothing left to wait on (``asyncio.wait`` refuses an empty
+                    # set).
+                    continue
+
+            # Poll for newly created tasks even while existing tasks are running.
+            # Without the timeout, a source created right after the initial fill
+            # waits until an active task finishes before being picked up.
+            done, _ = await asyncio.wait(
+                active.keys(),
+                return_when=asyncio.FIRST_COMPLETED,
+                timeout=1.0,
+            )
+            for finished in done:
+                entry = active.pop(finished)
+                claimed.discard(entry.task_id)
+                running_sources.discard(entry.source)
+                if finished.cancelled():
+                    logger.warning("Crawl task {} cancelled", entry.task_id)
+                    continue
+                exc = finished.exception()
+                if exc is not None:
+                    logger.error("Crawl task {} stopped: {}", entry.task_id, exc)
+            await asyncio.sleep(0.2)
+        except Exception as exc:
+            # The queue has to outlive its own mistakes.  Online on 2026-09-22
+            # the database restarted under a running worker: the poll that
+            # followed raised out of this coroutine, and it never ran again --
+            # every task created afterwards sat ``pending`` until the container
+            # was restarted by hand.  One logged retry turns that permanent
+            # outage into a hiccup.  ``CancelledError`` is a ``BaseException``,
+            # so a real shutdown still stops the loop here.
+            logger.error("Crawl queue loop error; retrying: {}", exc)
+            await asyncio.sleep(_LOOP_ERROR_BACKOFF_SECONDS)
 
 
 async def main_async() -> None:

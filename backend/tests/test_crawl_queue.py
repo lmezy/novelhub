@@ -11,6 +11,7 @@ from app.services.crawl_runner import (
     _ActiveTask,
     _abandoned_tasks,
     _next_pending_tasks,
+    _progress_marker,
     _release_abandoned,
     _task_slot_budget,
     _worker_loop,
@@ -284,6 +285,99 @@ async def test_crawl_runner_progress_does_not_lazy_load_expired_orm_state():
     assert task.status == "completed"
     assert chapter_seen["current_book"] == "Book"
     assert chapter_seen["pages_checked"] == 1
+
+
+def test_progress_marker_moves_when_only_the_image_counter_moves():
+    """An album chapter's only progress is its images.
+
+    Online on 2026-09-22 two gallery tasks were killed as "no progress for 60
+    minutes" while their logs showed images being fetched until minutes before
+    the kill: the marker did not include the one counter that was moving.
+    """
+    base = {
+        "pages_checked": 3,
+        "books_found": 40,
+        "books_synced": 12,
+        "current_book": "Album",
+        "current_chapter": "Chapter 1",
+        "current_chapters_created": 2,
+        "current_images_done": 100,
+        "current_images_total": 512,
+    }
+
+    assert _progress_marker(base) == _progress_marker(dict(base))
+    assert _progress_marker({**base, "current_images_done": 101}) != _progress_marker(base)
+    assert _progress_marker({**base, "current_images_total": 513}) != _progress_marker(base)
+
+
+@pytest.mark.asyncio
+async def test_chapter_progress_reaches_the_row_before_the_tenth_update():
+    """Waiting for the tenth report froze the row for a whole album chapter.
+
+    That row is what the stall watchdog reads, so a task downloading its first
+    image album looked hung from its first minute to its sixtieth and was killed
+    (both online cases on 2026-09-22 were gallery sources).
+    """
+    task = _task(progress={"next_page": 1})
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=task)
+    db.refresh = AsyncMock()
+    db.commit = AsyncMock()
+    seen: list[tuple[int, dict]] = []
+
+    def _report(images_done: int) -> dict:
+        return {
+            "book_title": "Album",
+            "chapter_title": "Chapter 1",
+            "created_chapters": 0,
+            "skipped_chapters": 0,
+            "failed_chapters": 0,
+            "total_chapters": 1,
+            "images_done": images_done,
+            "images_total": 512,
+        }
+
+    class FakeSyncService:
+        def __init__(self, db):
+            self.db = db
+
+        async def discover_and_sync_all(self, *args, **kwargs):
+            before = db.commit.await_count
+            # Long enough for the time bound to pass since the task started, and
+            # nowhere near the tenth report.
+            await asyncio.sleep(0.03)
+            await kwargs["chapter_progress_cb"](_report(1))
+            seen.append((db.commit.await_count - before, dict(task.progress)))
+            # A second report straight away must not write again: the row moves
+            # on a clock, not once per image.
+            await kwargs["chapter_progress_cb"](_report(2))
+            seen.append((db.commit.await_count - before, dict(task.progress)))
+            return {
+                "pages_checked": 0,
+                "books_found": 0,
+                "books_synced": 0,
+                "books_failed": 0,
+                "chapters_created": 0,
+                "chapters_skipped": 0,
+                "chapters_failed": 0,
+            }
+
+    session = AsyncMock()
+    session.__aenter__ = AsyncMock(return_value=db)
+    session.__aexit__ = AsyncMock(return_value=False)
+
+    with (
+        patch.object(settings, "SYNC_WORKER_CONCURRENCY", 0),
+        patch("app.services.crawl_runner._CHAPTER_PROGRESS_COMMIT_SECONDS", 0.01),
+        patch("app.services.crawl_runner.SessionLocal", return_value=session),
+        patch("app.services.sync.SyncService", FakeSyncService),
+    ):
+        await run_crawl_task_async("task-1")
+
+    assert seen[0][0] == 1, "the first image report has to reach the task row"
+    assert seen[0][1]["current_images_done"] == 1
+    assert seen[0][1]["current_images_total"] == 512
+    assert seen[1][0] == 1, "reports inside the window must not write again"
 
 
 @pytest.mark.asyncio
@@ -870,7 +964,7 @@ def test_abandoned_tasks_never_touches_a_running_task_that_reports_progress():
             stall_seconds=600.0,
         )
         assert abandoned == []
-        assert entry.marker == (step, None, None, None, None, None)
+        assert entry.marker == (step, None, None, None, None, None, None, None)
     assert entry.stop_seen_at is None
 
 

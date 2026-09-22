@@ -1,0 +1,51 @@
+{
+    "bookSourceComment": "一夜春宵(yiyechunxiao.com)初稿(v0.1,2026-09-21):选择器全部用真实HTML+NovelHub规则引擎实测验证过,非猜测。book页div.info/h1,作者取首个dd(div.info dd.0@text,因6个dd无class只能按序取),分类+标签用&&拼接,目录tocUrl取list/相对链(全量,书页只放6章最新),正文section.chapter div.content单页(站内分页器是上下章导航,故不设nextContentUrl,避免把下一章正文拼进来)。searchUrl单页(约9结果,无分页)。分类/排行页同构div.novel-list(30条/页,站方约20页封顶)。VIP章只返回试读+“VIP专属”提示,同步会是残篇,属站方付费墙,本版不做绕过。charset=utf-8。抓取时无Cloudflare挑战,无需Cookie(若后续被拦再按docs/cookie-guide.md配)。站内已有“辣肉文”源覆盖同域搜索,本源补齐发现+已验证选择器。",
+    "bookSourceName": "一夜春宵",
+    "bookSourceGroup": "一夜春宵",
+    "bookSourceType": 0,
+    "bookSourceUrl": "https://www.yiyechunxiao.com",
+    "bookUrlPattern": "https?://(www\\.)?yiyechunxiao\\.com/book/\\d+/?$",
+    "charset": "utf-8",
+    "header": "{\n    \"User-Agent\": \"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36\"\n  }",
+    "customOrder": 0,
+    "enabled": true,
+    "enabledCookieJar": true,
+    "enabledExplore": true,
+    "exploreUrl": "[\n  { \"title\": \"历史\", \"url\": \"https://www.yiyechunxiao.com/cat/15/{{page}}.html\" },\n  { \"title\": \"穿越\", \"url\": \"https://www.yiyechunxiao.com/cat/30/{{page}}.html\" },\n  { \"title\": \"同人\", \"url\": \"https://www.yiyechunxiao.com/cat/45/{{page}}.html\" },\n  { \"title\": \"武侠\", \"url\": \"https://www.yiyechunxiao.com/cat/60/{{page}}.html\" },\n  { \"title\": \"校园\", \"url\": \"https://www.yiyechunxiao.com/cat/75/{{page}}.html\" },\n  { \"title\": \"都市\", \"url\": \"https://www.yiyechunxiao.com/cat/90/{{page}}.html\" },\n  { \"title\": \"乱伦\", \"url\": \"https://www.yiyechunxiao.com/cat/105/{{page}}.html\" },\n  { \"title\": \"科幻\", \"url\": \"https://www.yiyechunxiao.com/cat/120/{{page}}.html\" },\n  { \"title\": \"奇幻\", \"url\": \"https://www.yiyechunxiao.com/cat/135/{{page}}.html\" },\n  { \"title\": \"玄幻\", \"url\": \"https://www.yiyechunxiao.com/cat/150/{{page}}.html\" },\n  { \"title\": \"系统\", \"url\": \"https://www.yiyechunxiao.com/cat/165/{{page}}.html\" },\n  { \"title\": \"乡村\", \"url\": \"https://www.yiyechunxiao.com/cat/180/{{page}}.html\" },\n  { \"title\": \"异能\", \"url\": \"https://www.yiyechunxiao.com/cat/195/{{page}}.html\" },\n  { \"title\": \"明星\", \"url\": \"https://www.yiyechunxiao.com/cat/210/{{page}}.html\" },\n  { \"title\": \"贤者\", \"url\": \"https://www.yiyechunxiao.com/cat/225/{{page}}.html\" },\n  { \"title\": \"贤者小说\", \"url\": \"https://www.yiyechunxiao.com/cat/240/{{page}}.html\" },\n  { \"title\": \"东方玄幻\", \"url\": \"https://www.yiyechunxiao.com/cat/255/{{page}}.html\" },\n  { \"title\": \"架空历史\", \"url\": \"https://www.yiyechunxiao.com/cat/270/{{page}}.html\" },\n  { \"title\": \"重生\", \"url\": \"https://www.yiyechunxiao.com/cat/285/{{page}}.html\" },\n  { \"title\": \"娱乐明星\", \"url\": \"https://www.yiyechunxiao.com/cat/300/{{page}}.html\" },\n  { \"title\": \"最新小说\", \"url\": \"https://www.yiyechunxiao.com/rank/new/{{page}}.html\" },\n  { \"title\": \"热门排行\", \"url\": \"https://www.yiyechunxiao.com/rank/hot/{{page}}.html\" },\n  { \"title\": \"完本专区\", \"url\": \"https://www.yiyechunxiao.com/rank/complete/{{page}}.html\" }\n]",
+    "searchUrl": "https://www.yiyechunxiao.com/search/?q={{key}}",
+    "respondTime": 180000,
+    "ruleBookInfo": {
+        "author": "div.info dd.0@text",
+        "coverUrl": "div.cover img@src",
+        "intro": "meta[name='description']@content",
+        "kind": "div.info a[href*='/cat/']@text&&div.info a[href*='/tag/']@text",
+        "lastChapter": "div.info a[href*='/book/']@text",
+        "name": "div.info h1@text",
+        "tocUrl": "a[href*='list/']@href"
+    },
+    "ruleContent": {
+        "content": "section.chapter div.content@text"
+    },
+    "ruleExplore": {
+        "author": "span@text",
+        "bookList": "div.novel-list a",
+        "bookUrl": "@href",
+        "coverUrl": "img@data-src",
+        "name": "h4@text"
+    },
+    "ruleSearch": {
+        "author": "span.author@text",
+        "bookList": "div.novel-item",
+        "bookUrl": "a.title@href",
+        "coverUrl": "img@data-src",
+        "intro": "p.desc@text",
+        "name": "a.title@text"
+    },
+    "ruleToc": {
+        "chapterList": "div.chapter-list a",
+        "chapterName": "h4@text",
+        "chapterUrl": "@href"
+    },
+    "weight": 0,
+    "lastUpdateTime": "1789948800000"
+}

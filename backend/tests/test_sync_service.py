@@ -385,6 +385,73 @@ async def test_process_content_images_keeps_remote_url_when_download_fails():
 
 
 @pytest.mark.asyncio
+async def test_process_content_images_reports_progress_for_every_image():
+    """An album chapter is the only progress a task makes for hours.
+
+    The crawl queue's stall watchdog reads the counters this reports, so without
+    them a task on its 400th image looks identical to one that stopped an hour
+    ago (both online gallery kills on 2026-09-22 worked that way).
+    """
+    db = _mock_db()
+    storage = MagicMock()
+    storage.save_chapter_image.return_value = "book-1/images/abc.jpg"
+    service = SyncService(db, storage=storage)
+    plugin = SimpleNamespace(
+        fetch_content_image=AsyncMock(return_value=(b"\xff\xd8\xff", "image/jpeg")),
+    )
+    content = (
+        "![a](https://example.com/a.jpg) ![b](https://example.com/b.jpg) "
+        "![c](https://example.com/c.jpg)"
+    )
+    seen: list[tuple[int, int]] = []
+
+    async def progress_cb(handled: int, total_images: int) -> None:
+        seen.append((handled, total_images))
+
+    await service._process_content_images(
+        SimpleNamespace(id="book-1"),
+        "chapter-1",
+        content,
+        "https://example.com/read/1.html",
+        plugin,
+        image_progress_cb=progress_cb,
+    )
+
+    assert seen == [(1, 3), (2, 3), (3, 3)]
+
+
+@pytest.mark.asyncio
+async def test_process_content_images_reports_progress_while_fetches_fail():
+    """Grinding through a dead image host is still progress, not a hang.
+
+    The 2026-09-22 kills both happened on sources whose image host refused every
+    request: the counter has to keep moving so the watchdog can tell that apart
+    from a coroutine that will never come back.
+    """
+    db = _mock_db()
+    service = SyncService(db, storage=MagicMock())
+    plugin = SimpleNamespace(
+        fetch_content_image=AsyncMock(return_value=None),
+    )
+    content = "![a](https://example.com/a.jpg) ![b](https://example.com/b.jpg)"
+    seen: list[tuple[int, int]] = []
+
+    async def progress_cb(handled: int, total_images: int) -> None:
+        seen.append((handled, total_images))
+
+    await service._process_content_images(
+        SimpleNamespace(id="book-1"),
+        "chapter-1",
+        content,
+        "https://example.com/read/1.html",
+        plugin,
+        image_progress_cb=progress_cb,
+    )
+
+    assert seen == [(1, 2), (2, 2)]
+
+
+@pytest.mark.asyncio
 async def test_save_tags_deduplicates_duplicate_names():
     db = _mock_db()
     db.scalars = AsyncMock(return_value=[])

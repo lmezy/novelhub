@@ -1,0 +1,52 @@
+{
+    "bookSourceComment": "西瓜看书(xiguaks.com)v0.1(2026-09-22):选择器全部用--resolve直连抓到的真实HTML+NovelHub本机规则引擎实测验证过,非猜测。book页/chapter/{id}/(书+目录同页,101章如/segment/72518/1.html):书名h1,作者取详情section内首个用户链(section.flex.items-start a@text,整页a[href*=user]会把相关推荐作者全拼进来,已实测),封面同section内img,简介#desc@text(含字体图img缺字洞,属站方反爬,本版不做OCR),目录div.gap-3 a(101/101全量,同页,无nextTocUrl)。正文/segment/{bookId}/{n}.html单页,#chapter-content@text。搜索/search/?keyword={{key}}单页(15结果,page=2与page1内容完全一致,故不设分页)。发现用/tag-{id}/(如乱伦tag-1588,41条;第二种阅读指数卡片h3/a结构不同,bookList只收录主卡片,属预期内)。Cloudflare:直连偶发403(Just a moment),--resolve指定CF边缘IP可通;被拦时按docs/cookie-guide.md导入Cookie,IP须与NovelHub代理出口一致。",
+    "bookSourceName": "西瓜看书",
+    "bookSourceGroup": "西瓜看书",
+    "bookSourceType": 0,
+    "bookSourceUrl": "https://www.xiguaks.com",
+    "bookUrlPattern": "https?://(www\\.)?xiguaks\\.com/chapter/\\d+/?$",
+    "charset": "utf-8",
+    "header": "{\n    \"User-Agent\": \"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36\"\n  }",
+    "customOrder": 0,
+    "enabled": true,
+    "enabledCookieJar": true,
+    "enabledExplore": true,
+    "exploreUrl": "[\n  { \"title\": \"乱伦\", \"url\": \"https://www.xiguaks.com/tag-1588/\" },\n  { \"title\": \"母子\", \"url\": \"https://www.xiguaks.com/tag-1582/\" },\n  { \"title\": \"后宫\", \"url\": \"https://www.xiguaks.com/tag-1572/\" },\n  { \"title\": \"调教\", \"url\": \"https://www.xiguaks.com/tag-1577/\" },\n  { \"title\": \"同人\", \"url\": \"https://www.xiguaks.com/tag-1578/\" },\n  { \"title\": \"催眠\", \"url\": \"https://www.xiguaks.com/tag-1580/\" },\n  { \"title\": \"系统\", \"url\": \"https://www.xiguaks.com/tag-1579/\" },\n  { \"title\": \"都市\", \"url\": \"https://www.xiguaks.com/tag-1569/\" },\n  { \"title\": \"人妻\", \"url\": \"https://www.xiguaks.com/tag-1709/\" },\n  { \"title\": \"全家桶\", \"url\": \"https://www.xiguaks.com/tag-1583/\" },\n  { \"title\": \"绿帽\", \"url\": \"https://www.xiguaks.com/tag-1595/\" },\n  { \"title\": \"纯爱\", \"url\": \"https://www.xiguaks.com/tag-1573/\" },\n  { \"title\": \"重口\", \"url\": \"https://www.xiguaks.com/tag-1576/\" },\n  { \"title\": \"武侠\", \"url\": \"https://www.xiguaks.com/tag-1575/\" },\n  { \"title\": \"玄幻\", \"url\": \"https://www.xiguaks.com/tag-1596/\" },\n  { \"title\": \"仙侠\", \"url\": \"https://www.xiguaks.com/tag-1567/\" },\n  { \"title\": \"校园\", \"url\": \"https://www.xiguaks.com/tag-1581/\" },\n  { \"title\": \"NTR\", \"url\": \"https://www.xiguaks.com/tag-1695/\" },\n  { \"title\": \"乱\", \"url\": \"https://www.xiguaks.com/tag-1617/\" },\n  { \"title\": \"标签大全\", \"url\": \"https://www.xiguaks.com/tags.html\" }\n]",
+    "searchUrl": "https://www.xiguaks.com/search/?keyword={{key}}",
+    "respondTime": 180000,
+    "ruleBookInfo": {
+        "author": "section.flex.items-start a@text",
+        "coverUrl": "section.flex.items-start img@src",
+        "intro": "#desc@text",
+        "kind": "",
+        "lastChapter": "",
+        "name": "h1@text"
+    },
+    "ruleContent": {
+        "content": "#chapter-content@text"
+    },
+    "ruleExplore": {
+        "author": "div.space-y-1 span a.0@text||p.text-sm.text-gray-600 a@text||p.text-gray-600 a@text",
+        "bookList": "div.bg-white.p-2.rounded-lg.shadow-sm",
+        "bookUrl": "h3 a@href||p.text-lg a@href",
+        "coverUrl": "img@src",
+        "intro": "p.text-sm.text-gray-500.mt-1@text||p.line-clamp-4@text",
+        "lastChapter": "div.space-y-1 span a.1@text||p.text-sm.truncate@text",
+        "name": "h3 a@text||p.text-lg a@text"
+    },
+    "ruleSearch": {
+        "author": "p.text-xs a@text",
+        "bookList": "div.bg-white.p-2.rounded-lg.shadow.flex.items-center",
+        "bookUrl": "h3 a@href",
+        "coverUrl": "a.flex-shrink-0 img@src",
+        "intro": "p.text-sm.text-gray-600@text",
+        "name": "h3 a@text"
+    },
+    "ruleToc": {
+        "chapterList": "div.gap-3 a",
+        "chapterName": "@text",
+        "chapterUrl": "@href"
+    },
+    "weight": 0,
+    "lastUpdateTime": "1789948800000"
+}

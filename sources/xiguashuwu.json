@@ -1,0 +1,54 @@
+{
+    "bookSourceComment": "西瓜书屋(xiguashuwu.com)v0.1(2026-09-22):按云端Firecrawl抓到的真实页面结构编写,选择器未经本机规则引擎实测(本机curl/Invoke-WebRequest直连与--resolve指定CF边缘IP均被Cloudflare 403拦截,属banzhu同类外部终端,需用户侧导入Cookie验证,见docs/cookie-guide.md,IP须与NovelHub代理出口一致),属实验性初稿。book页/book/{id}/或/book/{id}/iszip/{0,1}/(详情+最新章节,二者内容一致):书名取书页主标题,作者a[href*='/writer/'],分类a[href*='/category/'],封面files/article/image大图,简介内容简介段。目录/book/{id}/catalog/(全量,100条/页,正序/倒序备选,实测book/2共34章、book/223296共14章):div正文区a。搜索/search/{key}(实测老师约120结果单页,站内搜q=参数无效):条目含[分类]书名/作者三段。分类/category/{cat}/{page}.html(20条/页,实测言情10页)与排行/rank/{week,month,all}/{cat}/{page}.html(20条/页,总榜5页)同构:条目含书名/作者/简介。bookUrlPattern同时覆盖/book/{id}/、/iszip/封面链与/book/{id}/{cid}.html章节链(章节链同步时由详情页进入,不走搜索过滤)。正文/book/{id}/{cid}.html单页,长章有{cid}_2.html分页故配nextContentUrl(实测142894标题已标(1/2))。VIP章站内提示发邮件simishuwu@gmail.com索取,同步为残篇,属站方付费墙,本版不做绕过。备用域xiguashuwu1~5.com(4号CF、5号维护页),主域不通时整串替换。charset=utf-8。",
+    "bookSourceName": "西瓜书屋",
+    "bookSourceGroup": "西瓜书屋",
+    "bookSourceType": 0,
+    "bookSourceUrl": "https://www.xiguashuwu.com",
+    "bookUrlPattern": "https?://(www\\.)?xiguashuwu\\.com/book/\\d+/([^/]+\\.html|catalog/?)?$",
+    "charset": "utf-8",
+    "header": "{\n    \"User-Agent\": \"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36\"\n  }",
+    "customOrder": 0,
+    "enabled": true,
+    "enabledCookieJar": true,
+    "enabledExplore": true,
+    "exploreUrl": "[\n  { \"title\": \"玄幻小说\", \"url\": \"https://www.xiguashuwu.com/category/1/{{page}}.html\" },\n  { \"title\": \"修真小说\", \"url\": \"https://www.xiguashuwu.com/category/2/{{page}}.html\" },\n  { \"title\": \"都市小说\", \"url\": \"https://www.xiguashuwu.com/category/3/{{page}}.html\" },\n  { \"title\": \"历史小说\", \"url\": \"https://www.xiguashuwu.com/category/4/{{page}}.html\" },\n  { \"title\": \"网游小说\", \"url\": \"https://www.xiguashuwu.com/category/5/{{page}}.html\" },\n  { \"title\": \"科幻小说\", \"url\": \"https://www.xiguashuwu.com/category/6/{{page}}.html\" },\n  { \"title\": \"言情小说\", \"url\": \"https://www.xiguashuwu.com/category/7/{{page}}.html\" },\n  { \"title\": \"其他小说\", \"url\": \"https://www.xiguashuwu.com/category/8/{{page}}.html\" },\n  { \"title\": \"经典小说\", \"url\": \"https://www.xiguashuwu.com/category/9/{{page}}.html\" },\n  { \"title\": \"同人小说\", \"url\": \"https://www.xiguashuwu.com/category/10/{{page}}.html\" },\n  { \"title\": \"高辣小说\", \"url\": \"https://www.xiguashuwu.com/category/11/{{page}}.html\" },\n  { \"title\": \"耽美小说\", \"url\": \"https://www.xiguashuwu.com/category/12/{{page}}.html\" },\n  { \"title\": \"情欲小说\", \"url\": \"https://www.xiguashuwu.com/category/13/{{page}}.html\" },\n  { \"title\": \"复古耽美\", \"url\": \"https://www.xiguashuwu.com/category/14/{{page}}.html\" },\n  { \"title\": \"复古言情\", \"url\": \"https://www.xiguashuwu.com/category/15/{{page}}.html\" },\n  { \"title\": \"总榜\", \"url\": \"https://www.xiguashuwu.com/rank/all/0/{{page}}.html\" },\n  { \"title\": \"月榜\", \"url\": \"https://www.xiguashuwu.com/rank/month/0/{{page}}.html\" },\n  { \"title\": \"周榜\", \"url\": \"https://www.xiguashuwu.com/rank/week/0/{{page}}.html\" }\n]",
+    "searchUrl": "https://www.xiguashuwu.com/search/{{key}}",
+    "respondTime": 180000,
+    "ruleBookInfo": {
+        "author": "a[href*='/writer/']@text",
+        "coverUrl": "img[src*='files/article/image']@src",
+        "intro": "meta[name='description']@content",
+        "kind": "a[href*='/category/']@text",
+        "lastChapter": "a[href*='/book/'][href$='.html']@text",
+        "name": "h1@text"
+    },
+    "ruleContent": {
+        "content": "h1@text&&div@text",
+        "nextContentUrl": "a:contains(下一页)@href"
+    },
+    "ruleExplore": {
+        "author": "a[href*='/writer/']@text",
+        "bookList": "a[href*='/book/'][href*='/iszip/']",
+        "bookUrl": "@href",
+        "intro": "",
+        "kind": "",
+        "lastChapter": "",
+        "name": "@text"
+    },
+    "ruleSearch": {
+        "author": "a[href*='/writer/']@text",
+        "bookList": "a[href*='/book/'][href*='/iszip/']",
+        "bookUrl": "@href",
+        "intro": "",
+        "kind": "",
+        "lastChapter": "",
+        "name": "@text"
+    },
+    "ruleToc": {
+        "chapterList": "a[href*='/book/'][href$='.html']",
+        "chapterName": "@text",
+        "chapterUrl": "@href"
+    },
+    "weight": 0,
+    "lastUpdateTime": "1789948800000"
+}
