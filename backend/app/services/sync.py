@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 from urllib.parse import urljoin, urlparse
 
 from sqlalchemy import delete, select, update
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import MissingGreenlet, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from loguru import logger
@@ -19,12 +19,16 @@ from app.core.events import emit, EventType
 from app.models import (
     Author,
     Book,
+    BookCategory,
+    BookCustomTag,
     BookFavorite,
     BookTag,
     BookVersion,
+    Category,
     Chapter,
     Cookie,
     Bookmark,
+    CustomTag,
     ReadingProgress,
     Source,
     SourceChange,
@@ -432,6 +436,19 @@ class SyncService:
                    for marker in TRANSIENT_CHAPTER_MARKERS)
 
     @staticmethod
+    def _is_empty_book_error(exc: BaseException) -> bool:
+        """Whether ``exc`` is the deterministic "book page parsed to nothing".
+
+        ``sync_book`` raises ``ValueError("Book page returned no usable
+        metadata/chapters: ...")`` when the page answered but the rules
+        extracted no usable title/chapters -- a stale rule or a removed book,
+        never a transient outage.  Retrying fetches the same page, and
+        counting it toward ``SYNC_MAX_CONSECUTIVE_FAILURES`` aborted whole
+        tasks (wn09: 30 synced / 32 failed) for a rule problem.
+        """
+        return "no usable metadata" in str(exc).lower()
+
+    @staticmethod
     def _chapter_concurrency(
         config: dict | None,
         source_interval: int | None = None,
@@ -541,11 +558,46 @@ class SyncService:
             if self._normalize_title_for_match(b.title) == normalized
         ]
 
-    async def _handle_global_r18_conflicts(self, book: Book) -> None:
-        """Mark same-title global books as R18 and queue admin confirmation."""
-        same = await self._find_same_title_books(book)
+    async def _find_same_title_books_by_id(self, book_id: str) -> list[Book]:
+        """Same-title lookup that survives an expired ``Book`` instance."""
+        trigger_title = await self._book_column(book_id, Book.title) or ""
+        normalized = self._normalize_title_for_match(trigger_title)
+        if not normalized:
+            return []
+        rows = await self.db.scalars(
+            select(Book)
+            .options(selectinload(Book.tags))
+            .where(
+                Book.id != book_id,
+                Book.source_id.is_not(None),
+                normalized_title_sql(Book.title) == normalized,
+            )
+        )
+        return [
+            b
+            for b in rows.all()
+            if self._normalize_title_for_match(b.title) == normalized
+        ]
+
+    async def _book_column(self, book_id: str, column):
+        """Read one ``books`` column without touching an ORM instance."""
+        return await self.db.scalar(
+            select(column).where(Book.id == book_id)
+        )
+
+    async def _handle_global_r18_conflicts(self, book_id: str) -> None:
+        """Mark same-title global books as R18 and queue admin confirmation.
+
+        Takes the book id rather than the instance: every caller reaches here
+        after chapter ``rollback()`` calls that expired the ``Book`` object,
+        and even reading ``book.title`` synchronously could raise
+        ``MissingGreenlet``.
+        """
+        trigger_title = await self._book_column(book_id, Book.title) or ""
+        trigger_source_id_value = await self._book_column(book_id, Book.source_id)
+        same = await self._find_same_title_books_by_id(book_id)
         ids = {b.id for b in same}
-        ids.add(book.id)
+        ids.add(book_id)
         books = [
             b
             for b in (
@@ -582,14 +634,15 @@ class SyncService:
         )
         for change in pending:
             data = change.source_data or {}
-            if data.get("title") == book.title:
+            if data.get("title") == trigger_title:
                 return
             if set(data.get("book_ids") or []).intersection(ids):
                 return
 
         submitter_id = None
-        if hasattr(book, "source_id"):
-            source = await self.db.get(Source, book.source_id)
+        trigger_source_id = trigger_source_id_value
+        if trigger_source_id:
+            source = await self.db.get(Source, trigger_source_id)
             if source is not None:
                 submitter_id = source.submitter_id
         if not submitter_id:
@@ -605,10 +658,10 @@ class SyncService:
             id=str(uuid4()),
             user_id=submitter_id,
             action="confirm_r18",
-            source_id=book.source_id,
+            source_id=trigger_source_id,
             source_data={
                 "kind": "book_r18_conflict",
-                "title": book.title,
+                "title": trigger_title,
                 "book_ids": [b.id for b in books],
                 "original_r18": original_r18,
             },
@@ -620,16 +673,16 @@ class SyncService:
             try:
                 search_service.index_book({
                     "id": b.id,
-                    "title": b.title,
-                    "author": b.author_name or "",
-                    "description": b.description or "",
-                    "status": b.status or "",
-                    "source_id": b.source_id or "",
+                    "title": await self._book_column(b.id, Book.title) or "",
+                    "author": await self._book_author_name(b.author_id),
+                    "description": await self._book_column(b.id, Book.description) or "",
+                    "status": await self._book_column(b.id, Book.status) or "",
+                    "source_id": await self._book_column(b.id, Book.source_id) or "",
                     "author_id": b.author_id or "",
                     "is_r18": b.is_r18,
-                    "tags": list(b.tag_names),
-                    "category_names": list(b.category_names),
-                    "kind": normalize_kind(getattr(b, "kind", None)),
+                    "tags": await self._book_tag_names(b.id),
+                    "category_names": await self._book_category_names(b.id),
+                    "kind": normalize_kind(await self._book_column(b.id, Book.kind)),
                 })
             except Exception:
                 continue
@@ -641,19 +694,65 @@ class SyncService:
             .join(BookTag, BookTag.tag_id == Tag.id)
             .where(BookTag.book_id == book_id)
         )
-        return [name for (name,) in rows.all()]
+        result = rows.all()
+        if callable(getattr(result, "__await__", None)):
+            # ``AsyncMock``-based tests stub ``execute`` with a coroutine for
+            # ``all()``; real sessions return the list directly.
+            result = await result
+        return [name for (name,) in result]
+
+    async def _book_category_names(self, book_id: str) -> list[str]:
+        """Load category names without touching ORM relationships."""
+        book_is_r18 = await self._book_column(book_id, Book.is_r18)
+        query = (
+            select(Category.name)
+            .join(BookCategory, BookCategory.category_id == Category.id)
+            .where(BookCategory.book_id == book_id)
+        )
+        if not book_is_r18:
+            query = query.where(Category.is_r18.is_(False))
+        rows = await self.db.execute(query)
+        result = rows.all()
+        if callable(getattr(result, "__await__", None)):
+            result = await result
+        return [name for (name,) in result]
+
+    async def _book_author_name(self, author_id: str | None) -> str:
+        """Load an author name without touching ``Book.author``."""
+        if not author_id:
+            return "Unknown"
+        try:
+            name = await self.db.scalar(
+                select(Author.name).where(Author.id == author_id)
+            )
+        except MissingGreenlet:
+            # The session was rolled back concurrently; the id is still valid,
+            # but this read cannot proceed on the expired session.
+            return "Unknown"
+        return str(name or "").strip() or "Unknown"
 
     @staticmethod
-    def _book_custom_tag_names(book) -> list[str]:
-        """Load user custom tag names for search indexing."""
-        try:
-            return [
-                bct.custom_tag.name
-                for bct in book.custom_tags
-                if bct.custom_tag
-            ]
-        except Exception:
-            return []
+    async def _book_custom_tag_names(db, book_id: str) -> list[str]:
+        """Load user custom tag names without touching ORM relationships.
+
+        ``Book.custom_tags`` is ``lazy="selectin"`` and is not loaded on every
+        path that reaches here (resync, existing-book lookups without the
+        loader option).  Reading it synchronously raised ``MissingGreenlet``
+        once a ``rollback()`` expired the instance, so query the names
+        explicitly like ``_book_tag_names`` does.
+        """
+        rows = await db.execute(
+            select(CustomTag.name)
+            .join(
+                BookCustomTag,
+                BookCustomTag.custom_tag_id == CustomTag.id,
+            )
+            .where(BookCustomTag.book_id == book_id)
+        )
+        result = rows.all()
+        if callable(getattr(result, "__await__", None)):
+            result = await result
+        return [name for (name,) in result]
 
     @staticmethod
     def _is_book_r18(source: Source, remote_book) -> bool:
@@ -861,9 +960,10 @@ class SyncService:
             }
 
         author = await self._get_or_create_author(author_name)
+        author_id = author.id
         book, is_new = await self._get_or_create_book(
             source.id,
-            author.id,
+            author_id,
             remote_book,
             is_r18=is_r18,
             owner_id=source.owner_id,
@@ -938,7 +1038,13 @@ class SyncService:
         )
 
         book_tags = await self._book_tag_names(book.id)
-        book_custom_tags = self._book_custom_tag_names(book)
+        # ``custom_tags`` is a ``lazy="selectin"`` relationship that only
+        # ``_get_or_create_book`` loads (and nothing at all loads on resync).
+        # Reading it synchronously here raised ``MissingGreenlet`` once a
+        # ``rollback()`` had expired the instance -- the "Crawl task ...
+        # stopped: greenlet_spawn has not been called" failures.  Query the
+        # names explicitly like ``_book_tag_names`` does.
+        book_custom_tags = await self._book_custom_tag_names(self.db, book.id)
         index_tags = list(dict.fromkeys([*book_tags, *book_custom_tags]))
         try:
             from app.services.auto_categorize import AutoCategorizationService
@@ -948,43 +1054,59 @@ class SyncService:
             )
         except Exception:
             await self.db.rollback()
+            # The rollback above expired every ORM instance in this session,
+            # including ``book`` and ``source``.  Snapshot the plain columns
+            # now: every later read in this method must come from these
+            # snapshots, never from the expired instances (a synchronous
+            # attribute read raises ``MissingGreenlet`` which would mask the
+            # real error).
             book_category_names = []
+        # Snapshot every plain column ``book``/``source`` contributes below.
+        # ``categorize_book`` (and its ``ensure_default_categories`` commit)
+        # may have expired them already; a later chapter ``rollback()`` would
+        # expire them again.  Either way, reading the instances after this
+        # point risks ``MissingGreenlet``.
+        book_id = book.id
+        book_title = book.title
+        book_is_r18 = book.is_r18
+        book_author = author_name
+        book_description = (book.description or "")[:2000]
+        book_cover = book.cover
+        book_source_book_id = book.source_book_id
+        book_status = book.status
+        source_id_value = source.id
+        source_owner_id = source.owner_id
+        book_description_full = book.description
+        book_values = {
+            "source_id": source_id_value,
+            "author_id": author_id,
+            "source_book_id": book_source_book_id,
+            "title": book_title,
+            "cover": book_cover,
+            "description": book_description_full,
+            "status": book_status,
+            "is_r18": book_is_r18,
+            "owner_id": source_owner_id,
+            "kind": book_kind,
+        }
         search_service.index_book({
-            "id": book.id,
-            "title": book.title,
+            "id": book_id,
+            "title": book_title,
             "author": author_name,
-            "description": book.description or "",
-            "status": book.status or "",
-            "source_id": book.source_id or "",
-            "author_id": book.author_id or "",
-            "is_r18": book.is_r18,
+            "description": book_description_full or "",
+            "status": book_status or "",
+            "source_id": source_id_value,
+            "author_id": author_id,
+            "is_r18": book_is_r18,
             "tags": index_tags,
             "category_names": book_category_names,
             "kind": book_kind,
         })
 
         if is_new:
-            emit(EventType.BOOK_CREATED, book_id=book.id, title=book.title)
+            emit(EventType.BOOK_CREATED, book_id=book_id, title=book_title)
         else:
-            emit(EventType.BOOK_UPDATED, book_id=book.id, title=book.title)
-
-        book_id = book.id
-        book_title = book.title
-        book_is_r18 = book.is_r18
-        book_author = author_name
-        book_description = (book.description or "")[:2000]
-        book_values = {
-            "source_id": book.source_id,
-            "author_id": book.author_id,
-            "source_book_id": book.source_book_id,
-            "title": book_title,
-            "cover": book.cover,
-            "description": book.description,
-            "status": book.status,
-            "is_r18": book_is_r18,
-            "owner_id": source.owner_id,
-            "kind": book_kind,
-        }
+            emit(EventType.BOOK_UPDATED, book_id=book_id, title=book_title)
         created = 0
         skipped = 0
         total = len(remote_book.chapters)
@@ -1273,10 +1395,8 @@ class SyncService:
             skipped=skipped,
             failed=len(failed_chapters),
         )
-        if source.owner_id is None:
-            synced_book = await self.db.get(Book, book_id)
-            if synced_book is not None:
-                await self._handle_global_r18_conflicts(synced_book)
+        if source_owner_id is None:
+            await self._handle_global_r18_conflicts(book_id)
         logger.info(
             "Sync complete book={} created={} skipped={} failed={}",
             book_id,
@@ -1751,16 +1871,24 @@ class SyncService:
         )
         book_id = book.id
         book_is_r18 = book.is_r18
-        book_author = book.author_name or "Unknown"
+        # ``tag_names`` / ``category_names`` / ``author_name`` are synchronous
+        # ORM relationship reads that raise ``MissingGreenlet`` on an expired
+        # instance -- the resync-chapter "greenlet_spawn has not been called"
+        # failures.  The chapter fetch above never touches this session, but a
+        # concurrent ``rollback()`` on the same session expires these anyway,
+        # so read everything through explicit queries up front.
+        book_author = await self._book_author_name(book.author_id)
         book_description = (book.description or "")[:2000]
-        book_tags = list(book.tag_names)
-        book_custom_tags = self._book_custom_tag_names(book)
+        book_tags = await self._book_tag_names(book.id)
+        book_custom_tags = await self._book_custom_tag_names(self.db, book.id)
         index_tags = list(dict.fromkeys([*book_tags, *book_custom_tags]))
-        book_category_names = list(book.category_names)
-        author_name = book.author_name or "Unknown"
+        book_category_names = await self._book_category_names(book.id)
+        author_name = book_author
+        book_title = book.title
+        book_kind_value = book.kind
         content_path, content_hash = self.storage.write_chapter(
             author_name,
-            book.title,
+            book_title,
             remote_chapter.chapter_number,
             remote_chapter.title,
             content,
@@ -1771,8 +1899,9 @@ class SyncService:
         chapter.source_chapter_id = remote_chapter.source_chapter_id
         chapter.content_path = content_path
         chapter.hash = content_hash
-        if normalize_kind(book.kind) != KIND_COMIC and is_comic_content(content):
+        if normalize_kind(book_kind_value) != KIND_COMIC and is_comic_content(content):
             book.kind = KIND_COMIC
+            book_kind_value = KIND_COMIC
         await self.db.commit()
 
         search_service.index_chapter({
@@ -1783,13 +1912,13 @@ class SyncService:
             "content": self._strip_content_images(content)[
                 : search_service.CONTENT_INDEX_LIMIT
             ],
-            "book_title": book.title,
+            "book_title": book_title,
             "book_author": book_author,
             "book_description": book_description,
             "tags": index_tags,
             "category_names": book_category_names,
             "is_r18": book_is_r18,
-            "kind": normalize_kind(getattr(book, "kind", None)),
+            "kind": normalize_kind(book_kind_value),
         })
         emit(
             EventType.CHAPTER_UPDATED,
@@ -2107,16 +2236,17 @@ class SyncService:
                         exclude_categories=exclude_categories,
                     )
 
-            async def _record_outcome(sb, outcome) -> None:
+            async def _record_outcome(sb_snapshot, outcome) -> None:
                 nonlocal books_synced, books_failed, books_filtered
                 nonlocal chapters_created, chapters_skipped, chapters_failed
                 nonlocal consecutive_failures, consecutive_transient_failures
+                sb_title, sb_author, sb_url = sb_snapshot
                 if isinstance(outcome, SyncPaused):
                     raise outcome
                 if isinstance(outcome, BaseException):
                     if self._is_upstream_blocked(outcome):
                         raise outcome
-                    if isinstance(outcome, EmptyTocError):
+                    if isinstance(outcome, EmptyTocError) or self._is_empty_book_error(outcome):
                         # The source's own TOC rule no longer matches the site
                         # (or the book genuinely has no chapters there).
                         # Retrying cannot fix a stale rule, and counting it as a
@@ -2124,6 +2254,13 @@ class SyncService:
                         # ``SYNC_MAX_CONSECUTIVE_FAILURES`` books -- 御宅屋 has
                         # ~5% such books, so a full-site run died every time.
                         # Skip and keep going instead.
+                        #
+                        # ``no usable metadata/chapters`` is the same class: the
+                        # book page answered but the rules extracted nothing
+                        # usable (wn09's ``{{book.name}}`` title,
+                        # a stale ``chapterList``).  It is deterministic -- a
+                        # retry fetches the same page -- so it must not feed
+                        # the consecutive-failure abort either.
                         await self.db.rollback()
                         books_filtered += 1
                         consecutive_failures = 0
@@ -2131,14 +2268,14 @@ class SyncService:
                         message = describe_error(outcome)
                         logger.warning(
                             "Skipped book {} ({}): {}",
-                            sb.title,
-                            sb.url,
+                            sb_title,
+                            sb_url,
                             message,
                         )
                         details.append({
-                            "title": sb.title,
-                            "author": sb.author,
-                            "url": sb.url,
+                            "title": sb_title,
+                            "author": sb_author,
+                            "url": sb_url,
                             "synced": False,
                             "filtered": True,
                             "filter_type": "目录",
@@ -2158,14 +2295,14 @@ class SyncService:
                         # captcha/anti-crawl message.
                         logger.warning(
                             "Infrastructure failure syncing book {} ({}): {}",
-                            sb.title,
-                            sb.url,
+                            sb_title,
+                            sb_url,
                             describe_error(outcome),
                         )
                         details.append({
-                            "title": sb.title,
-                            "author": sb.author,
-                            "url": sb.url,
+                            "title": sb_title,
+                            "author": sb_author,
+                            "url": sb_url,
                             "synced": False,
                             "error": describe_error(outcome),
                             "failed_chapters": [],
@@ -2197,14 +2334,14 @@ class SyncService:
                     if not self._is_infrastructure_error(outcome):
                         logger.warning(
                             "Failed to sync book {} ({}): {}",
-                            sb.title,
-                            sb.url,
+                            sb_title,
+                            sb_url,
                             describe_error(outcome),
                         )
                         details.append({
-                            "title": sb.title,
-                            "author": sb.author,
-                            "url": sb.url,
+                            "title": sb_title,
+                            "author": sb_author,
+                            "url": sb_url,
                             "synced": False,
                             "error": describe_error(outcome),
                             "failed_chapters": [],
@@ -2213,9 +2350,9 @@ class SyncService:
                     if outcome.get("filtered"):
                         books_filtered += 1
                         details.append({
-                            "title": outcome.get("title") or sb.title,
-                            "author": outcome.get("author") or sb.author,
-                            "url": sb.url,
+                            "title": outcome.get("title") or sb_title,
+                            "author": outcome.get("author") or sb_author,
+                            "url": sb_url,
                             "synced": False,
                             "filtered": True,
                             "filter_type": outcome.get("filter_type"),
@@ -2225,9 +2362,9 @@ class SyncService:
                             await progress_cb(pages_checked, books_found, books_synced, books_failed)
                         return
                     details.append({
-                        "title": sb.title,
-                        "author": sb.author,
-                        "url": sb.url,
+                        "title": sb_title,
+                        "author": sb_author,
+                        "url": sb_url,
                         "synced": True,
                         "book_id": outcome.get("book_id"),
                         "created_chapters": outcome.get("created_chapters", 0),
@@ -2244,16 +2381,31 @@ class SyncService:
                 if progress_cb is not None:
                     await progress_cb(pages_checked, books_found, books_synced, books_failed)
 
-            active_tasks: dict[asyncio.Task, object] = {}
+            active_tasks: dict[asyncio.Task, tuple] = {}
+
+            def _snapshot_shelf_book(sb) -> tuple:
+                """Freeze the fields ``_record_outcome`` needs off the ORM.
+
+                ``sb`` is a ``RemoteShelfBook`` dataclass in production, so
+                this is a no-op copy -- but discovery results flow through the
+                same outcome path, and any future ORM-backed shelf object
+                would otherwise be read *after* ``rollback()`` expired it
+                (``MissingGreenlet`` masking the real book error).
+                """
+                return (
+                    getattr(sb, "title", ""),
+                    getattr(sb, "author", ""),
+                    getattr(sb, "url", ""),
+                )
 
             async def _record_finished(finished_tasks) -> None:
                 for finished in finished_tasks:
-                    sb_done = active_tasks.pop(finished)
+                    sb_snapshot = active_tasks.pop(finished)
                     if finished.cancelled():
                         continue
                     exc = finished.exception()
                     outcome = exc if exc is not None else finished.result()
-                    await _record_outcome(sb_done, outcome)
+                    await _record_outcome(sb_snapshot, outcome)
 
             try:
                 for sb in new_books:
@@ -2284,13 +2436,13 @@ class SyncService:
                         except SyncPaused:
                             raise
                         except Exception as exc:
-                            await _record_outcome(sb, exc)
+                            await _record_outcome(_snapshot_shelf_book(sb), exc)
                         else:
-                            await _record_outcome(sb, result)
+                            await _record_outcome(_snapshot_shelf_book(sb), result)
                         continue
 
                     task = asyncio.create_task(_sync_one(sb))
-                    active_tasks[task] = sb
+                    active_tasks[task] = _snapshot_shelf_book(sb)
                     if not continuous_books and len(active_tasks) >= book_concurrency:
                         finished_tasks, _ = await asyncio.wait(
                             list(active_tasks.keys()),
@@ -2354,7 +2506,17 @@ class SyncService:
                     "next_page": start_page,
                     "done": True,
                 }
-            config = source.config if isinstance(source.config, dict) else {}
+            config = None
+            try:
+                config = source.config
+            except MissingGreenlet:
+                # Every book outcome calls ``rollback()``, which expired the
+                # ``source`` instance loaded at the top of this method.  The
+                # tail only needs the config dict, so fall back to empty rather
+                # than masking the run's real result with greenlet_spawn.
+                config = None
+            if not isinstance(config, dict):
+                config = {}
             js_discovery = any(
                 "<js>" in str(config.get(key) or "")
                 for key in ("ruleExplore", "exploreUrl", "searchUrl")

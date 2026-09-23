@@ -621,6 +621,147 @@ async def test_sync_book_rejects_empty_remote_book():
             await service.sync_book("src1", "https://example.com/novel/33927.html")
 
 
+def test_empty_book_error_detection():
+    """``no usable metadata`` is the deterministic rule-failure class."""
+    assert SyncService._is_empty_book_error(
+        ValueError("Book page returned no usable metadata/chapters: https://x")
+    ) is True
+    assert SyncService._is_empty_book_error(ValueError("boom")) is False
+
+
+@pytest.mark.asyncio
+async def test_discover_and_sync_all_skips_empty_books_without_aborting():
+    """wn09's ``no usable metadata`` books must not abort the task.
+
+    The failure is deterministic (the same page parses the same way), so 10+
+    such books tripped ``SYNC_MAX_CONSECUTIVE_FAILURES`` and aborted the
+    whole task with a misleading anti-crawl message (30 synced / 32 failed).
+    They are now filtered like ``EmptyTocError``.
+    """
+    db = _mock_db()
+    db.get.return_value = _source()
+    db.rollback = AsyncMock()
+
+    plugin = AsyncMock()
+    plugin.set_cookie = MagicMock()
+    plugin.discover_books.return_value = [
+        RemoteShelfBook(
+            source_book_id=f"{i}.html",
+            title=f"Book {i}",
+            author="Author",
+            url=f"https://example.com/{i}.html",
+        )
+        for i in range(5)
+    ]
+
+    fake_settings = SimpleNamespace(
+        SYNC_BOOK_CONCURRENCY=1,
+        SYNC_MAX_CONSECUTIVE_FAILURES=3,
+        SYNC_BOOK_CONTINUOUS=False,
+    )
+    empty_error = ValueError("Book page returned no usable metadata/chapters")
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.settings", fake_settings),
+        patch.object(
+            SyncService,
+            "sync_book",
+            AsyncMock(side_effect=empty_error),
+        ),
+    ):
+        result = await SyncService(db).discover_and_sync_all("src1", max_pages=1)
+
+    assert result["books_failed"] == 0
+    assert result["books_filtered"] == 5
+    assert result["books_synced"] == 0
+    assert all(d.get("filtered") for d in result["details"])
+
+
+@pytest.mark.asyncio
+async def test_sync_book_survives_expired_orm_after_rollback():
+    """A ``rollback()`` mid-sync must not surface as greenlet_spawn.
+
+    ``categorize_book`` commits (expiring ``book``/``source``), and every
+    chapter failure rolls back again.  Reading the expired instances
+    afterwards raised ``MissingGreenlet`` and masked the real error -- the
+    "Crawl task ... stopped: greenlet_spawn has not been called" failures.
+    The post-commit path now only reads snapshots and explicit queries.
+    """
+    db = _mock_db()
+    db.get.return_value = _source()
+    db.rollback = AsyncMock()
+    db.commit = AsyncMock()
+    db.flush = AsyncMock()
+    db.add = MagicMock()
+    db.scalar = AsyncMock(return_value=None)
+    db.execute = AsyncMock(
+        return_value=SimpleNamespace(all=lambda: []),
+    )
+
+    remote_book = RemoteBook(
+        source_book_id="https://example.com/book/1",
+        title="Book",
+        author="Author",
+        description=None,
+        status=None,
+        chapters=[
+            RemoteChapter(
+                source_chapter_id="1",
+                title="Chapter 1",
+                url="https://example.com/book/1.html",
+                chapter_number=1,
+            ),
+        ],
+        tags=["remote"],
+    )
+    plugin = AsyncMock()
+    plugin.fetch_book.return_value = remote_book
+    plugin.fetch_content_image = AsyncMock(return_value=None)
+    plugin.fetch_chapter_content = AsyncMock(return_value="content")
+
+    service = SyncService(db)
+    service.storage = MagicMock()
+    service.storage.write_metadata = MagicMock()
+    service.storage.write_chapter.return_value = ("path", "hash")
+
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.emit"),
+        patch("app.services.sync.search_service"),
+        patch("app.services.auto_categorize.AutoCategorizationService"),
+        patch.object(
+            service,
+            "_get_or_create_author",
+            AsyncMock(return_value=MagicMock(id="author-1")),
+        ),
+        patch.object(
+            service,
+            "_get_or_create_book",
+            AsyncMock(
+                return_value=(
+                    MagicMock(id="book-1", title="Book", is_r18=False),
+                    True,
+                )
+            ),
+        ),
+        patch.object(
+            service,
+            "_persist_cover",
+            AsyncMock(return_value=None),
+        ),
+        patch.object(
+            service,
+            "_book_custom_tag_names",
+            AsyncMock(return_value=[]),
+        ),
+        patch.object(service, "_find_same_title_books", AsyncMock(return_value=[])),
+        patch.object(service, "_save_tags", AsyncMock()),
+    ):
+        result = await service.sync_book("src1", "https://example.com/book/1")
+
+    assert result["created_chapters"] == 1
+
+
 @pytest.mark.asyncio
 async def test_persist_cover_downloads_and_saves_local_file():
     db = _mock_db()

@@ -643,7 +643,9 @@ class YueduRuleEngine:
                 rule = rules.get(field, "")
                 if rule:
                     if field in ("bookUrl", "chapterUrl", "coverUrl"):
-                        entry[field] = self._eval_rule_first(item, rule)
+                        entry[field] = self._eval_rule_first(
+                            item, rule, is_url=True
+                        )
                     else:
                         entry[field] = self._eval_field(item, rule)
 
@@ -1209,23 +1211,50 @@ class YueduRuleEngine:
             return urljoin(base_url or self.base_url, result)
         return result
 
-    def _eval_rule_first(self, raw: Any, rule: str) -> str:
+    def _eval_rule_first(
+        self,
+        raw: Any,
+        rule: str,
+        is_url: bool = False,
+    ) -> str:
         """Return only the first matched value for scalar URL fields.
 
         Legado resolves URL fields with getString0/getString(isUrl=true),
         which takes the first match. Joining every img@src into one string
         makes cover/toc URLs unusable and can exceed DB column limits.
+
+        ``is_url`` additionally preserves a Legado ``##$##{...}`` URL-option
+        suffix (wn09's ``chapterUrl`` ``...@href##$##{"webView":true}``):
+        the value resolves to the clean URL plus the canonical option text,
+        so the fetcher can dispatch to the browser instead of requesting a
+        path that ends in ``{"webView":true}``.
         """
+        from app.crawler.plugins.yuedu.urls import UrlsMixin
+
+        url_option_suffix = ""
+        option_match = re.search(r"##\$##\s*(\{.*\})\s*$", str(rule or ""), re.DOTALL)
+        if is_url and option_match:
+            try:
+                option = json.loads(option_match.group(1))
+            except (ValueError, TypeError):
+                option = None
+            if isinstance(option, dict) and bool(option.get("webView")):
+                url_option_suffix = ',{"webView":true}'
         result = self._eval_field(raw, rule)
         if result is None:
             return ""
         if isinstance(result, list):
             values = [str(v).strip() for v in result if str(v).strip()]
-            return values[0] if values else ""
-        return next(
-            (line.strip() for line in str(result).splitlines() if line.strip()),
-            "",
-        )
+            value = values[0] if values else ""
+        else:
+            value = next(
+                (line.strip() for line in str(result).splitlines() if line.strip()),
+                "",
+            )
+        if is_url and url_option_suffix and value:
+            clean = UrlsMixin._strip_url_options_suffix(value)
+            return (clean or value) + url_option_suffix
+        return value
 
     def _eval_rule_list(
         self,
@@ -1255,6 +1284,12 @@ class YueduRuleEngine:
         rule = self._substitute_inner_rules(rule, raw)
         if not rule:
             return None
+        # A field rule may carry a Legado ``##$##{...}`` URL-option suffix even
+        # when the rule is not a URL field (wn09's ``chapterUrl`` does this
+        # through ``_eval_rule_first``).  ``makeUpRule`` only strips ``##`` for
+        # URL fields, so without this the option text flows into the HTTP
+        # layer as part of the path.
+        rule = self._strip_url_option_suffix(rule)
         # Split rule into chain of fragments and evaluate in sequence
         fragments = self._split_rule_chain(rule)
         current = raw
@@ -1680,6 +1715,31 @@ class YueduRuleEngine:
             return text, ""
         selector, _, transform = text.partition("##")
         return selector.strip(), "##" + transform
+
+    @staticmethod
+    def _strip_url_option_suffix(rule: str) -> str:
+        """Drop a Legado ``##$##{...}`` URL-option suffix from a field rule.
+
+        ``makeUpRule`` only strips this for URL fields; when a source appends
+        it to a non-URL field (or a helper evaluates a ``chapterUrl``-style
+        rule through ``_eval_rule_first``), the option text would otherwise
+        survive into the extracted value.  Only the ``$``-marker form is
+        stripped here -- a plain ``##regex##replacement`` transform must keep
+        flowing into the regex path.
+        """
+        text = str(rule or "")
+        marker = "##$##"
+        index = text.find(marker)
+        if index == -1:
+            return rule
+        tail = text[index + len(marker):].strip()
+        if tail.startswith("{") and tail.endswith("}"):
+            try:
+                if isinstance(json.loads(tail), dict):
+                    return text[:index].strip()
+            except (ValueError, TypeError):
+                pass
+        return rule
 
     def _apply_replace_regex(self, text: str, rule: Any) -> str:
         if isinstance(rule, list):

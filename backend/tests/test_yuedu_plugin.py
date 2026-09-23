@@ -395,6 +395,118 @@ def test_book_id_from_url_strips_options_suffix():
     ) == "https://www.yaoluku.com/book/57076"
 
 
+def test_url_options_suffix_without_comma_only_accepts_webview_typo():
+    """wn09's ``chapterUrl`` drops the comma: ``...html{"webView":true}``.
+
+    Legado only honours the comma form (``AnalyzeUrl.paramPattern``), so the
+    comma-less form is accepted solely for this known ``webView`` typo -- a
+    bare ``{...}`` at the end of a path must otherwise stay part of the URL.
+    """
+    typo = "https://www.wn09.shop/photos-view-id-1.html{\"webView\":true}"
+    clean, options = YueduPlugin()._split_options_suffix(typo)
+    assert clean == "https://www.wn09.shop/photos-view-id-1.html"
+    assert (options or {}).get("web_view") is True
+    assert YueduPlugin._strip_url_options_suffix(typo) == (
+        "https://www.wn09.shop/photos-view-id-1.html"
+    )
+    # A non-webView braced tail is a path, not an option suffix.
+    path = "https://example.com/gallery/{size}/cover.jpg"
+    assert YueduPlugin()._split_options_suffix(path) == (path, None)
+    assert YueduPlugin._strip_url_options_suffix(path) == path
+
+
+def test_chapter_url_rule_option_suffix_is_stripped_from_value():
+    """``chapterUrl`` rules may carry ``##$##{"webView":true}`` (wn09).
+
+    The option suffix must not leak into the extracted chapter URL --
+    the old value ended in ``.html{"webView":true}`` and failed URL checks
+    downstream, leaving the book with 0 chapters.
+    """
+    engine = YueduRuleEngine({"bookSourceUrl": "https://www.wn09.shop/"})
+    html = (
+        "<html><body><ul><li>"
+        '<a href="/photos-view-id-1.html">pic</a>'
+        "</li></ul></body></html>"
+    )
+    soup = BeautifulSoup(html, "lxml")
+    value = engine._eval_rule_first(
+        soup.select_one("li"),
+        "//li//a/@href##$##{\"webView\":true}",
+    )
+    assert value == "/photos-view-id-1.html"
+
+
+def test_single_segment_album_chapter_survives_generic_filter():
+    """wn09 book/chapter URLs are single-segment (``/photos-*.html``).
+
+    The generic same-host filter required 2+ path segments, so a rule-less
+    fallback dropped every album page.  A sibling-shaped single segment
+    (same dir, same extension, different basename) is a chapter.
+    """
+    plugin = YueduPlugin({"bookSourceUrl": "https://www.wn09.shop/"})
+    book_url = "https://www.wn09.shop/photos-index-aid-342704.html"
+    chapter_url = "https://www.wn09.shop/photos-view-id-1.html"
+    assert plugin._is_chapter_url(chapter_url, book_url) is True
+    assert plugin._is_chapter_url(book_url, chapter_url) is True
+    # A bare homepage link is still not a chapter.
+    assert plugin._is_chapter_url("https://www.wn09.shop/", book_url) is False
+
+
+def test_is_chapter_url_rejects_forum_chrome_links():
+    """Forum thread views are chapters; profile/manage links are not."""
+    plugin = YueduPlugin({"bookSourceUrl": "https://forum.example"})
+    book_url = "https://forum.example/index.php?app=forum&act=threadview&tid=1"
+    assert plugin._is_chapter_url(
+        "https://forum.example/index.php?app=forum&act=threadview&tid=2",
+        book_url,
+    ) is True
+    assert plugin._is_chapter_url(
+        "https://forum.example/index.php?app=forum&act=userview&username=author",
+        book_url,
+    ) is False
+    assert plugin._is_chapter_url(
+        "https://forum.example/index.php?app=sys&act=threadmanage&tid=1",
+        book_url,
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_fetch_book_keeps_webview_suffix_as_request_option():
+    """wn09's ``chapterUrl`` needs the browser, not a polluted identity.
+
+    The chapter identity stays a clean URL while the ``,{"webView":true}``
+    suffix survives on the request URL so ``fetch_chapter_content`` can
+    dispatch to the browser.
+    """
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.wn09.shop/",
+        "ruleBookInfo": {"name": "h1@text"},
+        "ruleToc": {
+            "chapterList": "//div[@class='x']/ul/li",
+            "chapterName": "a@text",
+            "chapterUrl": "//li//a/@href##$##{\"webView\":true}",
+        },
+        "concurrentRate": "0",
+    })
+    html = (
+        "<html><head><title>T - site</title></head><body>"
+        "<h1>T</h1>"
+        '<div class="x"><ul><li><a href="/photos-view-id-1.html">pic</a></li>'
+        "</ul></div></body></html>"
+    )
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        book = await plugin.fetch_book(
+            "https://www.wn09.shop/photos-index-aid-1.html"
+        )
+
+    assert [chapter.url for chapter in book.chapters] == [
+        "https://www.wn09.shop/photos-view-id-1.html,{\"webView\":true}"
+    ]
+    assert [chapter.source_chapter_id for chapter in book.chapters] == [
+        "https://www.wn09.shop/photos-view-id-1.html"
+    ]
+
+
 def test_is_book_url_ignores_options_suffix():
     plugin = YueduPlugin({
         "bookSourceUrl": "https://www.yaoluku.com",

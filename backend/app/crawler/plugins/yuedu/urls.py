@@ -207,11 +207,33 @@ class UrlsMixin:
         segments = [segment for segment in path.split("/") if segment]
 
         if same_host:
-            if len(segments) < 2:
-                return False
             if any(segment in NAV_PATH_SEGMENTS for segment in segments):
                 return False
-            return True
+            if len(segments) >= 2:
+                return True
+            if parsed.query:
+                # Forum thread URLs (``index.php?app=forum&act=threadview``)
+                # live at the site root: the query string is the identity.
+                # Only thread views are chapters -- author/profile/manage
+                # links (``act=userview``/``threadmanage``/...) are site
+                # chrome that the generic scanner must still reject, or a
+                # forum book ends up with other users' pages as chapters.
+                query_params = dict(
+                    part.split("=", 1) if "=" in part else (part, "")
+                    for part in parsed.query.lower().split("&")
+                    if part
+                )
+                act = query_params.get("act", "")
+                return act in {"threadview", "thread", "viewthread", "view"}
+            # Single-segment album/page URLs (wn09's ``/photos-view-id-N.html``
+            # sibling of ``/photos-index-aid-N.html``): the only signal is the
+            # sibling shape -- same host, same directory, same extension, but a
+            # different basename.  Without this, ``fetch_book``'s rule-less
+            # fallback drops every such chapter and the book syncs 0 chapters
+            # even though the TOC rule already extracted them; with a
+            # discriminating ``bookUrlPattern`` the check above already
+            # rejected real book pages.
+            return self._same_book_shape(abs_url, abs_book)
 
         # External links are usually ads/mirror links on Chinese novel sites.
         # Only accept them when the path clearly looks like a chapter page.
@@ -306,7 +328,24 @@ class UrlsMixin:
         """Split a Legado URL option suffix (`,{...}`) from the request URL."""
         match = re.search(r"\s*,\s*(\{.*)$", rule_url, re.DOTALL)
         if not match:
-            return None
+            # Historical exception, not the rule: wn09's ``chapterUrl``
+            # ``...@href##$##{"webView":true}`` drops the comma.  Legado reads
+            # that as ``,{"webView":true}`` (the ``##$##`` separator vanishes
+            # with the regex transform), so accept the comma-less form only
+            # for a bare ``{"webView":...}`` tail.  Anything else keeps the
+            # URL untouched -- a ``{...}`` at the end of a *path* is part of
+            # the path itself (Legado's ``AnalyzeUrl.paramPattern`` is
+            # ``\\s*,\\s*(?=\\{)``).
+            bare = re.search(r"\s*(\{\"webView\".*\})\s*$", rule_url, re.DOTALL)
+            if not bare:
+                return None
+            try:
+                option = json.loads(bare.group(1))
+            except (json.JSONDecodeError, ValueError):
+                return None
+            if not isinstance(option, dict) or set(option) != {"webView"}:
+                return None
+            match = bare
         base_url = rule_url[: match.start()].strip()
         option_text = match.group(1)
         try:
@@ -366,11 +405,22 @@ class UrlsMixin:
         if not url:
             return url
         match = re.search(r"\s*,\s*(\{.*)$", url, re.DOTALL)
+        bare_webview = False
         if not match:
-            return url
+            bare = re.search(r"\s*(\{\"webView\".*\})\s*$", url, re.DOTALL)
+            if not bare:
+                return url
+            match = bare
+            bare_webview = True
         try:
-            json.loads(match.group(1))
+            parsed = json.loads(match.group(1))
         except (ValueError, TypeError):
+            return url
+        if not isinstance(parsed, dict):
+            return url
+        # Same historical exception as ``_parse_url_options``: accept the
+        # comma-less form only for a bare ``{"webView":...}`` tail.
+        if bare_webview and set(parsed) != {"webView"}:
             return url
         return url[: match.start()].strip()
     @staticmethod

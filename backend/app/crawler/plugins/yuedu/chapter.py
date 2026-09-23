@@ -38,12 +38,22 @@ class ChapterMixin:
         # lets one in-flight request overwrite another chapter's context.
         # Use a private engine for the complete parse of this chapter.
         chapter_engine = YueduRuleEngine(self.config)
-        chapter_engine.set_page_url(chapter.url)
+        # A ``chapter.url`` may carry a Legado ``,{...}`` URL-option suffix
+        # (wn09 appends ``,{"webView":true}`` to every album URL): strip it
+        # for identity/page-context purposes, exactly like ``fetch_book``
+        # does, and let ``_get`` dispatch on the webView flag.
+        fetch_url = chapter.url
+        _, chapter_options = self._split_options_suffix(str(chapter.url or ""))
+        chapter_web_view = bool((chapter_options or {}).get("web_view"))
+        if chapter_web_view:
+            fetch_url = str(fetch_url).split(",{", 1)[0].strip()
+        chapter_engine.set_page_url(fetch_url)
         web_js = chapter_engine.get_web_js()
         if web_js:
-            html = await self._get_with_web_js(chapter.url, web_js)
+            html = await self._get_with_web_js(fetch_url, web_js,
+                                               fallback_http=not chapter_web_view)
         else:
-            html = await self._get(chapter.url)
+            html = await self._get(fetch_url)
         if self._looks_like_removed_page(html):
             raise RuntimeError(
                 "章节在源站已被删除或禁用（站点提示：小说被禁用或已删除）: "
@@ -59,7 +69,7 @@ class ChapterMixin:
             "url": chapter.url,
             "tag": str(getattr(chapter, "tags", "") or ""),
         })
-        generic_content = self._parse_chapter_content_generic(html, chapter.url)
+        generic_content = self._parse_chapter_content_generic(html, fetch_url)
         if self._uses_android_js_rule("ruleContent", "content"):
             content = generic_content
         else:
@@ -90,19 +100,22 @@ class ChapterMixin:
         async def _fetch_content_page(page_url: str) -> str:
             async with content_semaphore:
                 if web_js:
-                    return await self._get_with_web_js(page_url, web_js)
+                    return await self._get_with_web_js(
+                        page_url, web_js,
+                        fallback_http=not chapter_web_view,
+                    )
                 return await self._get(page_url)
 
         pending_content_urls = [
             url
-            for url in chapter_engine.get_next_content_urls(html, chapter.url)
+            for url in chapter_engine.get_next_content_urls(html, fetch_url)
             if (
                 url not in seen_content_urls
                 and url.startswith(("http://", "https://"))
             )
         ]
         if gallery_mode:
-            gallery_next = self._gallery_next_url(html, chapter.url)
+            gallery_next = self._gallery_next_url(html, fetch_url)
             if gallery_next and gallery_next not in seen_content_urls:
                 pending_content_urls.append(gallery_next)
         seen_content_urls.update(pending_content_urls)
@@ -171,7 +184,7 @@ class ChapterMixin:
                 pass
 
         if not content:
-            content = self._parse_chapter_content_generic(html, chapter.url)
+            content = self._parse_chapter_content_generic(html, fetch_url)
         content = content.strip()
         if self._content_is_blocked(content):
             raise RuntimeError(

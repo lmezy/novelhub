@@ -294,6 +294,17 @@ class BookMixin:
                 if is_vip in ("true", "1", "yes") or is_pay in ("true", "1", "yes"):
                     title = f"[VIP] {title}"
                 continue
+            # A ``chapterUrl`` rule may carry a Legado ``,{...}`` / ``{...}``
+            # URL-option suffix (wn09's ``...@href##$##{"webView":true}``):
+            # split the fetch identity from the request options the way
+            # Legado's ``AnalyzeUrl`` does, so the identity stays a clean URL
+            # while the webView flag survives for the chapter fetch.
+            ch_url, chapter_options = self._split_options_suffix(str(ch_url))
+            chapter_suffix = ""
+            if chapter_options:
+                web_view = bool(chapter_options.get("web_view"))
+                if web_view:
+                    chapter_suffix = ',{"webView":true}'
             if ch_url and not ch_url.startswith("http"):
                 ch_url = self._make_absolute(ch_url, identity_url)
             if urlparse(ch_url).scheme not in ("http", "https"):
@@ -322,7 +333,7 @@ class BookMixin:
             chapters.append(RemoteChapter(
                 source_chapter_id=ch_url,
                 title=title,
-                url=ch_url,
+                url=ch_url + chapter_suffix,
                 chapter_number=chapter_num,
             ))
 
