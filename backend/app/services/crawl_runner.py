@@ -18,6 +18,7 @@ from app.core.clock import naive_now
 from app.core.config import (
     db_pool_capacity,
     settings,
+    sync_book_concurrency,
     sync_source_concurrency,
     task_stall_seconds,
     task_stop_grace_seconds,
@@ -546,20 +547,29 @@ _TASK_CONNECTION_RESERVE = 4
 
 
 def _task_slot_budget() -> int:
-    """How many crawl tasks this process's connection pool can actually serve."""
-    return max(1, db_pool_capacity() - _TASK_CONNECTION_RESERVE)
+    """How many crawl tasks this process's connection pool can actually serve.
+
+    A task does not hold one connection: ``run_crawl_task_async`` keeps its own
+    session for the whole full-site sync **and** ``discover_and_sync_all`` opens
+    one session per concurrently syncing book (``sync_book_concurrency()``,
+    default 3).  Dividing by that fan-out is what keeps the loop from starting
+    26 tasks that together need ~100 connections out of a pool of 30 -- the
+    "QueuePool limit of size 10 overflow 20 reached" outage of 2026-09-23.
+    """
+    per_task = 1 + sync_book_concurrency()
+    return max(1, (db_pool_capacity() - _TASK_CONNECTION_RESERVE) // per_task)
 
 
 def task_concurrency_limit() -> int:
     """Effective ceiling on concurrently running crawl tasks.
 
     ``SYNC_WORKER_CONCURRENCY`` is the operator's ceiling and ``0`` means "one
-    worker per source".  The pool budget is a *hard* one: every running task
-    holds a pooled connection for the entire full-site sync
-    (``run_crawl_task_async`` opens its session once and keeps it), so a task
-    beyond the pool cannot make progress at all -- it just waits
-    ``pool_timeout`` and then fails with "QueuePool limit of size 10 overflow 20
-    reached".  Whichever ceiling is lower wins.
+    worker per source".  The pool budget is a *hard* one: a running task holds
+    ``1 + SYNC_BOOK_CONCURRENCY`` pooled connections for the entire full-site
+    sync (one session of its own, plus one per concurrently syncing book -- see
+    ``_task_slot_budget``), so tasks beyond the pool cannot make progress at
+    all -- they just wait ``pool_timeout`` and then fail with "QueuePool limit
+    of size 10 overflow 20 reached".  Whichever ceiling is lower wins.
     """
     configured = sync_source_concurrency()
     budget = _task_slot_budget()

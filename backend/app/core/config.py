@@ -131,6 +131,24 @@ def sync_thread_count() -> int:
     return max(1, min(int(settings.SYNC_THREAD_COUNT), 9))
 
 
+def sync_book_concurrency() -> int:
+    """Effective per-task book concurrency, clamped like the sync does.
+
+    This is the single owner for "how many books one task syncs at once":
+    ``SyncService.discover_and_sync_all`` computes it as
+    ``min(max(1, SYNC_BOOK_CONCURRENCY), sync_thread_count())``.  The crawl
+    queue's connection budget (see ``crawl_runner.task_concurrency_limit``)
+    must use this same number -- a task holds one session for its whole life
+    plus one session per concurrently syncing book -- otherwise the budget
+    counts one connection per task while the sync actually holds four.
+    """
+    try:
+        value = int(getattr(settings, "SYNC_BOOK_CONCURRENCY", 3))
+    except (TypeError, ValueError):
+        value = 3
+    return max(1, min(value, sync_thread_count()))
+
+
 def sync_source_concurrency() -> int:
     """How many *book sources* may sync in parallel.
 

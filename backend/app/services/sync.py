@@ -13,7 +13,7 @@ from loguru import logger
 from app.crawler.base import EmptyTocError
 from app.crawler.registry import get_plugin
 from app.core import transient as core_transient
-from app.core.config import settings, sync_thread_count
+from app.core.config import settings, sync_book_concurrency, sync_thread_count
 from app.core.database import SessionLocal
 from app.core.events import emit, EventType
 from app.models import (
@@ -345,13 +345,60 @@ class SyncService:
         """Recognize WAF/rate-limit responses even when HTTPX exposes only a
         status line (for example ``403 Forbidden``) rather than the HTML
         anti-bot marker returned by the source.
+
+        Infrastructure failures (a full SQLAlchemy pool, a missing greenlet
+        context) are deliberately *not* upstream blocks: they say nothing
+        about the site, and classifying them here made pool exhaustion abort
+        books and tasks with a misleading captcha/anti-crawl error.
         """
+        if SyncService._is_infrastructure_error(exc):
+            return False
         message = str(exc).lower()
         if any(marker in message for marker in ("anti-bot", "captcha", "验证码", "rate-limit", "限流")):
             return True
         response = getattr(exc, "response", None)
         status = getattr(response, "status_code", None)
         return status in {403, 408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524}
+
+    #: Failures of our own stack, not of the site.  They carry a message rather
+    #: than a recognisable class name, so they are matched on text -- the one
+    #: message-based carve-out in this module.  Stricter matching (``queuepool``
+    #: rather than ``pool``) keeps real site errors such as "pool is banned"
+    #: out of this bucket.
+    INFRASTRUCTURE_ERROR_MARKERS = (
+        "queuepool limit",
+        "queuepool",
+        "connection timed out, timeout 30.00",
+        "greenlet_spawn has not been called",
+        "can't call await_only",
+        "missinggreenlet",
+        "this session's transaction has been rolled back",
+    )
+
+    @staticmethod
+    def _is_infrastructure_error(exc: BaseException) -> bool:
+        """Whether ``exc`` is our own stack failing, not the site or proxy.
+
+        A ``QueuePool limit ... reached`` timeout, a ``MissingGreenlet`` from a
+        rolled-back session, and friends mean "the crawler ran out of database
+        connections", not "the site is blocking us".  Counting them toward the
+        consecutive-failure abort hid pool exhaustion behind a captcha/anti-crawl
+        message and -- worse -- aborted healthy tasks because of it.
+        """
+        seen: set[int] = set()
+        cause: object | None = exc
+        while cause is not None and id(cause) not in seen:
+            seen.add(id(cause))
+            try:
+                message = f"{type(cause).__name__} {cause}".lower()
+            except Exception:
+                break
+            if any(marker in message for marker in SyncService.INFRASTRUCTURE_ERROR_MARKERS):
+                return True
+            cause = getattr(cause, "__cause__", None) or getattr(
+                cause, "__context__", None
+            )
+        return False
 
     @staticmethod
     def _is_transient_book_fetch(exc: BaseException) -> bool:
@@ -1048,6 +1095,26 @@ class SyncService:
                 remaining -= 1
                 await _checkpoint()
                 if error is not None:
+                    if self._is_infrastructure_error(error):
+                        # Same rule as the book-level counters below: our own
+                        # stack failing (pool exhaustion, rolled-back session)
+                        # is recorded but counts toward nothing -- it must not
+                        # trip either the anti-crawl abort or the transient
+                        # abort of this book.
+                        failed_chapters.append({
+                            "chapter_number": remote_chapter.chapter_number,
+                            "title": remote_chapter.title,
+                            "url": remote_chapter.url,
+                            "error": describe_error(error)[:300],
+                        })
+                        logger.warning(
+                            "Infrastructure failure syncing chapter {} ({}): {}",
+                            remote_chapter.title,
+                            remote_chapter.url,
+                            describe_error(error),
+                        )
+                        await _report_progress(remote_chapter)
+                        continue
                     if self._is_upstream_blocked(error):
                         consecutive_blocked += 1
                         failed_chapters.append({
@@ -1159,6 +1226,9 @@ class SyncService:
                     consecutive_transient = 0
                     created += 1
                 except SQLAlchemyError as exc:
+                    # A database failure while persisting a chapter (pool
+                    # exhaustion included) is our own stack, not the site: it
+                    # is recorded but counts toward nothing.
                     await self.db.rollback()
                     book_row_verified = False
                     failed_chapters.append({
@@ -2013,10 +2083,7 @@ class SyncService:
                 done = True
                 break
 
-            book_concurrency = min(
-                max(1, int(getattr(settings, "SYNC_BOOK_CONCURRENCY", 3))),
-                sync_thread_count(),
-            )
+            book_concurrency = sync_book_concurrency()
             continuous_books = bool(
                 getattr(settings, "SYNC_BOOK_CONTINUOUS", False)
             )
@@ -2082,7 +2149,28 @@ class SyncService:
                         return
                     await self.db.rollback()
                     books_failed += 1
-                    if self._is_transient_book_fetch(outcome):
+                    if self._is_infrastructure_error(outcome):
+                        # Our own stack failed (pool exhaustion, rolled-back
+                        # session), not the site.  Record the book as failed so
+                        # it is retried on the next run, but keep it out of both
+                        # consecutive-failure counters: infrastructure noise must
+                        # never abort a task, and especially never with a
+                        # captcha/anti-crawl message.
+                        logger.warning(
+                            "Infrastructure failure syncing book {} ({}): {}",
+                            sb.title,
+                            sb.url,
+                            describe_error(outcome),
+                        )
+                        details.append({
+                            "title": sb.title,
+                            "author": sb.author,
+                            "url": sb.url,
+                            "synced": False,
+                            "error": describe_error(outcome),
+                            "failed_chapters": [],
+                        })
+                    elif self._is_transient_book_fetch(outcome):
                         # Cloudflare 5xx / browser timeouts are a site or proxy
                         # hiccup, not an anti-crawl gate.  Aborting the task here
                         # used to hide the real cause behind a generic
@@ -2106,20 +2194,21 @@ class SyncService:
                                 "反爬的站点。请检查书源规则、Cookie 或站点验证状态后"
                                 "再同步。".format(max_consecutive_failures)
                             )
-                    logger.warning(
-                        "Failed to sync book {} ({}): {}",
-                        sb.title,
-                        sb.url,
-                        describe_error(outcome),
-                    )
-                    details.append({
-                        "title": sb.title,
-                        "author": sb.author,
-                        "url": sb.url,
-                        "synced": False,
-                        "error": describe_error(outcome),
-                        "failed_chapters": [],
-                    })
+                    if not self._is_infrastructure_error(outcome):
+                        logger.warning(
+                            "Failed to sync book {} ({}): {}",
+                            sb.title,
+                            sb.url,
+                            describe_error(outcome),
+                        )
+                        details.append({
+                            "title": sb.title,
+                            "author": sb.author,
+                            "url": sb.url,
+                            "synced": False,
+                            "error": describe_error(outcome),
+                            "failed_chapters": [],
+                        })
                 else:
                     if outcome.get("filtered"):
                         books_filtered += 1

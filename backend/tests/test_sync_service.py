@@ -89,6 +89,90 @@ def test_upstream_blocked_includes_http_status_errors():
     )
     assert SyncService._is_upstream_blocked(RuntimeError("验证码/限流"))
     assert not SyncService._is_upstream_blocked(RuntimeError("解析失败"))
+    # Infrastructure noise is never an upstream block: a full pool says
+    # nothing about the site, and treating it as a block made pool exhaustion
+    # abort books with a captcha/anti-crawl error (online 2026-09-23).
+    assert not SyncService._is_upstream_blocked(
+        RuntimeError("QueuePool limit of size 10 overflow 20 reached, "
+                     "connection timed out, timeout 30.00")
+    )
+    assert not SyncService._is_upstream_blocked(
+        RuntimeError("greenlet_spawn has not been called; can't call "
+                     "await_only() here")
+    )
+
+
+def test_infrastructure_errors_are_recognized_through_wrappers():
+    """Pool/greenlet failures must be found even when wrapped.
+
+    SQLAlchemy wraps the pool timeout (``TimeoutError``/``QueuePool`` in the
+    chain), so only checking the outer message misses it.
+    """
+    inner = RuntimeError(
+        "QueuePool limit of size 10 overflow 20 reached, "
+        "connection timed out, timeout 30.00"
+    )
+    outer = RuntimeError("could not start a new transaction")
+    outer.__cause__ = inner
+    assert SyncService._is_infrastructure_error(outer) is True
+    assert SyncService._is_infrastructure_error(inner) is True
+    assert SyncService._is_infrastructure_error(ValueError("boom")) is False
+    # "pool" alone is too loose: a site can ban a "pool" of IPs.
+    assert SyncService._is_infrastructure_error(
+        RuntimeError("your IP pool is banned")
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_discover_and_sync_all_skips_infrastructure_failures_without_aborting():
+    """A pool outage must not abort a task, and never as "anti-crawl".
+
+    Ten ``QueuePool limit`` failures in a row used to trip
+    ``SYNC_MAX_CONSECUTIVE_FAILURES`` and abort the whole task with the
+    misleading "同步连续失败超过 N 本…反爬" message (online 2026-09-23).
+    They are now recorded as failed books but counted toward nothing.
+    """
+    db = _mock_db()
+    db.get.return_value = _source()
+    db.rollback = AsyncMock()
+
+    plugin = AsyncMock()
+    plugin.set_cookie = MagicMock()
+    plugin.discover_books.return_value = [
+        RemoteShelfBook(
+            source_book_id=f"{i}.html",
+            title=f"Book {i}",
+            author="Author",
+            url=f"https://example.com/{i}.html",
+        )
+        for i in range(5)
+    ]
+
+    fake_settings = SimpleNamespace(
+        SYNC_BOOK_CONCURRENCY=1,
+        SYNC_MAX_CONSECUTIVE_FAILURES=3,
+        SYNC_BOOK_CONTINUOUS=False,
+    )
+    pool_error = RuntimeError(
+        "QueuePool limit of size 10 overflow 20 reached, "
+        "connection timed out, timeout 30.00"
+    )
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.settings", fake_settings),
+        patch.object(
+            SyncService,
+            "sync_book",
+            AsyncMock(side_effect=pool_error),
+        ),
+    ):
+        result = await SyncService(db).discover_and_sync_all("src1", max_pages=1)
+
+    assert result["books_failed"] == 5
+    assert result["books_synced"] == 0
+    # No abort: all five books were attempted, none tripped the counters.
+    assert len(result["details"]) == 5
+    assert all("QueuePool limit" in (d.get("error") or "") for d in result["details"])
 
 
 def test_transient_book_fetch_classification():

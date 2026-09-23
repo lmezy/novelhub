@@ -809,21 +809,28 @@ def test_pool_capacity_never_reaches_zero():
 def test_task_slots_stay_below_the_pool():
     """Tasks are always fewer than the connections they will each hold.
 
-    Every running task keeps one pooled connection for its whole life, so a task
-    count at or above the pool means the surplus waits ``pool_timeout`` and then
-    fails with "QueuePool limit of size 10 overflow 20 reached" -- which is
-    exactly what happened online on 2026-09-19.
+    Every running task keeps one pooled connection for its whole life plus one
+    per concurrently syncing book (``sync_book_concurrency()``, default 3), so
+    a task count at or above the pool means the surplus waits ``pool_timeout``
+    and then fails with "QueuePool limit of size 10 overflow 20 reached" --
+    which is exactly what happened online on 2026-09-23.
     """
     with patch.object(settings, "DB_POOL_SIZE", 10), patch.object(
         settings, "DB_MAX_OVERFLOW", 20
+    ), patch.object(settings, "SYNC_BOOK_CONCURRENCY", 3), patch.object(
+        settings, "SYNC_THREAD_COUNT", 9
     ):
-        assert _task_slot_budget() == 26
-        assert _task_slot_budget() < db_pool_capacity()
+        # (30 - 4 reserve) // (1 + 3 per task) = 6 tasks.
+        assert _task_slot_budget() == 6
+        assert _task_slot_budget() * 4 < db_pool_capacity()
 
     with patch.object(settings, "DB_POOL_SIZE", 3), patch.object(
         settings, "DB_MAX_OVERFLOW", 3
+    ), patch.object(settings, "SYNC_BOOK_CONCURRENCY", 3), patch.object(
+        settings, "SYNC_THREAD_COUNT", 9
     ):
-        assert _task_slot_budget() == 2
+        # (6 - 4 reserve) // 4 = 0 -> clamped to the 1 usable slot.
+        assert _task_slot_budget() == 1
 
     # A pool too small to reserve anything still yields one usable slot.
     with patch.object(settings, "DB_POOL_SIZE", 1), patch.object(
@@ -836,10 +843,12 @@ def test_task_concurrency_limit_cannot_exceed_the_pool():
     """An operator asking for more tasks than connections must not get them."""
     with patch.object(settings, "DB_POOL_SIZE", 10), patch.object(
         settings, "DB_MAX_OVERFLOW", 20
+    ), patch.object(settings, "SYNC_BOOK_CONCURRENCY", 3), patch.object(
+        settings, "SYNC_THREAD_COUNT", 9
     ):
         # Default: "one worker per source", bounded by the pool.
         with patch.object(settings, "SYNC_WORKER_CONCURRENCY", 0):
-            assert task_concurrency_limit() == 26
+            assert task_concurrency_limit() == 6
         # A ceiling below the budget is honoured.
         with patch.object(settings, "SYNC_WORKER_CONCURRENCY", 5):
             assert task_concurrency_limit() == 5
@@ -847,7 +856,7 @@ def test_task_concurrency_limit_cannot_exceed_the_pool():
         # regression: it used to return the number asked for (or a flat 32)
         # regardless of how many connections the pool could actually serve.
         with patch.object(settings, "SYNC_WORKER_CONCURRENCY", 100):
-            assert task_concurrency_limit() == 26
+            assert task_concurrency_limit() == 6
 
 
 @pytest.mark.asyncio
@@ -876,9 +885,12 @@ async def test_worker_loop_starts_no_more_tasks_than_the_pool_can_serve():
 
     with patch.object(settings, "DB_POOL_SIZE", 3), patch.object(
         settings, "DB_MAX_OVERFLOW", 3
+    ), patch.object(settings, "SYNC_BOOK_CONCURRENCY", 3), patch.object(
+        settings, "SYNC_THREAD_COUNT", 9
     ), patch.object(settings, "SYNC_WORKER_CONCURRENCY", 0):
         budget = task_concurrency_limit()
-        assert budget == 2
+        # (6 - 4 reserve) // (1 + 3 per task) = 0 -> clamped to 1.
+        assert budget == 1
         with (
             patch(
                 "app.services.crawl_runner._next_pending_tasks",
