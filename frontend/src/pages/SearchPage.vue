@@ -29,6 +29,10 @@ interface SearchHit {
   chapter_number?: number
   description?: string
   snippet?: string
+  // ``/api/search/advanced`` attaches the local cover (the search index does
+  // not carry one), so a result row can show the book's picture.
+  cover?: string | null
+  cover_url?: string | null
   matched_fields?: string[]
   matched_chapter?: {
     id: string
@@ -87,7 +91,20 @@ async function loadTags() {
   }
 }
 
-function doSearch() {
+const pageSize = 30
+const offset = ref(0)
+const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize)))
+const currentPage = computed(() => Math.floor(offset.value / pageSize) + 1)
+// Mirrors the current page so 上一页 / 下一页 and the jump box stay in sync.
+// Without this page, a result list was a dead end: the only way to page 12 of a
+// 300-hit search was eleven clicks on 下一页.
+const pageJump = ref(String(currentPage.value))
+
+watch(currentPage, (n) => {
+  pageJump.value = String(n)
+})
+
+function doSearch(resetPage = true) {
   const conds = activeConditions()
   if (conds.length === 0) {
     searched.value = false
@@ -95,6 +112,7 @@ function doSearch() {
     total.value = 0
     return
   }
+  if (resetPage) offset.value = 0
   searching.value = true
   searched.value = true
   error.value = ""
@@ -107,8 +125,8 @@ function doSearch() {
           conditions: conds,
           match: match.value,
           scope: "all",
-          offset: 0,
-          limit: 30,
+          offset: offset.value,
+          limit: pageSize,
         },
       )
       results.value = res.hits
@@ -121,16 +139,45 @@ function doSearch() {
   }, 250)
 }
 
-watch([conditions, match], () => doSearch(), { deep: true })
+// ``doSearch`` takes a flag, and a template handler would pass its event as
+// that flag, so the "search now" button / Enter key go through this wrapper.
+function doSearchNow() {
+  doSearch(true)
+}
+
+function changePage(nextOffset: number) {
+  const clamped = Math.max(0, Math.min(nextOffset, (totalPages.value - 1) * pageSize))
+  // Write the page back *before* the no-op check: a jump that clamps onto the
+  // page already on screen used to leave the typed number in the box, so the
+  // next 跳转 moved somewhere the box did not describe.
+  pageJump.value = String(Math.floor(clamped / pageSize) + 1)
+  if (clamped === offset.value) return
+  offset.value = clamped
+  doSearch(false)
+}
+
+function jumpToTypedPage() {
+  // ``Number("")`` is 0, not NaN, so a cleared box has to be caught explicitly.
+  const raw = String(pageJump.value).trim()
+  const typed = raw ? Math.trunc(Number(raw)) : Number.NaN
+  if (!Number.isFinite(typed) || typed < 1) {
+    pageJump.value = String(currentPage.value)
+    return
+  }
+  const target = Math.min(typed, totalPages.value)
+  pageJump.value = String(target)
+  changePage((target - 1) * pageSize)
+}
+
+// Any edit to the conditions is a *new* query, so it starts from page 1.
+watch([conditions, match], () => doSearch(true), { deep: true })
 
 function addCondition() {
   conditions.value.push({ enabled: true, field: "title", mode: "exact", value: "" })
-  doSearch()
 }
 
 function removeCondition(index: number) {
   conditions.value.splice(index, 1)
-  doSearch()
 }
 
 function goToHit(hit: SearchHit) {
@@ -141,6 +188,24 @@ function goToHit(hit: SearchHit) {
   } else if (hit.book_id) {
     router.push("/books/" + hit.book_id + "/chapters/" + hit.id)
   }
+}
+
+// A chapter hit lands in the reader, which has no way back to the book's own
+// page (chapter list / metadata).  This is the id that button opens instead.
+function hitBookId(hit: SearchHit) {
+  if (hit.type === "book") return hit.matched_chapter?.book_id || hit.id
+  return hit.book_id || ""
+}
+
+// An empty or broken cover falls back to the title placeholder rather than a
+// broken-image icon (same rule as the book cards).
+function hitCover(hit: SearchHit) {
+  return hit.cover || hit.cover_url || ""
+}
+
+function hitCoverFailed(hit: SearchHit) {
+  hit.cover = ""
+  hit.cover_url = ""
 }
 
 function applyQuery() {
@@ -235,7 +300,7 @@ onMounted(async () => {
             :list="c.field === 'tags' ? 'search-tag-options' : undefined"
             :placeholder="i18n.t('search_condition_placeholder')"
             class="flex-1 min-w-[180px] px-3 py-1.5 rounded-md border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-sm focus:outline-none focus:ring-2 focus:ring-accent/30"
-            @keydown.enter="doSearch"
+            @keydown.enter="doSearchNow"
           />
           <button
             v-if="conditions.length > 1"
@@ -255,7 +320,7 @@ onMounted(async () => {
           class="text-xs px-3 py-2 rounded-lg border border-accent/40 text-accent hover:bg-accent/5 transition-colors"
         >{{ i18n.t('search_conditions_add') }}</button>
         <button
-          @click="doSearch"
+          @click="doSearchNow"
           class="text-xs px-4 py-2 rounded-lg bg-accent text-white hover:opacity-90 transition-opacity"
         >{{ i18n.t('search_button') }}</button>
       </div>
@@ -279,41 +344,91 @@ onMounted(async () => {
           <div
             v-for="hit in results"
             :key="hit.type + '-' + hit.id"
-            @click="goToHit(hit)"
-            class="px-4 py-3 hover:bg-accent/5 cursor-pointer transition-colors"
+            class="flex items-start gap-2 px-4 py-3 hover:bg-accent/5 transition-colors"
           >
-            <div class="flex items-center gap-2 mb-1">
-              <span class="text-[10px] px-1.5 py-0.5 rounded bg-accent/10 text-accent">
-                {{ hit.type === 'book' ? i18n.t('search_books') : i18n.t('search_chapters') }}
-              </span>
-              <h3 class="text-sm font-medium">{{ hit.type === 'book' ? hit.title : hit.book_title }}</h3>
-              <span
-                v-for="field in hit.matched_fields || []"
-                :key="field"
-                class="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-900/60 text-amber-700 dark:text-amber-300"
-              >{{ i18n.t('search_field_' + field) }}</span>
+            <div @click="goToHit(hit)" class="flex min-w-0 flex-1 items-start gap-3 cursor-pointer">
+              <div class="h-[74px] w-[56px] shrink-0 overflow-hidden rounded bg-gray-100 dark:bg-gray-800">
+                <img v-if="hitCover(hit)" :src="hitCover(hit)" :alt="hit.type === 'book' ? hit.title : (hit.book_title || hit.title)" class="h-full w-full object-cover" loading="lazy" @error="hitCoverFailed(hit)" />
+                <div v-else class="flex h-full items-center justify-center px-1 text-center text-[10px] leading-tight text-muted dark:text-gray-500">{{ hit.type === 'book' ? hit.title : (hit.book_title || hit.title) }}</div>
+              </div>
+              <div class="min-w-0 flex-1">
+                <div class="flex items-center gap-2 mb-1">
+                  <span class="text-[10px] px-1.5 py-0.5 rounded bg-accent/10 text-accent">
+                    {{ hit.type === 'book' ? i18n.t('search_books') : i18n.t('search_chapters') }}
+                  </span>
+                  <h3 class="text-sm font-medium">{{ hit.type === 'book' ? hit.title : hit.book_title }}</h3>
+                  <span
+                    v-for="field in hit.matched_fields || []"
+                    :key="field"
+                    class="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-900/60 text-amber-700 dark:text-amber-300"
+                  >{{ i18n.t('search_field_' + field) }}</span>
+                </div>
+                <p v-if="hit.type === 'chapter' && hit.title" class="text-xs font-medium mb-0.5">
+                  <span class="text-muted dark:text-gray-400">{{ i18n.t('search_field_chapter_title') }}:</span>
+                  {{ hit.title }}
+                </p>
+                <p v-if="hit.author" class="text-xs text-muted dark:text-gray-400">{{ hit.author }}</p>
+                <p v-if="hit.snippet" class="text-xs text-muted dark:text-gray-400 mt-1 line-clamp-2">
+                  <SnippetText :text="hit.snippet" :terms="snippetTerms" />
+                </p>
+                <div
+                  v-if="hit.matched_chapter"
+                  class="mt-2 px-2.5 py-2 rounded bg-accent/5 border border-accent/10"
+                >
+                  <p class="text-xs font-medium mb-0.5">
+                    <span class="text-muted dark:text-gray-400">{{ i18n.t('search_field_chapter_title') }}:</span>
+                    {{ hit.matched_chapter.title }}
+                  </p>
+                  <p v-if="hit.matched_chapter.snippet" class="text-xs text-muted dark:text-gray-400 line-clamp-2">
+                    <span class="text-muted dark:text-gray-400">{{ i18n.t('search_field_content') }}:</span>
+                    <SnippetText :text="hit.matched_chapter.snippet" :terms="snippetTerms" />
+                  </p>
+                </div>
+              </div>
             </div>
-            <p v-if="hit.type === 'chapter' && hit.title" class="text-xs font-medium mb-0.5">
-              <span class="text-muted dark:text-gray-400">{{ i18n.t('search_field_chapter_title') }}:</span>
-              {{ hit.title }}
-            </p>
-            <p v-if="hit.author" class="text-xs text-muted dark:text-gray-400">{{ hit.author }}</p>
-            <p v-if="hit.snippet" class="text-xs text-muted dark:text-gray-400 mt-1 line-clamp-2">
-              <SnippetText :text="hit.snippet" :terms="snippetTerms" />
-            </p>
-            <div
-              v-if="hit.matched_chapter"
-              class="mt-2 px-2.5 py-2 rounded bg-accent/5 border border-accent/10"
-            >
-              <p class="text-xs font-medium mb-0.5">
-                <span class="text-muted dark:text-gray-400">{{ i18n.t('search_field_chapter_title') }}:</span>
-                {{ hit.matched_chapter.title }}
-              </p>
-              <p v-if="hit.matched_chapter.snippet" class="text-xs text-muted dark:text-gray-400 line-clamp-2">
-                <span class="text-muted dark:text-gray-400">{{ i18n.t('search_field_content') }}:</span>
-                <SnippetText :text="hit.matched_chapter.snippet" :terms="snippetTerms" />
-              </p>
-            </div>
+            <button
+              v-if="hitBookId(hit)"
+              @click="router.push('/books/' + hitBookId(hit))"
+              class="shrink-0 px-2 py-1 rounded border border-border dark:border-gray-700 text-[11px] text-muted dark:text-gray-400 hover:border-accent hover:text-accent transition-colors"
+              :title="i18n.t('search_open_book')"
+            >{{ i18n.t('search_books') }}</button>
+          </div>
+        </div>
+
+        <!-- Outside the results guard on purpose: a page whose slice came back
+             empty (deep page past the scanned window) must still offer a way
+             back, instead of stranding the user on "没有找到结果". -->
+        <div v-if="total > pageSize" class="mt-6">
+          <p v-if="results.length === 0" class="mb-3 text-center text-xs text-muted dark:text-gray-500">
+            {{ i18n.t('search_page_empty') }}
+          </p>
+          <div class="flex flex-wrap items-center justify-center gap-3 text-xs">
+            <button
+              @click="changePage(offset - pageSize)"
+              :disabled="currentPage <= 1"
+              class="rounded border border-border dark:border-gray-700 px-3 py-2 disabled:opacity-40"
+            >{{ i18n.t('books_previous') }}</button>
+            <span>{{ currentPage }} / {{ totalPages }}</span>
+            <button
+              @click="changePage(offset + pageSize)"
+              :disabled="currentPage >= totalPages"
+              class="rounded border border-border dark:border-gray-700 px-3 py-2 disabled:opacity-40"
+            >{{ i18n.t('books_next') }}</button>
+            <span class="inline-flex items-center gap-1">
+              {{ i18n.t('search_goto_page') }}
+              <input
+                v-model="pageJump"
+                type="number"
+                min="1"
+                :max="totalPages"
+                class="w-16 rounded border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 px-2 py-1.5 text-xs"
+                @keydown.enter="jumpToTypedPage"
+              />
+              <button
+                @click="jumpToTypedPage"
+                class="rounded border border-accent/50 px-2 py-1.5 text-accent"
+              >{{ i18n.t('search_goto') }}</button>
+            </span>
           </div>
         </div>
       </template>

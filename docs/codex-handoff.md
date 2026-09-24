@@ -1568,3 +1568,91 @@ C 和 B 才会生效（NAS 不 build，镜像是从 Docker Hub 拉的）。A 已
 **同型未改（等确认）**：`images.py:130` 与 `book.py:534` 也是 `if proxy is None: break`——直连优先时
 同样会跳过代理，只是这两处是「尽力而为」的封面/正文图（失败只返回 None），且它们已经有带 URL 的收尾
 告警，所以影响小得多。
+## 44. 搜索结果加封面、加「书籍」跳转、分页可直接跳页（2026-09-24）
+
+**现象**（用户报）：① 搜索结果里是书籍时不显示书籍图片；② 正文搜索点进去直接是正文，没有入口回这本书的书籍页；
+③ 结果出来以后只能一页一页点「下一页」，不能直接跳页。
+
+**根因（都在前端 + 一个后端字段缺口，不在索引）**：
+
+1. **结果里没有封面字段**。`/api/search/advanced` 的命中对象只带标题/作者/简介/片段，前端无从画图；
+   `PostSearch` 路由里 `_filter_visible_hits` 虽然已经在查 `books` 表，但只 select 了 `id/owner_id/is_public`。
+2. **章节命中的点击目标是阅读器**（`/books/{book_id}/chapters/{id}`），阅读器没有回到书籍页的入口，
+   书籍命中里「按正文匹配」的那一档（带 `matched_chapter`）同样直接进正文。
+3. **三个结果列表只有上一页/下一页**：`BooksPage.vue` 的本地搜索、高级搜索、书库浏览各有一段
+   分页控件，`SearchPage.vue`（/search）那更彻底——**完全没有分页**，只取 30 条，`total` 再大也翻不到。
+
+**改动**：
+
+- 后端 `api/routes/search.py`：`_load_book_meta` 一次查询同时取回 `cover/display_cover` 与可见性字段，
+  原来的可见性判定改从同一份 map 读；新增 `_cover_path` / `_with_cover` 给**每条命中**补 `cover` + `cover_url`
+  （章节命中用 `book_id` 找书，所以章节结果也有书封）。封面规则与 `books._book_cover_value` 一致：
+  用户自选封面 > 书源封面；远程 URL 原样返回，本地文件走 `/api/books/{id}/cover`；**没有封面就不给字段**，
+  前端据此显示占位块而不是指向必然 404 的 `<img>`。查询失败只记一条 warning 并返回无封面结果——
+  封面是装饰，不能把搜索变成 500。
+- 前端 `BooksPage.vue`（本地搜索、高级搜索、书库浏览）与 `SearchPage.vue`（/search）：
+  结果行左侧加 56×74 封面缩略图（`@error` 时退回书名占位）、加「书籍」按钮跳到 `/books/{id}`、
+  分页加「跳至 __ 页」输入框 + 「跳转」（页码越界自动夹到 1..总页数）。
+  `SearchPage.vue` 同时补上分页：`offset` 状态 + 30/页，条件变更回到第 1 页。
+- `stores/i18n.ts`：新增 `search_goto_page` / `search_goto` / `search_open_book`（zh + en）。
+
+**验证**：`backend` 全量 `902 passed`（其中 `tests/test_search_cover.py` 8 条：本地封面走 `/api/books/{id}/cover`、
+自选封面优先、章节用所属书的封面、无封面不给字段、不可见书照旧被过滤、封面查询挂掉仍返回命中、
+非管理员的 `total` 是真总数、GET 路由同样）；`vue-tsc --noEmit` 通过；`vite build` 通过。
+
+**未做（下一步）**：线上那次「同步停住很久」的定位。本机到 NAS 的 SSH（10022）被拒（TCP 能通但
+SSH banner 阶段连接被拒，Node 客户端显示 ECONNREFUSED），Web 侧 18088 可用但 `/api/crawl/tasks` 需要
+登录态。用户选择自己修 SSH 通道（或给一个浏览器里的 `novelhub_token`），拿到任一条通道后再读线上任务表。
+
+**部署提醒**：本次改了 backend 与 frontend，**重建 `lonezy/novelhub-backend` 与 `lonezy/novelhub-frontend`**；
+crawler 与 postgres 不用动。
+
+**复审后的修正（同一批改动，独立审阅发现 5 个真问题）**：
+
+1. **非管理员的 `total` 被压成 `len(hits)`**（`routes/search.py`，第 44 节之前就有的老逻辑）→ `total` 永远
+   不超过一页，于是**普通用户的「下一页」永远禁用、页码永远 1/1，新加的跳页框也不出现**。前端
+   `v-if="total > pageSize"` 正是靠它。已改成对所有人都返回真实总数：可见性过滤照旧生效（列表里没有
+   被隐藏的书），而"总共多少条"本来就不泄漏**是哪几本**，比"这一页装下了几条"更接近真话。
+   `/api/search` 的 GET 路由同步放开。
+2. **跳页框与列表不同步**（`BooksPage.vue`）：框里只跟随**路由 offset**（本地/高级搜索用），书库浏览用的是
+   `page.offset`，于是浏览翻页时框里数字不动、再点「跳转」会跳到另一个页。改成同时跟随
+   `[currentPageNumber, browsePageNumber]`，按当前视图取哪一个。
+3. **`SearchPage.vue` 的 `changePage` 在"夹到当前页"时提前 return**，没有回写页码 —— 输入 9 而只有 2 页时
+   框里会一直留着 9；空输入（`Number("") === 0`）也被静默吞掉。已改成先回写再判断，空输入显式还原。
+4. **`/search` 的分页条在 `v-if="results.length"` 里面**：越界/窗口外的空页只显示"没有找到结果"，
+   没有任何回到上一页的入口。已把分页条移到该分支之外，并加一条「这一页没有结果（结果窗口只覆盖前若干条
+   匹配）」提示。
+5. **`/search` 页漏了封面**（第 44 节初稿写成"两端都加了"是不准确的）：接口已经给每条命中带
+   `cover`/`cover_url`，但 `SearchPage.vue` 的 `SearchHit` 与行模板都没接。已补上 56×74 缩略图 +
+   `@error` 占位兜底。
+
+复审同时确认没有的问题：类型检查/事件参数无误、偏移量都被夹在 `[0, (pages-1)*size]`、旧行内容没有被删
+（只是被包了一层，`@click` 移到内层 div、书籍按钮是兄弟节点）、条件变更回第 1 页正确、sessionStorage
+分页缓存不会混用改版前后的页大小。
+
+## 45. 正文搜索只有 300 条 —— content 候选窗口是死上限（2026-09-24）
+
+**现象**（用户报）：正文搜索翻到大约第 8 页就没有了，"搜索结果只有 300 条"。
+
+**根因**：`services/search.py` 的 `CONTENT_CANDIDATE_LIMIT = 300` 是**硬上限**，不是本页的取数上限。
+正文打分必须拿到章节正文，所以候选窗口只能取 300 章（1000 章 = 96 MB / 18-25 s）；
+而窗口就是被排序、被缓存、被翻页的那份排名 —— `_single_condition_search` 里 `ranked[offset:offset+limit]`，
+`total = len(ranked)`。于是第 9 页（offset 320）永远取到空列表，`total` 最多 300，看起来就是"只有 300 条"。
+注意 `total` 本身还偏小：窗口里 300 个**引擎候选**，经 Python 精确子串过滤后可能只剩一百多条，
+所以真含关键词的章节数远多于页面显示的数字。
+
+**改动（`services/search.py`，其余文件不动）**：
+
+- 新增 `_content_window_for(offset)`：窗口按 `max(CONTENT_CANDIDATE_LIMIT, offset + 1)` 向上取整到 300 的倍数，
+  上限 `CONTENT_WINDOW_MAX = 2000`。第 1~8 页仍是一次 300 候选扫描；第 9 页 600、第 13 页 900……
+  每次翻页只多付一档，且窗口随缓存键一起变（`PAGE_CACHE_TTL_SECONDS` 内重复翻页免费）。
+- `_scan_condition` 加 `chunk_size`：窗口比一档宽时**按 1000 行分块**取（Meilisearch 不会一次给出
+  2000 章正文；分块的第二重作用是短页即结束，避免空页把循环卡住）。metadata 传 `chunk_size=window`，
+  所以它依旧是「一次 10000 宽请求」，第 28 节的既有行为没变。
+- 超过 2000 的页从最后一档里出（可能变短或为空）——这是刻意的：想真正「全库任意深」应该做
+  索引期 n-gram + filter 子串匹配（第 28 节的「未做」项），而不是继续放大窗口。
+
+**验证**：全量 `902 passed`（新增 4 条：窗口随页码增长的边界、只有正文走分块、
+跨页扫描不漏不重、正文与 metadata 的窗口/分块差异）。
+
+**部署提醒**：与第 44 节同批，重建 `lonezy/novelhub-backend`（+ frontend）即可。

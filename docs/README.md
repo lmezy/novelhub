@@ -92,6 +92,10 @@
 - **AI 分析说「书源未配置 Cookie」，但书源页显示「已保存 Cookie」** →
   [codex-handoff.md](codex-handoff.md) 第 27 节 + [ai-assistant.md](ai-assistant.md) “排错”
 - **搜索结果和搜索词没关系（搜「铃铛」出「铃木」）** → [codex-handoff.md](codex-handoff.md) 第 28 节
+- **搜索结果只有 300 条 / 正文搜索翻到第 8 页就到头** → [codex-handoff.md](codex-handoff.md) 第 45 节
+  + [source-search.md](source-search.md)「Search performance」
+- **搜索结果里看不到书封 / 正文搜索点进去回不到书籍页 / 只能一页页点「下一页」** →
+  [codex-handoff.md](codex-handoff.md) 第 44 节 + [source-search.md](source-search.md)
 - **高级搜索（多条件）怎么填都是 0 条** → [codex-handoff.md](codex-handoff.md) 第 28 节
 - **问「检索是不是全库检索」/ 结果为什么会少** → [codex-handoff.md](codex-handoff.md) 第 28 节
   「检索到底搜了多少库」

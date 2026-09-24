@@ -27,6 +27,10 @@ interface SearchHit {
   book_title?: string
   author?: string
   snippet?: string
+  // ``/api/search/advanced`` attaches the local cover (the search index does
+  // not carry one), so a result row can show the book's picture.
+  cover?: string | null
+  cover_url?: string | null
   matched_fields?: string[]
   matched_chapter?: { id: string; book_id: string; title: string; snippet?: string }
 }
@@ -120,11 +124,17 @@ const remoteTotal = ref(0)
 const remoteSearching = ref(false)
 const syncingUrl = ref("")
 
-const ADVANCED_CACHE_KEY = "novelhub:advanced-search-cache"
+// Versioned like the page cache below: rows gained a cover, so a snapshot of
+// the previous build is abandoned instead of repainting coverless results.
+const ADVANCED_CACHE_KEY = "novelhub:advanced-search-cache:v2"
 // Local search results are paged 40 at a time and every page used to be a fresh
 // ``/search/advanced`` call.  Keeping the pages that were already fetched makes
 // "next page" / going back instant instead of re-running the query.
-const SEARCH_PAGES_KEY = "novelhub:books-search-pages"
+//
+// ``:v2`` because the rows now carry a cover and the page size is a named
+// constant: a snapshot written by the previous build would repaint rows without
+// pictures, so it is simply abandoned (sessionStorage clears with the tab).
+const SEARCH_PAGES_KEY = "novelhub:books-search-pages:v2"
 const SEARCH_PAGES_MAX = 12
 const isAdvancedRoute = computed(() => String(route.query.advanced || "") === "1")
 
@@ -193,6 +203,58 @@ const showCovers = computed(() => auth.user?.settings?.show_covers !== false)
 const sourceNameMap = computed<Record<string, string>>(() => Object.fromEntries(sources.value.map((source) => [source.id, source.name])))
 const activeCategoryItem = computed(() => categories.value.find((category) => category.name === activeCategory.value))
 const allSelected = computed(() => page.value.items.length > 0 && page.value.items.every((book) => selectedIds.value.includes(book.id)))
+
+// Result pages hold 40 hits.  The list used to offer only 上一页 / 下一页, so
+// reaching page 12 of a 300-hit search meant eleven clicks.
+const SEARCH_PAGE_SIZE = 40
+
+// Typed page number for the "jump to page" box.  It mirrors whatever the URL
+// says, so 上一页 / 下一页 / the jump box all leave the box in sync.
+const pageJump = ref("")
+
+const currentPageNumber = computed(() => Math.floor(currentOffset.value / SEARCH_PAGE_SIZE) + 1)
+const browsePageSize = computed(() => page.value.limit || 24)
+const browsePageNumber = computed(() => Math.floor(page.value.offset / browsePageSize.value) + 1)
+
+function totalPages(total: number, size: number) {
+  return Math.max(1, Math.ceil(Math.max(0, total) / (size || 1)))
+}
+
+// The box shows the page of *whichever* list is on screen: the search lists are
+// driven by the route offset, the browse list by its own 24-item page.  Watching
+// only the route offset left the box reading "3" while browse had moved on, and
+// the next 跳转 then jumped to a page the number never described.
+watch([currentPageNumber, browsePageNumber], ([searchPage, browse]) => {
+  pageJump.value = String(isBrowsing.value ? browse : searchPage)
+}, { immediate: true })
+
+function jumpToTypedPage(handler: (offset: number) => void, total: number, size: number) {
+  const typed = Math.trunc(Number(pageJump.value))
+  const pages = totalPages(total, size)
+  if (!Number.isFinite(typed) || typed < 1) {
+    pageJump.value = String(currentPageNumber.value)
+    return
+  }
+  const target = Math.min(typed, pages)
+  pageJump.value = String(target)
+  handler((target - 1) * size)
+}
+
+// An empty/broken cover must not leave a broken-image icon in the row; the
+// template falls back to the same placeholder the book cards use.
+function hitCover(hit: SearchHit) {
+  return hit.cover || hit.cover_url || ""
+}
+
+function hitCoverFailed(hit: SearchHit) {
+  hit.cover = ""
+  hit.cover_url = ""
+}
+
+function hitBookId(hit: SearchHit) {
+  if (hit.type === "book") return hit.matched_chapter?.book_id || hit.id
+  return hit.book_id || hit.matched_chapter?.book_id || ""
+}
 
 const searchFields: { value: SearchField; label: string }[] = [
   { value: "title", label: "search_field_title" },
@@ -268,7 +330,7 @@ async function loadSearch() {
     scope: "all",
     ...(bookKind.value ? { kind: bookKind.value } : {}),
     offset: currentOffset.value,
-    limit: 40,
+    limit: SEARCH_PAGE_SIZE,
   })
   results.value = response.hits
   searchTotal.value = response.total
@@ -464,7 +526,7 @@ async function runAdvancedSearch(offset = 0) {
       scope: "all",
       ...(bookKind.value ? { kind: bookKind.value } : {}),
       offset,
-      limit: 40,
+      limit: SEARCH_PAGE_SIZE,
     })
     advancedResults.value = res.hits
     advancedTotal.value = res.total
@@ -734,25 +796,55 @@ onMounted(async () => {
         </div>
         <p v-if="!advancedSearching && advancedResults.length === 0" class="py-12 text-center text-sm text-muted dark:text-gray-400">{{ i18n.t('search_no_results') }}</p>
         <div v-if="advancedResults.length" class="divide-y divide-border border-y border-border dark:divide-gray-800 dark:border-gray-800">
-          <button v-for="hit in advancedResults" :key="hit.type + '-' + hit.id" @click="goToHit(hit)" class="block w-full px-2 py-4 text-left transition-colors hover:bg-accent/5">
-            <div class="flex flex-wrap items-center gap-2">
-              <span class="rounded bg-accent/10 px-1.5 py-0.5 text-[10px] text-accent">{{ hit.type === 'book' ? i18n.t('search_books') : i18n.t('search_chapters') }}</span>
-              <h3 class="text-sm font-medium">{{ hit.type === 'book' ? hit.title : hit.book_title }}</h3>
-              <span v-for="field in hit.matched_fields || []" :key="field" class="text-[10px] text-muted dark:text-gray-500">{{ i18n.t('search_field_' + field) }}</span>
-            </div>
-            <p v-if="hit.type === 'chapter'" class="mt-1 text-xs font-medium">{{ hit.title }}</p>
-            <p v-if="hit.author" class="mt-1 text-xs text-muted dark:text-gray-400">{{ hit.author }}</p>
-            <p v-if="hit.snippet" class="mt-1 line-clamp-2 text-xs text-muted dark:text-gray-400"><SnippetText :text="hit.snippet" :terms="advancedTerms" /></p>
-            <div v-if="hit.matched_chapter" class="mt-2 rounded bg-accent/5 px-2.5 py-2 border border-accent/10">
-              <p class="text-xs font-medium">{{ hit.matched_chapter.title }}</p>
-              <p v-if="hit.matched_chapter.snippet" class="mt-0.5 line-clamp-2 text-xs text-muted dark:text-gray-400"><SnippetText :text="hit.matched_chapter.snippet" :terms="advancedTerms" /></p>
-            </div>
-          </button>
+          <div v-for="hit in advancedResults" :key="hit.type + '-' + hit.id" class="flex items-start gap-3 px-2 py-4 transition-colors hover:bg-accent/5">
+            <button @click="goToHit(hit)" class="flex min-w-0 flex-1 items-start gap-3 text-left">
+              <div class="h-[74px] w-[56px] shrink-0 overflow-hidden rounded bg-gray-100 dark:bg-gray-800">
+                <img v-if="showCovers && hitCover(hit)" :src="hitCover(hit)" :alt="hit.type === 'book' ? hit.title : (hit.book_title || hit.title)" class="h-full w-full object-cover" loading="lazy" @error="hitCoverFailed(hit)" />
+                <div v-else class="flex h-full items-center justify-center px-1 text-center text-[10px] leading-tight text-muted dark:text-gray-500">{{ hit.type === 'book' ? hit.title : (hit.book_title || hit.title) }}</div>
+              </div>
+              <div class="min-w-0 flex-1">
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="rounded bg-accent/10 px-1.5 py-0.5 text-[10px] text-accent">{{ hit.type === 'book' ? i18n.t('search_books') : i18n.t('search_chapters') }}</span>
+                  <h3 class="text-sm font-medium">{{ hit.type === 'book' ? hit.title : hit.book_title }}</h3>
+                  <span v-for="field in hit.matched_fields || []" :key="field" class="text-[10px] text-muted dark:text-gray-500">{{ i18n.t('search_field_' + field) }}</span>
+                </div>
+                <p v-if="hit.type === 'chapter'" class="mt-1 text-xs font-medium">{{ hit.title }}</p>
+                <p v-if="hit.author" class="mt-1 text-xs text-muted dark:text-gray-400">{{ hit.author }}</p>
+                <p v-if="hit.snippet" class="mt-1 line-clamp-2 text-xs text-muted dark:text-gray-400"><SnippetText :text="hit.snippet" :terms="advancedTerms" /></p>
+                <div v-if="hit.matched_chapter" class="mt-2 rounded bg-accent/5 px-2.5 py-2 border border-accent/10">
+                  <p class="text-xs font-medium">{{ hit.matched_chapter.title }}</p>
+                  <p v-if="hit.matched_chapter.snippet" class="mt-0.5 line-clamp-2 text-xs text-muted dark:text-gray-400"><SnippetText :text="hit.matched_chapter.snippet" :terms="advancedTerms" /></p>
+                </div>
+              </div>
+            </button>
+            <button
+              v-if="hitBookId(hit)"
+              @click="router.push('/books/' + hitBookId(hit))"
+              class="shrink-0 rounded border border-border px-2 py-1 text-[11px] text-muted hover:border-accent hover:text-accent dark:border-gray-700 dark:text-gray-400"
+              :title="i18n.t('search_open_book')"
+            >{{ i18n.t('search_books') }}</button>
+          </div>
         </div>
-        <div v-if="advancedTotal > 40" class="mt-6 flex items-center justify-center gap-3 text-xs">
-          <button @click="changeAdvancedPage(currentOffset - 40)" :disabled="currentOffset === 0 || advancedSearching" class="rounded border border-border px-3 py-2 disabled:opacity-40 dark:border-gray-700">{{ i18n.t("books_previous") }}</button>
-          <span>{{ Math.floor(currentOffset / 40) + 1 }} / {{ Math.ceil(advancedTotal / 40) }}</span>
-          <button @click="changeAdvancedPage(currentOffset + 40)" :disabled="currentOffset + 40 >= advancedTotal || advancedSearching" class="rounded border border-border px-3 py-2 disabled:opacity-40 dark:border-gray-700">{{ i18n.t("books_next") }}</button>
+        <div v-if="advancedTotal > SEARCH_PAGE_SIZE" class="mt-6 flex flex-wrap items-center justify-center gap-3 text-xs">
+          <button @click="changeAdvancedPage(currentOffset - SEARCH_PAGE_SIZE)" :disabled="currentOffset === 0 || advancedSearching" class="rounded border border-border px-3 py-2 disabled:opacity-40 dark:border-gray-700">{{ i18n.t("books_previous") }}</button>
+          <span>{{ currentPageNumber }} / {{ totalPages(advancedTotal, SEARCH_PAGE_SIZE) }}</span>
+          <button @click="changeAdvancedPage(currentOffset + SEARCH_PAGE_SIZE)" :disabled="currentOffset + SEARCH_PAGE_SIZE >= advancedTotal || advancedSearching" class="rounded border border-border px-3 py-2 disabled:opacity-40 dark:border-gray-700">{{ i18n.t("books_next") }}</button>
+          <span class="inline-flex items-center gap-1">
+            {{ i18n.t('search_goto_page') }}
+            <input
+              v-model="pageJump"
+              type="number"
+              min="1"
+              :max="totalPages(advancedTotal, SEARCH_PAGE_SIZE)"
+              class="w-16 rounded border border-border bg-surface px-2 py-1.5 text-xs dark:border-gray-700 dark:bg-gray-900"
+              @keydown.enter="jumpToTypedPage(changeAdvancedPage, advancedTotal, SEARCH_PAGE_SIZE)"
+            />
+            <button
+              @click="jumpToTypedPage(changeAdvancedPage, advancedTotal, SEARCH_PAGE_SIZE)"
+              :disabled="advancedSearching"
+              class="rounded border border-accent/50 px-2 py-1.5 text-accent disabled:opacity-40"
+            >{{ i18n.t('search_goto') }}</button>
+          </span>
         </div>
       </template>
 
@@ -766,21 +858,54 @@ onMounted(async () => {
         </div>
         <p v-if="!results.length" class="py-12 text-center text-sm text-muted dark:text-gray-400">{{ i18n.t('search_no_results') }}</p>
         <div v-else class="divide-y divide-border border-y border-border dark:divide-gray-800 dark:border-gray-800">
-          <button v-for="hit in results" :key="hit.type + '-' + hit.id" @click="goToHit(hit)" class="block w-full px-2 py-4 text-left transition-colors hover:bg-accent/5">
-            <div class="flex flex-wrap items-center gap-2">
-              <span class="rounded bg-accent/10 px-1.5 py-0.5 text-[10px] text-accent">{{ hit.type === 'book' ? i18n.t('search_books') : i18n.t('search_chapters') }}</span>
-              <h3 class="text-sm font-medium">{{ hit.type === 'book' ? hit.title : hit.book_title }}</h3>
-              <span v-for="field in hit.matched_fields || []" :key="field" class="text-[10px] text-muted dark:text-gray-500">{{ i18n.t('search_field_' + field) }}</span>
-            </div>
-            <p v-if="hit.type === 'chapter'" class="mt-1 text-xs font-medium">{{ hit.title }}</p>
-            <p v-if="hit.author" class="mt-1 text-xs text-muted dark:text-gray-400">{{ hit.author }}</p>
-            <p v-if="hit.snippet" class="mt-1 line-clamp-2 text-xs text-muted dark:text-gray-400"><SnippetText :text="hit.snippet" :terms="quickTerms" /></p>
-          </button>
+          <div v-for="hit in results" :key="hit.type + '-' + hit.id" class="flex items-start gap-3 px-2 py-4 transition-colors hover:bg-accent/5">
+            <button @click="goToHit(hit)" class="flex min-w-0 flex-1 items-start gap-3 text-left">
+              <div class="h-[74px] w-[56px] shrink-0 overflow-hidden rounded bg-gray-100 dark:bg-gray-800">
+                <img v-if="showCovers && hitCover(hit)" :src="hitCover(hit)" :alt="hit.type === 'book' ? hit.title : (hit.book_title || hit.title)" class="h-full w-full object-cover" loading="lazy" @error="hitCoverFailed(hit)" />
+                <div v-else class="flex h-full items-center justify-center px-1 text-center text-[10px] leading-tight text-muted dark:text-gray-500">{{ hit.type === 'book' ? hit.title : (hit.book_title || hit.title) }}</div>
+              </div>
+              <div class="min-w-0 flex-1">
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="rounded bg-accent/10 px-1.5 py-0.5 text-[10px] text-accent">{{ hit.type === 'book' ? i18n.t('search_books') : i18n.t('search_chapters') }}</span>
+                  <h3 class="text-sm font-medium">{{ hit.type === 'book' ? hit.title : hit.book_title }}</h3>
+                  <span v-for="field in hit.matched_fields || []" :key="field" class="text-[10px] text-muted dark:text-gray-500">{{ i18n.t('search_field_' + field) }}</span>
+                </div>
+                <p v-if="hit.type === 'chapter'" class="mt-1 text-xs font-medium">{{ hit.title }}</p>
+                <p v-if="hit.author" class="mt-1 text-xs text-muted dark:text-gray-400">{{ hit.author }}</p>
+                <p v-if="hit.snippet" class="mt-1 line-clamp-2 text-xs text-muted dark:text-gray-400"><SnippetText :text="hit.snippet" :terms="quickTerms" /></p>
+                <div v-if="hit.matched_chapter" class="mt-2 rounded bg-accent/5 px-2.5 py-2 border border-accent/10">
+                  <p class="text-xs font-medium">{{ hit.matched_chapter.title }}</p>
+                  <p v-if="hit.matched_chapter.snippet" class="mt-0.5 line-clamp-2 text-xs text-muted dark:text-gray-400"><SnippetText :text="hit.matched_chapter.snippet" :terms="quickTerms" /></p>
+                </div>
+              </div>
+            </button>
+            <button
+              v-if="hitBookId(hit)"
+              @click="router.push('/books/' + hitBookId(hit))"
+              class="shrink-0 rounded border border-border px-2 py-1 text-[11px] text-muted hover:border-accent hover:text-accent dark:border-gray-700 dark:text-gray-400"
+              :title="i18n.t('search_open_book')"
+            >{{ i18n.t('search_books') }}</button>
+          </div>
         </div>
-        <div v-if="searchTotal > 40" class="mt-6 flex items-center justify-center gap-3 text-xs">
-          <button @click="changeSearchPage(currentOffset - 40)" :disabled="currentOffset === 0" class="rounded border border-border px-3 py-2 disabled:opacity-40 dark:border-gray-700">{{ i18n.t("books_previous") }}</button>
-          <span>{{ Math.floor(currentOffset / 40) + 1 }} / {{ Math.ceil(searchTotal / 40) }}</span>
-          <button @click="changeSearchPage(currentOffset + 40)" :disabled="currentOffset + 40 >= searchTotal" class="rounded border border-border px-3 py-2 disabled:opacity-40 dark:border-gray-700">{{ i18n.t("books_next") }}</button>
+        <div v-if="searchTotal > SEARCH_PAGE_SIZE" class="mt-6 flex flex-wrap items-center justify-center gap-3 text-xs">
+          <button @click="changeSearchPage(currentOffset - SEARCH_PAGE_SIZE)" :disabled="currentOffset === 0" class="rounded border border-border px-3 py-2 disabled:opacity-40 dark:border-gray-700">{{ i18n.t("books_previous") }}</button>
+          <span>{{ currentPageNumber }} / {{ totalPages(searchTotal, SEARCH_PAGE_SIZE) }}</span>
+          <button @click="changeSearchPage(currentOffset + SEARCH_PAGE_SIZE)" :disabled="currentOffset + SEARCH_PAGE_SIZE >= searchTotal" class="rounded border border-border px-3 py-2 disabled:opacity-40 dark:border-gray-700">{{ i18n.t("books_next") }}</button>
+          <span class="inline-flex items-center gap-1">
+            {{ i18n.t('search_goto_page') }}
+            <input
+              v-model="pageJump"
+              type="number"
+              min="1"
+              :max="totalPages(searchTotal, SEARCH_PAGE_SIZE)"
+              class="w-16 rounded border border-border bg-surface px-2 py-1.5 text-xs dark:border-gray-700 dark:bg-gray-900"
+              @keydown.enter="jumpToTypedPage(changeSearchPage, searchTotal, SEARCH_PAGE_SIZE)"
+            />
+            <button
+              @click="jumpToTypedPage(changeSearchPage, searchTotal, SEARCH_PAGE_SIZE)"
+              class="rounded border border-accent/50 px-2 py-1.5 text-accent"
+            >{{ i18n.t('search_goto') }}</button>
+          </span>
         </div>
       </template>
 
@@ -810,10 +935,25 @@ onMounted(async () => {
         <div v-else class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
           <BookCard v-for="book in page.items" :key="book.id" :book="book" :show-cover="showCovers" :source-name="book.source_id ? sourceNameMap[book.source_id] : ''" :selectable="auth.isAdmin" :selected="selectedIds.includes(book.id)" @select="toggleSelect" @favorite="toggleFavorite" @search="searchByField" />
         </div>
-        <div v-if="page.total > page.limit" class="mt-8 flex items-center justify-center gap-3 text-xs">
+        <div v-if="page.total > page.limit" class="mt-8 flex flex-wrap items-center justify-center gap-3 text-xs">
           <button @click="changePage(page.offset - page.limit)" :disabled="page.offset === 0" class="rounded border border-border px-3 py-2 disabled:opacity-40 dark:border-gray-700">{{ i18n.t('books_previous') }}</button>
-          <span>{{ Math.floor(page.offset / page.limit) + 1 }} / {{ Math.ceil(page.total / page.limit) }}</span>
+          <span>{{ browsePageNumber }} / {{ totalPages(page.total, browsePageSize) }}</span>
           <button @click="changePage(page.offset + page.limit)" :disabled="page.offset + page.limit >= page.total" class="rounded border border-border px-3 py-2 disabled:opacity-40 dark:border-gray-700">{{ i18n.t('books_next') }}</button>
+          <span class="inline-flex items-center gap-1">
+            {{ i18n.t('search_goto_page') }}
+            <input
+              v-model="pageJump"
+              type="number"
+              min="1"
+              :max="totalPages(page.total, browsePageSize)"
+              class="w-16 rounded border border-border bg-surface px-2 py-1.5 text-xs dark:border-gray-700 dark:bg-gray-900"
+              @keydown.enter="jumpToTypedPage(changePage, page.total, browsePageSize)"
+            />
+            <button
+              @click="jumpToTypedPage(changePage, page.total, browsePageSize)"
+              class="rounded border border-accent/50 px-2 py-1.5 text-accent"
+            >{{ i18n.t('search_goto') }}</button>
+          </span>
         </div>
       </template>
 

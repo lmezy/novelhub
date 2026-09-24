@@ -616,6 +616,93 @@ def test_snippet_is_anchored_at_the_match_and_marks_both_cuts():
     )
 
 
+def test_content_window_grows_with_the_requested_page():
+    """A 正文 search must not end at its first 300 candidates.
+
+    The flat 300-candidate window made page 9 impossible, which read as "搜索只有
+    300 条".  The window now grows in the same 300-candidate steps as the page
+    goes deeper, and caps so a rogue ``offset`` cannot ask Meilisearch for a
+    payload it refuses to build.
+    """
+    service, _ = _make_service()
+
+    # Pages 1-8 stay exactly as cheap as they were.  Page 8 *starts* at offset
+    # 280 and ends at 320, so its window already has to reach 320.
+    assert service._content_window_for(0) == 300
+    assert service._content_window_for(280) == 300
+    # Page 9 is the first page the old window could not serve at all.
+    assert service._content_window_for(320) == 600
+    assert service._content_window_for(480) == 600
+    # Page 13 crosses the second chunk.
+    assert service._content_window_for(600) == 900
+    # Beyond the cap the window stops growing: those pages are served from the
+    # last rows of the widest scan.
+    assert service._content_window_for(5000) == SearchService.CONTENT_WINDOW_MAX
+
+
+def test_content_window_only_applies_to_the_body():
+    """Only a 正文 scan is chunked; metadata keeps its single wide request."""
+    service, client = _make_service()
+    index = client.index.return_value
+    index.search.return_value = {"hits": []}
+
+    # Page 34 of a 正文 search: the window is 1 500, i.e. wider than one chunk,
+    # so the engine is asked for it piece by piece (the empty answer ends the
+    # walk, which is what the short-chunk rule is for).
+    service._single_condition_search(
+        {"field": "content", "mode": "exact", "value": "铃"},
+        scope="chapters", filters=None, offset=1320, limit=40,
+    )
+    content_call = index.search.call_args_list[0].args[1]
+
+    index.search.reset_mock()
+    # The same offset on a metadata field is a single request for the whole
+    # 10 000-wide window -- there is no text to carry.
+    service._single_condition_search(
+        {"field": "title", "mode": "exact", "value": "铃"},
+        scope="chapters", filters=None, offset=1320, limit=40,
+    )
+    title_call = index.search.call_args_list[0].args[1]
+
+    assert content_call["offset"] == 0
+    assert content_call["limit"] == SearchService._SCAN_CHUNK
+    assert title_call["offset"] == 0
+    assert title_call["limit"] == SearchService.METADATA_CANDIDATE_LIMIT
+
+
+def test_a_window_wider_than_one_engine_page_is_scanned_in_chunks():
+    """A wide body window is walked page by page, not in one huge request.
+
+    Meilisearch will not return a 2 000-document body-carrying page in one
+    answer, and a short page means the engine has nothing left to give.
+    """
+    service, _, chapters_index = _service_with_indexes()
+
+    def engine_page(query, options):
+        start = options["offset"]
+        limit = options["limit"]
+        hits = [
+            {"id": f"c{i}", "content": "铃" * 3}
+            for i in range(start, min(start + limit, 600))
+        ]
+        return {"hits": hits}
+
+    chapters_index.search.side_effect = engine_page
+
+    rows = service._scan_condition(
+        "chapters", "content", "铃", None, 900, chunk_size=250,
+    )
+
+    # 600 candidates exist, so the 900 window stops after the page that ran short
+    # (250 + 250 + 100 = 600) instead of asking for the remaining 300.
+    offsets = [call.args[1]["offset"] for call in chapters_index.search.call_args_list]
+    assert offsets == [0, 250, 500]
+    # Every candidate is scored once and the ranked list carries no duplicates.
+    ids = [doc_id for _score, doc_id, _snippet in rows]
+    assert len(ids) == len(set(ids)) == 600
+    assert ids[0] == "c0"  # equal scores tie-break on the id, so order is stable
+
+
 def test_advanced_search_fuzzy_single_condition_is_scored_not_engine_paged():
     """A single fuzzy condition must be filtered, not handed straight back.
 

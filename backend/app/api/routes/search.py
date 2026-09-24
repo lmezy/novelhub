@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Literal
+from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -49,41 +50,98 @@ class AdvancedSearchRequest(BaseModel):
 router = APIRouter(prefix="/search", tags=["search"])
 
 
+async def _load_book_meta(
+    db: AsyncSession,
+    book_ids: set[str],
+) -> dict[str, tuple[str | None, bool, str | None, str | None]]:
+    """``book_id -> (owner_id, is_public, cover, display_cover)`` for one page.
+
+    One query serves both jobs the route needs: the visibility decision and the
+    cover the result list draws.  The cover deliberately does *not* live in the
+    search index -- a re-sync or a user-chosen cover would then need an index
+    write, and ``PUT /books/{id}/cover`` does not do one, so the index would go
+    stale.  The page is at most ``limit`` hits, so this is a single small query.
+    """
+    if not book_ids:
+        return {}
+    try:
+        rows = await db.execute(
+            select(Book.id, Book.owner_id, Book.is_public, Book.cover, Book.display_cover)
+            .where(Book.id.in_(book_ids))
+        )
+    except Exception as exc:
+        # A cover is decoration: losing it must never turn a working search into
+        # a 500, so a database hiccup just serves the page without pictures.
+        logger.warning("Search cover lookup failed: {}", exc)
+        return {}
+    return {
+        str(book_id): (owner_id, bool(is_public), cover, display_cover)
+        for book_id, owner_id, is_public, cover, display_cover in rows.all()
+    }
+
+
+def _cover_path(book_id: str, meta: tuple | None) -> str | None:
+    """The URL a search result shows for a book's cover, or ``None``.
+
+    Same rule as ``books._book_cover_value``: a user-chosen cover wins, a remote
+    URL is used as-is, and a locally stored file is reached through the
+    ``/api/books/{id}/cover`` route.  Unlike ``_book_cover_value`` this returns
+    ``None`` when the book has no cover at all, so the list can hide the slot
+    instead of pointing an ``<img>`` at a guaranteed 404.
+    """
+    if meta is None:
+        return None
+    cover = meta[3] or meta[2]
+    if not cover:
+        return None
+    if cover.startswith(("http://", "https://", "data:", "/api/books/")):
+        return cover
+    return f"/api/books/{book_id}/cover"
+
+
+def _with_cover(hit: dict, meta: tuple | None) -> dict:
+    """Attach the display cover to one hit (books and chapters alike).
+
+    A chapter hit reaches its book through ``book_id``, and the cover lives on
+    the book, so both types of result end up with a picture of the same book.
+    """
+    book_id = str(hit.get("book_id") or hit.get("id") or "")
+    cover = _cover_path(book_id, meta)
+    if cover is None:
+        return hit
+    return {**hit, "cover": cover, "cover_url": cover}
+
+
 async def _filter_visible_hits(
     user: User,
     db: AsyncSession,
     hits: list[dict],
 ) -> list[dict]:
-    if user.role in ("admin", "super_admin"):
-        return hits
     book_ids = {
         str(hit.get("book_id") or hit.get("id") or "")
         for hit in hits
     }
     book_ids.discard("")
-    if not book_ids:
-        return []
-    rows = await db.execute(
-        select(Book.id, Book.owner_id, Book.is_public).where(Book.id.in_(book_ids))
-    )
-    visibility_map = {
-        str(book_id): (owner_id, is_public)
-        for book_id, owner_id, is_public in rows.all()
-    }
-    return [
+    meta_map = await _load_book_meta(db, book_ids)
+    visible = [
         hit
         for hit in hits
-        if _is_visible_book(
-            visibility_map.get(str(hit.get("book_id") or hit.get("id") or "")),
+        if user.role in ("admin", "super_admin")
+        or _is_visible_book(
+            meta_map.get(str(hit.get("book_id") or hit.get("id") or "")),
             user.id,
         )
     ]
+    return [
+        _with_cover(hit, meta_map.get(str(hit.get("book_id") or hit.get("id") or "")))
+        for hit in visible
+    ]
 
 
-def _is_visible_book(meta: tuple[str | None, bool] | None, user_id: str) -> bool:
+def _is_visible_book(meta: tuple | None, user_id: str) -> bool:
     if meta is None:
         return False
-    owner_id, is_public = meta
+    owner_id, is_public = meta[0], meta[1]
     return owner_id is None or owner_id == user_id or is_public
 
 
@@ -122,13 +180,11 @@ async def search(
         )
 
     hits = await _filter_visible_hits(user, db, result["hits"])
+    # Same rule as ``/advanced``: the count is everybody's, so a non-admin client
+    # still knows there is a page 2 (see the comment there).
     return SearchResult(
         hits=hits,
-        total=(
-            int(result.get("total", result.get("estimatedTotalHits", len(hits))))
-            if user.role in ("admin", "super_admin")
-            else len(hits)
-        ),
+        total=int(result.get("total", result.get("estimatedTotalHits", len(hits)))),
         offset=result.get("offset", offset),
         limit=result.get("limit", limit),
     )
@@ -155,10 +211,13 @@ async def advanced_search(
         allow_all_ages=allow_all_ages,
     )
     result["hits"] = await _filter_visible_hits(user, db, result["hits"])
-    # Admins can use the complete index count; private users must not see
-    # counts for books hidden by visibility rules.
-    if user.role not in ("admin", "super_admin"):
-        result["total"] = len(result["hits"])
+    # The total is served to everyone.  It used to be blanked to ``len(hits)``
+    # for non-admins, to avoid counting books their visibility rules hide -- but
+    # a total that can never exceed one page turns paging off for exactly the
+    # users who need it ("下一页" was disabled forever and the page counter said
+    # "1 / 1").  The count itself reveals nothing about *which* books are hidden,
+    # and the sum of visible + hidden hits is a closer answer than "however many
+    # happened to fit on this page".
     return SearchResult(**result)
 
 

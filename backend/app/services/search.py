@@ -26,7 +26,25 @@ class SearchService:
     # 1000 chapters is ~96 MB of JSON and took 18-25 s *on every request*
     # (measured on the live 115k-chapter index), while 300 is ~29 MB and stays
     # under a second.  300 candidates is still eight pages of 40 results.
+    #
+    # That window used to be the *hard* end of a 正文 search: with 300 candidates
+    # scored and ranked, page 9 did not exist and the result list simply stopped,
+    # which read as "搜索只有 300 条" (the reported bug).  It now grows with the
+    # page being asked for (``_content_window_for``), in the same 300-candidate
+    # chunks, up to ``CONTENT_WINDOW_MAX``; the first eight pages stay as cheap
+    # as they were and only an actual deep page pays for the wider scan.
     CONTENT_CANDIDATE_LIMIT = 300
+    # How many 正文 candidates one page may scan through.  2000 chapters is
+    # ~190 MB of JSON and some ten seconds, which is the point where a deep page
+    # stops being worth it -- and, measured against the live index, enough to
+    # answer "I only wanted to look further than page 8".  A page beyond this is
+    # served from the last rows of the window that was scanned.
+    CONTENT_WINDOW_MAX = 2000
+    # Per-request candidate count while walking a window wider than one engine
+    # page (see ``_scan_condition``).  Meilisearch's default ``pagination
+    # .maxTotalHits`` is 1000, so a window of at most that size is still exactly
+    # one request and only the 1500/2000-deep pages are split.
+    _SCAN_CHUNK = 1000
     # Single-condition searches score the engine's candidates in Python (see
     # ``_single_condition_search``) because Meilisearch cannot express a Chinese
     # substring match: charabia splits 白骨精 into 白/骨/精 and
@@ -44,9 +62,11 @@ class SearchService:
     # and chapters keep flowing in while a user pages, so this is deliberately
     # short; the cost of a miss is one scan.
     PAGE_CACHE_TTL_SECONDS = 120
-    # One entry is at most ~10 000 ``(score, id, snippet)`` pairs (~1.5 MB), so 16
-    # keeps the worst case around 24 MB per process.  Only a 正文 scan carries a
-    # snippet (its window is 300 rows, ~60 KB), so the ids still dominate.
+    # One entry is at most 10 000 ``(score, id, snippet)`` pairs.  The ids and
+    # scores dominate the metadata case (~1.5 MB), so 16 keeps the worst case
+    # around 24 MB per process.  A 正文 entry is smaller than that by design: its
+    # window caps at ``CONTENT_WINDOW_MAX`` rows and each row carries a bounded
+    # excerpt, so even sixteen deep-page scans stay in the low tens of MB.
     PAGE_CACHE_MAX_ENTRIES = 16
     # Multi-condition (AND/OR) searches used to score every condition on its own
     # candidate window and intersect the ids in Python.  For two conditions on
@@ -829,6 +849,18 @@ class SearchService:
             return self.CHAPTER_FIELD_ATTRS[field]
         return self.CHAPTER_BOOK_FIELD_ATTRS.get(field)
 
+    def _content_window_for(self, offset: int) -> int:
+        """How far a 正文 search has to scan to serve ``offset``.
+
+        Grows in ``CONTENT_CANDIDATE_LIMIT`` steps so that page 9 costs the same
+        per candidate as page 1, and caps at ``CONTENT_WINDOW_MAX``.  Metadata
+        keeps the flat 10 000 window: its scan does not carry any text, so page
+        250 costs nothing extra.
+        """
+        needed = max(self.CONTENT_CANDIDATE_LIMIT, int(offset) + 1)
+        steps = -(-needed // self.CONTENT_CANDIDATE_LIMIT)  # ceil
+        return min(self.CONTENT_WINDOW_MAX, steps * self.CONTENT_CANDIDATE_LIMIT)
+
     def _scan_condition(
         self,
         index_name: str,
@@ -837,6 +869,7 @@ class SearchService:
         filters: str | None,
         window: int,
         mode: str = "exact",
+        chunk_size: int | None = None,
     ) -> list[tuple[int, str, str]]:
         """Rank the engine's candidates with the shared Python scorer.
 
@@ -845,6 +878,13 @@ class SearchService:
         96 MB / 18 s that pulling every chapter body used to cost.  The result is
         a ranked ``(score, id, snippet)`` list -- tiny enough to cache, which is
         what makes pages 2..N cheap.
+
+        A window of at most ``chunk_size`` candidates is still exactly one
+        request -- ``window`` itself for a metadata scan, ``_SCAN_CHUNK`` for a
+        正文 one.  A wider window (only a deep 正文 page reaches it) is walked in
+        chunks, because Meilisearch will not build a 2 000-document body-carrying
+        page in one answer; a short chunk also means the engine has nothing left,
+        so the rest of the window is skipped.
 
         The snippet is built here because this is the only place that holds the
         stored text of every hit.  The page that is served is hydrated with an
@@ -859,18 +899,28 @@ class SearchService:
             retrieve.append("author")
         else:
             retrieve.extend(["book_id", "book_title"])
-        options = {
-            "limit": window,
-            "offset": 0,
-            "attributesToSearchOn": [attr],
-            "attributesToRetrieve": list(dict.fromkeys(retrieve)),
-            "showRankingScore": True,
-        }
-        if filters:
-            options["filter"] = filters
-        result = self.client.index(index_name).search(value, options)
+        hits: list[dict] = []
+        fetched = 0
+        step = self._SCAN_CHUNK if chunk_size is None else max(1, int(chunk_size))
+        while fetched < window:
+            chunk = min(step, window - fetched)
+            options = {
+                "limit": chunk,
+                "offset": fetched,
+                "attributesToSearchOn": [attr],
+                "attributesToRetrieve": list(dict.fromkeys(retrieve)),
+                "showRankingScore": True,
+            }
+            if filters:
+                options["filter"] = filters
+            page = self.client.index(index_name).search(value, options)
+            page_hits = page.get("hits", []) or []
+            hits.extend(page_hits)
+            fetched += len(page_hits)
+            if len(page_hits) < chunk:
+                break
         scored: list[tuple[int, str, str]] = []
-        for hit in result.get("hits", []) or []:
+        for hit in hits:
             text = hit.get(attr) or ""
             score = self._condition_score(
                 value,
@@ -1028,9 +1078,15 @@ class SearchService:
             return None
 
         window = (
-            self.CONTENT_CANDIDATE_LIMIT if attr == "content"
+            self._content_window_for(offset) if attr == "content"
             else self.METADATA_CANDIDATE_LIMIT
         )
+        # Metadata scans carry no text, so one wide request per page is fine (the
+        # 10 000 window is ~10 MB and has always been fetched like that).  A 正文
+        # scan drags the chapter bodies along, so it is fetched in 1 000-row
+        # pieces -- exactly one request for every window up to the first eight
+        # pages, and one chunk per extra 1 000 candidates beyond them.
+        chunk_size = self._SCAN_CHUNK if attr == "content" else window
         cache_key = "|".join((
             index_name, attr, cond["value"], filters or "",
             cond.get("mode") or "exact", str(window),
@@ -1039,7 +1095,7 @@ class SearchService:
         if ranked is None:
             ranked = self._scan_condition(
                 index_name, attr, cond["value"], filters, window,
-                cond.get("mode") or "exact",
+                cond.get("mode") or "exact", chunk_size=chunk_size,
             )
             self._page_cache_put(cache_key, ranked)
 
