@@ -119,13 +119,17 @@
   （约定是 `core/clock.py::naive_now()`；`deleted_accounts.deleted_at` 是唯一 aware 列）
 - **「一个帖子 = 一本单章书」的书只读到开头（合集帖 1-23 只显示 1-2）** →
   [codex-handoff.md](codex-handoff.md) 第 46 节（正文里的分帖链接会接成后续章节，需重新同步一次）
+- **设置页「API 令牌」创建报 500 / 令牌填了没人认 / 自动同步到底几点跑** →
+  [codex-handoff.md](codex-handoff.md) 第 47 节（令牌只接只读书库接口；定时同步的真实机制见
+  [full-site-sync.md](full-site-sync.md) 「自动更新」）
 
 ## 文档维护约定
 
 - **每次线上定位/修复**：在 [codex-handoff.md](codex-handoff.md) **文末追加一节**，
   只写「现象 → 根因 → 改动文件 → 验证」；不要粘长日志、逐条命令输出或历史测试次数。
 - **沉淀过的小节要持续压缩**：现象一句、根因要点、改动落点（文件/函数）、一条仍然有效的提醒；
-  细节去读代码。2026-09-19 做过一次（143KB → 66KB，1540 → 780 行），别让它再涨回去。
+  细节去读代码。2026-09-19 做过一次（143KB → 66KB，1540 → 780 行），但 2026-09-25 复测已经
+  又涨到 **144KB / 1699 行**，下次改动前值得先压一轮，别让它继续涨。
 - **可复用的排查结论**：写进 [full-site-sync.md](full-site-sync.md) 的排错清单
   （面向“用户看到什么报错该怎么办”）。
 - **架构或需求变化**：更新 [NovelHub-AI-Development-Context.md](NovelHub-AI-Development-Context.md)，

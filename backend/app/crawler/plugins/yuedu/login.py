@@ -9,7 +9,6 @@ Supported login patterns:
 3. Simple form URL: just a login page URL (auto-login not possible, manual cookie needed)
 """
 
-import asyncio
 import json
 import logging
 import re

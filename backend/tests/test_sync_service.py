@@ -726,7 +726,6 @@ async def test_sync_book_survives_expired_orm_after_rollback():
 
     with (
         patch("app.services.sync.get_plugin", return_value=plugin),
-        patch("app.services.sync.emit"),
         patch("app.services.sync.search_service"),
         patch("app.services.auto_categorize.AutoCategorizationService"),
         patch.object(
@@ -848,7 +847,6 @@ async def test_sync_book_continues_after_failed_chapter():
 
     with (
         patch("app.services.sync.get_plugin", return_value=plugin),
-        patch("app.services.sync.emit"),
         patch("app.services.sync.search_service"),
         patch("app.services.auto_categorize.AutoCategorizationService"),
         patch.object(service, "_save_tags", AsyncMock()),
@@ -915,7 +913,6 @@ async def test_sync_book_loads_existing_tags_without_lazy_load():
 
     with (
         patch("app.services.sync.get_plugin", return_value=plugin),
-        patch("app.services.sync.emit"),
         patch("app.services.sync.search_service"),
         patch("app.services.auto_categorize.AutoCategorizationService"),
         patch.object(service, "_get_or_create_author", AsyncMock(return_value=MagicMock(id="author-1"))),
@@ -989,7 +986,6 @@ async def test_sync_book_does_not_rewrite_other_source_tags():
 
     with (
         patch("app.services.sync.get_plugin", return_value=plugin),
-        patch("app.services.sync.emit"),
         patch("app.services.sync.search_service"),
         patch("app.services.auto_categorize.AutoCategorizationService"),
         patch.object(
@@ -1073,7 +1069,6 @@ async def test_sync_book_replaces_stale_source_tags():
 
     with (
         patch("app.services.sync.get_plugin", return_value=plugin),
-        patch("app.services.sync.emit"),
         patch("app.services.sync.search_service"),
         patch("app.services.auto_categorize.AutoCategorizationService"),
         patch.object(
@@ -1106,7 +1101,6 @@ async def test_sync_book_keeps_stored_tags_when_source_has_none():
 
     with (
         patch("app.services.sync.get_plugin", return_value=plugin),
-        patch("app.services.sync.emit"),
         patch("app.services.sync.search_service"),
         patch("app.services.auto_categorize.AutoCategorizationService"),
         patch.object(
@@ -1179,7 +1173,6 @@ async def test_sync_book_reports_chapter_progress():
 
     with (
         patch("app.services.sync.get_plugin", return_value=plugin),
-        patch("app.services.sync.emit"),
         patch("app.services.sync.search_service"),
         patch("app.services.auto_categorize.AutoCategorizationService"),
         patch.object(service, "_get_or_create_author", AsyncMock(return_value=MagicMock(id="author-1"))),
@@ -1258,7 +1251,6 @@ async def test_sync_book_continues_after_database_error():
 
     with (
         patch("app.services.sync.get_plugin", return_value=plugin),
-        patch("app.services.sync.emit"),
         patch("app.services.sync.search_service"),
         patch("app.services.auto_categorize.AutoCategorizationService"),
         patch.object(service, "_get_or_create_author", AsyncMock(return_value=MagicMock(id="author-1"))),
@@ -1716,7 +1708,6 @@ async def test_resync_chapter_updates_existing_row():
 
     with (
         patch("app.services.sync.get_plugin", return_value=plugin),
-        patch("app.services.sync.emit"),
         patch("app.services.sync.search_service") as search_mock,
     ):
         result = await service.resync_chapter("c1")
@@ -1779,7 +1770,6 @@ async def test_resync_chapter_matches_legacy_id_by_number():
 
     with (
         patch("app.services.sync.get_plugin", return_value=plugin),
-        patch("app.services.sync.emit"),
         patch("app.services.sync.search_service"),
     ):
         result = await service.resync_chapter("c1")
@@ -2634,7 +2624,6 @@ async def test_sync_book_checkpoint_stops_before_next_chapter():
 
     with (
         patch("app.services.sync.get_plugin", return_value=plugin),
-        patch("app.services.sync.emit"),
         patch("app.services.sync.search_service"),
         patch("app.services.auto_categorize.AutoCategorizationService"),
         patch.object(service, "_save_tags", AsyncMock()),

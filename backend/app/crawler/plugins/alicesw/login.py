@@ -1,6 +1,5 @@
 """AliceSW cookie authentication and session management."""
 
-import asyncio
 from http.cookiejar import Cookie, CookieJar
 from typing import Optional
 

@@ -1697,3 +1697,105 @@ crawler 与 postgres 不用动。
 
 **仍有效**：书源自己声明「不自动合并」时不看这句话 —— 上面四条判据不依赖站点，任何论坛书源
 只要正文里有同名前缀的分帖链接都会展开；正文里没有这类链接的单帖书完全不受影响。
+
+## 47. 历史遗留清理：API 令牌链路、自动同步的真实机制、死代码退休（2026-09-25）
+
+**现象**：第 46 节的「历史遗留问题」清单（每条都读过代码核实）。这一节记录两项**功能性**
+缺陷的修复、一批**已确认无人引用**的代码退休，以及复查后判定**不是问题**的项。
+
+**根因 1（功能坏）——API 令牌整条链路是死的**：设置页「API 令牌」面板写着
+「用于第三方工具访问 NovelHub」，但 ① `api/routes/tokens.py` 用了 `ApiToken` 却没导入
+（`NameError` → `POST /api/tokens` 永远 500，令牌根本建不出来）；② `services/auth.py` 里唯一
+读 `X-API-Token` 的 `get_current_user_or_token` **零调用者**，所以能建出来的令牌没有任何接口认。
+
+**改动（令牌）**：
+
+- `api/routes/tokens.py`：补 `ApiToken` 导入。
+- **只读**书库接口改挂 `get_current_user_or_token`：`GET /api/books`、`GET /api/books/{id}`、
+  `GET /api/books/{id}/chapters`、`GET /api/chapters/{id}`、`.../content`、`.../content/meta`、
+  `GET /api/search`、`POST /api/search/advanced`。**不**扩散到写入、用户私有数据（书签/进度/
+  书架/Cookie）与 admin 路由 —— 令牌存在第三方客户端配置里，泄漏时不能改任何数据。
+- `services/auth.py`：把这条边界写进 docstring（下一个人会先读这里）。
+- 新增 `tests/test_api_token_auth.py`：创建令牌、有效令牌解析到本人、未知/已吊销令牌 401、
+  只带 bearer 的分支行为不变、**令牌路由清单被精确钉死**（`test_the_token_surface_is_exactly_
+  the_read_only_library`），外加「只有 books/chapters/search 三个模块 import 了这个依赖」的
+  源码级保险和「admin 路由不接受令牌」的守卫。
+
+**根因 2（文档骗人）——自动同步的排期与文档不符**：`docs/full-site-sync.md` 写「Beat 每天 03:00
+跑 `daily_sync_all`」，但 `scheduler/app/celery_app.py` 的 `beat_schedule` 只有
+`auto_sync_check`（每分钟）+ `check_cookie_health`（02:00）；`daily_sync_all` 及
+`sync_single_source` / `resync_all_books` / `crawl_all_source` 全仓没有任何派发点
+（无 `send_task`/`apply_async`/`delay`）。按旧文档排查「凌晨为什么没同步」必然走错方向。
+顺带查到两件事：`services/task_queue.py::enqueue_crawl_all` 已退化成 `return task_id or ""`
+的**空壳**（4 个调用点都在纯调用它，无返回值使用），而 `crawl_all_source` 被路由到 `crawl`
+队列 —— crawler 容器的 Celery worker 是 `-Q scheduler` 启动的，**那个队列从来没人消费**。
+
+**改动（自动同步）**：
+
+- 删除 `services/task_queue.py` 与 4 处调用（`crawl.py` ×2、`yuedu.py`、`source_changes.py`）：
+  `crawl_tasks` 行本身就是队列，写行即入队（`docs/crawl-queue.md`），调用点是纯噪音。
+- 删除 `tasks.crawl_all_source` + `_crawl_all_source_async`（唯一派发者已不存在，队列也没人消费）、
+  它的 `task_routes` 条目，以及 celery 配置里的 `crawl` 队列。
+- `scheduler/app/tasks.py` 模块 docstring 改成如实描述：哪两个是**定时**的、哪三个是
+  **手动入口**（`docker exec … celery -A celery_app call tasks.<name>`），并说明它
+  「不是自动全站发现」，因为自动排期走 `auto_sync_check` + Admin 设置。
+- `docs/full-site-sync.md`「自动更新」重写：beat 的两条 crontab、`auto_sync_check` 读 Admin →
+  自动同步设置（默认关闭 / 默认 03:00 / 可设间隔）、`AUTO_SYNC_MAX_PAGES` 的真实归属、
+  以及**明确写出能力缺口**：自动同步只翻目录前几页，不在前几页里的老书不会被检查新章节，
+  要手动跑 `tasks.resync_all_books`。
+
+**根因 3（熵）——已确认零引用的代码**：逐个核实调用点后退休下列载体（`code-retirement`，
+本地 git 可回滚；不涉及任何持久化状态）：
+
+| 退休对象 | 核实结论 |
+| --- | --- |
+| `frontend/src/pages/SearchPage.vue`（437 行） | `/search` 早已 `redirect` 到 `/books`（`router/index.ts`），全仓无引用；它是高级搜索的第二份实现 |
+| `backend/app/core/rate_limit.py` | `main.py` 只留了被注释掉的导入与注册，全仓无其它引用（曾因 asyncpg/greenlet 冲突关闭） |
+| `backend/app/services/storage_backends.py` | `create_storage()` 零调用者；更关键的是 S3/WebDAV 子类只覆盖 4 个方法，封面/正文图片/路径解析仍是本地实现，**从来不是一个能用的后端** |
+| `backend/app/db_init.py` | `init_models()` 零引用；是绕过 Alembic 的第二条建表路径（backend 容器启动本来就跑 `alembic upgrade head`） |
+| `backend/app/core/events.py` | `subscribe()` 零调用者，`services/sync.py` 的 6 处 `emit()` 全部丢进空监听表 |
+| `schemas/common.py`、`schemas/book.py::AuthorOut`、`schemas/cookie.py::CookieMaskedOut`、`ai_client.py::describe_model_chain` | 四个符号零引用（前者整文件只有 `PaginatedResponse`） |
+| `services/sync.py` 的 `_exception_names` + `TRANSIENT_EXCEPTION_NAMES` 再导出 | 零调用点，只被 `test_transient_taxonomy.py` 引用；两层共用一个分类器的**不变式**改为「sync.py 里不许再出现这两个名字」+「分类必须走 `core_transient`」，比原来的同对象断言更强 |
+
+**顺带修掉的过期文档/配置**：`.env.example` 补齐 14 个「代码在读、文档没写」的变量
+（`AUTO_SYNC_MAX_PAGES`、`YUEDU_PLAYWRIGHT_CONCURRENCY`、`SYNC_TASK_*` 三项、
+`HTTP(S)_PROXY` 等），删掉已退休的 `STORAGE_BACKEND`/`S3_*`/`WEBDAV_*`；`BACKEND_PORT`/
+`FRONTEND_PORT` 从「写了没人读」改成 docker-compose 真正读取，并补 `NGINX_PORT`；
+`docs/NovelHub-AI-Development-Context.md` 的 Storage 行改成真实方法表 + 明写「没有对象存储后端」，
+并把两条新红线写进第 5 节（不许再引入 `create_all` 建表；API 令牌只接只读接口）；
+`docs/README.md` 的 handoff 体积数字改成实测值。i18n 删掉 52 个「标识符在整个前端源码里
+一次都不出现」的键（中英各 52 行，脚本先断言每个键恰好出现 2 次且为单行才动手）。
+
+**另外清掉的 22 处死导入**：退休过程里写了个 AST 级审计（导入名在整份文件里只出现在自己的
+import 行上），在 `backend/app`、`crawler/app`、`scheduler/app` 里抓到 22 个真·未使用导入
+（`admin.py` 的 `Source`/`SourceChange`/`get_current_user`、`ai_client.py` 的 `logger`、
+`services/{backup,cookie_health}.py` 的 `uuid4`、`crawler/registry.py` 的 `select`、
+`plugins/{alicesw,yuedu}/login.py` 的 `asyncio` …）。全部逐一核对「只出现一次」后按原行
+尾（CRLF）删掉，删完再跑 AST 解析确认文件仍合法、重扫为 0。**注意 `from __future__ import
+annotations` 会被这种审计误报为未使用**，别照着删。
+
+**验证**：后端 `925 passed`（新增 9 条令牌测试 + 2 条分类不变式测试；同时修好 20 条因依赖改名/
+`patch("app.services.sync.emit")` 失效的旧测试）；`vue-tsc --noEmit` 干净、`vite build` 通过；
+前端启动产物里已无 `SearchPage` chunk。
+
+**复查后判定「不是问题」的项**（避免下次重复报）：
+
+- `sync.py::content_image_limit()` 的 `getattr(settings, …, 512)` 兜底确实永不生效，但它是**防御性**
+  写法（全仓 `core/config.py` 的读取函数都是这个风格），删掉只能消除一处重复字面量，收益低于
+  改动风险 —— 保留，不再当缺陷。
+- `NovelHub-AI-Development-Context.md` 「约 434 行」是**准确**的：`plugins/yuedu/__init__.py`
+  实测 436 行（此前把它和别的文件搞混了）。
+- `scripts/seed_super_admin.py` / `scripts/init.sh` 无引用，但都有独立作用（按名字创建/提升
+  super_admin；建目录 + `docker compose up -d --build`），属手动运维入口 → 保留。
+- `book_versions` 表只被 `delete` 命中：这是**持久化状态**，不属代码退休，不自动处理。
+- 22 个 `.py` 带 UTF-8 BOM（`alembic/versions/0005_source_config.py`、`api/routes/categories.py`、
+  `core/{error_handlers,logging}.py`、`models/{category,book_category}.py`、`repositories/` 全部、
+  `schemas/{category,crawl}.py`、`services/{admin,auto_categorize,manual_login}.py`、
+  `crawler/app/crawler_service.py`）：Python 3 接受带 BOM 的源码，运行时无影响；只有「自己写的
+  AST/diff 脚本」会被 `ast.parse` 卡住。要清一条命令即可，但不值得在同一个提交里再脏 22 个文件。
+- 任务进度条在三处各算一遍（`AdminPage.vue`、`SyncPage.vue` ×2）：收敛需要改前端状态层，
+  不是顺手能做完的改动 → 仍然挂着。
+
+**仍有效**：`X-API-Token` 只认只读书库接口，加接口要同时改 `TOKEN_ACCEPTING_ROUTES`；
+自动同步的真实触发点是 `auto_sync_check`，要「每天把库里老书也检查一遍新章节」目前只能手动
+`tasks.resync_all_books`（想要自动，应把它做成自动同步的一个模式，而不是无条件定时任务）。

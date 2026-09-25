@@ -6,7 +6,11 @@ from app.api.file_response import cached_file_response
 from app.core.database import get_db
 from app.models import Book, Chapter, User
 from app.schemas.chapter import ChapterContentOut, ChapterOut
-from app.services.auth import get_current_user, get_current_user_media, require_admin
+from app.services.auth import (
+    get_current_user_media,
+    get_current_user_or_token,
+    require_admin,
+)
 from app.services.storage import BookStorage
 from app.services.sync import SyncService
 from app.services.visibility import ensure_book_visible
@@ -16,7 +20,7 @@ router = APIRouter(tags=["chapters"])
 
 
 @router.get("/books/{book_id}/chapters", response_model=list[ChapterOut])
-async def list_chapters(book_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+async def list_chapters(book_id: str, user: User = Depends(get_current_user_or_token), db: AsyncSession = Depends(get_db)):
     book = await db.get(Book, book_id)
     if not ensure_book_visible(user, book):
         raise HTTPException(status_code=404, detail="Book not found")
@@ -29,7 +33,7 @@ async def list_chapters(book_id: str, user: User = Depends(get_current_user), db
 
 
 @router.get("/chapters/{chapter_id}", response_model=ChapterContentOut)
-async def get_chapter(chapter_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+async def get_chapter(chapter_id: str, user: User = Depends(get_current_user_or_token), db: AsyncSession = Depends(get_db)):
     chapter = await db.get(Chapter, chapter_id)
     if chapter is None:
         raise HTTPException(status_code=404, detail="Chapter not found")
@@ -55,7 +59,7 @@ async def get_chapter(chapter_id: str, user: User = Depends(get_current_user), d
 @router.get("/chapters/{chapter_id}/content/meta")
 async def get_chapter_content_meta(
     chapter_id: str,
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user_or_token),
     db: AsyncSession = Depends(get_db),
 ):
     """Length and digest of a chapter body, without sending the body.
@@ -85,7 +89,7 @@ async def get_chapter_content_chunk(
     chapter_id: str,
     offset: int = Query(0, ge=0),
     limit: int = Query(200_000, ge=1, le=500_000),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user_or_token),
     db: AsyncSession = Depends(get_db),
 ):
     """Return a bounded chapter slice for very large one-chapter books.

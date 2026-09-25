@@ -13,7 +13,6 @@ from app.repositories.crawl_log import CrawlLogRepository
 from app.schemas.crawl import CrawlLogOut, CrawlTaskOut
 from app.services.auth import get_current_user
 from app.services.cookie_crypto import safe_decrypt_cookie
-from app.services.task_queue import enqueue_crawl_all
 
 router = APIRouter(prefix="/crawl", tags=["crawl"], dependencies=[Depends(get_current_user)])
 
@@ -105,7 +104,8 @@ async def create_crawl_task(
     await db.commit()
     await db.refresh(task)
 
-    enqueue_crawl_all(payload.source, payload.max_pages, task.id)
+    # No dispatch call: the pending row *is* the queue.  The crawler container's
+    # worker polls ``crawl_tasks`` in priority order (docs/crawl-queue.md).
     return task
 
 
@@ -270,7 +270,7 @@ async def retry_task(
         task.started_at = None
         task.finished_at = None
         await db.commit()
-        enqueue_crawl_all(task.source, task.max_pages or 200, task.id)
+        # ``status=pending`` is all it takes: the worker picks the row up again.
         return {"task_id": task.id, "status": "pending"}
 
     from app.crawler.registry import get_plugin

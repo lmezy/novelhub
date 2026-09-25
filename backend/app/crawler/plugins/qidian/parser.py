@@ -1,7 +1,6 @@
 """Qidian parser -- BeautifulSoup selectors for qidian.com."""
 
 import re
-from typing import Optional
 from bs4 import BeautifulSoup
 from app.crawler.base import RemoteBook, RemoteChapter
 

@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.models import Cookie, Source, User
-from app.services.cookie_crypto import encrypt_cookie, decrypt_cookie
+from app.services.cookie_crypto import encrypt_cookie
 from app.repositories.cookie import CookieRepository
 from app.schemas.cookie import CookieCreate, CookieOut, CookieUpdate
 from app.services.auth import get_current_user

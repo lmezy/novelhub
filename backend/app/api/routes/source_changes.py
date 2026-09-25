@@ -14,7 +14,6 @@ from app.services.auth import get_current_user, require_admin
 from app.services.book_kind import normalize_kind
 from app.services.search import search_service
 from app.services.source_patch import apply_source_patch
-from app.services.task_queue import enqueue_crawl_all
 
 router = APIRouter(prefix="/source-changes", tags=["source-changes"])
 
@@ -38,7 +37,6 @@ async def _enqueue_global_sync(
     )
     db.add(task)
     await db.commit()
-    enqueue_crawl_all(source_id, 0, task.id)
 
 
 @router.get("", response_model=list[SourceChangeOut])

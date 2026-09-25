@@ -5,7 +5,6 @@ via auto_login when credentials are available.
 """
 
 import asyncio
-from uuid import uuid4
 
 from loguru import logger
 from sqlalchemy import select

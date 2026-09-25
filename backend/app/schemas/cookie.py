@@ -1,4 +1,4 @@
-﻿from datetime import datetime
+from datetime import datetime
 from pydantic import BaseModel
 
 
@@ -23,7 +23,3 @@ class CookieOut(BaseModel):
 
     class Config:
         from_attributes = True
-
-
-class CookieMaskedOut(CookieOut):
-    cookie_data: str = "***encrypted***"

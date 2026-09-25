@@ -54,8 +54,27 @@ def test_the_plugin_and_the_service_share_one_taxonomy_object():
     """Not "equal" -- the same object, so they cannot drift apart again."""
     assert plugin_errors.TRANSIENT_TRANSPORT_ERROR_NAMES \
         is core_transient.TRANSIENT_EXCEPTION_NAMES
-    assert sync_module.TRANSIENT_EXCEPTION_NAMES \
-        is core_transient.TRANSIENT_EXCEPTION_NAMES
+
+
+def test_the_service_module_keeps_no_second_copy_of_the_taxonomy():
+    """The service must classify *through* ``core_transient``, not beside it.
+
+    ``services/sync.py`` used to re-export ``TRANSIENT_EXCEPTION_NAMES`` (and a
+    ``_exception_names`` alias) for its own call sites.  Both were unused, and
+    any local copy is exactly how the two layers drifted in the first place --
+    so their absence is the invariant now, not their presence.
+    """
+    for name in ("TRANSIENT_EXCEPTION_NAMES", "_exception_names"):
+        assert not hasattr(sync_module, name), (
+            f"services/sync.py reintroduced {name}; classify through "
+            "app.core.transient instead"
+        )
+
+
+def test_the_service_classifies_through_the_shared_object():
+    """A representative transient error reaches ``core_transient`` from here."""
+    assert SyncService._is_transient_book_fetch(httpx.ReadTimeout("")) is True
+    assert SyncService._is_transient_book_fetch(IndexError("list index out of range")) is False
 
 
 def test_both_import_paths_expose_the_same_classifier():
@@ -77,7 +96,7 @@ def test_the_classifier_agrees_across_layers(exc):
     plugin_says = core_transient.is_transient_transport_error(exc)
     service_says = bool(
         core_transient.exception_names(exc)
-        & sync_module.TRANSIENT_EXCEPTION_NAMES
+        & core_transient.TRANSIENT_EXCEPTION_NAMES
     ) or any(
         marker in str(exc).lower()
         for marker in core_transient.TRANSIENT_MESSAGE_MARKERS

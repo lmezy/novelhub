@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.models import Book, User
-from app.services.auth import get_current_user
+from app.services.auth import get_current_user, get_current_user_or_token
 from app.services.visibility import can_view_all_ages, can_view_r18
 from pydantic import BaseModel, Field
 
@@ -147,7 +147,7 @@ def _is_visible_book(meta: tuple | None, user_id: str) -> bool:
 
 @router.get("", response_model=SearchResult)
 async def search(
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user_or_token),
     db: AsyncSession = Depends(get_db),
     q: str = Query(default="", description="Search query"),
     scope: str = Query("books", pattern="^(books|chapters)$"),
@@ -193,7 +193,7 @@ async def search(
 @router.post("/advanced", response_model=SearchResult)
 async def advanced_search(
     payload: AdvancedSearchRequest,
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user_or_token),
     db: AsyncSession = Depends(get_db),
 ):
     allow_r18 = can_view_r18(user)

@@ -5,7 +5,7 @@ from typing import Optional
 
 from loguru import logger
 
-from app.crawler.base import RemoteBook, RemoteChapter
+from app.crawler.base import RemoteChapter
 from app.crawler.plugins.alicesw.config import AliceSWConfig
 from app.crawler.plugins.alicesw.crawler import AliceSWCrawler
 from app.crawler.plugins.alicesw.parser import AliceSWParser

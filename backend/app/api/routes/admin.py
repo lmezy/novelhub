@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.models import User, Source, SourceChange
+from app.models import User
 from app.schemas.user import AdminUserOut, UserOut
 from app.schemas.admin import (
     AdminUserCreate,
@@ -18,7 +18,7 @@ from app.schemas.admin import (
     UserRoleUpdate,
     UserR18Update,
 )
-from app.services.auth import get_current_user, require_admin, require_super_admin
+from app.services.auth import require_admin, require_super_admin
 from app.services.ai_client import (
     AIError,
     LLMClient,

@@ -28,7 +28,6 @@ from app.models import Cookie, CrawlTask, Source, SourceChange, User
 from app.services.auth import get_current_user
 from app.services.cookie_crypto import encrypt_cookie
 from app.services.proxy_config import get_proxy_config
-from app.services.task_queue import enqueue_crawl_all
 
 router = APIRouter(prefix="/yuedu", tags=["yuedu"])
 
@@ -1063,7 +1062,6 @@ async def import_yuedu_sources_as_tasks(
             )
             db.add(task)
             await db.flush()
-            enqueue_crawl_all(task.source, task.max_pages, task.id)
             tasks.append({
                 "id": task.id,
                 "task_id": task.id,

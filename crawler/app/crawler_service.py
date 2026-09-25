@@ -10,7 +10,6 @@ from app.models.crawl_log import CrawlLog
 from app.services.sync import SyncService
 from uuid import uuid4
 from datetime import datetime, timezone
-from sqlalchemy import select
 
 
 async def run_crawl_for_source(source_id: str) -> None:

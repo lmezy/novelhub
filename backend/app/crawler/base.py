@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional, Protocol
+from typing import Protocol
 
 
 @dataclass(frozen=True)

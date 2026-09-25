@@ -1,8 +1,25 @@
 """Celery tasks for automated novel syncing.
 
-daily_sync_all      -- beat-scheduled: sync every enabled source
-sync_single_source  -- sync one source by ID
-resync_all_books    -- resync every book already in the library
+What actually runs on a schedule (``celery_app.beat_schedule``):
+
+``auto_sync_check``    every minute -- the ONLY automatic sync trigger.  It reads
+                       the Admin -> 自动同步 settings and, when they are due,
+                       writes a ``crawl_tasks`` row per source.  Default time is
+                       03:00, bounded by ``AUTO_SYNC_MAX_PAGES``.
+``check_cookie_health`` 02:00 daily.
+
+These are **manual entrypoints**, not scheduled.  They exist for an operator
+inside the container (``celery -A celery_app call tasks.<name>``) and nothing in
+the code path dispatches them:
+
+``daily_sync_all``      sync every enabled source's bookshelf, or resync the
+                        books a source already contributed.
+``sync_single_source``  the same for one source id.
+``resync_all_books``    resync every book in the library.
+
+Manual full-site crawls do not need a Celery task at all: the API writes a
+``crawl_tasks`` row and the crawler container's worker polls that table
+(``docs/crawl-queue.md``).
 """
 
 import asyncio
@@ -55,19 +72,19 @@ def _auto_sync_max_pages() -> int:
 
 @app.task(name="tasks.daily_sync_all")
 def daily_sync_all() -> dict:
-    """Daily beat task: sync all enabled sources."""
+    """Manual: sync all enabled sources (bookshelf first, then resync)."""
     return _run_async(_daily_sync_all_async())
 
 
 @app.task(name="tasks.sync_single_source")
 def sync_single_source(source_id: str) -> dict:
-    """Sync a single source by its ID."""
+    """Manual: sync a single source by its ID."""
     return _run_async(_sync_single_source_async(source_id))
 
 
 @app.task(name="tasks.resync_all_books")
 def resync_all_books() -> dict:
-    """Resync every book in the library (checks for new chapters)."""
+    """Manual: resync every book in the library (checks for new chapters)."""
     return _run_async(_resync_all_books_async())
 
 
@@ -75,12 +92,6 @@ def resync_all_books() -> dict:
 def check_cookie_health() -> dict:
     """Periodic task: validate all cookies and auto-refresh expired ones."""
     return _run_async(_check_cookie_health_async())
-
-
-@app.task(name="tasks.crawl_all_source")
-def crawl_all_source(source_id: str, max_pages: int = 0, task_id: str | None = None) -> dict:
-    """Crawl every discoverable book from a source in the background."""
-    return _run_async(_crawl_all_source_async(source_id, max_pages, task_id))
 
 
 @app.task(name="tasks.auto_sync_check")
@@ -176,30 +187,10 @@ async def _check_cookie_health_async() -> dict:
     return await CookieHealthService.check_all_cookies()
 
 
-async def _crawl_all_source_async(source_id: str, max_pages: int, task_id: str | None) -> dict:
-    from app.core.database import SessionLocal
-    from app.models import CrawlTask
-    from app.services.crawl_runner import run_crawl_task_async
-
-    if task_id is None:
-        async with SessionLocal() as db:
-            task = CrawlTask(
-                id=str(uuid4()),
-                source=source_id,
-                mode="discover_all",
-                max_pages=max_pages,
-                status="pending",
-            )
-            db.add(task)
-            await db.commit()
-            task_id = task.id
-    return await run_crawl_task_async(task_id)
-
-
 async def _daily_sync_all_async() -> dict:
     from app.core.config import sync_source_concurrency
     from app.core.database import SessionLocal
-    from app.models import Book, CrawlLog, CrawlTask, Source
+    from app.models import Book, CrawlTask, Source
     from app.services.sync import SyncService
     from sqlalchemy import select
 

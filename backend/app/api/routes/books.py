@@ -18,7 +18,7 @@ from app.services.book_kind import (
     normalize_kind,
     reclassify_books as reclassify_book_kinds,
 )
-from app.services.auth import get_current_user, require_admin
+from app.services.auth import get_current_user, get_current_user_or_token, require_admin
 from app.services.book_cleanup import delete_books
 from app.services.book_title import normalize_title, normalized_title_sql
 from app.services.bookshelf import favorite_group_ids_by_book
@@ -171,7 +171,7 @@ async def _serialize_books(db: AsyncSession, books: list[Book], user: User) -> l
 
 
 @router.get("", response_model=list[BookOut])
-async def list_books(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+async def list_books(user: User = Depends(get_current_user_or_token), db: AsyncSession = Depends(get_db)):
     query = _apply_book_visibility(
         select(Book).options(selectinload(Book.tags), selectinload(Book.categories)),
         user,
@@ -837,7 +837,7 @@ async def unfavorite_book(
 
 
 @router.get("/{book_id}", response_model=BookOut)
-async def get_book(book_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+async def get_book(book_id: str, user: User = Depends(get_current_user_or_token), db: AsyncSession = Depends(get_db)):
     book = await db.get(Book, book_id)
     if not ensure_book_visible(user, book):
         raise HTTPException(status_code=404, detail="Book not found")

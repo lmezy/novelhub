@@ -5,7 +5,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.main import app
-from app.services.auth import get_current_user
+from app.services.auth import get_current_user_or_token
 
 
 @pytest.mark.asyncio
@@ -13,7 +13,7 @@ async def test_advanced_search_endpoint_returns_hits():
     async def fake_user():
         return SimpleNamespace(id="user-1", role="super_admin")
 
-    app.dependency_overrides[get_current_user] = fake_user
+    app.dependency_overrides[get_current_user_or_token] = fake_user
     payload = {
         "conditions": [{"field": "title", "mode": "exact", "value": "西游记"}],
         "match": "and",
@@ -50,7 +50,7 @@ async def test_legacy_search_endpoint_still_returns_hits():
     async def fake_user():
         return SimpleNamespace(id="user-1", role="super_admin")
 
-    app.dependency_overrides[get_current_user] = fake_user
+    app.dependency_overrides[get_current_user_or_token] = fake_user
     fake_result = {
         "hits": [{"id": "b1", "title": "西游记"}],
         "estimatedTotalHits": 1,

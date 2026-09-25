@@ -29,15 +29,17 @@ app.conf.update(
     task_default_queue="scheduler",
     task_queues={
         "scheduler": {"exchange": "scheduler", "routing_key": "scheduler"},
-        "crawl": {"exchange": "crawl", "routing_key": "crawl"},
     },
     task_routes={
         "tasks.daily_sync_all": {"queue": "scheduler"},
         "tasks.sync_single_source": {"queue": "scheduler"},
         "tasks.resync_all_books": {"queue": "scheduler"},
         "tasks.auto_sync_check": {"queue": "scheduler"},
-        "tasks.crawl_all_source": {"queue": "crawl"},
     },
+    # Kept as two short crontabs on purpose: the daily/hourly *policy* lives in
+    # the Admin -> 自动同步 settings that ``tasks.auto_sync_check`` reads (see
+    # docs/full-site-sync.md "自动更新"), so changing the sync schedule in the UI
+    # must not require editing this file.
     beat_schedule={
         "auto-sync-check": {
             "task": "tasks.auto_sync_check",

@@ -88,7 +88,6 @@ async def _lookup_source_async(source_id: str) -> NovelSourcePlugin:
     from app.core.database import LookupSessionLocal
     from app.models import Source
     from app.services.source_interval import apply_source_interval
-    from sqlalchemy import select
 
     async with LookupSessionLocal() as db:
         source = await db.get(Source, source_id)

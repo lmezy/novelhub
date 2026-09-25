@@ -14,7 +14,7 @@ from httpx import ASGITransport, AsyncClient
 
 from app.core.database import get_db
 from app.main import app
-from app.services.auth import get_current_user
+from app.services.auth import get_current_user_or_token
 
 
 def _db_with_books(rows):
@@ -41,7 +41,7 @@ async def _post_search(db, role="super_admin", user_id="user-1"):
     async def fake_user():
         return SimpleNamespace(id=user_id, role=role)
 
-    app.dependency_overrides[get_current_user] = fake_user
+    app.dependency_overrides[get_current_user_or_token] = fake_user
     app.dependency_overrides[get_db] = lambda: db
     try:
         transport = ASGITransport(app=app)
@@ -178,7 +178,7 @@ async def test_the_legacy_search_endpoint_also_reports_the_real_total():
     async def fake_user():
         return SimpleNamespace(id="user-1", role="user")
 
-    app.dependency_overrides[get_current_user] = fake_user
+    app.dependency_overrides[get_current_user_or_token] = fake_user
     db = _db_with_books([("b1", None, True, "covers/b1.jpg", None)])
     app.dependency_overrides[get_db] = lambda: db
     fake = {

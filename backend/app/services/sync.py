@@ -15,7 +15,6 @@ from app.crawler.registry import get_plugin
 from app.core import transient as core_transient
 from app.core.config import settings, sync_book_concurrency, sync_thread_count
 from app.core.database import SessionLocal
-from app.core.events import emit, EventType
 from app.models import (
     Author,
     Book,
@@ -140,13 +139,13 @@ CONTENT_IMAGE_RE = re.compile(
 )
 MAX_CONTENT_IMAGES_PER_CHAPTER = 512
 
-# The transient *exception* taxonomy lives in exactly one place now:
+# The transient *exception* taxonomy lives in exactly one place:
 # ``app.core.transient``.  This module used to keep its own list, which drifted
 # from the plugin's -- ``EndOfStream``/``WouldBlock`` were retryable in the
 # request loop but permanent here, so such a failure could count toward the
-# "连续失败" abort.  ``TRANSIENT_EXCEPTION_NAMES`` is re-exported for callers
-# that still import it from here.
-TRANSIENT_EXCEPTION_NAMES = core_transient.TRANSIENT_EXCEPTION_NAMES
+# "连续失败" abort.  Classification goes through ``core_transient`` directly
+# (see ``_is_transient_book_fetch``); nothing re-exports the name list from
+# here, and ``tests/test_transient_taxonomy.py`` fails if that changes.
 
 # Book-level transient markers (a book that failed for one of these is retried
 # later; "empty content" counts here because a source can answer with an empty
@@ -169,15 +168,6 @@ TRANSIENT_CHAPTER_MARKERS = (
     "timeout", "timed out", "connection", "connect error", "network",
     "request failed after retries",
 )
-
-
-def _exception_names(exc: BaseException) -> set[str]:
-    """All class names in an exception's MRO (works without importing HTTPX).
-
-    Kept as a thin alias so existing call sites read normally; the taxonomy
-    itself is :mod:`app.core.transient`.
-    """
-    return core_transient.exception_names(exc)
 
 
 def describe_error(exc: BaseException | None) -> str:
@@ -881,7 +871,6 @@ class SyncService:
         if source.plugin_name != "local_markdown" and not self._is_http_url(url):
             raise ValueError(f"Unsupported book URL: {url}")
 
-        emit(EventType.SYNC_STARTED, source_id=source_id, url=url)
         logger.info("Starting sync for source={} url={}", source_id, url)
 
         config = source.config if source.plugin_name == 'yuedu' else None
@@ -961,7 +950,9 @@ class SyncService:
 
         author = await self._get_or_create_author(author_name)
         author_id = author.id
-        book, is_new = await self._get_or_create_book(
+        # ``_get_or_create_book`` also reports whether the row is new; nothing
+        # consumes that flag any more (it only fed the retired event bus).
+        book, _is_new = await self._get_or_create_book(
             source.id,
             author_id,
             remote_book,
@@ -1103,10 +1094,6 @@ class SyncService:
             "kind": book_kind,
         })
 
-        if is_new:
-            emit(EventType.BOOK_CREATED, book_id=book_id, title=book_title)
-        else:
-            emit(EventType.BOOK_UPDATED, book_id=book_id, title=book_title)
         created = 0
         skipped = 0
         total = len(remote_book.chapters)
@@ -1340,11 +1327,6 @@ class SyncService:
                         "kind": book_kind,
                     })
 
-                    emit(
-                        EventType.CHAPTER_CREATED,
-                        chapter_id=chapter.id,
-                        book_id=book_id,
-                    )
                     consecutive_transient = 0
                     created += 1
                 except SQLAlchemyError as exc:
@@ -1388,13 +1370,6 @@ class SyncService:
             await asyncio.gather(*producers, return_exceptions=True)
             search_service.flush_chapters()
 
-        emit(
-            EventType.SYNC_COMPLETED,
-            book_id=book_id,
-            created=created,
-            skipped=skipped,
-            failed=len(failed_chapters),
-        )
         if source_owner_id is None:
             await self._handle_global_r18_conflicts(book_id)
         logger.info(
@@ -1920,11 +1895,6 @@ class SyncService:
             "is_r18": book_is_r18,
             "kind": normalize_kind(book_kind_value),
         })
-        emit(
-            EventType.CHAPTER_UPDATED,
-            chapter_id=chapter.id,
-            book_id=book_id,
-        )
 
         return {
             "chapter_id": chapter.id,

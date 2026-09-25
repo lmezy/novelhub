@@ -77,9 +77,37 @@ curl -X POST http://localhost:8088/api/crawl/tasks \
 
 ## 自动更新
 
-- Celery Beat 每天 `03:00` 跑 `daily_sync_all`：有 Cookie 的书源同步书架，没有 Cookie 的
-  书源对库内书籍检查新章节。它**不会**自动全站发现新书，发现新书要手动发起全站同步。
-  自动任务有 `AUTO_SYNC_MAX_PAGES`（默认 3）兜底，不会变成无限量爬取。
+Celery Beat 只挂了**两条** crontab（`scheduler/app/celery_app.py` 的 `beat_schedule`）：
+
+| 任务 | 频率 | 作用 |
+| --- | --- | --- |
+| `auto_sync_check` | 每分钟 | 唯一的自动同步触发点 |
+| `check_cookie_health` | 每天 02:00 | 校验并自动续期 Cookie |
+
+- `auto_sync_check` 自己不下场爬：它读 **Admin → 自动同步** 里的设置
+  （默认**关闭**；默认时刻 `03:00`，也可以按间隔小时数跑），到点后为每个启用的全局书源写一条
+  `mode=discover_all` 的 `crawl_tasks` 记录，由 crawler 容器的队列 worker 执行
+  （`docs/crawl-queue.md`）。所以改同步时间在界面上改就行，不用碰配置文件。
+  已经在排队/运行的同源任务不会重复堆叠。
+- 每次自动任务的页数上限是 `AUTO_SYNC_MAX_PAGES`（默认 3），不会变成无限量爬取。
+  它翻的是**书源目录的前几页**，因此既会发现新书，也会刷新这几页里已有的书；
+  **不在前几页里的老书不会被自动检查新章节**。要单独刷新用书详情页的「重新同步」，
+  或在容器里手动跑下面的任务。
+
+`scheduler/app/tasks.py` 里另外三个任务是**手动入口**，不在 beat 里、代码里也没有任何地方派发它们：
+
+```bash
+docker exec novelhub-crawler sh -lc 'cd /app/scheduler_app && python -m celery -A celery_app call tasks.resync_all_books'
+```
+
+- `tasks.daily_sync_all`：逐个书源同步书架；没 Cookie 的书源改成对库内书籍检查新章节。
+- `tasks.sync_single_source`：同上，但只针对一个 `source_id`。
+- `tasks.resync_all_books`：把库里每本书都检查一遍新章节（最贴近上面「老书不会自动刷新」的缺口）。
+
+> 2026-09-25 之前这份文档写的是「Beat 每天 03:00 跑 `daily_sync_all`」，代码里从来没有这条
+> 排期，`AUTO_SYNC_MAX_PAGES` 描述的其实是 `auto_sync_check`。按旧文档排查「凌晨为什么没同步」
+> 会得出错误结论，已按实际实现改正。
+
 - 再次同步同一本书按章节 URL 去重；失败章节下次会重试；已存在的章节不会被覆盖，
   需要覆盖用阅读页的“重同步本章”或书详情页的“重新同步”。
 - cookie 健康检查（`check_cookie_health`）每项最多 `COOKIE_CHECK_ITEM_TIMEOUT`（默认 60s），

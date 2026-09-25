@@ -84,7 +84,15 @@ async def get_current_user_or_token(
     x_api_token: str | None = Header(default=None, alias="X-API-Token"),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    """Authenticate via API token OR JWT bearer."""
+    """Authenticate via API token OR JWT bearer.
+
+    Used by the **read-only** library surface only (book list/detail, chapter
+    list/body, search) so that a token pasted into a third-party client can
+    read the library as its owner.  Everything that writes, everything that
+    touches one user's own rows (bookmarks, progress, bookshelf, cookies) and
+    every admin route stays on :func:`get_current_user` / :func:`require_admin`:
+    a leaked token must not be able to change or delete anything.
+    """
     if x_api_token:
         from app.services.token_service import TokenService
         api_token = await TokenService(db).verify_token(x_api_token)

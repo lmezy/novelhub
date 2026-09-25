@@ -33,7 +33,7 @@ Scheduler 容器：Celery Beat（定时同步、cookie 健康检查）
 | Source Engine（代码在 `backend/app/crawler/`，容器是 `crawler`） | 加载书源规则、搜索、书籍信息、目录、正文、Cookie/自动登录、请求管理 | 不暴露 Web API、不写 UI 逻辑 |
 | `scheduler/` | 定时同步、任务投递、重试、队列 | — |
 | `frontend/` | 阅读、搜索、管理界面 | 不写业务逻辑 |
-| Storage 抽象 | `save_book/save_chapter/save_cover/read/delete/exists`；当前本地磁盘，未来可接 S3/WebDAV | 业务层不直接 `open()/write()` |
+| Storage 抽象 | `BookStorage`（`services/storage.py`，本地磁盘）：`book_dir` / `write_metadata` / `write_chapter` / `read_chapter` / `save_cover` / `save_display_cover` / `save_chapter_image` / `chapter_image_path` | 业务层不直接 `open()/write()`。**没有** S3/WebDAV 后端：`services/storage_backends.py` 只有 S3/WebDAV 两个子类、9 个方法里 5 个（封面、正文图片、路径解析）仍是本地实现，且从未被任何调用点选用，已于 2026-09-25 删除；真要接对象存储，得先把这些方法一起抽象掉 |
 
 **YueDu 插件已按职责拆分**（2026-09-19，见 [codex-handoff.md](codex-handoff.md) 第 32 节）：
 `plugins/yuedu/__init__.py` 从 5,972 行降到约 434 行，只留插件协议面与共享类级缓存；
@@ -67,7 +67,8 @@ Scheduler 容器：Celery Beat（定时同步、cookie 健康检查）
 - 正文以 Markdown 落 Storage：`storage/books/{author}/{title}/000001.md` + `metadata.json`。
 - 更新必须是增量：拉目录 → 按章节 URL/Hash 比对 → 只下载新增 → 更新索引；
   支持断点恢复与失败重试。
-- 结构变更必须走 Alembic 迁移。
+- 结构变更必须走 Alembic 迁移（backend 容器启动时自动 `alembic upgrade head`）。
+  **不要**再引入 `Base.metadata.create_all` 之类的第二条建表路径。
 
 ## 5. 修改代码时的约束
 
@@ -78,6 +79,11 @@ Scheduler 容器：Celery Beat（定时同步、cookie 健康检查）
 5. 不改 `yuedu/`（开源阅读源码，仅作规则格式参考）；不为单站点写死逻辑。
 6. 不绕过验证码 / WAF / 登录限制；不提交任何凭据。
 7. 每处修复都要能说清「现象 → 根因 → 改动文件 → 验证」，并补可复现的测试。
+8. **API 令牌（`X-API-Token`）只接只读书库接口**（书籍列表/详情、章节目录/正文、搜索），
+   由 `services/auth.py::get_current_user_or_token` 提供。写入、用户私有数据（书签/进度/书架/
+   Cookie）与所有 admin 路由一律走 `get_current_user` / `require_admin`——令牌存在第三方客户端
+   的配置里，泄漏时不能改任何数据。`tests/test_api_token_auth.py` 把这个路由清单钉死，
+   加接口是一个需要显式决定的安全动作。
 
 ## 6. 后续可做（都不是阻塞项）
 

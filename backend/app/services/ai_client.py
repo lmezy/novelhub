@@ -24,10 +24,9 @@ import json
 import re
 import ssl
 import time
-from typing import Any, AsyncIterator, Iterable, Sequence
+from typing import Any, AsyncIterator, Sequence
 
 import httpx
-from loguru import logger
 
 from app.services.ai_config import AIConfig
 
@@ -654,10 +653,6 @@ class LLMClient:
             "latency_ms": int(elapsed * 1000),
             "proxy": self.proxy_url,
         }
-
-
-def describe_model_chain(models: Iterable[str]) -> str:
-    return " -> ".join(str(m) for m in models if m)
 
 
 async def diagnose(cfg: AIConfig, *, test_embeddings: bool = True) -> dict[str, Any]:

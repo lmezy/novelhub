@@ -16,7 +16,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
-from uuid import uuid4
 
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession

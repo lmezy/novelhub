@@ -16,7 +16,7 @@ from app.schemas.source import (
     SourceOut,
     SourceUpdate,
 )
-from app.services.auth import get_current_user, require_admin
+from app.services.auth import get_current_user
 from app.services.book_cleanup import delete_books
 from app.services.book_kind import normalize_kind
 from app.services.search import search_service
