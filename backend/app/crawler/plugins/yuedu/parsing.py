@@ -10,14 +10,20 @@ title overflowing a filesystem component limit.
 """
 
 from app.crawler.base import RemoteChapter
+from app.crawler.plugins.yuedu.rule_engine import YueduRuleEngine
 from app.crawler.plugins.yuedu.selectors import GENERIC_BOOK_AUTHOR_SELECTORS
 from app.crawler.plugins.yuedu.selectors import GENERIC_BOOK_COVER_SELECTORS
 from app.crawler.plugins.yuedu.selectors import GENERIC_BOOK_DESC_SELECTORS
 from app.crawler.plugins.yuedu.selectors import GENERIC_BOOK_TITLE_SELECTORS
 from app.crawler.plugins.yuedu.selectors import GENERIC_CHAPTER_SELECTORS
+from app.crawler.plugins.yuedu.selectors import SERIES_INDEX_MAX_PARTS
+from app.crawler.plugins.yuedu.selectors import SERIES_INDEX_PART_TAIL_MAX
+from app.crawler.plugins.yuedu.selectors import SERIES_INDEX_PREFIX_MIN
+from app.crawler.plugins.yuedu.selectors import SERIES_INDEX_SKIP_TEXTS
 from bs4 import BeautifulSoup
 from bs4 import Tag
 from typing import Any
+from urllib.parse import urljoin
 from urllib.parse import urlparse
 import json
 import re
@@ -905,3 +911,157 @@ class ParsingMixin:
                 seen.add(key)
             lines.append(line)
         return "\n".join(lines).strip()
+
+    # ---- series index (合集帖) ------------------------------------------
+    #
+    # Forum sources model a post as a one-chapter book, so a post that merely
+    # *indexes* a work ("【忘尘山:高冷仙子皆为炉鼎】1-23") becomes a book whose
+    # single chapter holds just the first instalment: the source's ``ruleToc``
+    # matched the thread title, and the remaining parts are only reachable
+    # through the links the post body itself carries.  Everything below turns
+    # those links into chapters, so one book stops meaning "one part".
+
+    @staticmethod
+    def _title_key(text: str) -> str:
+        """Comparison key for a title: letters/digits/CJK only, lowercased.
+
+        Drops the punctuation that differs between a site's heading and its
+        link text (``：`` vs ``:``, ``（）`` vs ``()``, spaces).
+        """
+        return "".join(char for char in str(text or "").lower() if char.isalnum())
+
+    @staticmethod
+    def _common_key_prefix(keys: list[str]) -> str:
+        """Longest prefix shared by every key."""
+        if not keys:
+            return ""
+        prefix = keys[0]
+        for key in keys[1:]:
+            limit = min(len(prefix), len(key))
+            index = 0
+            while index < limit and prefix[index] == key[index]:
+                index += 1
+            prefix = prefix[:index]
+            if not prefix:
+                break
+        return prefix
+
+    @staticmethod
+    def _key_prefix_tail(text: str, prefix_key: str) -> str:
+        """Return what ``text`` says after its first ``prefix_key`` key chars."""
+        if not prefix_key:
+            return str(text or "")
+        raw = str(text or "")
+        seen = 0
+        for index, char in enumerate(raw):
+            if char.isalnum():
+                seen += 1
+                if seen == len(prefix_key):
+                    return raw[index + 1:]
+        return ""
+
+    def _content_body_elements(self, html: str) -> list[Any]:
+        """Elements the source's own content rule treats as the post body.
+
+        Anchoring on ``ruleContent.content`` is what separates the parts of a
+        work from the page chrome: a "相关推荐" box holds links too, and only the
+        body the source itself reads for the chapter may become chapters.
+        """
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            return []
+        rule = str(
+            (self.config.get("ruleContent") or {}).get("content") or ""
+        ).strip()
+        # A ``<js>``/``@js:`` content rule produces values, not elements.
+        if not rule or self._uses_android_js_rule("ruleContent", "content"):
+            return []
+        if rule.lower().startswith("@css:"):
+            rule = rule[5:].strip()
+        steps = YueduRuleEngine._split_element_steps(rule)
+        if not steps:
+            return []
+        try:
+            return list(engine._get_elements(html, steps[0]))
+        except Exception:
+            # A rule the engine cannot select is simply not usable here; the
+            # book keeps the single-chapter shape it had before.
+            return []
+
+    def _series_index_parts(
+        self,
+        html: str,
+        page_url: str,
+        book_title: str,
+    ) -> list[dict[str, str]]:
+        """Other parts of this work, as linked from inside the post body.
+
+        Returns ``[{"title", "url"}]`` in reading order (the announced part
+        number), or an empty list when the body does not carry a series index.
+        """
+        body_elements = self._content_body_elements(html)
+        if not body_elements:
+            return []
+        book_key = self._title_key(book_title)
+        if len(book_key) < SERIES_INDEX_PREFIX_MIN:
+            return []
+        page_host = urlparse(page_url).netloc.lower()
+        page_identity = page_url.split("#", 1)[0].rstrip("/")
+
+        candidates: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        for element in body_elements:
+            try:
+                anchors = element.select("a[href]")
+            except Exception:
+                continue
+            for anchor in anchors:
+                href = str(anchor.get("href") or "").strip()
+                title = anchor.get_text(" ", strip=True)
+                if not href or not title or title in SERIES_INDEX_SKIP_TEXTS:
+                    continue
+                if self._inside_navigation(anchor):
+                    continue
+                target = urljoin(page_url, href).split("#", 1)[0]
+                if not target.startswith(("http://", "https://")):
+                    continue
+                if urlparse(target).netloc.lower() != page_host:
+                    continue
+                if target.rstrip("/") == page_identity or target in seen_urls:
+                    continue
+                key = self._title_key(title)
+                if len(key) < 2:
+                    continue
+                seen_urls.add(target)
+                candidates.append({"title": title, "url": target, "key": key})
+
+        if len(candidates) < 2:
+            return []
+        # Every part repeats the work's own name and differs only in its part
+        # marker, so the shared prefix must be long *and* belong to this book.
+        prefix = self._common_key_prefix([item["key"] for item in candidates])
+        if len(prefix) < SERIES_INDEX_PREFIX_MIN or not book_key.startswith(prefix):
+            return []
+
+        parts: list[dict[str, Any]] = []
+        for candidate in candidates:
+            tail = self._key_prefix_tail(candidate["title"], prefix)
+            if len(self._title_key(tail)) > SERIES_INDEX_PART_TAIL_MAX:
+                continue
+            numbers = re.findall(r"\d{1,4}", tail)
+            if not numbers:
+                continue
+            parts.append({
+                "title": candidate["title"],
+                "url": candidate["url"],
+                "order": (int(numbers[0]), int(numbers[-1])),
+            })
+        if len(parts) < 2:
+            return []
+        # The index lists the newest part first; reading order is the announced
+        # part number.  ``sort`` is stable, so equal orders keep page order.
+        parts.sort(key=lambda item: item["order"])
+        return [
+            {"title": str(item["title"]), "url": str(item["url"])}
+            for item in parts[:SERIES_INDEX_MAX_PARTS]
+        ]

@@ -338,16 +338,41 @@ class BookMixin:
             ))
 
         if not chapters and self_chapter_title:
-            chapters = [RemoteChapter(
-                source_chapter_id=url,
-                title=(
-                    self_chapter_title
-                    if self_chapter_title not in ("", "Chapter 1")
-                    else book_title
+            self_title = (
+                self_chapter_title
+                if self_chapter_title not in ("", "Chapter 1")
+                else book_title
+            )
+            # A post can be the index of a whole work ("…1-23"): its own body
+            # links to every other instalment, while ``ruleToc`` only ever saw
+            # the thread title.  Keeping this page as the book's *only* chapter
+            # left the rest of the work unreadable, so the linked parts become
+            # chapters too -- the book page stays chapter 1 because it carries
+            # the opening instalment.
+            series_parts = self._series_index_parts(html, identity_url, book_title)
+            if series_parts:
+                logger.info(
+                    "Series index expanded into %s chapters for %s",
+                    len(series_parts) + 1,
+                    identity_url,
+                )
+            chapters = [
+                RemoteChapter(
+                    source_chapter_id=url,
+                    title=self_title,
+                    url=url,
+                    chapter_number=1,
                 ),
-                url=url,
-                chapter_number=1,
-            )]
+                *[
+                    RemoteChapter(
+                        source_chapter_id=part["url"],
+                        title=part["title"],
+                        url=part["url"],
+                        chapter_number=index,
+                    )
+                    for index, part in enumerate(series_parts, start=2)
+                ],
+            ]
         if not chapters and not android_toc_rule:
             if toc_url_from_rules and toc_url.rstrip("/") != identity_url.rstrip("/"):
                 # The source declared a dedicated catalogue page and it came

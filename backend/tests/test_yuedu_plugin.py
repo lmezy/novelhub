@@ -992,6 +992,144 @@ async def test_fetch_book_keeps_forum_self_url_as_single_chapter():
     ]
 
 
+# 禁忌书屋 (cool18) shape: ruleToc points at the thread itself, and a thread
+# that indexes a whole work links the other instalments from inside its body.
+SERIES_INDEX_SOURCE = {
+    "bookSourceUrl": "https://forum.example",
+    "bookSourceName": "论坛书源",
+    "ruleBookInfo": {"name": ".main-title@text", "tocUrl": "@js:baseUrl"},
+    "ruleToc": {
+        "chapterList": ".title-section",
+        "chapterName": ".main-title@text",
+        "chapterUrl": "@js:baseUrl",
+    },
+    "ruleContent": {
+        "title": ".main-title@text",
+        "content": "@css:#content-section pre@text",
+    },
+}
+
+SERIES_INDEX_URL = "https://forum.example/index.php?app=forum&act=threadview&tid=1"
+
+
+def _series_index_page(body_links: str, related_links: str = "") -> str:
+    return f"""
+    <html><body>
+      <h1 class="main-title">【忘尘山:高冷仙子皆为炉鼎】1-23 作者:林澈</h1>
+      <div class="title-section"></div>
+      <div id="content-section">
+        <pre>
+　　【忘尘山：高冷仙子皆为炉鼎】（1-2）作者：林澈
+　　{body_links}
+　　叶青云穿越到了一个名为神州大陆的玄幻世界。
+        </pre>
+      </div>
+      <div class="relatedChapterList">{related_links}</div>
+    </body></html>
+    """
+
+
+@pytest.mark.asyncio
+async def test_fetch_book_expands_series_index_into_chapters():
+    """A post that indexes a work must not stay one truncated chapter.
+
+    The source's ``ruleToc`` only sees the thread title, so the parts listed in
+    the body are the only way to the rest of the work.  They are also listed
+    newest-first, so the chapters have to be re-ordered by the announced part
+    number instead of page order.
+    """
+    plugin = YueduPlugin(SERIES_INDEX_SOURCE)
+    html = _series_index_page(
+        body_links=(
+            '<a href="https://forum.example/index.php?tid=7">'
+            "【忘尘山：高冷仙子皆为炉鼎】（7）</a>"
+            '<a href="https://forum.example/index.php?tid=4">'
+            "【忘尘山：高冷仙子皆为炉鼎】（4-6）</a>"
+            '<a href="https://forum.example/index.php?tid=3">'
+            "【忘尘山：高冷仙子皆为炉鼎】（3）</a>"
+        ),
+    )
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        book = await plugin.fetch_book(SERIES_INDEX_URL)
+
+    assert book.title == "【忘尘山:高冷仙子皆为炉鼎】1-23"
+    assert [chapter.url for chapter in book.chapters] == [
+        SERIES_INDEX_URL,
+        "https://forum.example/index.php?tid=3",
+        "https://forum.example/index.php?tid=4",
+        "https://forum.example/index.php?tid=7",
+    ]
+    assert [chapter.chapter_number for chapter in book.chapters] == [1, 2, 3, 4]
+    assert [chapter.next_url for chapter in book.chapters] == [
+        "https://forum.example/index.php?tid=3",
+        "https://forum.example/index.php?tid=4",
+        "https://forum.example/index.php?tid=7",
+        None,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_book_ignores_part_links_outside_the_content_rule():
+    """Only the body the content rule reads may become chapters.
+
+    A "相关推荐" block repeats the same title shape; taking it would add other
+    books as chapters (the failure mode behind 御宅屋's 601 empty chapters).
+    """
+    plugin = YueduPlugin(SERIES_INDEX_SOURCE)
+    html = _series_index_page(
+        body_links="",
+        related_links=(
+            '<a href="https://forum.example/index.php?tid=8">'
+            "【忘尘山：高冷仙子皆为炉鼎】（8）</a>"
+            '<a href="https://forum.example/index.php?tid=9">'
+            "【忘尘山：高冷仙子皆为炉鼎】（9）</a>"
+        ),
+    )
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        book = await plugin.fetch_book(SERIES_INDEX_URL)
+
+    assert len(book.chapters) == 1
+    assert book.chapters[0].url == SERIES_INDEX_URL
+
+
+@pytest.mark.asyncio
+async def test_fetch_book_leaves_unrelated_body_links_alone():
+    """Links in the body that are not parts of this work stay links."""
+    plugin = YueduPlugin(SERIES_INDEX_SOURCE)
+    html = _series_index_page(
+        body_links=(
+            '<a href="https://forum.example/index.php?tid=21">邻居家的猫</a>'
+            '<a href="https://forum.example/index.php?tid=22">另一本完全不同的书</a>'
+            '<a href="https://www.other.example/index.php?tid=3">'
+            "【忘尘山：高冷仙子皆为炉鼎】（3）</a>"
+        ),
+    )
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        book = await plugin.fetch_book(SERIES_INDEX_URL)
+
+    assert [chapter.url for chapter in book.chapters] == [SERIES_INDEX_URL]
+
+
+@pytest.mark.asyncio
+async def test_fetch_book_ignores_series_navigation_anchors():
+    """返回主帖 / 上一页 are chrome inside the body, never chapters."""
+    plugin = YueduPlugin(SERIES_INDEX_SOURCE)
+    html = _series_index_page(
+        body_links=(
+            '<a href="https://forum.example/index.php?tid=1">返回主帖</a>'
+            '<a href="https://forum.example/index.php?tid=2">下一页</a>'
+        ),
+    )
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        book = await plugin.fetch_book(SERIES_INDEX_URL)
+
+    assert [chapter.url for chapter in book.chapters] == [SERIES_INDEX_URL]
+
+
 @pytest.mark.asyncio
 async def test_fetch_book_uses_chapter_url_as_source_id():
     plugin = YueduPlugin({

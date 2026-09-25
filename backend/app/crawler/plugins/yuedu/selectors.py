@@ -241,3 +241,38 @@ TOC_NOISE_TITLES = {
     "返回目录",
     "开始阅读",
 }
+
+# Anchor texts that are pure navigation inside a post body.  A series index
+# (合集帖) links to the other parts of the same work using the work's own title,
+# so anything in this set can never be a part of the series.
+SERIES_INDEX_SKIP_TEXTS = TOC_NOISE_TITLES | {
+    "上一页",
+    "下一页",
+    "末页",
+    "上一頁",
+    "下一頁",
+    "下页",
+    "下頁",
+    "末頁",
+    "返回主帖",
+    "返回主頁",
+    "返回",
+    "home",
+    "next",
+    "prev",
+    "previous",
+    "login",
+}
+
+# What is left of a part title once the work's own name is stripped is just a
+# part marker ("（3）", "（4-6）", "第7章"), so it stays short.  A longer tail is a
+# real title: the link is then a recommendation, not a part of this work.
+SERIES_INDEX_PART_TAIL_MAX = 12
+
+# How much of the work's own name every part link has to repeat before the
+# cluster counts as one series.  Short shared prefixes ("第", "上") are noise.
+SERIES_INDEX_PREFIX_MIN = 4
+
+# Upper bound for one series-index expansion.  A page linking to more parts
+# than this is an archive index, not the table of contents of one book.
+SERIES_INDEX_MAX_PARTS = 200

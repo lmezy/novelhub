@@ -117,6 +117,8 @@
   [codex-handoff.md](codex-handoff.md) 第 32 节（插件已按职责拆成 18 个模块）
 - 时间戳又对不上 / 差 8 小时 → [codex-handoff.md](codex-handoff.md) 第 32 节
   （约定是 `core/clock.py::naive_now()`；`deleted_accounts.deleted_at` 是唯一 aware 列）
+- **「一个帖子 = 一本单章书」的书只读到开头（合集帖 1-23 只显示 1-2）** →
+  [codex-handoff.md](codex-handoff.md) 第 46 节（正文里的分帖链接会接成后续章节，需重新同步一次）
 
 ## 文档维护约定
 

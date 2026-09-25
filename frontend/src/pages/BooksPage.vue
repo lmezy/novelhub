@@ -196,9 +196,15 @@ function rememberAdvancedPage(conds: ActiveCondition[], matchMode: "and" | "or",
 
 const activeCategory = computed(() => String(route.query.category || ""))
 const activeSource = computed(() => String(route.query.source || route.query.source_id || ""))
+// ``?all=1`` is the "whole library" view: every book of this kind, no category
+// and no source filter.  Without it the home view offered a 查看全部 per
+// category and per source, but no way to page through the library itself.
+const browseAll = computed(() => String(route.query.all || "") === "1")
 const currentOffset = computed(() => Math.max(0, Number(route.query.offset || 0) || 0))
 const isSearching = computed(() => Boolean(String(route.query.q || "").trim()))
-const isBrowsing = computed(() => !isSearching.value && Boolean(activeCategory.value || activeSource.value))
+const isBrowsing = computed(() =>
+  !isSearching.value && (browseAll.value || Boolean(activeCategory.value || activeSource.value))
+)
 const showCovers = computed(() => auth.user?.settings?.show_covers !== false)
 const sourceNameMap = computed<Record<string, string>>(() => Object.fromEntries(sources.value.map((source) => [source.id, source.name])))
 const activeCategoryItem = computed(() => categories.value.find((category) => category.name === activeCategory.value))
@@ -284,9 +290,10 @@ async function loadHome() {
   const params = new URLSearchParams({ section_limit: "6" })
   if (bookKind.value) params.set("kind", bookKind.value)
   home.value = await api.get<HomeData>("/books/home?" + params)
-  await loadHomeSources()
 }
 
+// "Browse by source" lives on the 书源搜索 tab only; it used to be rendered on
+// the home view as well, which made two places own the same blocks.
 async function loadHomeSources() {
   homeSources.value = []
   const results = await Promise.all(
@@ -454,6 +461,18 @@ async function deleteSourceBooks() {
   } finally { actionBusy.value = false }
 }
 
+// One "browse this source" block per source, listed on the 书源搜索 tab (it
+// used to sit on the shelf page, where it competed with the shelf itself).
+async function deleteSourceSection(section: { source: SourceItem; total: number }) {
+  if (!auth.isAdmin || !section.total) return
+  if (!confirm(i18n.t("books_source_delete_confirm", { name: section.source.name, n: section.total }))) return
+  actionBusy.value = true
+  try {
+    await api.post("/books/batch-delete-by-source", { source_id: section.source.id })
+    await loadHomeSources()
+  } finally { actionBusy.value = false }
+}
+
 function changePage(offset: number) {
   router.push({ path: listPath.value, query: { ...route.query, offset: String(Math.max(0, offset)) } })
 }
@@ -582,6 +601,13 @@ async function syncRemoteBook(item: RemoteBook) {
 }
 
 watch(() => route.query, loadCurrentView, { deep: true })
+
+// The 书源搜索 tab carries the "browse by source" blocks too, so fill them the
+// first time that tab is opened.
+watch(searchTab, async (tab) => {
+  if (tab !== "sources" || homeSources.value.length) return
+  try { await loadHomeSources() } catch { homeSources.value = [] }
+})
 
 // ``/novels`` and ``/comics`` share this component, so switching between them
 // changes the prop without changing the route query.
@@ -740,8 +766,9 @@ onMounted(async () => {
         </div>
       </div>
 
-      <nav class="mb-7 flex items-center gap-2 overflow-x-auto border-y border-border py-3 dark:border-gray-800">
-        <button @click="router.push(listPath)" class="shrink-0 rounded px-3 py-1.5 text-xs" :class="!activeCategory && !activeSource && !isSearching && !advancedActive ? 'bg-accent text-white' : 'text-muted hover:bg-black/5 dark:text-gray-400 dark:hover:bg-white/5'">{{ i18n.t('books_all_categories') }}</button>
+      <nav class="mb-7 flex flex-wrap items-center gap-2 border-y border-border py-3 dark:border-gray-800">
+        <button @click="router.push(listPath)" class="shrink-0 rounded px-3 py-1.5 text-xs" :class="!activeCategory && !activeSource && !browseAll && !isSearching && !advancedActive ? 'bg-accent text-white' : 'text-muted hover:bg-black/5 dark:text-gray-400 dark:hover:bg-white/5'">{{ i18n.t('books_all_categories') }}</button>
+        <button @click="router.push({ path: listPath, query: { all: '1' } })" class="shrink-0 rounded px-3 py-1.5 text-xs" :class="browseAll && !activeCategory && !activeSource ? 'bg-accent text-white' : 'text-muted hover:bg-black/5 dark:text-gray-400 dark:hover:bg-white/5'">{{ i18n.t('books_all_books') }}</button>
         <button v-for="category in categories" :key="category.id" @click="openCategory(category.name)" class="shrink-0 rounded px-3 py-1.5 text-xs" :class="activeCategory === category.name ? 'bg-accent text-white' : 'text-muted hover:bg-black/5 dark:text-gray-400 dark:hover:bg-white/5'">{{ category.name }}</button>
       </nav>
 
@@ -784,6 +811,36 @@ onMounted(async () => {
             </div>
           </div>
         </div>
+
+        <section v-if="homeSources.length" class="mt-10 border-t border-border pt-6 dark:border-gray-800">
+          <div class="mb-4 flex items-center justify-between">
+            <div>
+              <h2 class="text-lg font-semibold">{{ i18n.t('home_by_source') }}</h2>
+              <p class="mt-1 text-xs text-muted dark:text-gray-400">{{ i18n.t('home_source_all') }}</p>
+            </div>
+            <button @click="router.push({ path: listPath, query: { all: '1' } })" class="text-xs text-accent hover:underline">{{ i18n.t('books_view_all') }} ›</button>
+          </div>
+          <div v-for="section in homeSources" :key="section.source.id" class="mb-8">
+            <div class="mb-3 flex items-center justify-between">
+              <h3 class="text-sm font-semibold text-muted dark:text-gray-400">{{ section.source.name }}</h3>
+              <div class="flex items-center gap-3">
+                <button
+                  @click="router.push({ path: listPath, query: { source: section.source.id } })"
+                  class="text-xs text-accent hover:underline"
+                >{{ i18n.t('books_view_all_source') }} ({{ section.total }}) ›</button>
+                <button
+                  v-if="auth.isAdmin"
+                  @click="deleteSourceSection(section)"
+                  :disabled="actionBusy"
+                  class="text-xs text-red-600 hover:underline disabled:opacity-40"
+                >{{ i18n.t('books_source_delete', { n: section.total }) }}</button>
+              </div>
+            </div>
+            <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+              <BookCard v-for="book in section.books" :key="book.id" :book="book" :show-cover="showCovers" :source-name="book.source_id ? sourceNameMap[book.source_id] : ''" @favorite="toggleFavorite" @search="searchByField" />
+            </div>
+          </div>
+        </section>
       </template>
 
       <!-- advanced search results -->
@@ -961,6 +1018,7 @@ onMounted(async () => {
         <section v-if="home.latest.length" class="mb-10">
           <div class="mb-4 flex items-end justify-between">
             <div><h2 class="text-lg font-semibold">{{ i18n.t('books_latest') }}</h2><p class="mt-1 text-xs text-muted dark:text-gray-400">{{ i18n.t('home_books_count', { n: home.total }) }}</p></div>
+            <button @click="router.push({ path: listPath, query: { all: '1' } })" class="text-xs text-accent hover:underline">{{ i18n.t('books_view_all') }} ›</button>
           </div>
           <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
             <BookCard v-for="book in home.latest" :key="book.id" :book="book" :show-cover="showCovers" :source-name="book.source_id ? sourceNameMap[book.source_id] : ''" @favorite="toggleFavorite" @search="searchByField" />
@@ -974,21 +1032,6 @@ onMounted(async () => {
           </div>
           <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
             <BookCard v-for="book in section.books" :key="book.id" :book="book" :show-cover="showCovers" :source-name="book.source_id ? sourceNameMap[book.source_id] : ''" @favorite="toggleFavorite" @search="searchByField" />
-          </div>
-        </section>
-
-        <section v-if="homeSources.length" class="mb-10 border-t border-border pt-6 dark:border-gray-800">
-          <div class="mb-4 flex items-center justify-between">
-            <div class="flex items-center gap-2"><h2 class="text-lg font-semibold">{{ i18n.t('home_by_source') }}</h2></div>
-          </div>
-          <div v-for="section in homeSources" :key="section.source.id" class="mb-8">
-            <div class="mb-3 flex items-center justify-between">
-              <h3 class="text-sm font-semibold text-muted dark:text-gray-400">{{ section.source.name }}</h3>
-              <button @click="router.push({ path: listPath, query: { source: section.source.id } })" class="text-xs text-accent hover:underline">{{ i18n.t('books_view_all_source') }} ({{ section.total }}) ›</button>
-            </div>
-            <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-              <BookCard v-for="book in section.books" :key="book.id" :book="book" :show-cover="showCovers" :source-name="book.source_id ? sourceNameMap[book.source_id] : ''" @favorite="toggleFavorite" @search="searchByField" />
-            </div>
           </div>
         </section>
 
