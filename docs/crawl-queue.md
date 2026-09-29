@@ -36,11 +36,12 @@
 
 - 图片计数（`current_images_done` / `current_images_total`）在每张图开始下载前更新，见
   `sync._process_content_images` 的 `image_progress_cb`；
+- YueDu 章节的分页计数（`current_content_pages_done`）在每个章节页面返回后更新；漫画画廊先
+  遍历“下一页”再下载图片，避免整个画廊抓取期间任务行看起来停滞；
 - 章节级进度不再只等第 10 次才写库：`_CHAPTER_PROGRESS_COMMIT_SECONDS`（30 秒）一到就写。
 
-一个图集章节可能有几百张图、还是串行下载的（`MAX_CONTENT_IMAGES_PER_CHAPTER`），整章要几小时；
-以前这期间任务行一个字都不动（线上 2026-09-22 两个漫画源就是这么被判成“没进度”杀掉的，
-而被杀前 2~11 分钟日志里还在取图）。
+一个图集章节可能先逐页读取数百个画廊页面，再逐张保存图片；两阶段都可能耗时很久，
+所以任务页现在显示章节页与图片计数，watchdog 也会根据这两个计数判断任务是否仍在推进。
 
 ## 能做什么
 

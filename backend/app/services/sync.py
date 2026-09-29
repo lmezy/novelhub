@@ -303,11 +303,20 @@ class SyncService:
         plugin,
         remote_chapter,
         attempts: int = 3,
+        progress_cb: Callable[[int], Awaitable[None]] | None = None,
     ) -> str:
         """Fetch a chapter, retrying transient network errors."""
         last_error: Exception | None = None
+        supports_page_progress = callable(
+            getattr(type(plugin), "fetch_chapter_content_with_progress", None)
+        )
         for attempt in range(attempts):
             try:
+                if progress_cb is not None and supports_page_progress:
+                    return await plugin.fetch_chapter_content_with_progress(
+                        remote_chapter,
+                        progress_cb,
+                    )
                 return await plugin.fetch_chapter_content(remote_chapter)
             except Exception as exc:
                 last_error = exc
@@ -1103,14 +1112,14 @@ class SyncService:
             remote_chapter,
             images_done: int = 0,
             images_total: int = 0,
+            content_pages_done: int = 0,
         ) -> None:
             """Publish this book's progress to the crawl task row.
 
             ``images_done``/``images_total`` describe the image album of the
-            chapter being downloaded right now.  Between two chapter boundaries
-            they are the only fields that move (see
-            ``_process_content_images``), and the crawl queue's stall watchdog
-            reads exactly those.
+            chapter being downloaded right now. ``content_pages_done`` tracks
+            paginated chapter fetches before their embedded images are saved.
+            Both stages can be the only progress for a long-running comic.
             """
             if progress_cb is not None:
                 await progress_cb({
@@ -1124,6 +1133,7 @@ class SyncService:
                     "total_chapters": total,
                     "images_done": images_done,
                     "images_total": images_total,
+                    "content_pages_done": content_pages_done,
                 })
 
         existing_source_ids = await self._reconcile_chapter_ids(
@@ -1152,6 +1162,12 @@ class SyncService:
         results_queue = asyncio.Queue(maxsize=concurrency * 2)
 
         async def _producer(remote_chapter) -> None:
+            async def _report_content_pages(pages_done: int) -> None:
+                await _report_progress(
+                    remote_chapter,
+                    content_pages_done=pages_done,
+                )
+
             async def _report_images(handled: int, images_total: int) -> None:
                 await _report_progress(
                     remote_chapter,
@@ -1165,6 +1181,7 @@ class SyncService:
                     content = await self._fetch_chapter_with_retry(
                         plugin,
                         remote_chapter,
+                        progress_cb=_report_content_pages,
                     )
                     content = await self._process_content_images(
                         book,

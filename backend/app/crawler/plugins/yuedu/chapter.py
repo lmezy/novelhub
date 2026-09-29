@@ -12,6 +12,7 @@ from app.crawler.plugins.yuedu.common import logger
 from app.crawler.plugins.yuedu.rule_engine import YueduRuleEngine
 from bs4 import BeautifulSoup
 from bs4 import Tag
+from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import urljoin
 from urllib.parse import urlparse
@@ -25,6 +26,21 @@ class ChapterMixin:
     """Methods extracted from ``YueduPlugin``."""
 
     async def fetch_chapter_content(self, chapter: RemoteChapter) -> str:
+        return await self._fetch_chapter_content(chapter, progress_cb=None)
+
+    async def fetch_chapter_content_with_progress(
+        self,
+        chapter: RemoteChapter,
+        progress_cb: Callable[[int], Awaitable[None]],
+    ) -> str:
+        return await self._fetch_chapter_content(chapter, progress_cb=progress_cb)
+
+    async def _fetch_chapter_content(
+        self,
+        chapter: RemoteChapter,
+        *,
+        progress_cb: Callable[[int], Awaitable[None]] | None,
+    ) -> str:
         """Fetch and return the full text of a single chapter.
 
         Supports multi-page chapters via nextContentUrl rule.
@@ -64,6 +80,9 @@ class ChapterMixin:
                 "Upstream server returned a transient 5xx error page "
                 f"(Cloudflare/520 etc.): {chapter.url}"
             )
+        page_fetches_completed = 1
+        if progress_cb is not None:
+            await progress_cb(page_fetches_completed)
         chapter_engine.set_chapter_context({
             "title": str(getattr(chapter, "title", "") or ""),
             "url": chapter.url,
@@ -96,15 +115,27 @@ class ChapterMixin:
         max_pages = self._gallery_page_limit() if gallery_mode else 20
         seen_content_urls = {chapter.url}
         content_semaphore = asyncio.Semaphore(self._thread_count())
+        page_progress_lock = asyncio.Lock()
+
+        async def _report_content_page_fetch() -> None:
+            nonlocal page_fetches_completed
+            if progress_cb is None:
+                return
+            async with page_progress_lock:
+                page_fetches_completed += 1
+                await progress_cb(page_fetches_completed)
 
         async def _fetch_content_page(page_url: str) -> str:
             async with content_semaphore:
                 if web_js:
-                    return await self._get_with_web_js(
+                    page_html = await self._get_with_web_js(
                         page_url, web_js,
                         fallback_http=not chapter_web_view,
                     )
-                return await self._get(page_url)
+                else:
+                    page_html = await self._get(page_url)
+            await _report_content_page_fetch()
+            return page_html
 
         pending_content_urls = [
             url

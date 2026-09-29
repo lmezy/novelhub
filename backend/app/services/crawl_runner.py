@@ -330,15 +330,16 @@ async def run_crawl_task_async(task_id: str) -> dict:
                 progress_state.update({
                     "current_book": info.get("book_title") or "",
                     "current_chapter": info.get("chapter_title") or "",
+                    "current_content_pages_done": int(
+                        info.get("content_pages_done", 0) or 0
+                    ),
                     "current_chapters_created": info.get("created_chapters", 0),
                     "current_chapters_skipped": info.get("skipped_chapters", 0),
                     "current_chapters_failed": info.get("failed_chapters", 0),
                     "current_chapters_total": info.get("total_chapters", 0),
-                    # Images of the chapter being downloaded right now.  A
-                    # gallery chapter is fetched one image at a time, so an hour
-                    # or more can pass between two chapter reports and this is
-                    # the only counter that moves inside it (see
-                    # ``_progress_marker``).
+                    # Gallery page traversal and image downloads both happen
+                    # inside a chapter, before a chapter-level report can move.
+                    # Keep both counters visible to the stall watchdog.
                     "current_images_done": int(info.get("images_done", 0) or 0),
                     "current_images_total": int(info.get("images_total", 0) or 0),
                 })
@@ -626,9 +627,8 @@ def _progress_marker(progress: Any) -> tuple:
     marker over a long period is the worker's only evidence that a coroutine
     parked on a dead connection is not coming back.
 
-    Image progress belongs here because an album chapter is downloaded one image
-    at a time: without it a task that is fetching its 400th image looks exactly
-    like one that stopped an hour ago.
+    Gallery page and image progress belong here because an album chapter may
+    spend hours in those two stages before its chapter-level counters change.
     """
     if not isinstance(progress, dict):
         progress = {}
@@ -638,6 +638,7 @@ def _progress_marker(progress: Any) -> tuple:
         progress.get("books_synced"),
         progress.get("current_book"),
         progress.get("current_chapter"),
+        progress.get("current_content_pages_done"),
         progress.get("current_chapters_created"),
         progress.get("current_images_done"),
         progress.get("current_images_total"),

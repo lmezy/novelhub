@@ -287,8 +287,8 @@ async def test_crawl_runner_progress_does_not_lazy_load_expired_orm_state():
     assert chapter_seen["pages_checked"] == 1
 
 
-def test_progress_marker_moves_when_only_the_image_counter_moves():
-    """An album chapter's only progress is its images.
+def test_progress_marker_moves_for_gallery_pages_and_images():
+    """An album can report progress while pages or images are being fetched.
 
     Online on 2026-09-22 two gallery tasks were killed as "no progress for 60
     minutes" while their logs showed images being fetched until minutes before
@@ -300,12 +300,14 @@ def test_progress_marker_moves_when_only_the_image_counter_moves():
         "books_synced": 12,
         "current_book": "Album",
         "current_chapter": "Chapter 1",
+        "current_content_pages_done": 18,
         "current_chapters_created": 2,
         "current_images_done": 100,
         "current_images_total": 512,
     }
 
     assert _progress_marker(base) == _progress_marker(dict(base))
+    assert _progress_marker({**base, "current_content_pages_done": 19}) != _progress_marker(base)
     assert _progress_marker({**base, "current_images_done": 101}) != _progress_marker(base)
     assert _progress_marker({**base, "current_images_total": 513}) != _progress_marker(base)
 
@@ -333,6 +335,7 @@ async def test_chapter_progress_reaches_the_row_before_the_tenth_update():
             "skipped_chapters": 0,
             "failed_chapters": 0,
             "total_chapters": 1,
+            "content_pages_done": 18 + images_done,
             "images_done": images_done,
             "images_total": 512,
         }
@@ -377,6 +380,8 @@ async def test_chapter_progress_reaches_the_row_before_the_tenth_update():
     assert seen[0][0] == 1, "the first image report has to reach the task row"
     assert seen[0][1]["current_images_done"] == 1
     assert seen[0][1]["current_images_total"] == 512
+    assert seen[0][1]["current_content_pages_done"] == 19
+    assert seen[1][1]["current_content_pages_done"] == 20
     assert seen[1][0] == 1, "reports inside the window must not write again"
 
 
@@ -976,7 +981,7 @@ def test_abandoned_tasks_never_touches_a_running_task_that_reports_progress():
             stall_seconds=600.0,
         )
         assert abandoned == []
-        assert entry.marker == (step, None, None, None, None, None, None, None)
+        assert entry.marker == (step, None, None, None, None, None, None, None, None)
     assert entry.stop_seen_at is None
 
 

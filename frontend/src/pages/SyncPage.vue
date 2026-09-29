@@ -521,6 +521,11 @@ onMounted(async () => {
           <span>{{ i18n.t('sync_found') }} {{ activeTask.progress?.books_found || 0 }}</span>
           <span v-if="activeTask.priority !== undefined">{{ i18n.t('sync_priority') }} {{ activeTask.priority }}</span>
         </div>
+        <div v-if="activeTask.progress?.current_book || activeTask.progress?.current_chapter" class="mb-3 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted dark:text-gray-400">
+          <span>{{ activeTask.progress?.current_book }} · {{ activeTask.progress?.current_chapter }}</span>
+          <span v-if="activeTask.progress?.current_content_pages_done">{{ i18n.t('sync_chapter_pages_fetched', { n: activeTask.progress.current_content_pages_done }) }}</span>
+          <span v-if="activeTask.progress?.current_images_total">{{ i18n.t('sync_images_progress', { done: activeTask.progress.current_images_done || 0, total: activeTask.progress.current_images_total }) }}</span>
+        </div>
         <div class="grid grid-cols-3 gap-2 text-center mb-4">
           <div class="p-2 rounded bg-green-50 dark:bg-green-950">
             <div class="text-sm font-semibold text-green-700 dark:text-green-400">{{ activeTask.progress?.books_synced || 0 }}</div>

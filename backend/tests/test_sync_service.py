@@ -505,6 +505,46 @@ async def test_process_content_images_reports_progress_for_every_image():
 
 
 @pytest.mark.asyncio
+async def test_fetch_chapter_with_retry_forwards_page_progress_when_supported():
+    chapter = SimpleNamespace(title="Chapter", url="https://example.com/1")
+    page_counts: list[int] = []
+
+    async def report_page_progress(pages_done: int) -> None:
+        page_counts.append(pages_done)
+
+    class ProgressPlugin:
+        async def fetch_chapter_content(self, chapter):
+            return "plain"
+
+        async def fetch_chapter_content_with_progress(self, chapter, progress_cb):
+            await progress_cb(7)
+            return "paged"
+
+    plugin = ProgressPlugin()
+
+    result = await SyncService._fetch_chapter_with_retry(
+        plugin,
+        chapter,
+        progress_cb=report_page_progress,
+    )
+
+    assert result == "paged"
+    assert page_counts == [7]
+
+    fallback_plugin = SimpleNamespace(
+        fetch_chapter_content=AsyncMock(return_value="plain"),
+    )
+    fallback = await SyncService._fetch_chapter_with_retry(
+        fallback_plugin,
+        chapter,
+        progress_cb=report_page_progress,
+    )
+
+    assert fallback == "plain"
+    fallback_plugin.fetch_chapter_content.assert_awaited_once_with(chapter)
+
+
+@pytest.mark.asyncio
 async def test_process_content_images_reports_progress_while_fetches_fail():
     """Grinding through a dead image host is still progress, not a hang.
 

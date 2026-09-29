@@ -173,9 +173,16 @@ async def test_fetch_chapter_content_walks_gallery_until_the_album_ends():
         url="https://reader.test/view/1",
         tags="",
     )
+    page_progress: list[int] = []
+
+    async def report_page_progress(pages_done: int) -> None:
+        page_progress.append(pages_done)
 
     with patch.object(plugin, "_get", get):
-        content = await plugin.fetch_chapter_content(chapter)
+        content = await plugin.fetch_chapter_content_with_progress(
+            chapter,
+            report_page_progress,
+        )
 
     assert content.splitlines() == [
         "![](https://img.test/data/1/002.jpg?verify=2)",
@@ -184,6 +191,7 @@ async def test_fetch_chapter_content_walks_gallery_until_the_album_ends():
         "![](https://img.test/data/1/005.jpg?verify=5)",
     ]
     assert get.await_count == 4
+    assert page_progress == [1, 2, 3, 4]
 
 
 @pytest.mark.asyncio

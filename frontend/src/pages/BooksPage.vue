@@ -867,10 +867,10 @@ onMounted(async () => {
                 </div>
                 <p v-if="hit.type === 'chapter'" class="mt-1 text-xs font-medium">{{ hit.title }}</p>
                 <p v-if="hit.author" class="mt-1 text-xs text-muted dark:text-gray-400">{{ hit.author }}</p>
-                <p v-if="hit.snippet" class="mt-1 line-clamp-2 text-xs text-muted dark:text-gray-400"><SnippetText :text="hit.snippet" :terms="advancedTerms" /></p>
+                <p v-if="hit.snippet" class="mt-1 line-clamp-4 text-xs text-muted dark:text-gray-400 sm:line-clamp-2"><SnippetText :text="hit.snippet" :terms="advancedTerms" /></p>
                 <div v-if="hit.matched_chapter" class="mt-2 rounded bg-accent/5 px-2.5 py-2 border border-accent/10">
                   <p class="text-xs font-medium">{{ hit.matched_chapter.title }}</p>
-                  <p v-if="hit.matched_chapter.snippet" class="mt-0.5 line-clamp-2 text-xs text-muted dark:text-gray-400"><SnippetText :text="hit.matched_chapter.snippet" :terms="advancedTerms" /></p>
+                  <p v-if="hit.matched_chapter.snippet" class="mt-0.5 line-clamp-4 text-xs text-muted dark:text-gray-400 sm:line-clamp-2"><SnippetText :text="hit.matched_chapter.snippet" :terms="advancedTerms" /></p>
                 </div>
               </div>
             </button>
@@ -929,10 +929,10 @@ onMounted(async () => {
                 </div>
                 <p v-if="hit.type === 'chapter'" class="mt-1 text-xs font-medium">{{ hit.title }}</p>
                 <p v-if="hit.author" class="mt-1 text-xs text-muted dark:text-gray-400">{{ hit.author }}</p>
-                <p v-if="hit.snippet" class="mt-1 line-clamp-2 text-xs text-muted dark:text-gray-400"><SnippetText :text="hit.snippet" :terms="quickTerms" /></p>
+                <p v-if="hit.snippet" class="mt-1 line-clamp-4 text-xs text-muted dark:text-gray-400 sm:line-clamp-2"><SnippetText :text="hit.snippet" :terms="quickTerms" /></p>
                 <div v-if="hit.matched_chapter" class="mt-2 rounded bg-accent/5 px-2.5 py-2 border border-accent/10">
                   <p class="text-xs font-medium">{{ hit.matched_chapter.title }}</p>
-                  <p v-if="hit.matched_chapter.snippet" class="mt-0.5 line-clamp-2 text-xs text-muted dark:text-gray-400"><SnippetText :text="hit.matched_chapter.snippet" :terms="quickTerms" /></p>
+                  <p v-if="hit.matched_chapter.snippet" class="mt-0.5 line-clamp-4 text-xs text-muted dark:text-gray-400 sm:line-clamp-2"><SnippetText :text="hit.matched_chapter.snippet" :terms="quickTerms" /></p>
                 </div>
               </div>
             </button>
