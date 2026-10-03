@@ -1285,6 +1285,37 @@ async def test_explore_rule_items_survive_without_book_url_pattern():
 
 
 @pytest.mark.asyncio
+async def test_xiguashuwu_source_asset_discovers_catalog_cards():
+    from pathlib import Path
+
+    source_path = Path(__file__).resolve().parents[2] / "sources" / "xiguashuwu.json"
+    source_config = json.loads(source_path.read_text(encoding="utf-8"))
+    plugin = YueduPlugin(source_config)
+    html = """
+    <div class="CGsectionTwo-right-content-unit">
+      <p>示例小说 <a href="/book/123/catalog/">阅读本书</a></p>
+      <p>示例作者</p>
+      <p>示例简介</p>
+      <p>12万字</p>
+    </div>
+    """
+
+    with patch.object(plugin, "_get", AsyncMock(return_value=html)):
+        books = await plugin.discover_books(
+            url="https://www.xiguashuwu.com/category/1/1.html",
+            page=1,
+        )
+
+    assert [(book.title, book.author, book.url) for book in books] == [
+        (
+            "示例小说",
+            "示例作者",
+            "https://www.xiguashuwu.com/book/123/catalog/",
+        ),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_explore_items_still_filtered_when_pattern_declared():
     plugin = YueduPlugin({
         "bookSourceUrl": "https://example.com",

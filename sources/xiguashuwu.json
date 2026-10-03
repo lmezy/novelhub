@@ -4,7 +4,7 @@
     "bookSourceGroup": "西瓜书屋",
     "bookSourceType": 0,
     "bookSourceUrl": "https://www.xiguashuwu.com",
-    "bookUrlPattern": "https?://(www\\.)?xiguashuwu\\.com/book/\\d+/([^/]+\\.html|catalog/?)?$",
+    "bookUrlPattern": "https?://(www\\.)?xiguashuwu\\.com/book/\\d+/(?:catalog/?|iszip/[01]/?)?$",
     "charset": "utf-8",
     "header": "{\n    \"User-Agent\": \"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36\"\n  }",
     "customOrder": 0,
@@ -27,22 +27,24 @@
         "nextContentUrl": "a:contains(下一页)@href"
     },
     "ruleExplore": {
-        "author": "a[href*='/writer/']@text",
-        "bookList": "a[href*='/book/'][href*='/iszip/']",
-        "bookUrl": "@href",
-        "intro": "",
+        "author": "p.1@text",
+        "bookList": ".CGsectionTwo-right-content-unit",
+        "bookUrl": "a@href",
+        "intro": "p.2@text##.*/",
         "kind": "",
         "lastChapter": "",
-        "name": "@text"
+        "name": "p.0@text##阅读本书",
+        "wordCount": "p.3@text"
     },
     "ruleSearch": {
-        "author": "a[href*='/writer/']@text",
-        "bookList": "a[href*='/book/'][href*='/iszip/']",
-        "bookUrl": "@href",
+        "author": "span.2@text",
+        "bookList": ".SHsectionThree-middle p",
+        "bookUrl": "span.1@a@href",
+        "coverUrl": "img@src",
         "intro": "",
-        "kind": "",
+        "kind": "span.0@text##\\[|\\]",
         "lastChapter": "",
-        "name": "@text"
+        "name": "span.1@text"
     },
     "ruleToc": {
         "chapterList": "a[href*='/book/'][href$='.html']",

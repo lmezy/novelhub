@@ -2172,15 +2172,6 @@ class SyncService:
                         source_id, page, books_synced, message,
                     )
                     return _result_so_far(done_state=True, next_page=page)
-                if await _source_has_books():
-                    # Page 1 is the only page missing, but this source already
-                    # has books here: the site is having a moment, not the rule.
-                    logger.warning(
-                        "Discovery for {} failed on the first page, but the source "
-                        "already has books in the library: {}",
-                        source_id, message,
-                    )
-                    return _result_so_far(done_state=True, next_page=page)
                 raise
             if not page_books:
                 done = True

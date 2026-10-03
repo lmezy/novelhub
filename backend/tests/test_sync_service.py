@@ -2073,24 +2073,23 @@ async def test_discover_and_sync_all_keeps_books_when_a_later_page_breaks():
 
 
 @pytest.mark.asyncio
-async def test_discover_and_sync_all_first_page_break_with_library_is_not_a_failure():
-    """Page 1 failing for a source that already has books is a site hiccup."""
+async def test_discover_and_sync_all_first_page_break_with_library_is_retryable():
+    """A first-page failure must not be reported as a completed empty sync."""
     db = _mock_db()
     db.get.return_value = _source()
     db.rollback = AsyncMock()
-    # Only "does this source already have books?" reaches ``db.scalar`` now --
-    # the stored Cookie is read by ``load_source_cookie`` on its own session.
-    db.scalar.return_value = "book-id"
 
     plugin = AsyncMock()
     plugin.set_cookie = MagicMock()
     plugin.discover_books.side_effect = RuntimeError("ConnectError")
 
     with patch("app.services.sync.get_plugin", return_value=plugin):
-        result = await SyncService(db).discover_and_sync_all("src1", max_pages=10)
+        with pytest.raises(RuntimeError, match="ConnectError") as excinfo:
+            await SyncService(db).discover_and_sync_all("src1", max_pages=10)
 
-    assert result["books_synced"] == 0
-    assert result["done"] is True
+    from app.services.crawl_runner import _is_transient_task_error
+
+    assert _is_transient_task_error(excinfo.value) is True
 
 
 @pytest.mark.asyncio
