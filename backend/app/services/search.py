@@ -34,6 +34,7 @@ class SearchService:
     # chunks, up to ``CONTENT_WINDOW_MAX``; the first eight pages stay as cheap
     # as they were and only an actual deep page pays for the wider scan.
     CONTENT_CANDIDATE_LIMIT = 300
+    CONTENT_RECALL_RETRY_THRESHOLD = 40
     # How many 正文 candidates one page may scan through.  2000 chapters is
     # ~190 MB of JSON and some ten seconds, which is the point where a deep page
     # stops being worth it -- and, measured against the live index, enough to
@@ -79,10 +80,8 @@ class SearchService:
     # hits are scored and cached for paging; it is much larger than the
     # per-condition window because the engine did the selection already.
     CONJUNCTION_CANDIDATE_LIMIT = 1000
-    # Page hits are re-checked against the real field text (the engine's CJK
-    # matching drops a term silently sometimes).  The check needs the stored
-    # field, so it is capped: pages beyond this many hits come from the engine's
-    # own match, still ranked, just not re-verified.
+    # Complete small exact result sets are verified before paging; larger sets
+    # are checked page by page because verification retrieves stored text.
     CONJUNCTION_VERIFY_MAX_HITS = 200
     # Words returned around the match when a chapter body is used as a snippet.
     SNIPPET_CROP_WORDS = 60
@@ -899,43 +898,71 @@ class SearchService:
             retrieve.append("author")
         else:
             retrieve.extend(["book_id", "book_title"])
-        hits: list[dict] = []
-        fetched = 0
         step = self._SCAN_CHUNK if chunk_size is None else max(1, int(chunk_size))
-        while fetched < window:
-            chunk = min(step, window - fetched)
-            options = {
-                "limit": chunk,
-                "offset": fetched,
-                "attributesToSearchOn": [attr],
-                "attributesToRetrieve": list(dict.fromkeys(retrieve)),
-                "showRankingScore": True,
-            }
-            if filters:
-                options["filter"] = filters
-            page = self.client.index(index_name).search(value, options)
-            page_hits = page.get("hits", []) or []
-            hits.extend(page_hits)
-            fetched += len(page_hits)
-            if len(page_hits) < chunk:
-                break
-        scored: list[tuple[int, str, str]] = []
-        for hit in hits:
-            text = hit.get(attr) or ""
-            score = self._condition_score(
-                value,
-                text,
-                mode,
-                hit.get("_rankingScore", 0),
-            )
-            if score > 0:
-                scored.append((
+        index = self.client.index(index_name)
+
+        def collect_candidates(matching_strategy: str | None) -> list[dict]:
+            candidates: list[dict] = []
+            fetched = 0
+            while fetched < window:
+                chunk = min(step, window - fetched)
+                options = {
+                    "limit": chunk,
+                    "offset": fetched,
+                    "attributesToSearchOn": [attr],
+                    "attributesToRetrieve": list(dict.fromkeys(retrieve)),
+                    "showRankingScore": True,
+                }
+                if filters:
+                    options["filter"] = filters
+                if matching_strategy:
+                    options["matchingStrategy"] = matching_strategy
+                page = index.search(value, options)
+                page_hits = page.get("hits", []) or []
+                candidates.extend(page_hits)
+                fetched += len(page_hits)
+                if len(page_hits) < chunk:
+                    break
+            return candidates
+
+        def score_candidates(candidates: list[dict]) -> list[tuple[int, str, str]]:
+            scored_by_id: dict[str, tuple[int, str, str]] = {}
+            for hit in candidates:
+                text = hit.get(attr) or ""
+                score = self._condition_score(
+                    value,
+                    text,
+                    mode,
+                    hit.get("_rankingScore", 0),
+                )
+                if score <= 0:
+                    continue
+                doc_id = str(hit.get("id"))
+                candidate = (
                     score,
-                    str(hit.get("id")),
+                    doc_id,
                     self._snippet(text, [value]) if attr == "content" else "",
-                ))
-        scored.sort(key=lambda row: (-row[0], row[1]))
-        return scored
+                )
+                previous = scored_by_id.get(doc_id)
+                if previous is None or candidate[0] > previous[0]:
+                    scored_by_id[doc_id] = candidate
+            return sorted(
+                scored_by_id.values(),
+                key=lambda row: (-row[0], row[1]),
+            )
+
+        if index_name != self.INDEX_CHAPTERS or attr != "content" or len(value) <= 1:
+            return score_candidates(collect_candidates(None))
+
+        try:
+            candidates = collect_candidates("all")
+        except meilisearch.errors.MeilisearchApiError:
+            return score_candidates(collect_candidates(None))
+
+        scored = score_candidates(candidates)
+        if scored and len(scored) >= min(self.CONTENT_RECALL_RETRY_THRESHOLD, window):
+            return scored
+        return score_candidates(candidates + collect_candidates(None))
 
     def _hydrate(self, index_name: str, ids: list[str]) -> dict[str, dict]:
         """Fetch the full documents for the ids of one page.
@@ -1180,16 +1207,11 @@ class SearchService:
     def _conjunction_query(active: list[dict]) -> str:
         """The engine query for an AND: one term per condition, deduplicated.
 
-        Exact multi-character values are sent as ``"phrase"`` queries.
-        Meilisearch tokenizes CJK into single characters, so a bare
-        ``师妹 乳环`` with ``matchingStrategy: "all"`` matches any chapter
-        holding the four characters scattered anywhere (3 094 hits on the live
-        index for a 20-chapter intersection), while the page-level substring
-        gate then drops every one of them -- total says thousands, the list is
-        empty.  Quoting makes the engine require the contiguous substring,
-        which is exactly what exact mode verifies.  Fuzzy values stay
-        unquoted: fuzzy only requires every character to appear, which is what
-        the bare character tokens already express.
+        Exact multi-character values are quoted to improve engine ranking.
+        CJK phrase queries can still return scattered character matches, so
+        exact-mode hits must be checked against their stored text. Fuzzy values
+        stay unquoted: fuzzy only requires every character to appear, which is
+        what the bare character tokens already express.
         """
         terms: list[str] = []
         seen: set[str] = set()
@@ -1268,7 +1290,7 @@ class SearchService:
         index_name: str,
         ids: list[str],
         attr: str,
-    ) -> dict[str, str]:
+    ) -> dict[str, str | None]:
         """The stored text of ``attr`` for a page's ids, in one engine call."""
         if not ids or not attr:
             return {}
@@ -1282,12 +1304,12 @@ class SearchService:
         except meilisearch.errors.MeilisearchApiError as exc:
             logger.warning("Conjunction verification unavailable: {}", exc)
             return {}
-        values: dict[str, str] = {}
+        values: dict[str, str | None] = {}
         for hit in result.get("hits", []) or []:
             text = hit.get(attr)
             # No stored value means the field is not retrievable; report it as
             # "unknown" so the caller falls back to the engine's own match.
-            values[str(hit.get("id"))] = "" if text is None else str(text)
+            values[str(hit.get("id"))] = None if text is None else str(text)
         return values
 
     def _conjunction_search(
@@ -1316,6 +1338,8 @@ class SearchService:
             str(self.CONJUNCTION_CANDIDATE_LIMIT),
         ))
         ranked = self._page_cache_get(cache_key)
+        verified_text: dict[str, str | None] = {}
+        verification_attempted = False
         engine_total: int | None = None
         now = time.monotonic()
         cached_total = self._conjunction_totals.get(cache_key)
@@ -1326,6 +1350,39 @@ class SearchService:
                 index_name, attr, active, filters,
                 self.CONJUNCTION_CANDIDATE_LIMIT,
             )
+            if (
+                ranked
+                and engine_total is not None
+                and engine_total <= len(ranked)
+                and len(ranked) <= self.CONJUNCTION_VERIFY_MAX_HITS
+                and all((cond.get("mode") or "exact") == "exact" for cond in active)
+            ):
+                candidate_ids = [row[1] for row in ranked]
+                candidate_text = self._conjunction_values(
+                    index_name, candidate_ids, attr,
+                )
+                verification_attempted = True
+                verified_text = candidate_text
+                if (
+                    len(candidate_text) == len(ranked)
+                    and all(text is not None for text in candidate_text.values())
+                ):
+                    verified_ranked = []
+                    for _rank_score, doc_id, snippet in ranked:
+                        text = candidate_text[doc_id] or ""
+                        match_score = sum(
+                            1
+                            for cond in active
+                            if self._condition_score(
+                                cond["value"],
+                                text,
+                                cond.get("mode") or "exact",
+                            ) > 0
+                        )
+                        if match_score == len(active):
+                            verified_ranked.append((match_score, doc_id, snippet))
+                    ranked = verified_ranked
+                    engine_total = len(ranked)
             self._page_cache_put(cache_key, ranked)
             self._conjunction_totals[cache_key] = (
                 now + self.PAGE_CACHE_TTL_SECONDS, engine_total,
@@ -1343,17 +1400,12 @@ class SearchService:
             attr,
         )
         page_ids = [row[1] for row in page_rows]
-        # Re-check the page against the stored text.  Quoted exact values make
-        # the engine require the contiguous substring, so a mismatch here means
-        # a fuzzy condition scattered its characters -- the only residual gap
-        # the engine can still produce.  Verified survivors are always served;
-        # unverifiable ids are served too (the engine required every quoted
-        # term), so the list can never be shorter than what this page ranked.
-        # The honest ``total`` is what the engine counted; a page that verifies
-        # to fewer rows still keeps that total, otherwise the header count
-        # ("一千多条") would contradict an empty list ("没有找到结果").
-        stored: dict[str, str] = {}
-        if page_ids and len(page_ids) <= self.CONJUNCTION_VERIFY_MAX_HITS:
+        stored = verified_text
+        if (
+            not verification_attempted
+            and page_ids
+            and len(page_ids) <= self.CONJUNCTION_VERIFY_MAX_HITS
+        ):
             stored = self._conjunction_values(index_name, page_ids, attr)
         hits = []
         for _score, doc_id, _snippet in page_rows:
@@ -1370,21 +1422,7 @@ class SearchService:
                 ) > 0
             )
             if score < len(active):
-                # AND gate failed: only a fuzzy condition can still fail here.
-                # Exact values were already required as contiguous phrases by
-                # the quoted engine query, so dropping the row would make the
-                # list shorter than the ranked page (and, at the extreme, an
-                # empty list under a non-zero total).  Fuzzy values keep their
-                # bare character tokens, so their scatter matches must still
-                # be dropped -- that is the one residual gap the engine leaves.
-                has_fuzzy = any(
-                    (cond.get("mode") or "exact") != "exact"
-                    for cond in active
-                )
-                if not has_fuzzy:
-                    score = len(active)
-                else:
-                    continue
+                continue
             hits.append(
                 self._serialize_scored_hit(
                     hit,

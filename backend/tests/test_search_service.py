@@ -976,6 +976,56 @@ def _chapter_bodies():
     return {"c1": "铃儿走进仙山。", "c2": "仙子摇响了铃。"}
 
 
+def test_single_content_scan_uses_all_matching_for_multichar_candidates():
+    service, _, chapters_index = _service_with_indexes()
+    chapters_index.search.return_value = {
+        "hits": [
+            {"id": f"c{index_number}", "content": "师妹的乳环"}
+            for index_number in range(SearchService.CONTENT_RECALL_RETRY_THRESHOLD)
+        ],
+    }
+
+    ranked = service._scan_condition(
+        SearchService.INDEX_CHAPTERS,
+        "content",
+        "乳环",
+        None,
+        SearchService.CONTENT_CANDIDATE_LIMIT,
+    )
+
+    assert len(ranked) == SearchService.CONTENT_RECALL_RETRY_THRESHOLD
+    assert chapters_index.search.call_count == 1
+    assert chapters_index.search.call_args.args[0] == "乳环"
+    assert chapters_index.search.call_args.args[1]["matchingStrategy"] == "all"
+
+
+def test_single_content_scan_unions_legacy_candidates_when_underfilled():
+    service, _, chapters_index = _service_with_indexes()
+
+    def _search(query, options):
+        if options.get("matchingStrategy") == "all":
+            return {"hits": [{"id": "c1", "content": "师妹的乳环"}]}
+        return {"hits": [
+            {"id": "c1", "content": "师妹的乳环"},
+            {"id": "c2", "content": "另一本书也有乳环"},
+        ]}
+
+    chapters_index.search.side_effect = _search
+
+    ranked = service._scan_condition(
+        SearchService.INDEX_CHAPTERS,
+        "content",
+        "乳环",
+        None,
+        SearchService.CONTENT_CANDIDATE_LIMIT,
+    )
+
+    assert [row[1] for row in ranked] == ["c1", "c2"]
+    assert chapters_index.search.call_count == 2
+    assert chapters_index.search.call_args_list[0].args[1]["matchingStrategy"] == "all"
+    assert "matchingStrategy" not in chapters_index.search.call_args_list[1].args[1]
+
+
 def _route_chapters(conjunction_hits, stored, engine_total):
     """Route the mock's calls the way the engine answers them.
 
@@ -1169,13 +1219,7 @@ def test_book_metadata_and_keeps_the_wide_window_path():
 
 
 def test_conjunction_query_quotes_exact_multi_character_values():
-    """Exact values must reach the engine as phrase queries.
-
-    Live index: bare ``师妹 乳环`` matched 3 094 chapters (any chapter holding
-    the four characters scattered), while only 20 hold both substrings.  The
-    page-level gate dropped every scattered hit, so total said thousands and
-    the list was empty.  Quoting makes the engine require the substrings.
-    """
+    """Quote exact values to improve engine ranking before body verification."""
     assert (
         SearchService._conjunction_query([
             {"field": "content", "mode": "exact", "value": "师妹"},
@@ -1203,28 +1247,26 @@ def test_conjunction_query_leaves_fuzzy_and_single_char_values_bare():
     )
 
 
-def test_same_field_exact_and_never_drops_a_ranked_page_row():
-    """An all-exact AND must serve every row the engine ranked.
-
-    Regression for 师妹 + 乳环: exact values are quoted, so the engine
-    already required the substrings; the page gate must not re-drop them,
-    otherwise total is non-zero while the list is empty.
-    """
+def test_same_field_exact_and_filters_cjk_false_positives():
+    """Quoted CJK queries can still return scattered-character candidates."""
     service, _, chapters_index = _service_with_indexes()
-    chapters_index.search.side_effect = [
-        {"hits": [{"id": "c1"}, {"id": "c2"}], "estimatedTotalHits": 2},
-        {"hits": [
+
+    def _search(query, options):
+        if options.get("matchingStrategy") == "all":
+            return {"hits": [{"id": "c1"}, {"id": "c2"}], "estimatedTotalHits": 2}
+        if "content" in (options.get("attributesToRetrieve") or []):
+            return {"hits": [
+                {"id": "c1", "content": "师妹与乳环同时出现"},
+                {"id": "c2", "content": "师妹出现，但乳与环分开"},
+            ]}
+        return {"hits": [
             {"id": "c1", "book_id": "b1", "title": "第1章", "book_title": "师妹传",
              "_formatted": {"content": "师妹…乳环"}},
             {"id": "c2", "book_id": "b2", "title": "第2章", "book_title": "乳环录",
              "_formatted": {"content": "乳环…师妹"}},
-        ]},
-        {"hits": [
-            {"id": "c1", "content": "这章只有师没有妹，更无乳环二字连写"},
-            {"id": "c2", "content": "同样散落的师与妹，以及乳与环"},
-        ]},
-    ]
+        ]}
 
+    chapters_index.search.side_effect = _search
     result = service.advanced_search(
         [
             {"field": "content", "mode": "exact", "value": "师妹"},
@@ -1234,9 +1276,8 @@ def test_same_field_exact_and_never_drops_a_ranked_page_row():
         scope="chapters",
     )
 
-    # The engine required both phrases; the page keeps both rows.
-    assert [hit["id"] for hit in result["hits"]] == ["c1", "c2"]
-    assert result["total"] == 2
+    assert [hit["id"] for hit in result["hits"]] == ["c1"]
+    assert result["total"] == 1
     scan = chapters_index.search.call_args_list[0]
     assert scan.args[0] == '"师妹" "乳环"'
     assert scan.args[1]["matchingStrategy"] == "all"
