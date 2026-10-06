@@ -21,30 +21,16 @@ class SearchService:
     # chapter batch.  1000 keeps the same semantics at ~0.5 s while still
     # offering 25 pages of 40 results.
     CANDIDATE_LIMIT = 1000
-    # ``content`` needs its own, much smaller window.  Scoring a content match
-    # requires the chapter text itself, so the candidate fetch has to carry it:
-    # 1000 chapters is ~96 MB of JSON and took 18-25 s *on every request*
-    # (measured on the live 115k-chapter index), while 300 is ~29 MB and stays
-    # under a second.  300 candidates is still eight pages of 40 results.
-    #
-    # That window used to be the *hard* end of a 正文 search: with 300 candidates
-    # scored and ranked, page 9 did not exist and the result list simply stopped,
-    # which read as "搜索只有 300 条" (the reported bug).  It now grows with the
-    # page being asked for (``_content_window_for``), in the same 300-candidate
-    # chunks, up to ``CONTENT_WINDOW_MAX``; the first eight pages stay as cheap
-    # as they were and only an actual deep page pays for the wider scan.
-    CONTENT_CANDIDATE_LIMIT = 300
+    # Meilisearch's ``pagination.maxTotalHits`` -- the highest page number its
+    # ranking rules will serve (``_ensure_index`` applies this to both indexes).
+    MAX_TOTAL_HITS = 10_000
+    # 正文 searches score the full engine candidate window in chunks before
+    # reporting their total. Returning only the first 300 candidates also made
+    # the frontend disable pagination before the old on-demand window could grow.
+    CONTENT_CANDIDATE_LIMIT = MAX_TOTAL_HITS
+    CONTENT_SEARCH_LIMIT = CONTENT_CANDIDATE_LIMIT
     CONTENT_RECALL_RETRY_THRESHOLD = 40
-    # How many 正文 candidates one page may scan through.  2000 chapters is
-    # ~190 MB of JSON and some ten seconds, which is the point where a deep page
-    # stops being worth it -- and, measured against the live index, enough to
-    # answer "I only wanted to look further than page 8".  A page beyond this is
-    # served from the last rows of the window that was scanned.
-    CONTENT_WINDOW_MAX = 2000
-    # Per-request candidate count while walking a window wider than one engine
-    # page (see ``_scan_condition``).  Meilisearch's default ``pagination
-    # .maxTotalHits`` is 1000, so a window of at most that size is still exactly
-    # one request and only the 1500/2000-deep pages are split.
+    # Per-request candidate count while walking the full body-search window.
     _SCAN_CHUNK = 1000
     # Single-condition searches score the engine's candidates in Python (see
     # ``_single_condition_search``) because Meilisearch cannot express a Chinese
@@ -55,20 +41,14 @@ class SearchService:
     # ``id`` + the searched field, which is 0.02-0.7 s for 10 000 documents, and
     # the ordered result is cached for repeat pages.
     METADATA_CANDIDATE_LIMIT = 10_000
-    # Meilisearch's ``pagination.maxTotalHits`` -- the highest page number its
-    # ranking rules will serve (it refuses ``page * hitsPerPage`` beyond this).
-    # Both indexes are created with this value (``_ensure_index``).
-    MAX_TOTAL_HITS = 10_000
     # How long a scored single-condition result stays usable for paging.  Books
     # and chapters keep flowing in while a user pages, so this is deliberately
     # short; the cost of a miss is one scan.
     PAGE_CACHE_TTL_SECONDS = 120
-    # One entry is at most 10 000 ``(score, id, snippet)`` pairs.  The ids and
-    # scores dominate the metadata case (~1.5 MB), so 16 keeps the worst case
-    # around 24 MB per process.  A 正文 entry is smaller than that by design: its
-    # window caps at ``CONTENT_WINDOW_MAX`` rows and each row carries a bounded
-    # excerpt, so even sixteen deep-page scans stay in the low tens of MB.
+    # One entry is at most 10 000 ``(score, id, snippet)`` pairs. Content rows
+    # retain only a bounded excerpt, not the chapter bodies, after scoring.
     PAGE_CACHE_MAX_ENTRIES = 16
+    CONDITION_CACHE_MAX_ENTRIES = 8
     # Multi-condition (AND/OR) searches used to score every condition on its own
     # candidate window and intersect the ids in Python.  For two conditions on
     # the same attribute that is arithmetically hopeless: 正文 「铃」 has 9 619
@@ -77,14 +57,14 @@ class SearchService:
     # intersection held 1 299 chapters.  Same-attribute AND now asks the engine
     # for the conjunction (`matchingStrategy: "all"`) instead, which finds real
     # intersections at any depth.  The window below is how many of those ranked
-    # hits are scored and cached for paging; it is much larger than the
-    # per-condition window because the engine did the selection already.
-    CONJUNCTION_CANDIDATE_LIMIT = 1000
+    # hits are scored and cached for paging; the engine narrows candidates before
+    # returning ids, and chapter bodies are fetched only for the current page.
+    CONJUNCTION_CANDIDATE_LIMIT = MAX_TOTAL_HITS
     # Complete small exact result sets are verified before paging; larger sets
     # are checked page by page because verification retrieves stored text.
     CONJUNCTION_VERIFY_MAX_HITS = 200
     # Words returned around the match when a chapter body is used as a snippet.
-    SNIPPET_CROP_WORDS = 60
+    SNIPPET_CROP_WORDS = 160
     # A served snippet is a window anchored *at* the match rather than centred on
     # it.  The result list clamps a snippet to two lines, and a phone line holds
     # roughly a third of a desktop line's glyphs (a 320 px viewport fits ~21 CJK
@@ -95,7 +75,7 @@ class SearchService:
     # below plus the ``...`` marker stay inside the first phone line; the tail is
     # the part the clamp trims first, so it can be generous.
     SNIPPET_LEAD_CHARS = 12
-    SNIPPET_TAIL_CHARS = 160
+    SNIPPET_TAIL_CHARS = 320
     CONTENT_INDEX_LIMIT = 100_000
     DESCRIPTION_INDEX_LIMIT = 2000
 
@@ -183,6 +163,9 @@ class SearchService:
         self._chapter_buffer: list[dict] = []
         self._ensured: set[str] = set()
         self._page_cache: dict[str, tuple[float, list[tuple[int, str, str]]]] = {}
+        self._condition_cache: dict[
+            str, tuple[float, dict[str, tuple[int, dict]]]
+        ] = {}
         # The engine's own hit count for a conjunction query.  It has to be kept
         # with the cached ranking, otherwise page 1 would report the engine's
         # count and page 2 the window's -- the result list would "change" as the
@@ -461,6 +444,8 @@ class SearchService:
         value: str,
         filters: str | None,
         limit: int | None = None,
+        offset: int = 0,
+        matching_strategy: str | None = None,
     ) -> dict:
         options = {
             "limit": int(
@@ -468,13 +453,15 @@ class SearchService:
                 or (self.CONTENT_CANDIDATE_LIMIT if attr == "content"
                     else self.CANDIDATE_LIMIT)
             ),
-            "offset": 0,
+            "offset": offset,
             "attributesToSearchOn": [attr],
             # Cap the payload: without this a chapter search returned every
             # candidate's full 100 KB body (313 MB for one page click).
             "attributesToRetrieve": self._retrieve_attrs(index_name, attr),
             "showRankingScore": True,
         }
+        if matching_strategy:
+            options["matchingStrategy"] = matching_strategy
         if filters:
             options["filter"] = filters
         try:
@@ -497,10 +484,11 @@ class SearchService:
 
         The books index answers a 10 000-document window in 0.1-0.3 s (measured
         on the live 24k-book index), so book-side conditions simply score every
-        match.  The chapters index is two orders of magnitude slower at that
-        width (47-250 s measured on the live 115k-chapter index), so chapter-side
-        conditions keep the small window, and ``content`` keeps the smallest one
-        because its candidates have to carry the body (``_retrieve_attrs``).
+        match. The chapters index is two orders of magnitude slower at that
+        width (47-250 s measured on the live 115k-chapter index), so chapter
+        metadata conditions keep the small window. Content uses the full engine
+        candidate window; body queries are fetched in chunks and retained as
+        bounded snippets while their scores are combined.
         """
         if attr == "content":
             return self.CONTENT_CANDIDATE_LIMIT
@@ -527,21 +515,91 @@ class SearchService:
         filters: str | None,
         limit: int | None = None,
     ) -> dict[str, tuple[int, dict]]:
-        result = self._search_field(
-            index_name, attr, value, filters,
-            limit if limit is not None else self._candidate_window(index_name, attr),
+        window = (
+            limit if limit is not None
+            else self._candidate_window(index_name, attr)
         )
-        candidates: dict[str, tuple[int, dict]] = {}
-        for hit in result.get("hits", []):
-            text = hit.get(attr) or ""
-            score = self._condition_score(
-                value,
-                text,
-                mode,
-                hit.get("_rankingScore", 0),
-            )
-            if score > 0:
-                candidates[str(hit.get("id"))] = (score, hit)
+        cache_key = "|".join((
+            index_name, attr, value, mode, filters or "", str(window),
+        ))
+        now = time.monotonic()
+        cached = self._condition_cache.get(cache_key)
+        if cached is not None:
+            expires_at, candidates = cached
+            if expires_at >= now:
+                return candidates
+            self._condition_cache.pop(cache_key, None)
+        step = min(self._SCAN_CHUNK, window) if attr == "content" else window
+
+        def collect(matching_strategy: str | None) -> dict[str, tuple[int, dict]]:
+            candidates: dict[str, tuple[int, dict]] = {}
+            fetched = 0
+            while fetched < window:
+                chunk = min(step, window - fetched)
+                result = self._search_field(
+                    index_name,
+                    attr,
+                    value,
+                    filters,
+                    limit=chunk,
+                    offset=fetched,
+                    matching_strategy=matching_strategy,
+                )
+                page_hits = result.get("hits", []) or []
+                for hit in page_hits:
+                    text = hit.get(attr) or ""
+                    score = self._condition_score(
+                        value,
+                        text,
+                        mode,
+                        hit.get("_rankingScore", 0),
+                    )
+                    if score <= 0:
+                        continue
+                    doc_id = str(hit.get("id"))
+                    retained_hit = hit
+                    if attr == "content":
+                        retained_hit = dict(hit)
+                        retained_hit[attr] = self._snippet(text, [value])
+                    previous = candidates.get(doc_id)
+                    if previous is None or score > previous[0]:
+                        candidates[doc_id] = (score, retained_hit)
+                fetched += len(page_hits)
+                if len(page_hits) < chunk:
+                    break
+            return candidates
+
+        if index_name != self.INDEX_CHAPTERS or attr != "content" or len(value) <= 1:
+            candidates = collect(None)
+        else:
+            try:
+                candidates = collect("all")
+            except meilisearch.errors.MeilisearchApiError:
+                candidates = collect(None)
+            else:
+                if not candidates or len(candidates) < min(
+                    self.CONTENT_RECALL_RETRY_THRESHOLD, window,
+                ):
+                    for doc_id, candidate in collect(None).items():
+                        previous = candidates.get(doc_id)
+                        if previous is None or candidate[0] > previous[0]:
+                            candidates[doc_id] = candidate
+
+        now = time.monotonic()
+        for stale_key in [
+            key
+            for key, (expires_at, _) in self._condition_cache.items()
+            if expires_at < now
+        ]:
+            self._condition_cache.pop(stale_key, None)
+        self._condition_cache[cache_key] = (
+            now + self.PAGE_CACHE_TTL_SECONDS, candidates,
+        )
+        while len(self._condition_cache) > self.CONDITION_CACHE_MAX_ENTRIES:
+            oldest = min(
+                self._condition_cache.items(), key=lambda item: item[1][0],
+            )[0]
+            self._condition_cache.pop(oldest, None)
         return candidates
 
     @classmethod
@@ -849,16 +907,14 @@ class SearchService:
         return self.CHAPTER_BOOK_FIELD_ATTRS.get(field)
 
     def _content_window_for(self, offset: int) -> int:
-        """How far a 正文 search has to scan to serve ``offset``.
+        """Scan all candidates available to a single-condition 正文 search.
 
-        Grows in ``CONTENT_CANDIDATE_LIMIT`` steps so that page 9 costs the same
-        per candidate as page 1, and caps at ``CONTENT_WINDOW_MAX``.  Metadata
-        keeps the flat 10 000 window: its scan does not carry any text, so page
-        250 costs nothing extra.
+        Returning only the requested page's candidate window made ``total`` an
+        underestimate, so the frontend disabled its next-page control at 300.
+        The complete engine window is now scored and cached once, then all pages
+        use that same ranking. The offset is intentionally irrelevant.
         """
-        needed = max(self.CONTENT_CANDIDATE_LIMIT, int(offset) + 1)
-        steps = -(-needed // self.CONTENT_CANDIDATE_LIMIT)  # ceil
-        return min(self.CONTENT_WINDOW_MAX, steps * self.CONTENT_CANDIDATE_LIMIT)
+        return self.CONTENT_SEARCH_LIMIT
 
     def _scan_condition(
         self,
@@ -873,17 +929,14 @@ class SearchService:
         """Rank the engine's candidates with the shared Python scorer.
 
         Only ``id``, the searched field and the cheapest display fields are
-        retrieved, so a 10 000 document window costs 0.02-0.7 s instead of the
-        96 MB / 18 s that pulling every chapter body used to cost.  The result is
-        a ranked ``(score, id, snippet)`` list -- tiny enough to cache, which is
-        what makes pages 2..N cheap.
+        retrieved. Body candidates are read in bounded chunks, scored as they
+        arrive, and reduced to a ranked ``(score, id, snippet)`` list for the
+        page cache; this avoids retaining full chapter texts after each chunk.
 
-        A window of at most ``chunk_size`` candidates is still exactly one
-        request -- ``window`` itself for a metadata scan, ``_SCAN_CHUNK`` for a
-        正文 one.  A wider window (only a deep 正文 page reaches it) is walked in
-        chunks, because Meilisearch will not build a 2 000-document body-carrying
-        page in one answer; a short chunk also means the engine has nothing left,
-        so the rest of the window is skipped.
+        A window wider than ``chunk_size`` is walked in chunks, so a complete
+        正文 candidate set never has to be returned in one large response. A
+        short chunk means the engine has nothing left, so the remaining window
+        is skipped.
 
         The snippet is built here because this is the only place that holds the
         stored text of every hit.  The page that is served is hydrated with an
@@ -901,8 +954,12 @@ class SearchService:
         step = self._SCAN_CHUNK if chunk_size is None else max(1, int(chunk_size))
         index = self.client.index(index_name)
 
-        def collect_candidates(matching_strategy: str | None) -> list[dict]:
-            candidates: list[dict] = []
+        def collect_scored_candidates(
+            matching_strategy: str | None,
+            scored_by_id: dict[str, tuple[int, str, str]] | None = None,
+        ) -> dict[str, tuple[int, str, str]]:
+            if scored_by_id is None:
+                scored_by_id = {}
             fetched = 0
             while fetched < window:
                 chunk = min(step, window - fetched)
@@ -919,50 +976,52 @@ class SearchService:
                     options["matchingStrategy"] = matching_strategy
                 page = index.search(value, options)
                 page_hits = page.get("hits", []) or []
-                candidates.extend(page_hits)
+                for hit in page_hits:
+                    text = hit.get(attr) or ""
+                    score = self._condition_score(
+                        value,
+                        text,
+                        mode,
+                        hit.get("_rankingScore", 0),
+                    )
+                    if score <= 0:
+                        continue
+                    doc_id = str(hit.get("id"))
+                    candidate = (
+                        score,
+                        doc_id,
+                        self._snippet(text, [value]) if attr == "content" else "",
+                    )
+                    previous = scored_by_id.get(doc_id)
+                    if previous is None or candidate[0] > previous[0]:
+                        scored_by_id[doc_id] = candidate
                 fetched += len(page_hits)
                 if len(page_hits) < chunk:
                     break
-            return candidates
 
-        def score_candidates(candidates: list[dict]) -> list[tuple[int, str, str]]:
-            scored_by_id: dict[str, tuple[int, str, str]] = {}
-            for hit in candidates:
-                text = hit.get(attr) or ""
-                score = self._condition_score(
-                    value,
-                    text,
-                    mode,
-                    hit.get("_rankingScore", 0),
-                )
-                if score <= 0:
-                    continue
-                doc_id = str(hit.get("id"))
-                candidate = (
-                    score,
-                    doc_id,
-                    self._snippet(text, [value]) if attr == "content" else "",
-                )
-                previous = scored_by_id.get(doc_id)
-                if previous is None or candidate[0] > previous[0]:
-                    scored_by_id[doc_id] = candidate
+            return scored_by_id
+
+        def rank_candidates(
+            scored_by_id: dict[str, tuple[int, str, str]],
+        ) -> list[tuple[int, str, str]]:
             return sorted(
                 scored_by_id.values(),
                 key=lambda row: (-row[0], row[1]),
             )
 
         if index_name != self.INDEX_CHAPTERS or attr != "content" or len(value) <= 1:
-            return score_candidates(collect_candidates(None))
+            return rank_candidates(collect_scored_candidates(None))
 
         try:
-            candidates = collect_candidates("all")
+            scored_by_id = collect_scored_candidates("all")
         except meilisearch.errors.MeilisearchApiError:
-            return score_candidates(collect_candidates(None))
+            return rank_candidates(collect_scored_candidates(None))
 
-        scored = score_candidates(candidates)
+        scored = rank_candidates(scored_by_id)
         if scored and len(scored) >= min(self.CONTENT_RECALL_RETRY_THRESHOLD, window):
             return scored
-        return score_candidates(candidates + collect_candidates(None))
+        collect_scored_candidates(None, scored_by_id)
+        return rank_candidates(scored_by_id)
 
     def _hydrate(self, index_name: str, ids: list[str]) -> dict[str, dict]:
         """Fetch the full documents for the ids of one page.
@@ -1109,10 +1168,10 @@ class SearchService:
             else self.METADATA_CANDIDATE_LIMIT
         )
         # Metadata scans carry no text, so one wide request per page is fine (the
-        # 10 000 window is ~10 MB and has always been fetched like that).  A 正文
-        # scan drags the chapter bodies along, so it is fetched in 1 000-row
-        # pieces -- exactly one request for every window up to the first eight
-        # pages, and one chunk per extra 1 000 candidates beyond them.
+        # 10 000 window is ~10 MB and has always been fetched like that). A 正文
+        # scan reads all available candidates in 1 000-row chunks; broad queries
+        # cost more, but pagination receives the full verified total rather than
+        # stopping at the first 300 candidates.
         chunk_size = self._SCAN_CHUNK if attr == "content" else window
         cache_key = "|".join((
             index_name, attr, cond["value"], filters or "",

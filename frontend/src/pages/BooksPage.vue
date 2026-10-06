@@ -124,17 +124,16 @@ const remoteTotal = ref(0)
 const remoteSearching = ref(false)
 const syncingUrl = ref("")
 
-// Versioned like the page cache below: rows gained a cover, so a snapshot of
-// the previous build is abandoned instead of repainting coverless results.
-const ADVANCED_CACHE_KEY = "novelhub:advanced-search-cache:v2"
+// Versioned like the page cache below so a snapshot with shorter snippets is
+// abandoned instead of repainting the previous build's excerpts.
+const ADVANCED_CACHE_KEY = "novelhub:advanced-search-cache:v3"
 // Local search results are paged 40 at a time and every page used to be a fresh
 // ``/search/advanced`` call.  Keeping the pages that were already fetched makes
 // "next page" / going back instant instead of re-running the query.
 //
-// ``:v2`` because the rows now carry a cover and the page size is a named
-// constant: a snapshot written by the previous build would repaint rows without
-// pictures, so it is simply abandoned (sessionStorage clears with the tab).
-const SEARCH_PAGES_KEY = "novelhub:books-search-pages:v2"
+// ``:v3`` because body snippets now include more surrounding text; old cached
+// pages would otherwise keep showing the shorter excerpts.
+const SEARCH_PAGES_KEY = "novelhub:books-search-pages:v3"
 const SEARCH_PAGES_MAX = 12
 const isAdvancedRoute = computed(() => String(route.query.advanced || "") === "1")
 
@@ -867,10 +866,10 @@ onMounted(async () => {
                 </div>
                 <p v-if="hit.type === 'chapter'" class="mt-1 text-xs font-medium">{{ hit.title }}</p>
                 <p v-if="hit.author" class="mt-1 text-xs text-muted dark:text-gray-400">{{ hit.author }}</p>
-                <p v-if="hit.snippet" class="mt-1 line-clamp-4 text-xs text-muted dark:text-gray-400 sm:line-clamp-2"><SnippetText :text="hit.snippet" :terms="advancedTerms" /></p>
+                <p v-if="hit.snippet" class="mt-1 line-clamp-8 text-xs text-muted dark:text-gray-400 sm:line-clamp-4"><SnippetText :text="hit.snippet" :terms="advancedTerms" /></p>
                 <div v-if="hit.matched_chapter" class="mt-2 rounded bg-accent/5 px-2.5 py-2 border border-accent/10">
                   <p class="text-xs font-medium">{{ hit.matched_chapter.title }}</p>
-                  <p v-if="hit.matched_chapter.snippet" class="mt-0.5 line-clamp-4 text-xs text-muted dark:text-gray-400 sm:line-clamp-2"><SnippetText :text="hit.matched_chapter.snippet" :terms="advancedTerms" /></p>
+                  <p v-if="hit.matched_chapter.snippet" class="mt-0.5 line-clamp-8 text-xs text-muted dark:text-gray-400 sm:line-clamp-4"><SnippetText :text="hit.matched_chapter.snippet" :terms="advancedTerms" /></p>
                 </div>
               </div>
             </button>
@@ -929,10 +928,10 @@ onMounted(async () => {
                 </div>
                 <p v-if="hit.type === 'chapter'" class="mt-1 text-xs font-medium">{{ hit.title }}</p>
                 <p v-if="hit.author" class="mt-1 text-xs text-muted dark:text-gray-400">{{ hit.author }}</p>
-                <p v-if="hit.snippet" class="mt-1 line-clamp-4 text-xs text-muted dark:text-gray-400 sm:line-clamp-2"><SnippetText :text="hit.snippet" :terms="quickTerms" /></p>
+                <p v-if="hit.snippet" class="mt-1 line-clamp-8 text-xs text-muted dark:text-gray-400 sm:line-clamp-4"><SnippetText :text="hit.snippet" :terms="quickTerms" /></p>
                 <div v-if="hit.matched_chapter" class="mt-2 rounded bg-accent/5 px-2.5 py-2 border border-accent/10">
                   <p class="text-xs font-medium">{{ hit.matched_chapter.title }}</p>
-                  <p v-if="hit.matched_chapter.snippet" class="mt-0.5 line-clamp-4 text-xs text-muted dark:text-gray-400 sm:line-clamp-2"><SnippetText :text="hit.matched_chapter.snippet" :terms="quickTerms" /></p>
+                  <p v-if="hit.matched_chapter.snippet" class="mt-0.5 line-clamp-8 text-xs text-muted dark:text-gray-400 sm:line-clamp-4"><SnippetText :text="hit.matched_chapter.snippet" :terms="quickTerms" /></p>
                 </div>
               </div>
             </button>

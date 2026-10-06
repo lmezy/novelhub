@@ -85,13 +85,9 @@ def test_candidate_limit_is_bounded_for_fast_advanced_search():
     assert "content" not in SearchService.BOOK_RETRIEVE_ATTRS
 
 
-def test_content_search_uses_a_smaller_candidate_window():
-    """``content`` is the one field whose candidates must carry the text.
-
-    1000 chapters is ~96 MB of JSON and took 18-25 s on every request against
-    the live index; 300 keeps it under a second.
-    """
-    assert SearchService.CONTENT_CANDIDATE_LIMIT < SearchService.CANDIDATE_LIMIT
+def test_content_search_uses_the_full_engine_candidate_window():
+    """Content searches can inspect the full engine window, fetched in chunks."""
+    assert SearchService.CONTENT_CANDIDATE_LIMIT == SearchService.MAX_TOTAL_HITS
     service, client = _make_service()
     index = client.index.return_value
     index.search.return_value = {"hits": []}
@@ -244,7 +240,7 @@ def test_exact_page_is_hydrated_by_id():
     assert result["hits"][0]["author"] == "吴承恩"
 
 
-def test_exact_content_search_uses_the_small_window():
+def test_exact_content_search_scans_the_full_engine_window_in_chunks():
     service, _, chapters_index = _service_with_indexes()
     chapters_index.search.return_value = {"hits": []}
 
@@ -254,7 +250,8 @@ def test_exact_content_search_uses_the_small_window():
     )
 
     scan_options = chapters_index.search.call_args.args[1]
-    assert scan_options["limit"] == SearchService.CONTENT_CANDIDATE_LIMIT
+    assert service._content_window_for(0) == SearchService.MAX_TOTAL_HITS
+    assert scan_options["limit"] == SearchService._SCAN_CHUNK
 
 
 def test_exact_metadata_search_uses_the_wide_window():
@@ -576,9 +573,7 @@ def test_content_search_serves_the_match_and_not_the_head_of_the_chapter():
 
     snippet = result["hits"][0]["snippet"]
     assert "老鸡婆" in snippet
-    # The list clamps a snippet to two lines and a 320 px phone fits ~21 CJK
-    # glyphs per line at ``text-xs``, so the lead plus the marker must stay
-    # inside the first line, otherwise mobile hides a hit the desktop shows.
+    # Keep the hit near the front so list clamping never hides the keyword.
     assert snippet.index("老鸡婆") <= SearchService.SNIPPET_LEAD_CHARS + len("...")
     assert body[:50] not in snippet, "the chapter head is not the hit"
     assert len(snippet) > SearchService.SNIPPET_TAIL_CHARS, "context after the match"
@@ -616,28 +611,13 @@ def test_snippet_is_anchored_at_the_match_and_marks_both_cuts():
     )
 
 
-def test_content_window_grows_with_the_requested_page():
-    """A 正文 search must not end at its first 300 candidates.
-
-    The flat 300-candidate window made page 9 impossible, which read as "搜索只有
-    300 条".  The window now grows in the same 300-candidate steps as the page
-    goes deeper, and caps so a rogue ``offset`` cannot ask Meilisearch for a
-    payload it refuses to build.
-    """
+def test_content_window_covers_the_full_engine_candidate_limit():
+    """All content-search pages use one fully scanned ranking window."""
     service, _ = _make_service()
 
-    # Pages 1-8 stay exactly as cheap as they were.  Page 8 *starts* at offset
-    # 280 and ends at 320, so its window already has to reach 320.
-    assert service._content_window_for(0) == 300
-    assert service._content_window_for(280) == 300
-    # Page 9 is the first page the old window could not serve at all.
-    assert service._content_window_for(320) == 600
-    assert service._content_window_for(480) == 600
-    # Page 13 crosses the second chunk.
-    assert service._content_window_for(600) == 900
-    # Beyond the cap the window stops growing: those pages are served from the
-    # last rows of the widest scan.
-    assert service._content_window_for(5000) == SearchService.CONTENT_WINDOW_MAX
+    assert service._content_window_for(0) == SearchService.MAX_TOTAL_HITS
+    assert service._content_window_for(320) == SearchService.MAX_TOTAL_HITS
+    assert service._content_window_for(5000) == SearchService.MAX_TOTAL_HITS
 
 
 def test_content_window_only_applies_to_the_body():
@@ -646,9 +626,7 @@ def test_content_window_only_applies_to_the_body():
     index = client.index.return_value
     index.search.return_value = {"hits": []}
 
-    # Page 34 of a 正文 search: the window is 1 500, i.e. wider than one chunk,
-    # so the engine is asked for it piece by piece (the empty answer ends the
-    # walk, which is what the short-chunk rule is for).
+    # A 正文 search scans the complete engine window in bounded chunks.
     service._single_condition_search(
         {"field": "content", "mode": "exact", "value": "铃"},
         scope="chapters", filters=None, offset=1320, limit=40,
@@ -656,8 +634,8 @@ def test_content_window_only_applies_to_the_body():
     content_call = index.search.call_args_list[0].args[1]
 
     index.search.reset_mock()
-    # The same offset on a metadata field is a single request for the whole
-    # 10 000-wide window -- there is no text to carry.
+    # The same offset on a metadata field is one request for its 10 000-wide
+    # window -- there is no text to carry.
     service._single_condition_search(
         {"field": "title", "mode": "exact", "value": "铃"},
         scope="chapters", filters=None, offset=1320, limit=40,
@@ -668,6 +646,90 @@ def test_content_window_only_applies_to_the_body():
     assert content_call["limit"] == SearchService._SCAN_CHUNK
     assert title_call["offset"] == 0
     assert title_call["limit"] == SearchService.METADATA_CANDIDATE_LIMIT
+
+
+def test_single_condition_content_search_scans_past_the_old_300_limit():
+    service, _, chapters_index = _service_with_indexes()
+    chapter_count = 1250
+    chapter_docs = [
+        {
+            "id": f"c{i}",
+            "book_id": "b1",
+            "title": f"第{i}章",
+            "book_title": "测试书",
+            "content": f"正文命中铃字 {i}",
+        }
+        for i in range(chapter_count)
+    ]
+
+    def engine_page(query, options):
+        if options.get("filter"):
+            return {"hits": chapter_docs}
+        start = options["offset"]
+        end = min(start + options["limit"], chapter_count)
+        return {"hits": chapter_docs[start:end]}
+
+    chapters_index.search.side_effect = engine_page
+
+    result = service.advanced_search(
+        [{"field": "content", "mode": "exact", "value": "铃"}],
+        scope="chapters",
+        offset=0,
+        limit=40,
+    )
+
+    assert result["total"] == chapter_count
+    assert len(result["hits"]) == 40
+    scan_calls = [
+        call.args[1]
+        for call in chapters_index.search.call_args_list
+        if not call.args[1].get("filter")
+    ]
+    assert [(call["offset"], call["limit"]) for call in scan_calls] == [
+        (0, SearchService._SCAN_CHUNK),
+        (SearchService._SCAN_CHUNK, SearchService._SCAN_CHUNK),
+    ]
+
+
+def test_multi_condition_content_candidates_scan_in_chunks_and_keep_snippets():
+    service, _, chapters_index = _service_with_indexes()
+    chapter_count = 1250
+    chapter_docs = [
+        {
+            "id": f"c{i}",
+            "book_id": "b1",
+            "title": f"第{i}章",
+            "book_title": "测试书",
+            "content": "甲" * 500 + "铃" + "乙" * 500,
+        }
+        for i in range(chapter_count)
+    ]
+
+    def engine_page(query, options):
+        start = options["offset"]
+        end = min(start + options["limit"], chapter_count)
+        return {"hits": chapter_docs[start:end]}
+
+    chapters_index.search.side_effect = engine_page
+
+    candidates = service._collect_condition(
+        "chapters", "content", "铃", "exact", None,
+    )
+
+    assert len(candidates) == chapter_count
+    snippet = candidates["c0"][1]["content"]
+    assert "铃" in snippet
+    assert len(snippet) < len(chapter_docs[0]["content"])
+    scan_calls = [call.args[1] for call in chapters_index.search.call_args_list]
+    assert [(call["offset"], call["limit"]) for call in scan_calls] == [
+        (0, SearchService._SCAN_CHUNK),
+        (SearchService._SCAN_CHUNK, SearchService._SCAN_CHUNK),
+    ]
+    cached = service._collect_condition(
+        "chapters", "content", "铃", "exact", None,
+    )
+    assert cached is candidates
+    assert len(chapters_index.search.call_args_list) == len(scan_calls)
 
 
 def test_a_window_wider_than_one_engine_page_is_scanned_in_chunks():
