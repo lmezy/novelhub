@@ -104,6 +104,24 @@ class Settings(BaseSettings):
     # legitimately report a page only every few minutes.
     SYNC_TASK_STALL_SECONDS:int=3600
 
+    # How many book sources one "search every source" request may query at the
+    # same time.  Each source keeps its own ``concurrentRate`` limiter, so a
+    # source never sees a higher request rate than a single-source search would
+    # produce; this cap only bounds how many *different* sites are in flight, and
+    # therefore how many sockets and how much memory the fan-out holds.
+    SEARCH_FANOUT_CONCURRENCY:int=8
+    # A single source's search may take this long before it is reported as
+    # timed out.  Sites that answer slowly still contribute their results in a
+    # later wave; the request as a whole is never held hostage by one dead host.
+    SEARCH_FANOUT_SOURCE_TIMEOUT_SECONDS:float=20.0
+    # Book sources are untrusted third-party hosts, so one request must not be
+    # able to start an unbounded number of them.  ``0`` means "every enabled
+    # source the caller may see".
+    SEARCH_FANOUT_MAX_SOURCES:int=0
+    # How many results one source may contribute to a fan-out search.  A source
+    # that answers with its own paging is asked for this many on the first page.
+    SEARCH_FANOUT_RESULTS_PER_SOURCE:int=20
+
 
 settings=Settings()
 

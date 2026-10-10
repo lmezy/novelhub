@@ -1,11 +1,13 @@
+import json
+from uuid import uuid4
+
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from sqlalchemy import delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.database import get_db
-from app.crawler.registry import get_plugin
-from uuid import uuid4
 from app.crawler.registry import get_plugin
 from app.models import Source, Book, Cookie, CrawlTask, CrawlLog, User
 from app.models.source_credential import SourceCredential
@@ -20,6 +22,12 @@ from app.services.auth import get_current_user
 from app.services.book_cleanup import delete_books
 from app.services.book_kind import normalize_kind
 from app.services.search import search_service
+from app.services.search_fanout import (
+    can_search_source,
+    fanout_results_per_source,
+    fanout_search,
+    search_async,
+)
 from app.services.source_interval import apply_source_interval
 from app.services.visibility import can_view_all_ages, can_view_r18
 
@@ -28,15 +36,34 @@ router = APIRouter(prefix="/sources", tags=["sources"])
 
 
 def _can_view_source(user: User, source: Source) -> bool:
-    if user.role in ("admin", "super_admin"):
-        return True
-    return source.owner_id is None or source.owner_id == user.id
+    """Owner/role gate, shared with the fan-out search (``can_search_source``)."""
+    return can_search_source(user, source)
 
 
 def _can_edit_source(user: User, source: Source) -> bool:
     if user.role in ("admin", "super_admin"):
         return True
     return source.owner_id is not None and source.owner_id == user.id
+
+
+def _parse_source_ids(raw: str | None) -> list[str] | None:
+    """Split the ``sources`` query parameter into ids (``None`` = every source)."""
+    if not raw:
+        return None
+    ids = [part.strip() for part in str(raw).split(",")]
+    return [value for value in ids if value] or None
+
+
+def _clamp_fanout_limit(limit: int | None) -> int:
+    """Per-source result cap for a fan-out search.
+
+    Bounded like the single-source endpoint's ``limit``: each extra result costs
+    another rule-parsed row in one upstream response, and a fan-out multiplies
+    that by the number of sources.
+    """
+    if limit is None:
+        return fanout_results_per_source()
+    return min(max(1, int(limit)), 100)
 
 
 @router.get("", response_model=list[SourceOut])
@@ -169,6 +196,83 @@ async def update_source(
                 continue
 
     return source
+
+
+@router.get("/search")
+async def search_all_sources(
+    q: str,
+    sources: str | None = None,
+    limit: int | None = None,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Search **every** enabled source for one keyword, at the same time.
+
+    The single-source endpoint makes the reader pick a site and wait for it; in
+    practice a book may live on any of the (tens of) imported sources, so this
+    fans one keyword out concurrently and returns each source's results together
+    with what went wrong for the ones that failed.
+
+    ``sources`` optionally narrows the fan-out to a comma-separated set of ids.
+    Results are capped per source (``limit``, default
+    ``SEARCH_FANOUT_RESULTS_PER_SOURCE``); there is no cap on how many sources
+    are searched other than ``SEARCH_FANOUT_MAX_SOURCES``.
+    """
+    query = (q or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Query is required")
+    return await fanout_search(
+        db,
+        user,
+        query,
+        source_ids=_parse_source_ids(sources),
+        limit_per_source=_clamp_fanout_limit(limit),
+    )
+
+
+@router.get("/search/stream")
+async def stream_search_all_sources(
+    q: str,
+    sources: str | None = None,
+    limit: int | None = None,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """The same fan-out, streamed as Server-Sent Events.
+
+    Sources answer at wildly different speeds (a cached site in 200 ms, a
+    Cloudflare-protected one after 15 s, a dead host never).  Streaming lets the
+    UI paint each site's hits the moment they land instead of waiting for the
+    slowest one, and shows which sources are still running.  Frames are
+    ``data: {json}\\n\\n`` exactly like the AI chat stream.
+    """
+    query = (q or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Query is required")
+    events = search_async(
+        db,
+        user,
+        query,
+        source_ids=_parse_source_ids(sources),
+        limit_per_source=_clamp_fanout_limit(limit),
+    )
+
+    async def frames():
+        async for event in events:
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        yield 'data: {"type": "end"}\n\n'
+
+    return StreamingResponse(
+        frames(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            # nginx fronts the backend in the shipped compose file; without this
+            # it buffers the whole stream and every result arrives at once.
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/{source_id}/search", response_model=RemoteBookSearchOut)

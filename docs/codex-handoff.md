@@ -1828,3 +1828,99 @@ AND 对小型、完整的精确结果集（最多 200 条）先取回正文逐�
 **边界与代价**：所有正文搜索路径的候选上限是 Meilisearch 的 10000 条，宽泛词扫描会明显更慢；章节元数据的多条件搜索仍保留原候选窗口。要对 116k 章节做到任意深的全库子串检索，需要另建 n-gram 索引。
 
 **验证**：`test_search_service.py` 59 项、`test_search_api.py` 与 `test_search_cover.py` 共 9 项通过；`npm run typecheck` 和 `npm run build` 通过。新增 1250 条候选跨 1000 条分块及短期缓存回归测试。改动仅在本地，未访问或修改 NAS，也未修改 `yuedu/`。
+
+## 50. 书源搜索改成「全部书源并发 + 流式返回」（2026-10-06）
+
+**现象**（用户报）：「去掉搜索的数量限制，并提高获取结果的速度」。书源搜索页只能
+**选一个源**、每次固定 **30 条**、**没有下一页**；想找一本书要挨个源点一遍。
+
+**根因**：`BooksPage.vue` 的 `runSourceSearch` 写死 `page=1&limit=30` 且模板里没有任何分页
+控件，后端 `GET /sources/{id}/search` 也只处理一个源。线上 20 个启用书源，全部是 yuedu。
+
+**改动**（新增并发 fan-out，两个新接口 + 一处 UI）：
+
+- 新增 `services/search_fanout.py`：`search_async()` 把一个关键词并发打到**每个可见且启用的
+  书源**，产 `start` / 每源一条 `source`（结果或错误）/ `done` 事件。
+  - 可见性判据抽成 `can_search_source()`，`routes/sources.py::_can_view_source` 改为委托它：
+    单源与多源两条路径用同一份规则（admin 全可见；非 admin 只可见 `owner_id IS NULL` 或本人；
+    R18 / 全年龄偏好继续过滤），**命名 id 不能绕过判据**。
+  - `SEARCH_FANOUT_CONCURRENCY`(8) 只限制同时在飞的站数；每个源仍走自己的
+    `concurrentRate` / 每源「同步间隔」限速（`transport._sleep_rate_limit`），所以站点看到的
+    请求频率与单源搜索一致，扇出不会变相压站。
+  - `SEARCH_FANOUT_SOURCE_TIMEOUT_SECONDS`(20s) 给每个源单独计时，一个死站只影响它自己。
+  - 所有数据库访问串行化在一把锁后面：worker 共享请求的那一个 `AsyncSession`，asyncpg 不允许
+    同一连接并发。库内「已入库」查询放在取到 semaphore **之外**，否则扇出会退化成排队等 Postgres。
+  - `get_plugin()` 每次都返回**新实例**，所以多个源不会共享可变插件状态。
+- 两个新接口（都放在 `/{source_id}/search` 之前，避免 `search` 被当成 source id）：
+  `GET /sources/search`（聚合 JSON）与 `GET /sources/search/stream`（SSE，结果**按完成顺序**
+  推送，快的源先显示）。`sources=` 可只在指定源里搜，`limit=` 每源条数（默认
+  `SEARCH_FANOUT_RESULTS_PER_SOURCE`=20，上限 100）。
+- 前端：`BooksPage.vue` 书源搜索页新增「全部书源 / 单个书源」切换 + 每源条数下拉
+  （10/20/30/50/100）；全部书源模式按源分组、先到先画，仍在跑的源显示计数，无结果/失败的源
+  收进 `<details>` 里并带失败原因；离开页面 `onBeforeUnmount` 会 abort 流。
+  `api/stream.ts` 的 SSE 解析抽成 `pump()` 并新增 `streamGet()`（`EventSource` 带不了
+  Authorization 头，所以仍走 fetch）。
+
+**验证**：新增 `backend/tests/test_source_search_fanout.py` 29 项（含并发性——
+4 个源各 50ms 必须远快于串行 200ms、慢源超时不拖住快源、失败源不吞掉别的源结果、
+命名 id 不越权、禁用源不搜、插件构造失败不算崩、SSE 帧格式与逐源推送）；后端全量
+**960 passed**；`npm run typecheck` 与 `npm run build` 通过。
+
+**仍有效**：书源搜索结果**上限不再是 30 条**，而是「每源 N 条 × 源数」；但**单个源仍然只有
+第 1 页**——一个源自己分页（第 2、3 页）仍取不到，需要给 fan-out 加「每源多页并发」才能到。
+线上 20 个源时实测并发就是 20 个请求，`SEARCH_FANOUT_MAX_SOURCES` 可设上限。
+
+## 51. 库内搜索为什么「去不掉 10000 上限」，以及正文搜索为什么慢（2026-10-06）
+
+**结论先说**：这两件事都不是改参数能解决的，根因是**用 Meilisearch 当全文字符串索引**
+（666k 章正文、94GB 索引、12GB 内存 / 2 CPU 的容器）。下面是在线实测，供下次直接引用。
+
+**实测（只读，NAS 上 Meilisearch 1.12.8，43,630 本书 / 666,328 章）**：
+
+| 事实 | 数值 |
+|---|---|
+| `books` 索引窗口 10000（只取 id） | 0.5s（热）/ 7.3s（冷） |
+| `chapters` 索引窗口 10000（只取 id，**无 q、纯 filter**） | **514s / 631s**（两次） |
+| `chapters` 正文 1000 条（当前正文搜索的一「块」） | **73-110s / 每个查询**（冷热都慢） |
+| `chapters` 按 `book_id` 过滤后取 73 条正文 | 8.2s |
+| 单个正文块的大小 | 1000 条 ≈ **20-72 MB** |
+| `q=的` 的 `estimatedTotalHits` | 10000（= 引擎上限，不是真实命中数） |
+| index 体积 / 内存 / CPU | **94GB**（`data.ms/indexes`）/ 12GB 限额（实测已用 10.13GB）/ 2 核 |
+| 索引写入速率 | 8.2 个 task/分钟，**常年有积压** |
+
+**根因（三条，缺一不可）**：
+
+1. **上限是引擎的，不是我们的**。Meilisearch 的 bucket sort **按设计**在
+   `pagination.maxTotalHits`（默认/线上 10000）处截断，`estimatedTotalHits` 也停在同一个数。
+   把 `maxTotalHits` 调到 30000 可以下发（PATCH 返回 `taskUid`），但线上**轮询 20s 都没生效**
+   ——settings 任务排在**几十万条文档索引任务**后面。且在索引长期积压的机器上，放宽上限只会
+   让每个查询扫更多文档。
+2. **正文搜索的耗时与查询词无关，是「按文档取正文」的固定成本**。实测 `乳环`(93.7s)、
+   `铃铛`(99.7s)、`仙`(72.9s) 三个词、无论稀有还是常用，取 1000 条正文都要 70-110s，
+   即 **~0.07-0.1s/文档**。所以「更精确的词会更快」是错的，慢的是把正文从盘上捞出来。
+3. **索引本身已经压垮了内存**。666k 章 × 约 140KB 正文 = 94GB 索引塞在 12GB 容器里，
+   再叠加常年排队的索引写入，于是连「只取 10000 个 id、不带 q」都要 8-10 分钟。
+
+**因此：**
+
+- `MAX_TOTAL_HITS` / `CONTENT_CANDIDATE_LIMIT` / `CONTENT_WINDOW_MAX` 这些常量**不是**瓶颈，
+  调大只会更慢；第 49 节把正文窗口从 300 提到 10000，在这台机器上等于把一次正文搜索从
+  ~30s 变成 **10-18 分钟**（10 块 × 73-110s），实际不可用。
+- 「任意深、全库」的字符子串检索需要**另一套索引**，且正文不在 Postgres 里
+  （`chapters` 表没有 `content` 列，正文只在 Storage 与 Meilisearch 各一份），所以 n-gram /
+  `pg_trgm` 都要重新把 666k 章正文读一遍入库——`pg_trgm` 可用但**未安装**，且对 CJK 只对
+  ≥3 字串有效（trigram 从字符切，2 字词退化成全表扫）。
+
+**下一步的候选（按代价从低到高，尚未做）**：
+
+1. **给正文入库加体积上限**（例如只索引每本书前 N 章，或把 `CONTENT_INDEX_LIMIT` 从 100k
+   降到 20-30k），索引能瘦一半以上，是最快见效且可回滚的一步；代价是老书的中后段搜不到。
+2. **正文搜索彻底不进引擎**：只索引书名/作者/章节名，正文检索改成在需要时从 Storage 读
+   （NAS 是 NVMe，但 666k 文件的全扫描要自己做并发与中断控制）。
+3. **把 `chapters` 索引与 `books` 索引拆到不同实例/机器**，给搜索容器更多内存（当前 2 核
+   12GB 是硬伤）。
+4. 真正要「无上限」：另建一套「正文 → 子串索引」（如外部 n-gram 索引或独立 PG 表 + 前缀索引），
+   这是个独立项目，不适合顺手做。
+
+**验证方式**：以上数字都来自 NAS 上的只读 curl / psql（见 `_scratch/nh_probe*.sh`）；本次未改动
+线上任何配置（`maxTotalHits` 已确认仍是 10000，`nh_scale_probe` 是既有的一次性索引）。

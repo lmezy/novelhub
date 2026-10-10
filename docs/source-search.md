@@ -12,7 +12,41 @@ fetch chapters -> download content -> storage/database/search -> web reader.
 5. Each result is checked against the local library (`in_library`).
 6. Admin users can click Sync to download the book into NovelHub.
 
-## API
+## Searching every source at once
+
+Guessing which of one's sources carries a book does not scale, so the Book
+Sources tab defaults to **全部书源**: one keyword goes to every enabled source the
+caller may see, concurrently (Legado's behaviour). The page is a Server-Sent
+Event stream, so each site's hits appear as soon as that site answers rather than
+after the slowest one; sources still running are counted, and sites that returned
+nothing or failed are kept in a collapsed list with the reason.
+
+```bash
+# aggregated JSON (waits for every source)
+curl -X GET "http://localhost:8088/api/sources/search?q=keyword&limit=20" \
+  -H "Authorization: Bearer $TOKEN"
+
+# streamed (one event per source, in completion order)
+curl -N -X GET "http://localhost:8088/api/sources/search/stream?q=keyword" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Both accept `sources=` (comma-separated ids; the visibility gate still applies, so
+naming a source cannot reach one the caller may not use) and `limit=` (results
+**per source**, default `SEARCH_FANOUT_RESULTS_PER_SOURCE`, max 100).
+
+Behaviour worth knowing:
+
+- Each source keeps its own `concurrentRate` / per-source 拉取间隔 limiter, so a
+  fan-out does not raise the request rate any single site sees.
+  `SEARCH_FANOUT_CONCURRENCY` only bounds how many sites are in flight.
+- `SEARCH_FANOUT_SOURCE_TIMEOUT_SECONDS` times each source out on its own: one dead
+  host cannot hold the stream. A slow source still contributes if it answers
+  later, and a failure is reported per source instead of shrinking the result set.
+- Each source is queried at **page 1** only. The per-source cap multiplies by the
+  number of sources; paging deeper *within* one source is not implemented yet.
+
+### Single source (unchanged)
 
 ```bash
 curl -X GET "http://localhost:8088/api/sources/yuedu_xxx/search?q=keyword&page=1&limit=30" \

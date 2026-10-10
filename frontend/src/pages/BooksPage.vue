@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue"
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { useRoute, useRouter } from "vue-router"
 import { api } from "../api/client"
+import { streamGet } from "../api/stream"
 import BookCard from "../components/BookCard.vue"
 import NavBar from "../components/NavBar.vue"
 import SnippetText from "../components/SnippetText.vue"
@@ -56,6 +57,17 @@ interface RemoteBook {
   word_count?: string | null
   in_library: boolean
   book_id?: string | null
+}
+// One book source's slice of a fan-out search. ``pending`` means the site has
+// not answered yet, which is what makes the streamed view useful: a fast source
+// paints while a slow one is still running.
+interface SourceGroup {
+  source_id: string
+  source_name: string
+  items: RemoteBook[]
+  pending: boolean
+  error: string | null
+  elapsed_ms: number
 }
 
 const route = useRoute()
@@ -123,6 +135,16 @@ const remoteResults = ref<RemoteBook[]>([])
 const remoteTotal = ref(0)
 const remoteSearching = ref(false)
 const syncingUrl = ref("")
+// "all" fans one keyword out to every enabled source at once; "one" keeps the
+// original single-source search (and its ``page``/``limit`` shape).
+const sourceScope = ref<"all" | "one">("all")
+const sourceGroups = ref<SourceGroup[]>([])
+const sourceFailureCount = ref(0)
+const sourceQueryUsed = ref("")
+// Per-source result cap. The fan-out multiplies it by the number of sources, so
+// it stays a single number the user can raise intentionally.
+const sourceLimit = ref(20)
+let sourceAbort: AbortController | null = null
 
 // Versioned like the page cache below so a snapshot with shorter snippets is
 // abandoned instead of repainting the previous build's excerpts.
@@ -560,18 +582,99 @@ async function runAdvancedSearch(offset = 0) {
 
 // ---------- source search (remote book sources) ----------
 
-async function runSourceSearch() {
+/**
+ * Search every enabled source at once and paint each site as it answers.
+ *
+ * The backend streams Server-Sent Events in completion order, so a source that
+ * returns in 200 ms is visible long before a site that takes 15 s (or times
+ * out). A source that fails stays in the list with its reason instead of
+ * silently shrinking the result set.
+ */
+async function runAllSourceSearch() {
+  const q = sourceQuery.value.trim()
+  if (!q) return
+  sourceAbort?.abort()
+  const controller = new AbortController()
+  sourceAbort = controller
+
+  remoteSearching.value = true
+  advancedError.value = ""
+  sourceGroups.value = []
+  sourceFailureCount.value = 0
+  sourceQueryUsed.value = q
+  const byId = new Map<string, SourceGroup>()
+
+  try {
+    await streamGet(
+      "/sources/search/stream",
+      { q, limit: String(sourceLimit.value) },
+      (event) => {
+        if (event.type === "start") {
+          // Seed every source as "pending" so the count of sites still running
+          // is visible from the first frame.
+          sourceGroups.value = sources.value.map((source) => ({
+            source_id: source.id,
+            source_name: source.name,
+            items: [],
+            pending: true,
+            error: null,
+            elapsed_ms: 0,
+          }))
+          for (const group of sourceGroups.value) byId.set(group.source_id, group)
+          return
+        }
+        if (event.type !== "source") return
+        const items = (event.results || []) as RemoteBook[]
+        const next: SourceGroup = {
+          source_id: event.source_id,
+          source_name: event.source_name,
+          items,
+          pending: false,
+          error: event.error || null,
+          elapsed_ms: event.elapsed_ms || 0,
+        }
+        const existing = byId.get(event.source_id)
+        if (existing) {
+          Object.assign(existing, next)
+        } else {
+          byId.set(event.source_id, next)
+          sourceGroups.value = [...sourceGroups.value, next]
+        }
+        if (next.error) sourceFailureCount.value += 1
+        // Repaint: the array is mutated in place, so the list has to be
+        // replaced for Vue to notice.
+        sourceGroups.value = [...sourceGroups.value]
+      },
+      controller.signal,
+    )
+  } catch (e) {
+    if (!controller.signal.aborted) {
+      advancedError.value = e instanceof Error ? e.message : i18n.t("search_failed")
+    }
+  } finally {
+    if (sourceAbort === controller) sourceAbort = null
+    remoteSearching.value = false
+    sourceGroups.value = sourceGroups.value.map((group) => ({ ...group, pending: false }))
+  }
+}
+
+async function runSingleSourceSearch() {
   const q = sourceQuery.value.trim()
   if (!q) return
   if (!sourceSearchId.value) {
     advancedError.value = i18n.t("search_select_source")
     return
   }
+  sourceAbort?.abort()
+  sourceAbort = null
   remoteSearching.value = true
   advancedError.value = ""
+  sourceGroups.value = []
+  sourceFailureCount.value = 0
+  sourceQueryUsed.value = q
   try {
     const res = await api.get<{ results: RemoteBook[]; total: number }>(
-      "/sources/" + encodeURIComponent(sourceSearchId.value) + "/search?q=" + encodeURIComponent(q) + "&page=1&limit=30",
+      "/sources/" + encodeURIComponent(sourceSearchId.value) + "/search?q=" + encodeURIComponent(q) + "&page=1&limit=" + sourceLimit.value,
     )
     remoteResults.value = res.results || []
     remoteTotal.value = res.total
@@ -581,6 +684,22 @@ async function runSourceSearch() {
     remoteSearching.value = false
   }
 }
+
+function runSourceSearch() {
+  return sourceScope.value === "all" ? runAllSourceSearch() : runSingleSourceSearch()
+}
+
+// Sources that answered with at least one book, in completion order. Empty
+// answers are kept out of the way so a keyword that only three sites know about
+// does not bury its hits under twenty "0 results" headers.
+const filledSourceGroups = computed(() => sourceGroups.value.filter((group) => group.items.length))
+const emptySourceGroups = computed(() => sourceGroups.value.filter((group) => !group.items.length))
+const pendingSourceCount = computed(() => sourceGroups.value.filter((group) => group.pending).length)
+const remoteResultCount = computed(() =>
+  sourceScope.value === "all"
+    ? sourceGroups.value.reduce((total, group) => total + group.items.length, 0)
+    : remoteResults.value.length,
+)
 
 async function syncRemoteBook(item: RemoteBook) {
   if (syncingUrl.value) return
@@ -625,6 +744,14 @@ onMounted(async () => {
   }
   try { await loadNavigation() } catch { categories.value = []; sources.value = [] }
   await loadCurrentView()
+})
+
+// A fan-out search keeps a streaming request open for as long as the slowest
+// source takes. Leaving the page must cancel it, otherwise a site that never
+// answers keeps a request (and its sockets) alive behind the view.
+onBeforeUnmount(() => {
+  sourceAbort?.abort()
+  sourceAbort = null
 })
 </script>
 
@@ -679,10 +806,20 @@ onMounted(async () => {
         </form>
 
         <form v-else @submit.prevent="runSourceSearch" class="mx-auto mt-3 flex max-w-2xl overflow-hidden rounded-lg border border-border bg-surface shadow-sm focus-within:border-accent dark:border-gray-700 dark:bg-gray-900">
-          <select v-model="sourceSearchId" class="max-w-36 border-r border-border bg-transparent px-3 py-3 text-xs outline-none dark:border-gray-700">
+          <button
+            type="button"
+            class="border-r border-border px-3 py-3 text-xs whitespace-nowrap dark:border-gray-700"
+            :class="sourceScope === 'all' ? 'text-accent' : 'text-muted dark:text-gray-400'"
+            :title="i18n.t('search_scope_hint')"
+            @click="sourceScope = sourceScope === 'all' ? 'one' : 'all'"
+          >{{ sourceScope === 'all' ? i18n.t('search_scope_all') : i18n.t('search_scope_one') }}</button>
+          <select v-if="sourceScope === 'one'" v-model="sourceSearchId" class="max-w-36 border-r border-border bg-transparent px-3 py-3 text-xs outline-none dark:border-gray-700">
             <option v-for="source in sources" :key="source.id" :value="source.id">{{ source.name }}</option>
           </select>
           <input v-model="sourceQuery" type="search" :placeholder="i18n.t('search_source_query_placeholder')" class="min-w-0 flex-1 bg-transparent px-4 py-3 text-sm outline-none" />
+          <select v-model.number="sourceLimit" class="border-l border-border bg-transparent px-2 py-3 text-xs outline-none dark:border-gray-700" :title="i18n.t('search_source_limit_hint')">
+            <option v-for="n in [10, 20, 30, 50, 100]" :key="n" :value="n">{{ n }}{{ i18n.t('search_source_limit_suffix') }}</option>
+          </select>
           <button type="submit" class="flex w-12 items-center justify-center bg-accent text-lg text-white" :title="i18n.t('search_button')">⌕</button>
         </form>
 
@@ -776,40 +913,109 @@ onMounted(async () => {
 
       <!-- source search results -->
       <template v-else-if="searchTab === 'sources'">
-        <div class="mb-4 flex items-center justify-between">
+        <div class="mb-4 flex flex-wrap items-center justify-between gap-2">
           <h2 class="text-lg font-semibold">{{ i18n.t('search_book_sources') }}</h2>
-          <span v-if="remoteSearching" class="text-xs text-muted dark:text-gray-400">{{ i18n.t('search_searching') }}</span>
-        </div>
-        <p v-if="advancedError" class="mb-4 text-sm text-red-600">{{ advancedError }}</p>
-        <p v-else-if="sourceQuery.trim() && remoteResults.length === 0 && !remoteSearching" class="py-12 text-center text-sm text-muted dark:text-gray-400">{{ i18n.t('search_remote_empty') }}</p>
-        <div v-else-if="remoteResults.length" class="divide-y divide-border border border-border rounded-lg bg-surface overflow-hidden dark:divide-gray-800 dark:border-gray-700 dark:bg-gray-900">
-          <div v-for="item in remoteResults" :key="item.source_id + '-' + item.url" class="flex items-center gap-3 px-4 py-3">
-            <div class="min-w-0 flex-1">
-              <div class="flex flex-wrap items-center gap-2">
-                <h3 class="text-sm font-medium truncate">{{ item.name }}</h3>
-                <span v-if="item.in_library" class="rounded bg-green-100 px-1.5 py-0.5 text-[10px] text-green-700 dark:bg-green-900 dark:text-green-300">{{ i18n.t('search_remote_in_library') }}</span>
-              </div>
-              <p class="mt-0.5 text-xs text-muted dark:text-gray-400">
-                {{ item.author }}
-                <span v-if="item.latest_chapter" class="ml-2">{{ item.latest_chapter }}</span>
-              </p>
-              <p v-if="item.intro" class="mt-1 line-clamp-2 text-xs text-muted dark:text-gray-400">{{ item.intro }}</p>
-            </div>
-            <div class="shrink-0">
-              <button
-                v-if="!item.in_library"
-                @click="syncRemoteBook(item)"
-                :disabled="syncingUrl === item.url"
-                class="rounded bg-accent px-3 py-1.5 text-xs text-white disabled:opacity-50"
-              >{{ syncingUrl === item.url ? i18n.t('search_remote_syncing') : i18n.t('search_remote_sync') }}</button>
-              <button
-                v-else-if="item.book_id"
-                @click="router.push('/books/' + item.book_id)"
-                class="rounded border border-accent/50 px-3 py-1.5 text-xs text-accent"
-              >{{ i18n.t('search_open') }}</button>
-            </div>
+          <div class="flex flex-wrap items-center gap-3 text-xs text-muted dark:text-gray-400">
+            <span v-if="sourceScope === 'all' && sourceQueryUsed">
+              {{ i18n.t('search_fanout_summary', { sources: sourceGroups.length, hits: remoteResultCount }) }}
+            </span>
+            <span v-if="pendingSourceCount" class="text-accent">{{ i18n.t('search_fanout_pending', { n: pendingSourceCount }) }}</span>
+            <span v-else-if="remoteSearching">{{ i18n.t('search_searching') }}</span>
           </div>
         </div>
+        <p v-if="advancedError" class="mb-4 text-sm text-red-600">{{ advancedError }}</p>
+
+        <!-- one keyword, every source: grouped, painted as each site answers -->
+        <template v-else-if="sourceScope === 'all'">
+          <p v-if="!sourceQueryUsed" class="py-12 text-center text-sm text-muted dark:text-gray-400">{{ i18n.t('search_fanout_hint') }}</p>
+          <template v-else>
+            <p v-if="!sourceGroups.length && !remoteSearching" class="py-12 text-center text-sm text-muted dark:text-gray-400">{{ i18n.t('search_remote_empty') }}</p>
+            <section v-for="group in filledSourceGroups" :key="group.source_id" class="mb-8">
+              <div class="mb-3 flex flex-wrap items-center gap-3 border-b border-border pb-2 dark:border-gray-800">
+                <h3 class="text-sm font-semibold">{{ group.source_name }}</h3>
+                <span class="text-xs text-muted dark:text-gray-400">{{ i18n.t('search_fanout_hits', { n: group.items.length }) }}</span>
+                <span class="text-[11px] text-muted dark:text-gray-500">{{ (group.elapsed_ms / 1000).toFixed(1) }}s</span>
+              </div>
+              <div class="divide-y divide-border overflow-hidden rounded-lg border border-border bg-surface dark:divide-gray-800 dark:border-gray-700 dark:bg-gray-900">
+                <div v-for="item in group.items" :key="group.source_id + '-' + item.url" class="flex items-center gap-3 px-4 py-3">
+                  <div class="min-w-0 flex-1">
+                    <div class="flex flex-wrap items-center gap-2">
+                      <h4 class="truncate text-sm font-medium">{{ item.name }}</h4>
+                      <span v-if="item.in_library" class="rounded bg-green-100 px-1.5 py-0.5 text-[10px] text-green-700 dark:bg-green-900 dark:text-green-300">{{ i18n.t('search_remote_in_library') }}</span>
+                    </div>
+                    <p class="mt-0.5 text-xs text-muted dark:text-gray-400">
+                      {{ item.author }}
+                      <span v-if="item.latest_chapter" class="ml-2">{{ item.latest_chapter }}</span>
+                    </p>
+                    <p v-if="item.intro" class="mt-1 line-clamp-2 text-xs text-muted dark:text-gray-400">{{ item.intro }}</p>
+                  </div>
+                  <div class="shrink-0">
+                    <button
+                      v-if="!item.in_library"
+                      @click="syncRemoteBook(item)"
+                      :disabled="syncingUrl === item.url"
+                      class="rounded bg-accent px-3 py-1.5 text-xs text-white disabled:opacity-50"
+                    >{{ syncingUrl === item.url ? i18n.t('search_remote_syncing') : i18n.t('search_remote_sync') }}</button>
+                    <button
+                      v-else-if="item.book_id"
+                      @click="router.push('/books/' + item.book_id)"
+                      class="rounded border border-accent/50 px-3 py-1.5 text-xs text-accent"
+                    >{{ i18n.t('search_open') }}</button>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <!-- sites that answered with nothing / failed: kept, but out of the way -->
+            <details v-if="emptySourceGroups.length" class="mt-2 border-t border-border pt-4 dark:border-gray-800">
+              <summary class="cursor-pointer text-xs text-muted dark:text-gray-400">
+                {{ i18n.t('search_fanout_other_sources', { n: emptySourceGroups.length, failed: sourceFailureCount }) }}
+              </summary>
+              <div class="mt-3 flex flex-wrap gap-2">
+                <span
+                  v-for="group in emptySourceGroups"
+                  :key="group.source_id"
+                  class="rounded border px-2 py-1 text-[11px]"
+                  :class="group.error ? 'border-red-300 text-red-600 dark:border-red-900 dark:text-red-400' : 'border-border text-muted dark:border-gray-700 dark:text-gray-500'"
+                  :title="group.error || ''"
+                >{{ group.source_name }}<template v-if="group.pending"> …</template><template v-else-if="group.error"> ⚠</template></span>
+              </div>
+            </details>
+          </template>
+        </template>
+
+        <!-- single source, original shape -->
+        <template v-else>
+          <p v-if="sourceQuery.trim() && remoteResults.length === 0 && !remoteSearching" class="py-12 text-center text-sm text-muted dark:text-gray-400">{{ i18n.t('search_remote_empty') }}</p>
+          <div v-else-if="remoteResults.length" class="divide-y divide-border border border-border rounded-lg bg-surface overflow-hidden dark:divide-gray-800 dark:border-gray-700 dark:bg-gray-900">
+            <div v-for="item in remoteResults" :key="item.source_id + '-' + item.url" class="flex items-center gap-3 px-4 py-3">
+              <div class="min-w-0 flex-1">
+                <div class="flex flex-wrap items-center gap-2">
+                  <h3 class="text-sm font-medium truncate">{{ item.name }}</h3>
+                  <span v-if="item.in_library" class="rounded bg-green-100 px-1.5 py-0.5 text-[10px] text-green-700 dark:bg-green-900 dark:text-green-300">{{ i18n.t('search_remote_in_library') }}</span>
+                </div>
+                <p class="mt-0.5 text-xs text-muted dark:text-gray-400">
+                  {{ item.author }}
+                  <span v-if="item.latest_chapter" class="ml-2">{{ item.latest_chapter }}</span>
+                </p>
+                <p v-if="item.intro" class="mt-1 line-clamp-2 text-xs text-muted dark:text-gray-400">{{ item.intro }}</p>
+              </div>
+              <div class="shrink-0">
+                <button
+                  v-if="!item.in_library"
+                  @click="syncRemoteBook(item)"
+                  :disabled="syncingUrl === item.url"
+                  class="rounded bg-accent px-3 py-1.5 text-xs text-white disabled:opacity-50"
+                >{{ syncingUrl === item.url ? i18n.t('search_remote_syncing') : i18n.t('search_remote_sync') }}</button>
+                <button
+                  v-else-if="item.book_id"
+                  @click="router.push('/books/' + item.book_id)"
+                  class="rounded border border-accent/50 px-3 py-1.5 text-xs text-accent"
+                >{{ i18n.t('search_open') }}</button>
+              </div>
+            </div>
+          </div>
+        </template>
 
         <section v-if="homeSources.length" class="mt-10 border-t border-border pt-6 dark:border-gray-800">
           <div class="mb-4 flex items-center justify-between">

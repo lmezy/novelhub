@@ -1,8 +1,8 @@
 /**
- * Server-Sent-Events helper for the AI endpoints.
+ * Server-Sent-Events helper for the streamed endpoints.
  *
- * `EventSource` cannot send an Authorization header or a JSON body, so the
- * streamed chat uses `fetch` plus a manual SSE frame parser. Frames look like
+ * `EventSource` cannot send an Authorization header or a JSON body, so streams
+ * use `fetch` plus a manual SSE frame parser. Frames look like
  * `data: {"type":"delta","text":"..."}\n\n`.
  */
 
@@ -15,6 +15,13 @@ export interface StreamEvent {
 
 function token(): string | null {
   return localStorage.getItem("novelhub_token")
+}
+
+function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  const headers: Record<string, string> = { ...extra }
+  const t = token()
+  if (t) headers["Authorization"] = `Bearer ${t}`
+  return headers
 }
 
 async function errorFrom(res: Response): Promise<string> {
@@ -30,52 +37,30 @@ async function errorFrom(res: Response): Promise<string> {
   return `Request failed: ${res.status}`
 }
 
-export async function streamPost(
-  path: string,
-  body: unknown,
-  onEvent: (event: StreamEvent) => void,
-  signal?: AbortSignal,
-): Promise<void> {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    Accept: "text/event-stream",
-  }
-  const t = token()
-  if (t) headers["Authorization"] = `Bearer ${t}`
-
-  const res = await fetch(`${BASE}${path}`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body ?? {}),
-    signal,
-  })
-
-  if (!res.ok) {
-    if (res.status === 401 && t) {
-      localStorage.removeItem("novelhub_token")
-      window.dispatchEvent(new CustomEvent("novelhub:unauthorized"))
+function emitFrame(frame: string, onEvent: (event: StreamEvent) => void) {
+  for (const rawLine of frame.split("\n")) {
+    const line = rawLine.trim()
+    if (!line.startsWith("data:")) continue
+    const payload = line.slice(5).trim()
+    if (!payload || payload === "[DONE]") continue
+    try {
+      onEvent(JSON.parse(payload) as StreamEvent)
+    } catch {
+      /* ignore malformed frame */
     }
-    throw new Error(await errorFrom(res))
   }
+}
+
+/** Read an SSE response body frame by frame, in arrival order. */
+async function pump(
+  res: Response,
+  onEvent: (event: StreamEvent) => void,
+): Promise<void> {
   if (!res.body) throw new Error("当前浏览器不支持流式响应。")
 
   const reader = res.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ""
-
-  const emit = (frame: string) => {
-    for (const rawLine of frame.split("\n")) {
-      const line = rawLine.trim()
-      if (!line.startsWith("data:")) continue
-      const payload = line.slice(5).trim()
-      if (!payload || payload === "[DONE]") continue
-      try {
-        onEvent(JSON.parse(payload) as StreamEvent)
-      } catch {
-        /* ignore malformed frame */
-      }
-    }
-  }
 
   for (;;) {
     const { done, value } = await reader.read()
@@ -86,9 +71,67 @@ export async function streamPost(
       const frame = buffer.slice(0, index)
       const separatorLength = buffer[index] === "\r" ? 4 : 2
       buffer = buffer.slice(index + separatorLength)
-      emit(frame)
+      emitFrame(frame, onEvent)
       index = buffer.search(/\r?\n\r?\n/)
     }
   }
-  if (buffer.trim()) emit(buffer)
+  if (buffer.trim()) emitFrame(buffer, onEvent)
 }
+
+async function stream(
+  path: string,
+  init: RequestInit,
+  onEvent: (event: StreamEvent) => void,
+): Promise<void> {
+  const res = await fetch(`${BASE}${path}`, init)
+
+  if (!res.ok) {
+    if (res.status === 401 && token()) {
+      localStorage.removeItem("novelhub_token")
+      window.dispatchEvent(new CustomEvent("novelhub:unauthorized"))
+    }
+    throw new Error(await errorFrom(res))
+  }
+  await pump(res, onEvent)
+}
+
+export function streamPost(
+  path: string,
+  body: unknown,
+  onEvent: (event: StreamEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  return stream(
+    path,
+    {
+      method: "POST",
+      headers: authHeaders({
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+      }),
+      body: JSON.stringify(body ?? {}),
+      signal,
+    },
+    onEvent,
+  )
+}
+
+/**
+ * The same stream over GET, for endpoints whose word is in the query string
+ * (the all-source search). Events arrive in completion order, so a fast site
+ * paints before a slow one finishes.
+ */
+export function streamGet(
+  path: string,
+  params: Record<string, string> = {},
+  onEvent: (event: StreamEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const query = new URLSearchParams(params).toString()
+  return stream(
+    query ? `${path}?${query}` : path,
+    { method: "GET", headers: authHeaders({ Accept: "text/event-stream" }), signal },
+    onEvent,
+  )
+}
+
