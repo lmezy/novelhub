@@ -140,6 +140,8 @@ class YueduLoginParser:
             logger.warning("playwright not installed; cannot do form-based login")
             return None
 
+        from app.services.proxy_config import playwright_context_kwargs
+
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(
                 headless=True,
@@ -149,6 +151,7 @@ class YueduLoginParser:
                 context = await browser.new_context(
                     viewport={"width": 1280, "height": 720},
                     locale="zh-CN",
+                    **playwright_context_kwargs(),
                 )
                 page = await context.new_page()
 
@@ -596,8 +599,24 @@ class YueduLoginParser:
 
         logger.info(f"Yuedu auto-login: {method} {url}")
 
+        from app.services.proxy_config import get_proxy_config
+
+        proxy_url = None
+        cfg = get_proxy_config()
+        if cfg.enabled:
+            proxy_url = cfg.https_proxy or cfg.http_proxy
+
         try:
-            async with httpx.AsyncClient(headers=headers, timeout=30, follow_redirects=False) as client:
+            async with httpx.AsyncClient(
+                headers=headers,
+                timeout=30,
+                follow_redirects=False,
+                proxy=proxy_url,
+                trust_env=False,
+                # Proxy (Clash) TLS interception uses a local CA cert; browsers
+                # accept it interactively but httpx cannot (see transport.py).
+                verify=False,
+            ) as client:
                 if method == "POST":
                     resp = await client.post(url, content=body)
                 else:

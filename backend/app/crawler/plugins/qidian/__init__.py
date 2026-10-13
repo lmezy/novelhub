@@ -95,9 +95,12 @@ class QidianPlugin:
         except ImportError:
             return None
         try:
+            from app.services.proxy_config import playwright_context_kwargs
+
             async with async_playwright() as pw:
                 browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
-                page = await browser.new_page()
+                context = await browser.new_context(**playwright_context_kwargs())
+                page = await context.new_page()
                 await page.goto(f"{self.config.base_url}/login", wait_until="networkidle", timeout=30000)
                 await page.fill('input[name="username"], input[type="text"]', username)
                 await page.fill('input[name="password"], input[type="password"]', password)

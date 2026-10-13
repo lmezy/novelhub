@@ -1928,6 +1928,38 @@ AND 对小型、完整的精确结果集（最多 200 条）先取回正文逐�
 **验证方式**：以上数字都来自 NAS 上的只读 curl / psql（见 `_scratch/nh_probe*.sh`）；本次未改动
 线上任何配置（`maxTotalHits` 已确认仍是 10000，`nh_scale_probe` 是既有的一次性索引）。
 
+## 52. 代理设置只覆盖了「手动登录」：其余浏览器/HTTP/curl 入口直连（2026-10-12）
+
+**现象**：后台「代理设置」已开启（`storage/proxy_config.json` → `http://127.0.0.1:27890`），
+远程手动登录能打开被墙站点，但 webJs 渲染、自动登录、JS API 登录、起点登录仍报
+`ERR_CONNECTION_CLOSED` / `ConnectTimeout`，日志初判是「代理没生效」。
+
+**根因**：把 `proxy_config` 接进请求路径的只有一部分代码——webJs 渲染（`render.py::_launch_chromium`，
+launch 级 proxy）、yuedu HTTP（`transport.py`）、jsoup shim 的 curl、后端 yuedu 路由早就接上了；
+漏网的是：yuedu 表单自动登录的 `new_context`、`_do_api_login` 的 `httpx.AsyncClient`、
+`PlaywrightCrawler.start()`（起点/番茄抓取主路径）、起点/番茄 `auto_login` 里
+`browser.new_page()` 的默认 context、以及 `js_runtime._build_login_script` 里登录 JS 自带 curl。
+（任务书里 `yuedu/__init__.py:1797` 与任何版本都对不上：NAS 容器内代码与本地 HEAD 一致，
+逐处按实际代码核对后，除 webJs 渲染已是 launch 级 proxy 外，其余缺陷都成立。）
+
+**改动**（只改本地代码）：
+
+- `app/services/proxy_config.py`：新增 `playwright_context_kwargs()`，enabled 时返回 `{"proxy": {...}}`。
+- `app/crawler/plugins/yuedu/login.py`：`_execute_playwright_login` 的 `new_context` 接入；
+  `_do_api_login` 的 httpx 补 `proxy=` 并统一 `trust_env=False` / `verify=False`（同 `transport.py`，
+  代理的本地 CA 拦截 httpx 默认不认）。
+- `app/crawler/playwright_crawler.py`、`plugins/qidian/__init__.py`、`plugins/fanqie/__init__.py`：
+  浏览器 context 接入（后两者原是 `browser.new_page()` 默认 context；fanqie 与起点同款，一并修）。
+- `app/crawler/plugins/yuedu/js_runtime.py`：登录 JS 的 curl 补 `-x "$DSH_HTTP_PROXY" -k`
+  （与 jsoup shim `__nhCurlRaw` 同款；容器里没有 `HTTPS_PROXY`，Chromium 也不读环境变量）。
+
+**验证**：`backend/tests/test_proxy_wiring.py` 8 条（回退改动后 6 条失败）；全量
+`cd backend && python -m pytest -q` → **968 passed**。部署需重建 backend 与 crawler 两镜像
+（两镜像共用 `backend/` 代码）。
+
+**注意**：`cf_clearance` 绑定出口 IP，代理开启后 Cookie 的取得（远程浏览器）与校验
+（httpx / 自动登录浏览器）必须都走代理，否则同一书源必然验证码/403。
+
 ## 53. 库内搜索的数量上限真去掉了：索引期 gram + filter（2026-10-12）
 
 **现象**：搜「的」这类常见字，结果只有 10 000 条、翻到某一页就到底；`total` 明显小于真实命中数。

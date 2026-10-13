@@ -700,7 +700,13 @@ function _httpSync(url, method, body, extraHeaders) {{
             let escapedBody = body.replace(/'/g, "'\\\\''");
             bodyArg = " -d '" + escapedBody + "'";
         }}
-        let cmd = 'curl -s -S -L --max-time 30 -X ' + method + headerArgs + bodyArg + ' "' + url + '"';
+        // curl does not read the DSH_HTTP_PROXY name and the container exports
+        // no HTTPS_PROXY, so hand the configured proxy to curl explicitly --
+        // the same way the jsoup shim's __nhCurlRaw does.  -k matches the
+        // proxy's local-CA TLS interception.
+        let proxy = (typeof process !== 'undefined' && process.env && process.env.DSH_HTTP_PROXY) || '';
+        let proxyArg = proxy ? ("-x '" + String(proxy).replace(/'/g, "'\\\\''") + "' -k") : "";
+        let cmd = 'curl -s -S -L --max-time 30 ' + proxyArg + ' -X ' + method + headerArgs + bodyArg + ' "' + url + '"';
         let output = execSync(cmd, {{ maxBuffer: 10 * 1024 * 1024, timeout: 35000 }});
         return output.toString('utf-8');
     }} catch(e) {{

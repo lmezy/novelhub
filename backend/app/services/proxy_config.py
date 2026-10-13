@@ -92,3 +92,16 @@ def get_playwright_proxy() -> dict | None:
     if not server:
         return None
     return {"server": server}
+
+
+def playwright_context_kwargs() -> dict:
+    """Context kwargs that keep a Playwright context on the configured proxy.
+
+    ``browser.new_context(**playwright_context_kwargs())`` makes the browser's
+    egress match the proxied HTTP path.  A context that connects directly
+    cannot open blocked sites, and cookies like ``cf_clearance`` are bound to
+    the egress IP, so a direct context invalidates the session the proxied
+    path obtained.
+    """
+    proxy = get_playwright_proxy()
+    return {"proxy": proxy} if proxy else {}

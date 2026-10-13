@@ -52,10 +52,16 @@ class PlaywrightCrawler:
             headless=self._headless,
             args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
         )
+        # Keep this crawler on the admin-configured proxy: it is the fetch
+        # path for the 起点/番茄 plugins, and a direct context cannot open
+        # blocked sites.
+        from app.services.proxy_config import playwright_context_kwargs
+
         self._context = await self._browser.new_context(
             user_agent=self._user_agent,
             viewport={"width": 1280, "height": 720},
             locale="zh-CN",
+            **playwright_context_kwargs(),
         )
         if self._cookie_str:
             await self._apply_cookies()
