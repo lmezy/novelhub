@@ -7,6 +7,14 @@ from loguru import logger
 
 from app.core.config import settings
 from app.services.book_kind import KIND_NOVEL, normalize_kind
+from app.services.search_ngrams import (
+    GRAM_FIELD_FOR_BOOK,
+    GRAM_FIELD_FOR_CHAPTER,
+    book_gram_fields,
+    chapter_gram_fields,
+    gram_field_for,
+    gram_filter,
+)
 
 
 class SearchService:
@@ -21,13 +29,23 @@ class SearchService:
     # chapter batch.  1000 keeps the same semantics at ~0.5 s while still
     # offering 25 pages of 40 results.
     CANDIDATE_LIMIT = 1000
-    # Meilisearch's ``pagination.maxTotalHits`` -- the highest page number its
-    # ranking rules will serve (``_ensure_index`` applies this to both indexes).
-    MAX_TOTAL_HITS = 10_000
-    # 正文 searches score the full engine candidate window in chunks before
-    # reporting their total. Returning only the first 300 candidates also made
-    # the frontend disable pagination before the old on-demand window could grow.
-    CONTENT_CANDIDATE_LIMIT = MAX_TOTAL_HITS
+    # Meilisearch's ``pagination.maxTotalHits`` -- the highest rank its ranking
+    # rules will ever serve (``_ensure_index`` applies this to both indexes).
+    # It is also, therefore, the hard ceiling on how many hits *any* query can
+    # see: the engine refuses to return documents past this rank no matter what
+    # ``limit`` says, so the old 10 000 meant a query matching 12 466 books
+    # reported 10 000 and could not be paged past it.  The live corpus is
+    # ~33.5k books / ~117k chapters, so the ceiling is set above both; the gram
+    # filter (``search_ngrams``) does the narrowing that the truncated candidate
+    # windows used to do, and it can address every match the engine holds.
+    # Overridable through ``MEILI_MAX_TOTAL_HITS`` for a library that outgrows it.
+    MAX_TOTAL_HITS = 200_000
+    # 正文 searches score the engine candidate window in chunks before reporting
+    # their total.  This deliberately does **not** follow ``MAX_TOTAL_HITS``: a
+    # 正文 scan retrieves the stored body of every candidate, and 10 000 chapters
+    # already measured 118 MB / 105 s on the live index, so 117 000 would be
+    # ~1.4 GB per search.  The body is the one thing a wider window cannot buy.
+    CONTENT_CANDIDATE_LIMIT = 10_000
     CONTENT_SEARCH_LIMIT = CONTENT_CANDIDATE_LIMIT
     CONTENT_RECALL_RETRY_THRESHOLD = 40
     # Per-request candidate count while walking the full body-search window.
@@ -49,6 +67,14 @@ class SearchService:
     # retain only a bounded excerpt, not the chapter bodies, after scoring.
     PAGE_CACHE_MAX_ENTRIES = 16
     CONDITION_CACHE_MAX_ENTRIES = 8
+    # ...and an entry is no longer bounded by 10 000 either, now that a
+    # gram-narrowed scan can walk a whole index.  Sixteen entries of 200 000 rows
+    # would be hundreds of MB in a backend container limited to 1 GB, so both
+    # caches are additionally bounded by the number of ranked rows they hold and
+    # evict the least recently stored entry until both budgets fit.  Section 28
+    # of codex-handoff.md sizes one 33.6k-book ranking at ~5 MB.
+    PAGE_CACHE_MAX_ROWS = 250_000
+    CONDITION_CACHE_MAX_ROWS = 120_000
     # Multi-condition (AND/OR) searches used to score every condition on its own
     # candidate window and intersect the ids in Python.  For two conditions on
     # the same attribute that is arithmetically hopeless: 正文 「铃」 has 9 619
@@ -59,7 +85,22 @@ class SearchService:
     # intersections at any depth.  The window below is how many of those ranked
     # hits are scored and cached for paging; the engine narrows candidates before
     # returning ids, and chapter bodies are fetched only for the current page.
-    CONJUNCTION_CANDIDATE_LIMIT = MAX_TOTAL_HITS
+    # Like ``CONTENT_SEARCH_LIMIT`` this deliberately does not follow
+    # ``MAX_TOTAL_HITS``: the ranked list is held in memory per page-cache entry,
+    # and a window as wide as the whole engine ceiling would put hundreds of MB
+    # into a backend container limited to 1 GB.
+    CONJUNCTION_CANDIDATE_LIMIT = 10_000
+    # How many candidates one gram-narrowed condition may walk, per index.  A
+    # gram filter makes a chunk selective, but it does not make the *engine*
+    # fast: on the production box the chapters index has 666k documents inside a
+    # 94 GB store served from 12 GB of RAM, where a single unfiltered 10 000-row
+    # window measured 514-631 s (codex-handoff.md section 51).  So the two
+    # indexes get different budgets -- the books index is 43.6k small documents
+    # and answers a 10 000-row id-only window in 0.5 s hot, while a chapters
+    # walk is bounded at ten times what it used to be allowed rather than at the
+    # whole library.  Raise the chapters budget only after measuring it there.
+    SCAN_BUDGET_BOOKS = MAX_TOTAL_HITS
+    SCAN_BUDGET_CHAPTERS = 10_000
     # Complete small exact result sets are verified before paging; larger sets
     # are checked page by page because verification retrieves stored text.
     CONJUNCTION_VERIFY_MAX_HITS = 200
@@ -162,6 +203,11 @@ class SearchService:
         self.client = meilisearch.Client(settings.MEILI_HOST, settings.MEILI_KEY)
         self._chapter_buffer: list[dict] = []
         self._ensured: set[str] = set()
+        # Indexes whose gram fields are known to be present on **every** document,
+        # so a gram-filtered metadata search cannot hide a not-yet-backfilled
+        # book.  Populated by ``sync_book_grams`` / ``rebuild_index``; see
+        # ``gram_index_ready`` for why this is not probed per search.
+        self._gram_ready: set[str] = set()
         self._page_cache: dict[str, tuple[float, list[tuple[int, str, str]]]] = {}
         self._condition_cache: dict[
             str, tuple[float, dict[str, tuple[int, dict]]]
@@ -172,6 +218,45 @@ class SearchService:
         # user pages, which is exactly the 0-result complaint this replaces.
         self._conjunction_totals: dict[str, tuple[float, int | None]] = {}
 
+    def max_total_hits(self) -> int:
+        """The engine's ``pagination.maxTotalHits`` for this deployment.
+
+        ``MAX_TOTAL_HITS`` is the default the class ships with; a library that
+        grows past it can raise the ceiling from configuration instead of
+        needing a code change, because the value is applied to the index
+        settings on the next ``_ensure_index``.
+        """
+        try:
+            configured = int(getattr(settings, "MEILI_MAX_TOTAL_HITS", 0) or 0)
+        except (TypeError, ValueError):
+            configured = 0
+        return configured if configured > 0 else self.MAX_TOTAL_HITS
+
+    @classmethod
+    def gram_fields(cls, name: str) -> tuple[str, ...]:
+        """The derived gram attributes ``name`` declares filterable and writes."""
+        return GRAM_FIELD_FOR_BOOK if name == cls.INDEX_BOOKS else GRAM_FIELD_FOR_CHAPTER
+
+    @classmethod
+    def scan_budget(cls, name: str) -> int:
+        """How far a gram-narrowed walk on ``name`` may go, in candidates.
+
+        Never above the engine's own ceiling: asking the engine for more than
+        ``maxTotalHits`` rows is not an error, it just silently stops there, and a
+        window larger than the ceiling would report a total the engine cannot
+        serve pages for.
+        """
+        budget = (
+            cls.SCAN_BUDGET_BOOKS if name == cls.INDEX_BOOKS
+            else cls.SCAN_BUDGET_CHAPTERS
+        )
+        return max(1, min(budget, cls.MAX_TOTAL_HITS))
+
+    @classmethod
+    def filterable_attributes(cls, name: str) -> list[str]:
+        """Every filterable attribute of one index, base fields plus grams."""
+        return [*cls.FILTERABLE_ATTRIBUTES, *cls.gram_fields(name)]
+
     def _ensure_index(self, name: str, primary_key: str = "id") -> None:
         if name in self._ensured:
             return
@@ -180,13 +265,13 @@ class SearchService:
         except meilisearch.errors.MeilisearchApiError:
             self.client.create_index(name, {"primaryKey": primary_key})
         index = self.client.index(name)
-        index.update_filterable_attributes(self.FILTERABLE_ATTRIBUTES)
+        index.update_filterable_attributes(self.filterable_attributes(name))
         if name == self.INDEX_BOOKS:
             index.update_searchable_attributes(self.SEARCHABLE_BOOKS)
         else:
             index.update_searchable_attributes(self.SEARCHABLE_CHAPTERS)
         try:
-            index.update_pagination_settings({"maxTotalHits": self.MAX_TOTAL_HITS})
+            index.update_pagination_settings({"maxTotalHits": self.max_total_hits()})
         except Exception:
             pass
         self._ensured.add(name)
@@ -203,28 +288,50 @@ class SearchService:
         # started on /novels or /comics inside its own half of the library, and
         # a document without the field matches neither side of the filter.
         doc["kind"] = normalize_kind(doc.get("kind"))
+        # The derived gram fields are what let a metadata search reach every
+        # match instead of the engine's first ``maxTotalHits``; they are computed
+        # here, in the one funnel every write path goes through, so a book cannot
+        # be indexed without them (``sync_book_grams`` backfills older ones).
+        doc.update(book_gram_fields(doc))
         self.client.index(self.INDEX_BOOKS).add_documents([doc])
         logger.debug("Indexed book {}", doc.get("id"))
 
     def index_chapter(self, chapter: dict) -> None:
         self._ensure_index(self.INDEX_CHAPTERS)
-        self.client.index(self.INDEX_CHAPTERS).add_documents([chapter])
-        logger.debug("Indexed chapter {}", chapter.get("id"))
+        doc = dict(chapter)
+        doc.update(chapter_gram_fields(doc))
+        self.client.index(self.INDEX_CHAPTERS).add_documents([doc])
+        logger.debug("Indexed chapter {}", doc.get("id"))
 
     def update_book_tags(self, book_id: str, tags: list[str]) -> None:
+        """Merge new tags into an indexed book.
+
+        ``update_documents`` (HTTP PUT) merges the given fields and leaves the
+        rest of the document alone.  ``add_documents`` (HTTP POST) *replaces*
+        the document, so this one-field write used to reduce the whole book to
+        ``{id, tags}`` -- dropping ``kind`` (making it unfindable from /novels
+        and /comics) and every derived gram field with it.  Only a later
+        ``sync_book_kinds`` backfill repaired the damage.
+        """
         self._ensure_index(self.INDEX_BOOKS)
-        self.client.index(self.INDEX_BOOKS).add_documents([{"id": book_id, "tags": tags}])
+        self.client.index(self.INDEX_BOOKS).update_documents([{"id": book_id, "tags": tags}])
 
     def update_chapter_tags(self, chapter_id: str, tags: list[str]) -> None:
+        """Merge new tags into an indexed chapter (see ``update_book_tags``)."""
         self._ensure_index(self.INDEX_CHAPTERS)
-        self.client.index(self.INDEX_CHAPTERS).add_documents([
+        self.client.index(self.INDEX_CHAPTERS).update_documents([
             {"id": chapter_id, "tags": tags}
         ])
 
     def buffer_chapter(self, chapter: dict) -> None:
         """Queue a chapter for batched indexing, flushing in chunks."""
         self._ensure_index(self.INDEX_CHAPTERS)
-        self._chapter_buffer.append(chapter)
+        doc = dict(chapter)
+        # ``flush_chapters`` sends these with ``add_documents``, which replaces
+        # the stored document, so the gram fields have to be on the buffered copy
+        # rather than merged in later.
+        doc.update(chapter_gram_fields(doc))
+        self._chapter_buffer.append(doc)
         if len(self._chapter_buffer) >= self.CHAPTER_BUFFER_SIZE:
             self.flush_chapters()
 
@@ -506,6 +613,112 @@ class SearchService:
             options["filter"] = filters
         return self.client.index(index_name).search("", options)
 
+    # ---- gram narrowing: the engine does the substring match ----
+
+    def index_missing_grams(self, index_name: str) -> bool:
+        """Whether ``index_name`` still holds documents without the gram fields.
+
+        Same shape as ``index_missing_kind``, opposite direction: "missing" means
+        *any* document lacks the field, and the caller must then keep its
+        windowed path.  A partly backfilled index is the dangerous state -- the
+        gram filter would silently drop the books that are not backfilled yet,
+        and there is no per-document way to tell at query time which those are.
+        ``NOT EXISTS`` is a filter, so it answers in one cheap request.
+        """
+        self._ensure_index(index_name)
+        probe = self.gram_fields(index_name)[0]
+        try:
+            result = self.client.index(index_name).search("", {
+                "limit": 1,
+                "filter": f"{probe} NOT EXISTS",
+                "attributesToRetrieve": ["id"],
+            })
+        except Exception as exc:
+            logger.warning("Could not probe {} for gram fields: {}", index_name, exc)
+            # An unknown index state must not read as "safe to narrow": on an
+            # index whose filterable attributes do not carry the probe (or an
+            # engine that rejects the filter) the gram path would answer every
+            # search with nothing, which is worse than a truncated answer.
+            return True
+        return bool(result.get("hits"))
+
+    def gram_index_ready(self, index_name: str) -> bool:
+        """Whether metadata searches on ``index_name`` may use the gram filter.
+
+        Deliberately *not* a per-search probe.  The answer only turns true once a
+        full backfill has **verified** that every document carries the fields
+        (``sync_book_grams``, or ``rebuild_index`` which writes them itself), and
+        the state changes at most twice in a deployment's life -- re-probing it
+        on the hot path would add a request to every search to re-learn a
+        constant.  Until it is verified, searches keep the windowed path, which
+        is exactly the behaviour that shipped before the gram fields existed.
+        """
+        return index_name in self._gram_ready
+
+    @staticmethod
+    def _combine_filters(*parts: str | None) -> str | None:
+        """AND several optional filters, leaving a lone part byte-identical.
+
+        Existing call sites pass a single expression and their tests pin the
+        exact string; wrapping that in parentheses would change what the engine
+        receives for no benefit.
+        """
+        kept = [part for part in parts if part]
+        if not kept:
+            return None
+        if len(kept) == 1:
+            return kept[0]
+        return " AND ".join(f"({part})" for part in kept)
+
+    def gram_narrowing(
+        self,
+        index_name: str,
+        attr: str,
+        value: str,
+        mode: str,
+    ) -> str | None:
+        """The filter that reduces a metadata scan to its real candidates.
+
+        ``None`` whenever the narrowing is not available, and every caller keeps
+        its windowed scan in that case:
+
+        * the attribute is not grammed (``description``, ``content``, arrays);
+        * the mode is neither ``exact`` nor ``fuzzy``;
+        * the query is empty;
+        * the index is not backfilled yet, or its state could not be probed.
+
+        Both modes are narrowable, and both are worth it: the library search box
+        sends ``fuzzy`` for title/author, so narrowing only ``exact`` would leave
+        the most-used search on its truncated window.
+        """
+        if mode not in ("exact", "fuzzy"):
+            return None
+        field = gram_field_for(attr)
+        if field is None or field not in self.gram_fields(index_name):
+            return None
+        if not self.gram_index_ready(index_name):
+            return None
+        return gram_filter(field, value, mode)
+
+    def gram_narrowed_filters(
+        self,
+        index_name: str,
+        attr: str,
+        value: str,
+        mode: str,
+        filters: str | None,
+    ) -> str | None:
+        """``filters`` AND-ed with the gram narrowing, or ``None`` if unavailable.
+
+        A non-``None`` answer means the engine has already discarded every
+        document that cannot match, so the caller may drop its candidate window
+        and walk the result until a chunk comes back short.
+        """
+        narrowing = self.gram_narrowing(index_name, attr, value, mode)
+        if not narrowing:
+            return None
+        return self._combine_filters(filters, narrowing)
+
     def _collect_condition(
         self,
         index_name: str,
@@ -519,6 +732,19 @@ class SearchService:
             limit if limit is not None
             else self._candidate_window(index_name, attr)
         )
+        # A gram-narrowed condition behaves like a 正文 scan: the engine has
+        # already discarded the non-matches, so the window only bounds the walk
+        # and the chunks stay small.  This is what lifts the 1 000-candidate
+        # window that hid 99% of the chapter index from a multi-condition search
+        # -- ``book_title``/``book_author`` are grammed, so the walk now reaches
+        # far more of what the query really matches.
+        narrowed = (
+            None if limit is not None
+            else self.gram_narrowed_filters(index_name, attr, value, mode, filters)
+        )
+        if narrowed:
+            window = self.scan_budget(index_name)
+            filters = narrowed
         cache_key = "|".join((
             index_name, attr, value, mode, filters or "", str(window),
         ))
@@ -529,7 +755,11 @@ class SearchService:
             if expires_at >= now:
                 return candidates
             self._condition_cache.pop(cache_key, None)
-        step = min(self._SCAN_CHUNK, window) if attr == "content" else window
+        step = (
+            min(self._SCAN_CHUNK, window)
+            if attr == "content" or narrowed
+            else window
+        )
 
         def collect(matching_strategy: str | None) -> dict[str, tuple[int, dict]]:
             candidates: dict[str, tuple[int, dict]] = {}
@@ -595,11 +825,11 @@ class SearchService:
         self._condition_cache[cache_key] = (
             now + self.PAGE_CACHE_TTL_SECONDS, candidates,
         )
-        while len(self._condition_cache) > self.CONDITION_CACHE_MAX_ENTRIES:
-            oldest = min(
-                self._condition_cache.items(), key=lambda item: item[1][0],
-            )[0]
-            self._condition_cache.pop(oldest, None)
+        self._evict_to_budget(
+            self._condition_cache,
+            self.CONDITION_CACHE_MAX_ENTRIES,
+            self.CONDITION_CACHE_MAX_ROWS,
+        )
         return candidates
 
     @classmethod
@@ -1173,6 +1403,16 @@ class SearchService:
         # cost more, but pagination receives the full verified total rather than
         # stopping at the first 300 candidates.
         chunk_size = self._SCAN_CHUNK if attr == "content" else window
+        # A gram-narrowed scan has no ranking window to respect -- the engine
+        # already dropped every document that cannot hold the query -- so it
+        # walks in cheap id-sized chunks up to this index's scan budget.
+        narrowed = self.gram_narrowed_filters(
+            index_name, attr, cond["value"], cond.get("mode") or "exact", filters,
+        )
+        if narrowed:
+            window = self.scan_budget(index_name)
+            chunk_size = self._SCAN_CHUNK
+            filters = narrowed
         cache_key = "|".join((
             index_name, attr, cond["value"], filters or "",
             cond.get("mode") or "exact", str(window),
@@ -1225,11 +1465,31 @@ class SearchService:
         ]:
             self._page_cache.pop(stale, None)
         self._page_cache[key] = (now + self.PAGE_CACHE_TTL_SECONDS, ranked)
-        while len(self._page_cache) > self.PAGE_CACHE_MAX_ENTRIES:
-            oldest = min(
-                self._page_cache.items(), key=lambda item: item[1][0],
-            )[0]
-            self._page_cache.pop(oldest, None)
+        self._evict_to_budget(
+            self._page_cache,
+            self.PAGE_CACHE_MAX_ENTRIES,
+            self.PAGE_CACHE_MAX_ROWS,
+        )
+
+    @staticmethod
+    def _cached_rows(cache: dict) -> int:
+        """Total rows held by a ``{key: (expires_at, payload)}`` cache."""
+        return sum(len(payload) for _expires_at, payload in cache.values())
+
+    @classmethod
+    def _evict_to_budget(cls, cache: dict, max_entries: int, max_rows: int) -> None:
+        """Drop the least recently stored entries until both budgets fit.
+
+        Entry count alone stopped being a memory bound once a single cached
+        ranking could cover a whole index: what matters is how many scored rows
+        are resident.  The entry that was just stored is never the one evicted,
+        so a result larger than the whole budget is still served from cache.
+        """
+        while len(cache) > 1 and (
+            len(cache) > max_entries or cls._cached_rows(cache) > max_rows
+        ):
+            oldest = min(cache.items(), key=lambda item: item[1][0])[0]
+            cache.pop(oldest, None)
 
     # ---- multi-condition AND: one conjunction query, then the same scorer ----
 
@@ -1493,11 +1753,14 @@ class SearchService:
             )
         # The engine's count is capped by the cached ranking: it may count
         # 1 299 hits while the window kept the best 1 000, and promising pages
-        # the window cannot serve is worse than a slightly smaller total.
-        # ``MAX_TOTAL_HITS`` is Meilisearch's own paging ceiling.
+        # the window cannot serve is worse than a slightly smaller total.  The
+        # cap is the *window* (``CONJUNCTION_CANDIDATE_LIMIT``), not the engine's
+        # ``maxTotalHits``: the engine ceiling was raised to cover the whole
+        # library, and using it here would promise pages that this ranking,
+        # deliberately kept small to bound memory, cannot produce.
         total = min(
             engine_total if engine_total is not None else len(ranked),
-            max(len(ranked), self.MAX_TOTAL_HITS),
+            max(len(ranked), self.CONJUNCTION_CANDIDATE_LIMIT),
         )
         total = max(total, offset + len(page_rows))
         return {"hits": hits, "total": total, "offset": offset, "limit": limit}
@@ -1818,6 +2081,10 @@ class SearchService:
                     except Exception:
                         pass
                 self._ensured.clear()
+                # The gram fields are written by the rebuild itself, but the
+                # probe's cached answer belongs to the index that was just
+                # deleted.
+                self._gram_ready.clear()
                 self._ensure_index(self.INDEX_BOOKS)
                 self._ensure_index(self.INDEX_CHAPTERS)
 
@@ -1878,6 +2145,11 @@ class SearchService:
                         "tags": meta.get("tags") or [],
                         "category_names": meta.get("category_names") or [],
                         "kind": meta.get("kind") or KIND_NOVEL,
+                        **chapter_gram_fields({
+                            "title": chapter.title or "",
+                            "book_title": meta.get("title", ""),
+                            "book_author": meta.get("author", ""),
+                        }),
                     })
                     if len(batch) >= self.CHAPTER_BUFFER_SIZE:
                         self.client.index(self.INDEX_CHAPTERS).add_documents(batch)
@@ -1886,6 +2158,11 @@ class SearchService:
                 if batch:
                     self.client.index(self.INDEX_CHAPTERS).add_documents(batch)
                     result["chapters"] += len(batch)
+
+                # The rebuild just wrote every document, gram fields included, so
+                # the metadata search may take the gram path immediately rather
+                # than waiting for the next startup backfill.
+                self._gram_ready.update({self.INDEX_BOOKS, self.INDEX_CHAPTERS})
 
         await _rebuild()
         return result
@@ -2042,6 +2319,123 @@ class SearchService:
             logger.debug("Deleted book {} from search index", book_id)
         except Exception:
             pass
+
+    async def sync_book_grams(
+        self,
+        *,
+        force: bool = False,
+    ) -> dict:
+        """Merge the derived gram fields into every existing document.
+
+        The fields were introduced after both indexes already held the whole
+        library, and a search cannot use the gram filter until *every* document
+        carries them -- a partly migrated index would answer with the backfilled
+        books only, silently dropping the rest.  So this walks the library once
+        (``update_documents`` merges, so nothing else in the document is touched
+        and no chapter body has to be re-read) and the startup caller is a no-op
+        on every later restart.
+
+        Books are read from Postgres; a chapter's ``book_title``/``book_author``
+        come from its book row, which ``Chapter`` can be joined to, so no storage
+        read is involved either.
+        """
+        self._ensure_index(self.INDEX_BOOKS)
+        self._ensure_index(self.INDEX_CHAPTERS)
+        need_books = force or self.index_missing_grams(self.INDEX_BOOKS)
+        need_chapters = force or self.index_missing_grams(self.INDEX_CHAPTERS)
+        # The probes above have just answered for both indexes, so an index with
+        # nothing missing is ready *right now* -- this is also how a process that
+        # starts after an earlier backfill (or after ``rebuild_index``) learns it
+        # may take the gram path without paying a per-search probe.
+        if not need_books:
+            self._gram_ready.add(self.INDEX_BOOKS)
+        if not need_chapters:
+            self._gram_ready.add(self.INDEX_CHAPTERS)
+        result = {
+            "books": 0,
+            "chapters": 0,
+            "skipped": not (need_books or need_chapters),
+        }
+        if result["skipped"]:
+            return result
+
+        from sqlalchemy import select
+
+        from app.core.database import SessionLocal
+        from app.models import Book, Chapter
+
+        async with SessionLocal() as db:
+            books_index = self.client.index(self.INDEX_BOOKS)
+            chapters_index = self.client.index(self.INDEX_CHAPTERS)
+            if need_books:
+                last_id = ""
+                while True:
+                    rows = (
+                        await db.execute(
+                            select(Book.id, Book.title, Book.author_name)
+                            .where(Book.id > last_id)
+                            .order_by(Book.id)
+                            .limit(self.KIND_BACKFILL_BATCH)
+                        )
+                    ).all()
+                    if not rows:
+                        break
+                    docs = []
+                    for book_id, title, author in rows:
+                        doc = {
+                            "id": str(book_id),
+                            "title": title or "",
+                            "author": author or "",
+                        }
+                        last_id = str(book_id)
+                        docs.append({**doc, **book_gram_fields(doc)})
+                    books_index.update_documents(docs)
+                    result["books"] += len(docs)
+            if need_chapters:
+                last_id = ""
+                while True:
+                    rows = (
+                        await db.execute(
+                            select(
+                                Chapter.id, Chapter.title,
+                                Book.title, Book.author_name,
+                            )
+                            .join(Book, Book.id == Chapter.book_id)
+                            .where(Chapter.id > last_id)
+                            .order_by(Chapter.id)
+                            .limit(self.KIND_BACKFILL_BATCH)
+                        )
+                    ).all()
+                    if not rows:
+                        break
+                    docs = []
+                    for chapter_id, title, book_title, book_author in rows:
+                        doc = {
+                            "id": str(chapter_id),
+                            "title": title or "",
+                            "book_title": book_title or "",
+                            "book_author": book_author or "",
+                        }
+                        last_id = str(chapter_id)
+                        docs.append({**doc, **chapter_gram_fields(doc)})
+                    chapters_index.update_documents(docs)
+                    result["chapters"] += len(docs)
+
+        # Verify rather than assume.  Only an index that now reports nothing
+        # missing may take the gram path: a backfill interrupted halfway would
+        # otherwise hide exactly the documents it never reached, and a search
+        # that silently loses books is worse than one that is merely truncated.
+        for index_name in (self.INDEX_BOOKS, self.INDEX_CHAPTERS):
+            if self.index_missing_grams(index_name):
+                self._gram_ready.discard(index_name)
+            else:
+                self._gram_ready.add(index_name)
+        logger.info(
+            "Backfilled search grams: {} books, {} chapters",
+            result["books"],
+            result["chapters"],
+        )
+        return result
 
 
 search_service = SearchService()

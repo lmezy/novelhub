@@ -3,6 +3,7 @@ from typing import Literal
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 
 from app.core.database import get_db
 from app.models import Book, User
@@ -158,8 +159,15 @@ async def search(
 ):
     allow_r18 = can_view_r18(user)
     allow_all_ages = can_view_all_ages(user)
+    # ``search_service`` speaks the synchronous Meilisearch client, and this
+    # backend runs a single uvicorn worker: calling it directly from the event
+    # loop froze *every* other request for the whole search.  A 正文 search
+    # measured 105 s against the live index, so one reader's search was a
+    # 105-second outage for everybody.  The thread pool keeps the loop serving
+    # while the search runs.
     if scope == "books":
-        result = search_service.search_books(
+        result = await run_in_threadpool(
+            search_service.search_books,
             q,
             offset=offset,
             limit=limit,
@@ -169,7 +177,8 @@ async def search(
             kind=kind,
         )
     else:
-        result = search_service.search_chapters(
+        result = await run_in_threadpool(
+            search_service.search_chapters,
             q,
             offset=offset,
             limit=limit,
@@ -198,7 +207,11 @@ async def advanced_search(
 ):
     allow_r18 = can_view_r18(user)
     allow_all_ages = can_view_all_ages(user)
-    result = search_service.advanced_search(
+    # Same reason as ``GET /search`` above: an advanced search is a synchronous
+    # engine call that can run for minutes on a broad 正文 query, and blocking
+    # the event loop for it takes the whole API down with it.
+    result = await run_in_threadpool(
+        search_service.advanced_search,
         [condition.model_dump() for condition in payload.conditions],
         match=payload.match,
         scope=payload.scope,
@@ -246,5 +259,20 @@ async def sync_index_kinds(user: User = Depends(get_current_user)):
     """
     try:
         return {"status": "ok", **await search_service.sync_book_kinds(force=True)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/index/grams")
+async def sync_index_grams(user: User = Depends(get_current_user)):
+    """Merge the derived gram fields into both indexes (metadata search depth).
+
+    A metadata search can only see every match once *every* document carries
+    these fields, and it falls back to the old truncated window until then.  The
+    startup task calls this on an index that still lacks them; this endpoint is
+    the manual escape hatch after restoring or re-importing an index.
+    """
+    try:
+        return {"status": "ok", **await search_service.sync_book_grams(force=True)}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc

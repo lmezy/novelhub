@@ -89,6 +89,18 @@ async def ensure_search_indexes():
 
     asyncio.create_task(_backfill_kinds())
 
+    # The derived gram fields (``services/search_ngrams.py``) are what let a
+    # metadata search see every match instead of the engine's first
+    # ``maxTotalHits``.  A search cannot use them until *every* document carries
+    # them, so this walks the library once and is a no-op afterwards.
+    async def _backfill_grams() -> None:
+        try:
+            await search_service.sync_book_grams()
+        except Exception as exc:  # pragma: no cover - startup best effort
+            logger.warning("Search gram backfill failed: {}", exc)
+
+    asyncio.create_task(_backfill_grams())
+
 
 @app.get("/")
 async def root():

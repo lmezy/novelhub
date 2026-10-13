@@ -1,10 +1,13 @@
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
 from meilisearch.errors import MeilisearchApiError
 
+from app.core.config import settings
 from app.services.search import SearchService
+from app.services.search_ngrams import field_grams
 
 
 def _make_service():
@@ -32,7 +35,31 @@ def test_ensure_index_updates_settings():
 
     index.update_filterable_attributes.assert_called_once()
     index.update_searchable_attributes.assert_called_once()
-    index.update_pagination_settings.assert_called_once_with({"maxTotalHits": 10000})
+    index.update_pagination_settings.assert_called_once_with(
+        {"maxTotalHits": service.max_total_hits()}
+    )
+
+
+def test_engine_ceiling_covers_the_whole_library_and_is_configurable():
+    """The engine refuses to serve documents past ``maxTotalHits``.
+
+    At 10 000 it was both the paging limit and the hard cap on hits a search
+    could ever see: a query matching 12 466 books reported 10 000 and could not
+    be paged further, no matter what the candidate windows did.  The default has
+    to sit above the live corpus (~33.5k books / ~117k chapters), and a
+    deployment that outgrows it must be able to raise it without a code change.
+    """
+    service, _ = _make_service()
+    assert SearchService.MAX_TOTAL_HITS >= 200_000
+    assert service.max_total_hits() == SearchService.MAX_TOTAL_HITS
+
+    with patch.object(settings, "MEILI_MAX_TOTAL_HITS", 500_000):
+        assert service.max_total_hits() == 500_000
+    # A nonsense override must not shrink the ceiling below the class default.
+    with patch.object(settings, "MEILI_MAX_TOTAL_HITS", 0):
+        assert service.max_total_hits() == SearchService.MAX_TOTAL_HITS
+    with patch.object(settings, "MEILI_MAX_TOTAL_HITS", "lots"):
+        assert service.max_total_hits() == SearchService.MAX_TOTAL_HITS
 
 
 def test_ensure_indexes_creates_missing_indexes():
@@ -85,9 +112,18 @@ def test_candidate_limit_is_bounded_for_fast_advanced_search():
     assert "content" not in SearchService.BOOK_RETRIEVE_ATTRS
 
 
-def test_content_search_uses_the_full_engine_candidate_window():
-    """Content searches can inspect the full engine window, fetched in chunks."""
-    assert SearchService.CONTENT_CANDIDATE_LIMIT == SearchService.MAX_TOTAL_HITS
+def test_content_search_uses_its_own_candidate_window():
+    """The 正文 window is bounded by bandwidth, not by the engine's ceiling.
+
+    It used to be written as ``= MAX_TOTAL_HITS``, which was fine while that
+    ceiling was 10 000 and became a 1.4 GB-per-search footgun the moment the
+    ceiling was raised to cover the whole library: a 正文 scan retrieves every
+    candidate's stored body, so widening it must be a deliberate act rather than
+    a side effect of raising the engine's paging limit.
+    """
+    assert SearchService.CONTENT_CANDIDATE_LIMIT == SearchService.CONTENT_SEARCH_LIMIT
+    assert SearchService.CONTENT_CANDIDATE_LIMIT < SearchService.MAX_TOTAL_HITS
+    assert SearchService.CONJUNCTION_CANDIDATE_LIMIT < SearchService.MAX_TOTAL_HITS
     service, client = _make_service()
     index = client.index.return_value
     index.search.return_value = {"hits": []}
@@ -250,7 +286,7 @@ def test_exact_content_search_scans_the_full_engine_window_in_chunks():
     )
 
     scan_options = chapters_index.search.call_args.args[1]
-    assert service._content_window_for(0) == SearchService.MAX_TOTAL_HITS
+    assert service._content_window_for(0) == SearchService.CONTENT_SEARCH_LIMIT
     assert scan_options["limit"] == SearchService._SCAN_CHUNK
 
 
@@ -611,13 +647,13 @@ def test_snippet_is_anchored_at_the_match_and_marks_both_cuts():
     )
 
 
-def test_content_window_covers_the_full_engine_candidate_limit():
+def test_content_window_covers_the_full_content_candidate_limit():
     """All content-search pages use one fully scanned ranking window."""
     service, _ = _make_service()
 
-    assert service._content_window_for(0) == SearchService.MAX_TOTAL_HITS
-    assert service._content_window_for(320) == SearchService.MAX_TOTAL_HITS
-    assert service._content_window_for(5000) == SearchService.MAX_TOTAL_HITS
+    assert service._content_window_for(0) == SearchService.CONTENT_SEARCH_LIMIT
+    assert service._content_window_for(320) == SearchService.CONTENT_SEARCH_LIMIT
+    assert service._content_window_for(5000) == SearchService.CONTENT_SEARCH_LIMIT
 
 
 def test_content_window_only_applies_to_the_body():
@@ -1343,4 +1379,413 @@ def test_same_field_exact_and_filters_cjk_false_positives():
     scan = chapters_index.search.call_args_list[0]
     assert scan.args[0] == '"师妹" "乳环"'
     assert scan.args[1]["matchingStrategy"] == "all"
+
+
+# ---- derived gram fields: exact CJK substring matching at engine depth ----
+#
+# The behaviour under test is the fix for "search has a number limit": a metadata
+# search could only ever see the candidates the engine ranked inside its window,
+# so a query matching more documents than that window reported a smaller total
+# and could not be paged further.  These tests pin the two halves -- that every
+# write path produces the fields, and that a search only takes the gram path once
+# a backfill has verified the whole index carries them.
+
+
+def _gram_ready_books_service(fake_search):
+    service, books_index, _ = _service_with_indexes()
+    service._gram_ready.add(SearchService.INDEX_BOOKS)
+    books_index.search.side_effect = fake_search
+    return service, books_index
+
+
+def test_index_book_writes_the_gram_fields():
+    service, client = _make_service()
+    index = client.index.return_value
+
+    service.index_book({"id": "b1", "title": "【小铃铛】", "author": "张三"})
+
+    doc = index.add_documents.call_args.args[0][0]
+    assert doc["title_grams"] == field_grams("【小铃铛】")
+    assert "铃铛" in doc["title_grams"]  # the query this whole path exists for
+    assert doc["author_grams"] == field_grams("张三")
+    assert doc["kind"]  # the pre-existing field is still written
+
+
+def test_index_chapter_writes_the_gram_fields():
+    service, client = _make_service()
+    index = client.index.return_value
+
+    service.index_chapter(
+        {"id": "c1", "title": "第1章", "book_title": "铃铛", "book_author": "张三"}
+    )
+
+    doc = index.add_documents.call_args.args[0][0]
+    assert doc["book_title_grams"] == field_grams("铃铛")
+    assert doc["book_author_grams"] == field_grams("张三")
+    assert doc["title_grams"] == field_grams("第1章")
+
+
+def test_buffered_chapters_carry_their_gram_fields():
+    """``flush_chapters`` replaces the whole document, so grams must be buffered."""
+    service, client = _make_service()
+    index = client.index.return_value
+
+    service.buffer_chapter({"id": "c1", "book_title": "铃铛"})
+    service.flush_chapters()
+
+    doc = index.add_documents.call_args.args[0][0]
+    assert doc["book_title_grams"] == field_grams("铃铛")
+
+
+def test_update_book_tags_merges_instead_of_replacing_the_document():
+    """``add_documents`` is HTTP POST (replace); a tags-only write wiped the doc.
+
+    It dropped ``kind`` (so the book vanished from /novels and /comics search)
+    and every other field with it, and only a later ``sync_book_kinds`` backfill
+    repaired the damage.  ``update_documents`` is HTTP PUT (merge).
+    """
+    service, client = _make_service()
+    index = client.index.return_value
+
+    service.update_book_tags("b1", ["武侠"])
+    service.update_chapter_tags("c1", ["武侠"])
+
+    assert index.add_documents.call_count == 0
+    assert index.update_documents.call_count == 2
+    assert index.update_documents.call_args_list[0].args[0] == [
+        {"id": "b1", "tags": ["武侠"]}
+    ]
+
+
+def test_gram_probe_finds_an_index_that_still_lacks_the_fields():
+    service, client = _make_service()
+    index = client.index.return_value
+    index.search.return_value = {"hits": [{"id": "b1"}]}
+
+    assert service.index_missing_grams(SearchService.INDEX_BOOKS) is True
+
+    options = index.search.call_args.args[1]
+    assert options["filter"] == "title_grams NOT EXISTS"
+    assert options["limit"] == 1
+
+
+def test_gram_probe_treats_an_unprobeable_index_as_missing():
+    """No answer must never be read as "safe to narrow".
+
+    Taking the gram path on an index whose state could not be established would
+    answer every metadata search with nothing.
+    """
+    service, client = _make_service()
+    client.index.return_value.search.side_effect = RuntimeError("engine down")
+
+    assert service.index_missing_grams(SearchService.INDEX_BOOKS) is True
+
+
+@pytest.mark.asyncio
+async def test_gram_backfill_marks_an_already_complete_index_ready():
+    service, client = _make_service()
+    index = client.index.return_value
+    index.search.return_value = {"hits": []}  # nothing missing
+
+    result = await service.sync_book_grams()
+
+    assert result == {"books": 0, "chapters": 0, "skipped": True}
+    assert index.update_documents.call_count == 0
+    assert service.gram_index_ready(SearchService.INDEX_BOOKS)
+    assert service.gram_index_ready(SearchService.INDEX_CHAPTERS)
+
+
+def test_metadata_search_keeps_its_window_until_the_index_is_verified():
+    service, books_index, _ = _service_with_indexes()
+    books_index.search.return_value = {"hits": []}
+
+    service.advanced_search(
+        [{"field": "title", "mode": "exact", "value": "白骨精"}], scope="books"
+    )
+
+    scan = books_index.search.call_args_list[0].args[1]
+    assert "title_grams" not in (scan.get("filter") or "")
+    assert scan["limit"] == SearchService.METADATA_CANDIDATE_LIMIT
+
+
+def test_verified_index_narrows_the_metadata_scan_with_a_gram_filter():
+    hits = [{"id": f"b{i}", "title": "三打白骨精", "_rankingScore": 0.5} for i in range(3)]
+    service, books_index = _gram_ready_books_service(
+        lambda query, options: (
+            {"hits": []} if "id IN" in (options.get("filter") or "") else {"hits": hits}
+        )
+    )
+
+    result = service.advanced_search(
+        [{"field": "title", "mode": "exact", "value": "白骨精"}], scope="books"
+    )
+
+    scan = books_index.search.call_args_list[0].args[1]
+    assert scan["filter"] == '(title_grams = "白骨") AND (title_grams = "骨精")'
+    # Narrowed walks are chunked: the engine has already discarded the
+    # non-matches, so there is no wide ranking window to fetch in one request.
+    assert scan["limit"] == SearchService._SCAN_CHUNK
+    assert result["total"] == 3
+
+
+def test_gram_narrowed_scan_reaches_the_hits_the_wide_window_could_not():
+    """The reported limit at unit scale: 12 466 real matches, 10 000 served.
+
+    The ungrammed scan asks the engine for its whole 10 000-wide candidate window
+    in one request, so everything ranked below that is invisible and the total is
+    an undercount.  The gram-filtered scan ranks only the documents that actually
+    hold the query and walks them until a chunk comes back short.
+    """
+    total_hits = 12_466
+    docs = [
+        {"id": f"b{i:05d}", "title": "铃铛", "_rankingScore": 0.5}
+        for i in range(total_hits)
+    ]
+
+    def engine(query, options):
+        if "id IN" in (options.get("filter") or ""):
+            return {"hits": []}  # hydration: the total does not depend on it
+        offset = int(options.get("offset") or 0)
+        limit = int(options.get("limit") or 0)
+        return {"hits": docs[offset : offset + limit]}
+
+    windowed, windowed_index, _ = _service_with_indexes()
+    windowed_index.search.side_effect = engine
+    before = windowed.advanced_search(
+        [{"field": "title", "mode": "exact", "value": "铃铛"}], scope="books"
+    )
+
+    narrowed, _ = _gram_ready_books_service(engine)
+    after = narrowed.advanced_search(
+        [{"field": "title", "mode": "exact", "value": "铃铛"}], scope="books"
+    )
+
+    assert before["total"] == SearchService.METADATA_CANDIDATE_LIMIT
+    assert after["total"] == total_hits
+    # And the extra hits are pageable, not just counted.
+    last_page = narrowed.advanced_search(
+        [{"field": "title", "mode": "exact", "value": "铃铛"}],
+        scope="books",
+        offset=total_hits - 40,
+        limit=40,
+    )
+    assert len(last_page["hits"]) == 40
+
+
+def test_fuzzy_search_is_narrowed_by_its_characters_too():
+    """The library search box sends ``fuzzy`` for title/author.
+
+    Fuzzy means "every character appears somewhere, any order, gaps allowed", so
+    an AND over the query's distinct characters is exactly that test -- narrowing
+    only ``exact`` would have left the most-used search on its window.
+    """
+    service, books_index = _gram_ready_books_service(
+        lambda query, options: {"hits": []}
+    )
+
+    service.advanced_search(
+        [{"field": "title", "mode": "fuzzy", "value": "铃铛"}], scope="books"
+    )
+
+    fuzzy_scan = books_index.search.call_args_list[0].args[1]
+    assert fuzzy_scan["filter"] == '(title_grams = "铃") AND (title_grams = "铛")'
+    assert fuzzy_scan["limit"] == SearchService._SCAN_CHUNK
+
+
+def test_single_character_exact_search_is_narrowed_by_that_character():
+    """The broadest exact query there is, and the one most needing a filter.
+
+    的 matches 12 466 books on the live index -- well past the 10 000-candidate
+    window a single-character search used to fall back to.
+    """
+    service, books_index = _gram_ready_books_service(
+        lambda query, options: {"hits": []}
+    )
+
+    service.advanced_search(
+        [{"field": "title", "mode": "exact", "value": "铃"}], scope="books"
+    )
+
+    scan = books_index.search.call_args_list[0].args[1]
+    assert scan["filter"] == 'title_grams = "铃"'
+    assert scan["limit"] == SearchService._SCAN_CHUNK
+
+
+def test_ungrammed_fields_keep_their_window_in_both_modes():
+    """``description`` is deliberate: 2 000 characters of grams per book is not.
+
+    Whatever the mode, a field with no gram attribute must fall back rather than
+    be filtered on a field that does not exist.
+    """
+    service, books_index = _gram_ready_books_service(
+        lambda query, options: {"hits": []}
+    )
+
+    for mode in ("exact", "fuzzy"):
+        books_index.search.reset_mock()
+        service.advanced_search(
+            [{"field": "description", "mode": mode, "value": "铃铛"}], scope="books"
+        )
+        scan = books_index.search.call_args_list[0].args[1]
+        assert "grams" not in (scan.get("filter") or "")
+        assert scan["limit"] == SearchService.METADATA_CANDIDATE_LIMIT
+
+
+def test_page_cache_is_bounded_by_rows_not_only_by_entries():
+    """A cached ranking can now cover a whole index, so entry count is not a bound.
+
+    Sixteen entries of a few hundred thousand rows each would be hundreds of MB
+    in a backend container limited to 1 GB, which is what raising a scan budget
+    would otherwise have bought silently.
+    """
+    service, _ = _make_service()
+    budget = SearchService.PAGE_CACHE_MAX_ROWS
+    big = [(1, f"b{i}", "") for i in range(budget // 2 + 1)]
+
+    service._page_cache_put("first", big)
+    service._page_cache_put("second", big)
+
+    assert SearchService._cached_rows(service._page_cache) <= budget
+    assert "second" in service._page_cache  # the newest entry always survives
+    assert "first" not in service._page_cache
+
+
+def test_page_cache_keeps_an_entry_larger_than_the_whole_budget():
+    """The result just computed must be servable from cache, not evicted by itself."""
+    service, _ = _make_service()
+    oversized = [(1, f"b{i}", "") for i in range(SearchService.PAGE_CACHE_MAX_ROWS + 10)]
+
+    service._page_cache_put("only", oversized)
+
+    assert service._page_cache_get("only") is oversized
+
+
+def test_condition_cache_is_bounded_by_rows_too():
+    service, _ = _make_service()
+    budget = SearchService.CONDITION_CACHE_MAX_ROWS
+    candidates = {f"b{i}": (1, {"id": f"b{i}"}) for i in range(budget // 2 + 1)}
+
+    service._condition_cache["a"] = (time.monotonic() + 60, candidates)
+    service._condition_cache["b"] = (time.monotonic() + 60, candidates)
+    service._condition_cache["c"] = (time.monotonic() + 60, candidates)
+
+    service._evict_to_budget(
+        service._condition_cache,
+        SearchService.CONDITION_CACHE_MAX_ENTRIES,
+        budget,
+    )
+
+    assert SearchService._cached_rows(service._condition_cache) <= budget
+    assert "c" in service._condition_cache
+
+
+def test_scan_budget_is_per_index_and_never_exceeds_the_engine_ceiling():
+    """A gram-narrowed walk is bounded by the index it walks.
+
+    The chapters index is orders of magnitude more expensive per row in
+    production -- 666k documents in a 94 GB store on 12 GB of RAM, where one
+    unfiltered 10 000-row id-only window measured 514-631 s (codex-handoff
+    section 51) -- so it must not inherit the books index's budget just because
+    books can afford it.
+    """
+    assert (
+        SearchService.scan_budget(SearchService.INDEX_BOOKS)
+        == SearchService.MAX_TOTAL_HITS
+    )
+    assert (
+        SearchService.scan_budget(SearchService.INDEX_CHAPTERS)
+        == SearchService.SCAN_BUDGET_CHAPTERS
+    )
+    assert SearchService.SCAN_BUDGET_CHAPTERS < SearchService.SCAN_BUDGET_BOOKS
+
+    # Asking for more rows than the engine will serve is not an error, it just
+    # stops there -- and a budget above the ceiling would report a total the
+    # engine cannot page.
+    with patch.object(SearchService, "MAX_TOTAL_HITS", 5_000):
+        assert SearchService.scan_budget(SearchService.INDEX_BOOKS) == 5_000
+        assert SearchService.scan_budget(SearchService.INDEX_CHAPTERS) == 5_000
+
+
+def test_chapter_gram_walk_stops_at_the_chapter_budget():
+    """A chapter walk cannot run away just because the filter is narrowing.
+
+    The fake engine never returns a short chunk, so the only thing that can end
+    the walk is the budget: exactly ``SCAN_BUDGET_CHAPTERS / _SCAN_CHUNK``
+    requests, not one per matching chapter.
+    """
+    service, _, chapters_index = _service_with_indexes()
+    service._gram_ready.add(SearchService.INDEX_CHAPTERS)
+
+    def engine(query, options):
+        limit = int(options.get("limit") or 0)
+        return {
+            "hits": [
+                {"id": f"c{options.get('offset', 0)}-{i}", "book_title": "铃铛"}
+                for i in range(limit)
+            ]
+        }
+
+    chapters_index.search.side_effect = engine
+    # A chapter-scoped ``title`` condition is scored against the chapter's
+    # ``book_title``, which is the grammed attribute.
+    service._single_condition_search(
+        {"field": "title", "mode": "exact", "value": "铃铛"},
+        scope="chapters",
+        filters=None,
+        offset=0,
+        limit=40,
+    )
+
+    scans = [
+        call for call in chapters_index.search.call_args_list
+        if call.args[1].get("filter", "").startswith("book_title_grams")
+    ]
+    assert len(scans) == SearchService.SCAN_BUDGET_CHAPTERS // SearchService._SCAN_CHUNK
+
+
+def test_gram_narrowing_is_anded_with_the_visibility_and_kind_filters():
+    service, books_index = _gram_ready_books_service(
+        lambda query, options: {"hits": []}
+    )
+
+    service.advanced_search(
+        [{"field": "title", "mode": "exact", "value": "铃铛"}],
+        scope="books",
+        kind="novel",
+    )
+
+    scan = books_index.search.call_args_list[0].args[1]
+    assert scan["filter"] == '(kind = "novel") AND (title_grams = "铃铛")'
+
+
+def test_chapter_metadata_and_search_gets_the_gram_narrowing_too():
+    """The 1 000-candidate chapter window hid 99% of the chapter index.
+
+    A chapter-scoped ``title``/``author`` condition is scored against the
+    chapter's ``book_title``/``book_author``, both of which are grammed -- so a
+    multi-condition AND on them narrows at the engine instead of intersecting
+    two truncated windows.  That is the same class of bug as "多条件搜索全是 0 条",
+    on the chapter side, where the window is 1 000 rather than 10 000.
+    """
+    service, _, chapters_index = _service_with_indexes()
+    service._gram_ready.add(SearchService.INDEX_CHAPTERS)
+    chapters_index.search.side_effect = lambda query, options: {"hits": []}
+
+    service.advanced_search(
+        [
+            {"field": "title", "mode": "exact", "value": "铃铛"},
+            {"field": "author", "mode": "exact", "value": "张三"},
+        ],
+        match="and",
+        scope="chapters",
+    )
+
+    scans = [call.args[1] for call in chapters_index.search.call_args_list]
+    filters = [scan.get("filter") or "" for scan in scans]
+    assert any('book_title_grams = "铃铛"' in value for value in filters)
+    assert any('book_author_grams = "张三"' in value for value in filters)
+    for scan, value in zip(scans, filters):
+        if "grams" in value:
+            assert scan["limit"] == SearchService._SCAN_CHUNK
+
 

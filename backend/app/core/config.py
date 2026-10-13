@@ -66,6 +66,17 @@ class Settings(BaseSettings):
     SYNC_RATE_COOLDOWN_EVERY:int=300
     SYNC_RATE_COOLDOWN_SECONDS:int=10
 
+    # Meilisearch ``pagination.maxTotalHits``: the highest rank the engine will
+    # ever serve, and therefore the hard ceiling on how many hits one search can
+    # see.  It used to be 10 000, which truncated any query matching more than
+    # that -- 12 466 books matched 的 on the live index and 10 000 were reported.
+    # The derived gram fields (``services/search_ngrams.py``) do the narrowing
+    # that the truncated candidate windows used to do, so the ceiling is set
+    # above the whole library (33.5k books / 117k chapters).  Raise it here if
+    # the library outgrows it; it is an index *setting*, applied on startup, so
+    # no reindex is needed.
+    MEILI_MAX_TOTAL_HITS:int=200000
+
     SYNC_CHAPTER_CONCURRENCY:int=9
     SYNC_BOOK_CONCURRENCY:int=3
     SYNC_BOOK_CONTINUOUS:bool=False

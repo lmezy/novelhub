@@ -34,7 +34,10 @@ docker exec -i -e PGPASSWORD="$POSTGRES_PASSWORD" novelhub-postgres \
 **线上 Meilisearch**：`novelhub-search`，host 网络 `http://127.0.0.1:17700`（Key 同 `.env` 的
 `MEILI_KEY`）。宿主机有 `curl`，可以直接
 `curl -s -H "Authorization: Bearer $MEILI_KEY" http://127.0.0.1:17700/indexes`；
-索引只有 `books`/`chapters`，`pagination.maxTotalHits=10000` 是搜索页数上限（见第 28 节）。
+索引只有 `books`/`chapters`，`pagination.maxTotalHits` 是搜索页数上限：第 28/51 节时代是
+10000（= 元数据能看到的条数上限），第 53 节起代码把它提到 200000 并改用索引期 gram + filter，
+但**部署后要用 `curl .../indexes/books/settings/pagination` 确认它真的生效**（写入积压时
+设置任务会排队，第 51 节）。
 
 **日志**：`docker logs novelhub-crawler`（同步任务、Celery、章节/书籍错误都在这里）。
 loguru 时间戳是容器本地时间（CST）；`docker logs --since` 用同一个时钟。
@@ -1924,3 +1927,93 @@ AND 对小型、完整的精确结果集（最多 200 条）先取回正文逐�
 
 **验证方式**：以上数字都来自 NAS 上的只读 curl / psql（见 `_scratch/nh_probe*.sh`）；本次未改动
 线上任何配置（`maxTotalHits` 已确认仍是 10000，`nh_scale_probe` 是既有的一次性索引）。
+
+## 53. 库内搜索的数量上限真去掉了：索引期 gram + filter（2026-10-12）
+
+**现象**：搜「的」这类常见字，结果只有 10 000 条、翻到某一页就到底；`total` 明显小于真实命中数。
+第 28 节记为「未做」，第 51 节判定「改常量解决不了」。
+
+**根因（上层的那一条）**：`pagination.maxTotalHits` 是引擎的**硬顶**——`limit=30000` 也只回
+10 000（本次在本机 Meilisearch 1.10 上复现：`engine limit=30000 for '小说' -> 10000 hits`），
+而元数据扫描窗口又恰好是 10 000（`METADATA_CANDIDATE_LIMIT`），两者叠在一起，
+**任何查询都永远看不到第 10 000 名之后的文档**。
+
+**做法**（第 28 节自己记的「更干净的方案」，这次只做元数据，正文不碰）：
+
+- 新增 `app/services/search_ngrams.py`：把书名/作者/章节标题/所属书名/所属书作者按 **1-gram +
+  2-gram** 展开成一个 filterable 字段（`title_grams` / `author_grams` / `book_title_grams` /
+  `book_author_grams`）。查询变成普通 filter：`铃铛` → `title_grams = "铃铛"`；
+  `白骨精` → `(title_grams = "白骨") AND (title_grams = "骨精")`（超集，Python 再复核连续子串）。
+  单字查询用 1-gram（原来会退回窗口，等于没修）。
+- **模糊（fuzzy）也必须收敛，否则等于没改到搜索框**：`BooksPage.vue` 的 `fuzzyFields` 让搜索框对
+  title/author 一律发 `fuzzy`，而 fuzzy 的判定是「查询里每个字都要出现（任意顺序、可断开）」——
+  字段里有 1-gram，所以「各字 1-gram 的 AND」与 `_condition_score` 的模糊门**严格等价**（不是超集），
+  `铃铛` → `(title_grams = "铃") AND (title_grams = "铛")`。第一版只收了 exact，实测发现搜索框
+  一点收益都没有，才补上。
+- **归一化必须照抄 `_condition_score` 的两侧差异**：字段侧 `" ".join(list).lower()`（不 strip），
+  查询侧 `value.strip().lower()`。合成一个函数的话，查询 `" 铃铛 "` 会去要求它自己那两个空格的
+  gram，把所有真命中都过滤掉——这条有专门的单测。
+- 字段缺失时**自动回退**到原来的窗口路径：回填没跑完就启用 filter 会把没回填的书**藏起来**
+  （比截断更糟）。所以 `gram_index_ready()` 只在 `sync_book_grams()` **校验**过「没有任何文档缺字段」
+  之后才置位，且**不在热路径上探测**（一辈子只变两次的事不值得每次搜索多一个请求）。
+- 写入路径统一带 gram：`index_book` / `index_chapter` / `buffer_chapter` / `rebuild_index`。
+- 天花板 `MAX_TOTAL_HITS` 10000 → **200000**，可由 `MEILI_MAX_TOTAL_HITS` 覆盖（是索引
+  **设置**，应用即可生效，不需要重建）。
+- 顺手修的既有 bug：`update_book_tags` / `update_chapter_tags` 用的是 `add_documents`
+  （HTTP **POST = 整体替换**），一次只写 tags 会把整篇文档冲成 `{id, tags}`——`kind` 一起没，
+  那本书当场从 /novels、/comics 搜索里消失，直到重启触发 `sync_book_kinds` 回填。改 `update_documents`
+  （HTTP **PUT = 合并**）。
+- `routes/search.py`：`advanced_search` / `search_books` 是**同步** Meilisearch 客户端，原来直接
+  在 `async def` 里调用，而 backend 是单 worker——一次正文搜索（线上实测 105s）等于**全站 API 停摆
+  105 秒**。改 `run_in_threadpool`。
+- **前端不用改**：页数完全由后端报的 `total` 驱动（`totalPages()` / 「跳至 __ 页」的 `:max`），
+  `total` 报对了页数自然就够。顺带记两条容易踩的接线事实：书库页的**搜索框**并不是走
+  `GET /api/search`，而是 `loadSearch()` → `POST /search/advanced` 发**一个**条件；`GET /api/search`
+  （`search_books` / `search_chapters`，直接问引擎、`total` 取 `estimatedTotalHits`）**前端没有调用**，
+  它的上限这次没动。
+
+**实测（本机 Meilisearch 1.10，33 573 本合成语料，同一份语料/引擎，只切路径）**：
+
+搜索框那条路（`title` + **fuzzy**，即 `BooksPage.vue` 真实发的形状）：
+
+| 查询 | 真值 | 窗口路径 total | gram 路径 total | 窗口传输行数 | gram 传输行数 | 窗口秒 | gram 秒 |
+|---|---|---|---|---|---|---|---|
+| `铃铛` | 3 052 | 3 052 | 3 052 | 6 145 | **3 092** | 0.12 | **0.04** |
+| `白骨精`（无真命中） | 0 | 0 | 0 | 5 494 | **0** | 0.04 | **0.00** |
+| `小说`（全部书名都含） | 33 573 | **10 000** | **33 573** | 10 040 | 33 613 | 0.08 | 0.32 |
+
+精确模式（高级搜索）同形状，结论一致。
+
+- 「传输行数」比墙钟时间更有说服力：本机索引小，看不出耗时差异；但**引擎必须递过来的文档数**
+  是硬件无关的。常见词（`铃铛`）从 6 145 降到 3 092——因为引擎的逐字匹配本来会把 `铃木`/`铛…`
+  一起吐出来再由 Python 剔掉，现在 filter 直接给真命中集；**无命中查询从 5 494 行降到 0 行**。
+  常见查询的耗时也随之下降（0.12→0.04s），因为要搬的文档少了一半。
+- `小说` 那行传输行数变多、耗时上升是**必然的**：要报出 33 573 就得拿到 33 573 行（35 个 1 000 行的
+  分块，0.32s）。这不是变慢，是原来那份答案本身是错的。
+- 边界（都实测过）：末页可取（offset 33 533 → 40 条）；越界一页返回 0 条且**不抛异常**；
+  单字 `的` → 6 715 = 真值；**`maxTotalHits` 没生效时（NAS 现状）报 10 000 且不报错**——
+  即第 51 节说的「设置任务排在几十万条索引任务后面」不会让这次改动出错，只是暂不生效。
+
+**为什么没有放开章节侧**：第 51 节的线上数据是 666k 章 / 94GB 索引 / 12GB 容器，**只取 id 的
+10 000 行窗口要 514-631s**。所以加了按索引区分的扫描预算：books 用整个天花板，
+chapters 停在 10 000（是原来的 10 倍，不是全库）。gram filter 让每个分块变**选择性**的，
+但本机语料证明不了 666k 章上的绝对耗时——**上线后第一件事是量一次 chapters 的 gram 查询**，
+再决定 `SCAN_BUDGET_CHAPTERS` 怎么调。
+
+**没做的**：
+
+- **正文（content）仍然是老样子**：`CONTENT_CANDIDATE_LIMIT` = 10 000，第 51 节的
+  「1 000 条正文 73-110s / 一次正文搜索十几分钟」**没有变**。正文不进 gram（每章几万个 token），
+  要解决得按第 51 节的候选清单走（给正文入库加体积上限 / 正文搜索彻底不进引擎 / 拆实例）。
+- 分块仍是**串行**的（`_scan_condition` 的 while 循环），没有并行化；也没有做「自适应块大小」
+  （命中多时改用 10 000 行的大块）。两者都能减少请求数，但在拿到 NAS 上章节侧的真实分块成本前
+  不值得动。
+- 章节侧**同字段 AND**（`_conjunction_search`）窗口仍是 10 000，没有跟着放开。
+- `description` / `book_description` / `tags` / `category_names` 没有 gram（长文本 token 爆炸；
+  数组字段是精确枚举，走窗口足够），它们的元数据条件仍受原窗口限制。
+- `sync_book_grams` 的**回填主体**（读 PG 分批 `update_documents`）只有 skip 分支有单测，没有
+  在真库上跑过；`rebuild_index` 里新增的置位也没有单测（需要 DB）。
+
+**验证**：`cd backend && python -m pytest -q` → **1020 passed**（改动前基线 1013）。
+部署后 `GET /indexes/books/settings/pagination` 可以确认 `maxTotalHits` 是否已经拿到 200000；
+`POST /api/search/index/grams` 是回填的手动入口（启动时会自动跑，探针说没缺就是 no-op）。
