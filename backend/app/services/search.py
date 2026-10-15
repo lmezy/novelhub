@@ -92,15 +92,36 @@ class SearchService:
     CONJUNCTION_CANDIDATE_LIMIT = 10_000
     # How many candidates one gram-narrowed condition may walk, per index.  A
     # gram filter makes a chunk selective, but it does not make the *engine*
-    # fast: on the production box the chapters index has 666k documents inside a
-    # 94 GB store served from 12 GB of RAM, where a single unfiltered 10 000-row
-    # window measured 514-631 s (codex-handoff.md section 51).  So the two
-    # indexes get different budgets -- the books index is 43.6k small documents
-    # and answers a 10 000-row id-only window in 0.5 s hot, while a chapters
-    # walk is bounded at ten times what it used to be allowed rather than at the
-    # whole library.  Raise the chapters budget only after measuring it there.
+    # fast: on the production box the chapters index holds 732 462 documents
+    # inside a 94 GB store served from 12 GB of RAM, where a zero-query 10 000-row
+    # window measured 514-631 s (codex-handoff.md section 51) and a 1 000-row
+    # window of an ordinary query measured 8.6 s cold / 0.07 s warm (measured
+    # 2026-10-15).  So the two indexes get different budgets -- the books index is
+    # 46k small documents and answers a 10 000-row id-only window in 0.5 s hot,
+    # while a chapters walk is bounded at ten times what it used to be allowed
+    # rather than at the whole library.  Raise the chapters budget only after
+    # measuring a real narrowed walk there.
     SCAN_BUDGET_BOOKS = MAX_TOTAL_HITS
     SCAN_BUDGET_CHAPTERS = 10_000
+    # Per-request candidate count while walking a *gram-narrowed* metadata scan.
+    # Deliberately far larger than ``_SCAN_CHUNK``: Meilisearch re-ranks the whole
+    # candidate set for every request (there is no cursor), so a 1 000-row walk
+    # over 45 000 books costs 45 rankings of 45 000 documents instead of five.
+    # Metadata rows carry no text, and 10 000 rows is the payload the
+    # pre-narrowing code already fetched in a single request (section 28 sizes it
+    # at ~10 MB), so this is a proven size rather than a new gamble.
+    METADATA_SCAN_CHUNK = 10_000
+    # Documents per ``update_documents`` call while backfilling the gram fields.
+    # The index holds ~732k chapters and Meilisearch processes writes one task at
+    # a time behind whatever the crawler is already queueing (section 51 measured
+    # 8.2 tasks/min), so a 1 000-document batch turns the backfill into ~740
+    # queued tasks and 10 000 turns it into ~74.  It is a merge, so each request
+    # carries only the ids and the grams.
+    GRAM_BACKFILL_BATCH = 10_000
+    # How long "this index is fully backfilled" is trusted before being
+    # re-verified.  See ``gram_index_ready``: the check exists so that a writer
+    # left on older code cannot silently hide its documents from search.
+    GRAM_READY_TTL_SECONDS = 600
     # Complete small exact result sets are verified before paging; larger sets
     # are checked page by page because verification retrieves stored text.
     CONJUNCTION_VERIFY_MAX_HITS = 200
@@ -205,9 +226,10 @@ class SearchService:
         self._ensured: set[str] = set()
         # Indexes whose gram fields are known to be present on **every** document,
         # so a gram-filtered metadata search cannot hide a not-yet-backfilled
-        # book.  Populated by ``sync_book_grams`` / ``rebuild_index``; see
-        # ``gram_index_ready`` for why this is not probed per search.
-        self._gram_ready: set[str] = set()
+        # book.  ``{index: monotonic deadline}``; populated by
+        # ``sync_book_grams`` / ``rebuild_index`` and re-verified by
+        # ``gram_index_ready`` once the deadline passes.
+        self._gram_ready: dict[str, float] = {}
         self._page_cache: dict[str, tuple[float, list[tuple[int, str, str]]]] = {}
         self._condition_cache: dict[
             str, tuple[float, dict[str, tuple[int, dict]]]
@@ -619,18 +641,26 @@ class SearchService:
         """Whether ``index_name`` still holds documents without the gram fields.
 
         Same shape as ``index_missing_kind``, opposite direction: "missing" means
-        *any* document lacks the field, and the caller must then keep its
+        *any* document lacks *any* gram field, and the caller must then keep its
         windowed path.  A partly backfilled index is the dangerous state -- the
-        gram filter would silently drop the books that are not backfilled yet,
-        and there is no per-document way to tell at query time which those are.
-        ``NOT EXISTS`` is a filter, so it answers in one cheap request.
+        gram filter would silently drop the documents that are not backfilled
+        yet, and there is no per-document way to tell at query time which those
+        are.  ``NOT EXISTS`` is a filter, so it answers in one cheap request.
+
+        Every gram field is probed, not just the first: an index that has
+        ``title_grams`` but not ``book_title_grams`` would pass a single-field
+        probe and then hide every chapter from a chapter-scoped title search.
         """
         self._ensure_index(index_name)
-        probe = self.gram_fields(index_name)[0]
+        # One clause per gram field, OR-ed: a document counts as covered only
+        # when it carries *all* of them.
+        missing = " OR ".join(
+            f"{field} NOT EXISTS" for field in self.gram_fields(index_name)
+        )
         try:
             result = self.client.index(index_name).search("", {
                 "limit": 1,
-                "filter": f"{probe} NOT EXISTS",
+                "filter": missing,
                 "attributesToRetrieve": ["id"],
             })
         except Exception as exc:
@@ -645,15 +675,38 @@ class SearchService:
     def gram_index_ready(self, index_name: str) -> bool:
         """Whether metadata searches on ``index_name`` may use the gram filter.
 
-        Deliberately *not* a per-search probe.  The answer only turns true once a
-        full backfill has **verified** that every document carries the fields
-        (``sync_book_grams``, or ``rebuild_index`` which writes them itself), and
-        the state changes at most twice in a deployment's life -- re-probing it
-        on the hot path would add a request to every search to re-learn a
-        constant.  Until it is verified, searches keep the windowed path, which
-        is exactly the behaviour that shipped before the gram fields existed.
+        The answer is only true once a full backfill has **verified** that every
+        document carries every gram field (``sync_book_grams``, or
+        ``rebuild_index`` which writes them itself), and it is then re-verified
+        once per ``GRAM_READY_TTL_SECONDS`` rather than on every search.
+
+        The re-verification exists because readiness can be *revoked* from the
+        outside: ``backend/`` code is shared by three containers and only some of
+        them may have been rebuilt, and a writer on the old code indexes
+        documents without the gram fields.  A stale "ready" would then hide
+        exactly those documents from every metadata search -- silently, and
+        looking like "the book is not in the library" rather than like a bug.
+        One probe per TTL turns that into a bounded, self-healing fallback to the
+        windowed path.
         """
-        return index_name in self._gram_ready
+        deadline = self._gram_ready.get(index_name)
+        if deadline is None:
+            return False
+        if deadline < time.monotonic():
+            if self.index_missing_grams(index_name):
+                self._gram_ready.pop(index_name, None)
+                logger.warning(
+                    "{} no longer holds complete gram fields; metadata search "
+                    "falls back to its candidate window",
+                    index_name,
+                )
+                return False
+        self._mark_gram_ready(index_name)
+        return True
+
+    def _mark_gram_ready(self, index_name: str) -> None:
+        """Record that ``index_name`` is verified complete, until the TTL."""
+        self._gram_ready[index_name] = time.monotonic() + self.GRAM_READY_TTL_SECONDS
 
     @staticmethod
     def _combine_filters(*parts: str | None) -> str | None:
@@ -757,8 +810,8 @@ class SearchService:
             self._condition_cache.pop(cache_key, None)
         step = (
             min(self._SCAN_CHUNK, window)
-            if attr == "content" or narrowed
-            else window
+            if attr == "content"
+            else (min(self.METADATA_SCAN_CHUNK, window) if narrowed else window)
         )
 
         def collect(matching_strategy: str | None) -> dict[str, tuple[int, dict]]:
@@ -1403,15 +1456,19 @@ class SearchService:
         # cost more, but pagination receives the full verified total rather than
         # stopping at the first 300 candidates.
         chunk_size = self._SCAN_CHUNK if attr == "content" else window
-        # A gram-narrowed scan has no ranking window to respect -- the engine
-        # already dropped every document that cannot hold the query -- so it
-        # walks in cheap id-sized chunks up to this index's scan budget.
+        # A gram-narrowed metadata scan has no ranking window to respect -- the
+        # engine already dropped every document that cannot hold the query -- so
+        # it walks up to this index's scan budget.  It walks in large steps, not
+        # in ``_SCAN_CHUNK`` rows: every request re-ranks the whole candidate set,
+        # so many small steps would multiply the engine's work by the number of
+        # steps.  The body is the only reason to keep steps small, and a body is
+        # never grammed.
         narrowed = self.gram_narrowed_filters(
             index_name, attr, cond["value"], cond.get("mode") or "exact", filters,
         )
         if narrowed:
             window = self.scan_budget(index_name)
-            chunk_size = self._SCAN_CHUNK
+            chunk_size = min(self.METADATA_SCAN_CHUNK, window)
             filters = narrowed
         cache_key = "|".join((
             index_name, attr, cond["value"], filters or "",
@@ -2162,7 +2219,8 @@ class SearchService:
                 # The rebuild just wrote every document, gram fields included, so
                 # the metadata search may take the gram path immediately rather
                 # than waiting for the next startup backfill.
-                self._gram_ready.update({self.INDEX_BOOKS, self.INDEX_CHAPTERS})
+                self._mark_gram_ready(self.INDEX_BOOKS)
+                self._mark_gram_ready(self.INDEX_CHAPTERS)
 
         await _rebuild()
         return result
@@ -2348,9 +2406,9 @@ class SearchService:
         # starts after an earlier backfill (or after ``rebuild_index``) learns it
         # may take the gram path without paying a per-search probe.
         if not need_books:
-            self._gram_ready.add(self.INDEX_BOOKS)
+            self._mark_gram_ready(self.INDEX_BOOKS)
         if not need_chapters:
-            self._gram_ready.add(self.INDEX_CHAPTERS)
+            self._mark_gram_ready(self.INDEX_CHAPTERS)
         result = {
             "books": 0,
             "chapters": 0,
@@ -2362,7 +2420,7 @@ class SearchService:
         from sqlalchemy import select
 
         from app.core.database import SessionLocal
-        from app.models import Book, Chapter
+        from app.models import Author, Book, Chapter
 
         async with SessionLocal() as db:
             books_index = self.client.index(self.INDEX_BOOKS)
@@ -2372,10 +2430,17 @@ class SearchService:
                 while True:
                     rows = (
                         await db.execute(
-                            select(Book.id, Book.title, Book.author_name)
+                            # ``Book.author_name`` is a Python property over the
+                            # ``author`` relationship, not a mapped column, so it
+                            # cannot appear in a ``select()`` -- naming it there
+                            # raised "Column expression ... expected" and killed
+                            # the whole backfill on its first query in production
+                            # (2026-10-14).  Join the table instead.
+                            select(Book.id, Book.title, Author.name)
+                            .outerjoin(Author, Author.id == Book.author_id)
                             .where(Book.id > last_id)
                             .order_by(Book.id)
-                            .limit(self.KIND_BACKFILL_BATCH)
+                            .limit(self.GRAM_BACKFILL_BATCH)
                         )
                     ).all()
                     if not rows:
@@ -2396,14 +2461,20 @@ class SearchService:
                 while True:
                     rows = (
                         await db.execute(
+                            # ``outerjoin``, not ``join``: a chapter whose book row
+                            # is missing must still receive its own
+                            # ``title_grams``, otherwise it stays "missing" for the
+                            # probe forever and the gram path can never switch on.
+                            # Such a chapter simply gets empty book-title grams.
                             select(
                                 Chapter.id, Chapter.title,
-                                Book.title, Book.author_name,
+                                Book.title, Author.name,
                             )
-                            .join(Book, Book.id == Chapter.book_id)
+                            .outerjoin(Book, Book.id == Chapter.book_id)
+                            .outerjoin(Author, Author.id == Book.author_id)
                             .where(Chapter.id > last_id)
                             .order_by(Chapter.id)
-                            .limit(self.KIND_BACKFILL_BATCH)
+                            .limit(self.GRAM_BACKFILL_BATCH)
                         )
                     ).all()
                     if not rows:
@@ -2427,9 +2498,9 @@ class SearchService:
         # that silently loses books is worse than one that is merely truncated.
         for index_name in (self.INDEX_BOOKS, self.INDEX_CHAPTERS):
             if self.index_missing_grams(index_name):
-                self._gram_ready.discard(index_name)
+                self._gram_ready.pop(index_name, None)
             else:
-                self._gram_ready.add(index_name)
+                self._mark_gram_ready(index_name)
         logger.info(
             "Backfilled search grams: {} books, {} chapters",
             result["books"],

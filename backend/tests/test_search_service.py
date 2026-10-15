@@ -1393,7 +1393,7 @@ def test_same_field_exact_and_filters_cjk_false_positives():
 
 def _gram_ready_books_service(fake_search):
     service, books_index, _ = _service_with_indexes()
-    service._gram_ready.add(SearchService.INDEX_BOOKS)
+    service._mark_gram_ready(SearchService.INDEX_BOOKS)
     books_index.search.side_effect = fake_search
     return service, books_index
 
@@ -1457,6 +1457,64 @@ def test_update_book_tags_merges_instead_of_replacing_the_document():
     ]
 
 
+class _FakeResult:
+    def all(self):
+        return []
+
+
+class _FakeSession:
+    """Async-session stand-in that records the statements it is asked to run."""
+
+    def __init__(self, captured: list):
+        self.captured = captured
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+    async def execute(self, statement):
+        self.captured.append(statement)
+        return _FakeResult()
+
+
+@pytest.mark.asyncio
+async def test_gram_backfill_statements_are_executable():
+    """The production backfill died on its first statement -- pin that it can run.
+
+    ``Book.author_name`` is a Python property over the ``author`` relationship,
+    not a mapped column (``models/book.py``).  Naming it in a ``select()`` raises
+    "Column expression, FROM clause, or other columns clause element expected",
+    which is how the startup backfill died on 2026-10-14 and left the gram path
+    off for a day.  Compiling each statement is enough to catch that class of
+    mistake without a database, and it also pins the joins the grams need.
+    """
+    from app.core import database as database_module
+
+    captured: list = []
+    service, client = _make_service()
+    # "missing" so the backfill actually builds its queries.
+    client.index.return_value.search.return_value = {"hits": [{"id": "x"}]}
+
+    with patch.object(
+        database_module, "SessionLocal", lambda: _FakeSession(captured)
+    ):
+        await service.sync_book_grams()
+
+    assert len(captured) == 2, "expected one books query and one chapters query"
+    compiled = [str(statement.compile()) for statement in captured]
+    for sql, expected_table in zip(compiled, ("books", "chapters")):
+        assert expected_table in sql
+        # A missing author must not drop the row: both queries outer-join it, so
+        # every document receives its own grams and the completeness probe can
+        # eventually pass.
+        assert "authors" in sql
+        assert "LEFT OUTER JOIN" in sql.upper()
+    # The books query must not carry the property into the select list.
+    assert "author_name" not in compiled[0]
+
+
 def test_gram_probe_finds_an_index_that_still_lacks_the_fields():
     service, client = _make_service()
     index = client.index.return_value
@@ -1465,7 +1523,12 @@ def test_gram_probe_finds_an_index_that_still_lacks_the_fields():
     assert service.index_missing_grams(SearchService.INDEX_BOOKS) is True
 
     options = index.search.call_args.args[1]
-    assert options["filter"] == "title_grams NOT EXISTS"
+    # Every gram field is probed, not just the first: an index carrying
+    # title_grams but not author_grams would pass a single-field probe and then
+    # serve an author search that hides documents.
+    assert options["filter"] == (
+        "title_grams NOT EXISTS OR author_grams NOT EXISTS"
+    )
     assert options["limit"] == 1
 
 
@@ -1524,7 +1587,7 @@ def test_verified_index_narrows_the_metadata_scan_with_a_gram_filter():
     assert scan["filter"] == '(title_grams = "白骨") AND (title_grams = "骨精")'
     # Narrowed walks are chunked: the engine has already discarded the
     # non-matches, so there is no wide ranking window to fetch in one request.
-    assert scan["limit"] == SearchService._SCAN_CHUNK
+    assert scan["limit"] == SearchService.METADATA_SCAN_CHUNK
     assert result["total"] == 3
 
 
@@ -1589,7 +1652,7 @@ def test_fuzzy_search_is_narrowed_by_its_characters_too():
 
     fuzzy_scan = books_index.search.call_args_list[0].args[1]
     assert fuzzy_scan["filter"] == '(title_grams = "铃") AND (title_grams = "铛")'
-    assert fuzzy_scan["limit"] == SearchService._SCAN_CHUNK
+    assert fuzzy_scan["limit"] == SearchService.METADATA_SCAN_CHUNK
 
 
 def test_single_character_exact_search_is_narrowed_by_that_character():
@@ -1608,7 +1671,7 @@ def test_single_character_exact_search_is_narrowed_by_that_character():
 
     scan = books_index.search.call_args_list[0].args[1]
     assert scan["filter"] == 'title_grams = "铃"'
-    assert scan["limit"] == SearchService._SCAN_CHUNK
+    assert scan["limit"] == SearchService.METADATA_SCAN_CHUNK
 
 
 def test_ungrammed_fields_keep_their_window_in_both_modes():
@@ -1710,11 +1773,13 @@ def test_chapter_gram_walk_stops_at_the_chapter_budget():
     """A chapter walk cannot run away just because the filter is narrowing.
 
     The fake engine never returns a short chunk, so the only thing that can end
-    the walk is the budget: exactly ``SCAN_BUDGET_CHAPTERS / _SCAN_CHUNK``
-    requests, not one per matching chapter.
+    the walk is the budget.  It also pins the *step*: metadata walks in large
+    steps because every request re-ranks the whole candidate set, so a walk that
+    fetched the same rows in ``_SCAN_CHUNK``-sized pieces would multiply the
+    engine's work by the number of steps.
     """
     service, _, chapters_index = _service_with_indexes()
-    service._gram_ready.add(SearchService.INDEX_CHAPTERS)
+    service._mark_gram_ready(SearchService.INDEX_CHAPTERS)
 
     def engine(query, options):
         limit = int(options.get("limit") or 0)
@@ -1737,10 +1802,16 @@ def test_chapter_gram_walk_stops_at_the_chapter_budget():
     )
 
     scans = [
-        call for call in chapters_index.search.call_args_list
+        call.args[1] for call in chapters_index.search.call_args_list
         if call.args[1].get("filter", "").startswith("book_title_grams")
     ]
-    assert len(scans) == SearchService.SCAN_BUDGET_CHAPTERS // SearchService._SCAN_CHUNK
+    fetched = sum(int(scan["limit"]) for scan in scans)
+    assert fetched == SearchService.SCAN_BUDGET_CHAPTERS
+    assert all(
+        int(scan["limit"]) == SearchService.METADATA_SCAN_CHUNK for scan in scans
+    )
+    assert len(scans) == -(-SearchService.SCAN_BUDGET_CHAPTERS
+                           // SearchService.METADATA_SCAN_CHUNK)
 
 
 def test_gram_narrowing_is_anded_with_the_visibility_and_kind_filters():
@@ -1768,7 +1839,7 @@ def test_chapter_metadata_and_search_gets_the_gram_narrowing_too():
     on the chapter side, where the window is 1 000 rather than 10 000.
     """
     service, _, chapters_index = _service_with_indexes()
-    service._gram_ready.add(SearchService.INDEX_CHAPTERS)
+    service._mark_gram_ready(SearchService.INDEX_CHAPTERS)
     chapters_index.search.side_effect = lambda query, options: {"hits": []}
 
     service.advanced_search(
@@ -1786,6 +1857,6 @@ def test_chapter_metadata_and_search_gets_the_gram_narrowing_too():
     assert any('book_author_grams = "张三"' in value for value in filters)
     for scan, value in zip(scans, filters):
         if "grams" in value:
-            assert scan["limit"] == SearchService._SCAN_CHUNK
+            assert scan["limit"] == SearchService.METADATA_SCAN_CHUNK
 
 

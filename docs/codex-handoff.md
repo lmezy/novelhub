@@ -1955,7 +1955,9 @@ launch 级 proxy）、yuedu HTTP（`transport.py`）、jsoup shim 的 curl、后
 
 **验证**：`backend/tests/test_proxy_wiring.py` 8 条（回退改动后 6 条失败）；全量
 `cd backend && python -m pytest -q` → **968 passed**。部署需重建 backend 与 crawler 两镜像
-（两镜像共用 `backend/` 代码）。
+（~~两镜像共用 `backend/` 代码~~ —— 更正：**`backend/` 代码被 backend、crawler、scheduler
+三个镜像共用**（`crawler/Dockerfile:34`、`scheduler/Dockerfile:24` 都 `COPY backend/`），
+三个都跑同步/索引写入，改 `app/` 下的任何东西都要三个一起重建，见第 54 节）。
 
 **注意**：`cf_clearance` 绑定出口 IP，代理开启后 Cookie 的取得（远程浏览器）与校验
 （httpx / 自动登录浏览器）必须都走代理，否则同一书源必然验证码/403。
@@ -2049,3 +2051,91 @@ chapters 停在 10 000（是原来的 10 倍，不是全库）。gram filter 让
 **验证**：`cd backend && python -m pytest -q` → **1020 passed**（改动前基线 1013）。
 部署后 `GET /indexes/books/settings/pagination` 可以确认 `maxTotalHits` 是否已经拿到 200000；
 `POST /api/search/index/grams` 是回填的手动入口（启动时会自动跑，探针说没缺就是 no-op）。
+
+## 54. 第 53 节的 gram 上线第一天没生效：`Book.author_name` 是 property（2026-10-15）
+
+**现象**：第 53 节部署 22 小时后，线上搜索行为**与改动前完全一样**。三个容器的代码、`maxTotalHits`
+都对，但索引里几乎没有 gram 字段：
+
+```
+books    : title_grams 506   / 45 974 篇
+chapters : title_grams 204   / 732 462 篇     ← 只有部署后新写入的文档有
+```
+
+**根因（我写错的 SQL）**：`Book.author_name` 是**关系上的 Python property**
+（`app/models/book.py:60-63`：`author = relationship("Author", lazy="joined")` + `@property`），
+不是映射列，**不能出现在 `select()` 里**。启动日志里的原文：
+
+```
+WARNING app.main:_backfill_grams:100 | Search gram backfill failed:
+  Column expression, FROM clause, or other columns clause element expected,
+  got <property object at 0x7efdcd868130>.
+```
+
+回填在**第一句查询**就抛错，`_backfill_grams` 只记一条 warning 就结束，**之后不再重试** →
+`_gram_ready` 从未置位 → 搜索一直走老的窗口路径。**这就是"保守门控"的价值**：它让搜索在这 22 小时里
+**没有出错**，只是没变好；如果当初让 filter 无条件启用，这 732k 篇文档会**全部从元数据搜索里消失**。
+
+同时那条探测告警是**预期噪音**，不是故障：启动时 `_ensure_index` 刚下发 `filterableAttributes`，
+设置任务还没生效，所以 chapters 探测报 `Attribute title_grams is not filterable`；代码把"探测不了"
+一律当"缺失"（安全方向）。
+
+**第二处（我自己引入的性能问题）**：第 53 节把元数据扫描改成了 `_SCAN_CHUNK`(1 000) 一块，而
+**Meilisearch 每个请求都会把整个候选集重新排一遍序**（没有游标）——45 000 本书 = 45 次 45 000 条
+的排序，而老代码刻意用"一次宽请求"。已改回大块（`METADATA_SCAN_CHUNK = 10 000`，即
+第 28 节验证过的那个 ~10 MB 单请求尺寸），章节的 10 000 预算因此变成**一个请求**而不是十个。
+
+**线上实测（2026-10-15，只读）**：
+
+| 项 | 值 |
+|---|---|
+| 三个容器代码 | backend / crawler / scheduler **全为新代码** |
+| `pagination.maxTotalHits` | **200000**（已生效） |
+| books / chapters 文档数 | 45 974 / **732 462** |
+| 已有 gram 字段 | 506 本 / 204 章（= 部署后新写入的，说明**在线写入路径正确**） |
+| Meilisearch 任务队列 | enqueued 0 / processing 0，历史 446 533 条，单任务排队 ≈4 分钟 |
+| 回填规模 | 46k 本书 + 732k 章；按 1 000/批 = **~740 个任务**，按 10 000/批 = **~74 个** |
+| `/volume1` | 16T/17T 已用（**95%**，927 G 空闲）；内存 13/31 G；swap 5/17 G |
+
+**章节索引的 filter 成本（同一个 q，chapters，limit=1000，都在 `book_title` 上搜）**：
+
+| 实验 | 耗时 |
+|---|---|
+| A 无 filter（老路径每块） | **0.0717 s** |
+| B 选择性 filter `book_id = 某本 5 376 章的书` | 0.159 s |
+| C 宽 filter `kind = "novel"`（几乎全库） | 0.148 s |
+| D gram filter `book_title_grams = "铃铛"` | 0.0968 s |
+
+- **同一条 A 在部署当天量到 8.57 s**，这次 0.07 s → 差距是**冷热缓存**，不是路径差异。
+  所以「章节侧很慢」不能只看单次数字。
+- 第 51 节的 514-631 s 是 **`q=""` + 纯 filter**（引擎要排序全部 732k 篇）；带 `q` 时查询先收窄，
+  filter 的成本被盖住。**这两组数字不能互相外推。**
+
+**修复**（本轮改动）：
+
+1. `sync_book_grams` 改用 `outerjoin(Author, Author.id == Book.author_id)`；章节查询用
+   **`outerjoin` 而非 `join`**：book 行缺失的章节也必须拿到自己的 `title_grams`，否则它永远"缺失"、
+   探针永远不过、gram 路径永远开不起来。
+2. 探测改为**检查所有 gram 字段**（`title_grams NOT EXISTS OR author_grams NOT EXISTS`）：
+   只有 `title_grams` 的索引能骗过单字段探测，然后让章节标题搜索把文档藏起来。
+3. `GRAM_BACKFILL_BATCH = 10 000`（原沿用 `KIND_BACKFILL_BATCH = 1 000`）：740 → 74 个任务。
+4. 元数据扫描改回大块（见上）。
+5. **`_gram_ready` 加自愈**：`backend/` 代码被三个容器共用，只要有一个没重建，它写入的新书就没有
+   gram 字段，而陈旧的"已就绪"会**静默藏掉这些书**（表现像"书不在库里"，不像 bug）。现在每
+   `GRAM_READY_TTL_SECONDS`(600s) 复探一次，不通过就退回窗口路径并打 warning。
+
+**回归测试**：`test_gram_backfill_statements_are_executable` 用假 session 走**真实代码路径**，
+把语句 `compile()` 一遍 —— 把 `Author.name` 换回 `Book.author_name` 时它以**与线上一字不差的报错**
+失败（`Column expression, ... got <property object at ...>`）。SQL 类错误单测盖不到，只有编译能盖。
+
+**验证**：`cd backend && python -m pytest -q` → **1034 passed**。
+
+**教训（三条，可复用）**：
+
+- **ORM 的 property 不是列**：`select()` 里只能放 `Column`/`InstrumentedAttribute`；
+  实例上能读的属性（`book.author_name`）在查询里必须换成 join。这类错误在**启动后台任务**里
+  只表现为一条 warning —— 必须让"回填/迁移失败"比"搜索变慢"更容易被看见。
+- **"每个请求重排整个候选集"是分块扫描的隐藏代价**：分块只在"每行都很大"（正文）时才划算。
+- **一次性的迁移任务必须有可观测的完成信号**：第 53 节在 skip 分支没有日志，导致"回填完成"和
+  "从未运行"在日志里长得一样；这次靠直接探测索引才定位到。
+
