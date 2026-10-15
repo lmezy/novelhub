@@ -126,11 +126,6 @@ class BookMixin:
         # before another concurrent book can overwrite the JS runtime's global
         # variable store.
         self._chapter_image_manifest = self._read_chapter_image_manifest()
-        # Whether the source's own ``ruleToc`` produced the list.  A rule that
-        # matched is authoritative about what a chapter URL looks like; the
-        # URL-shape heuristic below is only for the generic scanner, which
-        # happily returns navigation links.
-        toc_from_rules = bool(toc)
         android_toc_rule = self._uses_android_js_rule("ruleToc", "chapterList")
         # ``_find_toc_url`` only *guesses* a catalogue URL from a link on the
         # book page, and the guess can land on a site-wide index instead of this
@@ -166,7 +161,6 @@ class BookMixin:
             self.engine.set_page_url(identity_url if retry_toc else toc_url)
             if retry_toc:
                 toc = retry_toc
-                toc_from_rules = True
                 toc_url = identity_url
                 toc_html = html
                 self._chapter_image_manifest = self._read_chapter_image_manifest()
@@ -316,10 +310,7 @@ class BookMixin:
             if ch_url.rstrip("/") == identity_url.rstrip("/"):
                 self_chapter_title = self_chapter_title or title
                 continue
-            if not toc_from_rules and not self._is_chapter_url(
-                ch_url,
-                identity_url,
-            ):
+            if not self._is_chapter_url(ch_url, identity_url):
                 continue
             if (
                 title in ("目录", "简介", "上一章", "下一章", "返回目录", "首页", "开始阅读")

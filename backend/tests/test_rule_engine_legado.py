@@ -193,6 +193,38 @@ def test_real_source_style_rules():
     toc = engine.parse_toc(html)
     assert [c["chapterName"] for c in toc] == ["Chapter 1", "Chapter 2"]
     assert [c["chapterUrl"] for c in toc] == ["1", "2"]
+def test_field_rule_matches_item_root_element():
+    """Regression: a field rule must match an item that is itself the target tag.
+
+    Legado evaluates field rules against the item's outer HTML, so
+    ``chapterList: class.novel-list@a`` + ``chapterName: a@text`` /
+    ``chapterUrl: a@href`` reads the value from the selected ``<a>`` itself.
+    Our port handed the Tag to ``Tag.select``, which only sees descendants, so
+    the fields came back empty and the book fell through to the generic
+    scanner -- which then grabbed navigation buttons ("立即阅读"/"章节列表") as
+    chapter titles.  This is the BB成人小说 / 涩涩小说 "章节名不对" bug.
+    """
+    engine = YueduRuleEngine({
+        "bookSourceUrl": "https://bbxxxx.com",
+        "ruleToc": {
+            "chapterList": "class.novel-list@a",
+            "chapterName": "a@text",
+            "chapterUrl": "a@href",
+        },
+    })
+    engine.set_page_url("https://bbxxxx.com/novel/58042")
+    html = (
+        '<div class="btns">'
+        '<a class="btn-read" href="/novel/58042/2308140.html">立即阅读</a>'
+        '<a class="btn-mark" href="#chapters">章节列表</a>'
+        '</div>'
+        '<div class="novel-list">'
+        '<a href="/novel/58042/2308140.html"><h4>全1章</h4></a>'
+        '</div>'
+    )
+    toc = engine.parse_toc(html)
+    assert [c["chapterName"] for c in toc] == ["全1章"]
+    assert [c["chapterUrl"] for c in toc] == ["/novel/58042/2308140.html"]
 def test_element_list_rule_keeps_xpath_attribute_selectors_whole():
     """Regression: 绅士漫画's catalog rule is ``//div[@class='...']/ul/li``.
 

@@ -1441,6 +1441,18 @@ class YueduRuleEngine:
         parts = rule.split("@")
         elements: list[Tag] = [soup]
         attr_suffix = "text"
+        # A field rule with a selector step is evaluated against the item's
+        # *outer HTML* (Legado semantics), so the item element itself is
+        # selectable: ``chapterList`` may select the ``<a>`` and then
+        # ``chapterName: a@text`` / ``chapterUrl: a@href`` re-select that same
+        # ``<a>``.  ``Tag.select`` only sees descendants, so without re-parsing
+        # such rules came back empty and the book fell to the generic scanner,
+        # which grabbed navigation buttons ("立即阅读"/"章节列表") as titles.
+        # A bare ``@attr`` rule (e.g. ``href``) has no selector step and must
+        # keep extracting from the item directly, not from a wrapper document.
+        has_selector_steps = any(step.strip() for step in parts[:-1])
+        if has_selector_steps and isinstance(soup, Tag):
+            elements = [BeautifulSoup(str(soup), "lxml")]
         for i, part in enumerate(parts):
             part = part.strip()
             if not part:
