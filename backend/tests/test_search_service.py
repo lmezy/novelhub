@@ -1458,15 +1458,23 @@ def test_update_book_tags_merges_instead_of_replacing_the_document():
 
 
 class _FakeResult:
+    def __init__(self, rows=None):
+        self._rows = list(rows or [])
+
     def all(self):
-        return []
+        return list(self._rows)
 
 
 class _FakeSession:
-    """Async-session stand-in that records the statements it is asked to run."""
+    """Async-session stand-in that records the statements it is asked to run.
 
-    def __init__(self, captured: list):
+    ``rows`` may be a list or a callable taking the statement, so one fake can
+    answer the different queries a backfill issues.
+    """
+
+    def __init__(self, captured: list, rows=None):
         self.captured = captured
+        self.rows = rows
 
     async def __aenter__(self):
         return self
@@ -1476,7 +1484,131 @@ class _FakeSession:
 
     async def execute(self, statement):
         self.captured.append(statement)
-        return _FakeResult()
+        rows = self.rows(statement) if callable(self.rows) else self.rows
+        return _FakeResult(rows)
+
+
+def test_missing_document_ids_pages_until_the_engine_runs_short():
+    """A ``NOT EXISTS`` sweep collects ids, not the library it lives in."""
+    service, client = _make_service()
+    index = client.index.return_value
+
+    def engine(query, options):
+        offset = int(options.get("offset") or 0)
+        limit = int(options["limit"])
+        remaining = 2500 - offset
+        count = max(0, min(limit, remaining))
+        return {"hits": [{"id": f"b{offset + i}"} for i in range(count)]}
+
+    index.search.side_effect = engine
+
+    ids = service.missing_document_ids("books", "kind NOT EXISTS")
+
+    assert len(ids) == 2500
+    assert ids[0] == "b0" and ids[-1] == "b2499"
+    assert index.search.call_args_list[0].args[1]["filter"] == "kind NOT EXISTS"
+    assert index.search.call_args_list[0].args[1]["limit"] == (
+        SearchService.MISSING_SCAN_CHUNK
+    )
+
+
+@pytest.mark.asyncio
+async def test_startup_kind_repair_touches_only_the_missing_documents():
+    """The startup repair must not become a full-library rewrite.
+
+    The probe reports "something is missing" on the production index every single
+    time, and acting on it by rewriting the library meant 718k chapter updates
+    per restart (a near-full re-index) which could not change anything.  Only the
+    ids the engine actually reported may be written.
+    """
+    captured: list = []
+    service, client = _make_service()
+    books_index = MagicMock()
+    chapters_index = MagicMock()
+    client.index.side_effect = lambda name: (
+        books_index if name == "books" else chapters_index
+    )
+
+    books_index.search.return_value = {"hits": [{"id": "b1"}, {"id": "b2"}]}
+    chapters_index.search.return_value = {"hits": []}
+
+    def rows_for(statement):
+        sql = str(statement)
+        if "books.kind" in sql:  # the repair query
+            return [("b1", "novel"), ("b2", "comic")]
+        return [("b1",), ("b2",)]  # the presence check
+
+    with patch.object(
+        settings, "MEILI_GRAM_BACKFILL_CHAPTERS", False
+    ), patch(
+        "app.core.database.SessionLocal",
+        lambda: _FakeSession(captured, rows_for),
+    ):
+        result = await service.sync_book_kinds()
+
+    assert result["books"] == 2
+    assert result["chapters"] == 0
+    assert result["orphans"] == 0
+    # Exactly the two reported documents, in one request.
+    books_index.update_documents.assert_called_once()
+    written = books_index.update_documents.call_args.args[0]
+    assert sorted(doc["id"] for doc in written) == ["b1", "b2"]
+    # No library walk: the statements are the presence check and the repair only.
+    assert len(captured) == 2
+    chapters_index.update_documents.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_startup_kind_repair_drops_orphans_so_the_probe_can_ever_pass():
+    """A document whose row is gone can never be repaired -- delete it.
+
+    Leaving orphans in place is what kept ``kind NOT EXISTS`` matching on every
+    startup: the probe could never report the index as complete, so the repair
+    ran (as a full rewrite) on every restart, forever.
+    """
+    service, client = _make_service()
+    books_index = MagicMock()
+    chapters_index = MagicMock()
+    client.index.side_effect = lambda name: (
+        books_index if name == "books" else chapters_index
+    )
+    books_index.search.return_value = {"hits": [{"id": "gone"}]}
+    chapters_index.search.return_value = {"hits": []}
+
+    with patch(
+        "app.core.database.SessionLocal",
+        lambda: _FakeSession([], []),  # the presence check finds no row
+    ):
+        result = await service.sync_book_kinds()
+
+    assert result["orphans"] == 1
+    assert result["books"] == 0
+    books_index.delete_documents.assert_called_once_with(["gone"])
+    books_index.update_documents.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_gram_backfill_skips_chapters_unless_they_are_enabled():
+    """Chapters cost a near-full re-index, so they are opt-in."""
+    service, client = _make_service()
+    index = client.index.return_value
+    index.search.return_value = {"hits": []}
+
+    with patch.object(settings, "MEILI_GRAM_BACKFILL_CHAPTERS", False):
+        result = await service.sync_book_grams()
+
+    assert result["enabled"] == [SearchService.INDEX_BOOKS]
+    assert not service.gram_index_ready(SearchService.INDEX_CHAPTERS)
+
+
+def test_gram_filter_expression_covers_every_gram_field_of_an_index():
+    assert SearchService.gram_missing_filter("books") == (
+        "title_grams NOT EXISTS OR author_grams NOT EXISTS"
+    )
+    assert SearchService.gram_missing_filter("chapters") == (
+        "title_grams NOT EXISTS OR book_title_grams NOT EXISTS "
+        "OR book_author_grams NOT EXISTS"
+    )
 
 
 @pytest.mark.asyncio
@@ -1487,32 +1619,34 @@ async def test_gram_backfill_statements_are_executable():
     not a mapped column (``models/book.py``).  Naming it in a ``select()`` raises
     "Column expression, FROM clause, or other columns clause element expected",
     which is how the startup backfill died on 2026-10-14 and left the gram path
-    off for a day.  Compiling each statement is enough to catch that class of
-    mistake without a database, and it also pins the joins the grams need.
+    off for a day.  Compiling every statement the backfill builds catches that
+    class of mistake without a database, and the joins are pinned too.
     """
     from app.core import database as database_module
 
     captured: list = []
     service, client = _make_service()
-    # "missing" so the backfill actually builds its queries.
+    # "missing" so the backfill actually builds its queries, and chapters on so
+    # both index walks are exercised (they are opt-in by default).
     client.index.return_value.search.return_value = {"hits": [{"id": "x"}]}
 
     with patch.object(
         database_module, "SessionLocal", lambda: _FakeSession(captured)
-    ):
+    ), patch.object(settings, "MEILI_GRAM_BACKFILL_CHAPTERS", True):
         await service.sync_book_grams()
 
-    assert len(captured) == 2, "expected one books query and one chapters query"
+    assert captured, "the backfill built no statements at all"
     compiled = [str(statement.compile()) for statement in captured]
-    for sql, expected_table in zip(compiled, ("books", "chapters")):
-        assert expected_table in sql
-        # A missing author must not drop the row: both queries outer-join it, so
-        # every document receives its own grams and the completeness probe can
-        # eventually pass.
-        assert "authors" in sql
-        assert "LEFT OUTER JOIN" in sql.upper()
-    # The books query must not carry the property into the select list.
-    assert "author_name" not in compiled[0]
+
+    walk = [sql for sql in compiled if "authors" in sql]
+    assert walk, "no statement joins the authors table"
+    # A missing author must not drop the row: every walk left-joins it, so each
+    # document receives its own grams and the completeness probe can pass.
+    assert all("LEFT OUTER JOIN" in sql.upper() for sql in walk)
+    # The property must never reach a select list.
+    assert "author_name" not in " ".join(compiled)
+    assert any("chapters" in sql for sql in compiled)
+    assert any("books" in sql for sql in compiled)
 
 
 def test_gram_probe_finds_an_index_that_still_lacks_the_fields():
@@ -1552,10 +1686,16 @@ async def test_gram_backfill_marks_an_already_complete_index_ready():
 
     result = await service.sync_book_grams()
 
-    assert result == {"books": 0, "chapters": 0, "skipped": True}
+    assert result["skipped"] is True
+    assert (result["books"], result["chapters"], result["orphans"]) == (0, 0, 0)
+    # Chapters are opt-in: gramming them re-tokenises every chapter body, so the
+    # default is the cheap index only.
+    assert result["enabled"] == [SearchService.INDEX_BOOKS]
     assert index.update_documents.call_count == 0
     assert service.gram_index_ready(SearchService.INDEX_BOOKS)
-    assert service.gram_index_ready(SearchService.INDEX_CHAPTERS)
+    # The index that was not backfilled must never be reported ready, or searches
+    # would filter on fields it does not carry and answer with nothing.
+    assert not service.gram_index_ready(SearchService.INDEX_CHAPTERS)
 
 
 def test_metadata_search_keeps_its_window_until_the_index_is_verified():

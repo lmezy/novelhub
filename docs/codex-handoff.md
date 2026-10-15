@@ -2139,3 +2139,76 @@ WARNING app.main:_backfill_grams:100 | Search gram backfill failed:
 - **一次性的迁移任务必须有可观测的完成信号**：第 53 节在 skip 分支没有日志，导致"回填完成"和
   "从未运行"在日志里长得一样；这次靠直接探测索引才定位到。
 
+## 55. 同步任务超时与索引写入队列被堵：孤儿文档 + 全库重写（2026-10-15）
+
+**用户报告**：「同步任务里面有超时，因为连接时间太长」。**结论：与第 53/54 节的改动无关**，是站点侧；
+但顺着查出一个**更严重的既有问题**（索引写入队列被一次注定无效的全库重写堵住），已解除并根治。
+
+**超时的根因（站点侧，非本项目可控）**：
+
+```
+WARNING Configured proxy http://127.0.0.1:27890 request failed for
+        https://www.wn09.shop/photos-view-id-34609774.html (ConnectTimeout); retrying direct
+```
+
+| 实测（从 NAS 宿主） | 结果 |
+|---|---|
+| 直连 `wn09.shop` ×2 | **10 s 超时、http=000、失败** |
+| 走代理 `wn09.shop` ×2 | total **5.79 s / 5.55 s**、http=200（慢但通） |
+| 代理自身（走它访问 google ×3） | connect 0.0002 s / total 0.18 s / **204** |
+| `YUEDU_HTTP_CONNECT_TIMEOUT` | 默认 **5.0 s** < 该站走代理需要的 5.8 s → 必然 ConnectTimeout |
+
+- **历史基线**：近 30 天**没有任何任务**的 error 含 `timeout`（一直被"回退直连"兜住）；最近一次任务
+  失败是 **10-13**，10-14、10-15 **零失败**。24 小时内 `_Timeout` 只有 8 条，全是 ConnectTimeout，
+  且只指向这一个站点。**不是回归，是一直如此。**
+- 想让它同步：把 `YUEDU_HTTP_CONNECT_TIMEOUT` 调大（例如 12），或放弃该源。
+
+**真正的严重问题：`sync_book_kinds` 每次启动都重写全库 718k 章，而且注定无效**
+
+- 索引里有 **3 427 个孤儿文档**：chapters 索引中 `kind NOT EXISTS` 的文档，拿 id 回 Postgres 查
+  **0 rows**（PG 里已删除，索引里没删）。回填只能从 PG 取数据 → **永远修不好它们** →
+  `kind NOT EXISTS` 探测**每次启动都命中** → 每次启动重来一遍全库重写。
+- 更糟的是它**每次启动被下发两次**（日志里 "Backfilled search kind" 出现两遍；队列里
+  `docs/task=1000 × 1435 = 718k × 2`）。
+- 再叠加第 54 节的 gram 回填（732k 章）→ Meilisearch 写入队列被两轮全量重写堵死。
+  **实测**：单个批次从 10:11:47 开始 **19 分钟没结束**、最后一个成功任务也停在 10:11:47；
+  `enqueued 55 / processing 1580`；Meilisearch **10.92 → 11.03 GiB / 12 GiB**；
+  宿主 **load 9.42、iowait 27-33%、idle 5-13%**；涉及 **2 870 656 个文档重写**（≈ 全库的 4 倍）。
+
+**为什么章节的 gram 回填是灾难而 books 不是**：Meilisearch 每次更新都会**重新分词整个文档**，
+而 chapter 文档带最多 `CONTENT_INDEX_LIMIT`(100 000) 字的正文 → 给 732k 章加字段等于近乎重刷整个
+94 GB 索引。books 没有正文，所以便宜。
+
+**处置（已执行）**：只取消 chapters 索引里 `receivedDocuments >= 1000` 的批量任务
+（**保留** books 的 gram 任务和爬虫 1 文档/条的实时写入），共 **1 578 个任务被取消**
+（`POST /tasks/cancel?uids=...`；注意 **v1.10 只接受查询参数**，JSON body 会回
+`missing_task_filters`；取消**正在处理**的批次要等它自己结束，FIFO）。结果：
+
+| 指标 | 处置前 | 处置后 |
+|---|---|---|
+| `processing` | 1580 | **2** |
+| `canceled` | 0 | **1578** |
+| `books.title_grams` | 536 | **45 983（全部）** |
+| 宿主 load | 9.42 | **6.00** |
+
+**代码修复（三处，第 54 节风格的根因修复）**：
+
+1. `missing_document_ids(index, filter)`：把"探测到缺失"从**决定全库重写**改成**收集真正缺的 id**。
+2. `sync_book_kinds` 启动路径改为「只补探测到的 id + **删除孤儿**」：孤儿永远补不上，删掉它才是
+   让探测最终能报"完整"的唯一办法（它同时也是一个用户点不开的搜索结果）。章节的 kind 查询
+   改用 `outerjoin`，让"章节在、书没了"的情况也能拿到 kind。
+3. `sync_book_grams` **默认只回填 books**；chapters 需显式开
+   `MEILI_GRAM_BACKFILL_CHAPTERS=true`。未启用的索引**绝不置位 ready**（否则搜索会拿它没有的字段
+   去 filter，返回空）。verify 阶段先 `purge_orphan_documents` 再判就绪 —— 否则孤儿会让 gram 门
+   永远过不去，和第 2 点的 kind 探测是同一个坑。
+
+**回归测试**：`missing_document_ids` 分页；启动修复**只写探测到的文档**（断言写入的 id 恰好是
+报上来的两个，且没有库遍历）；孤儿被删除而不是重写；chapters 默认不参与 gram 回填且不被标就绪。
+
+**部署注意**：**先部署这次修复，再重启 backend**。当前线上代码的 gram 回填默认包含 chapters，
+此时重启会再排 732k 章的重写。部署后重启，`sync_book_grams` 会看到 books 已完整 → 直接置位 →
+**books 的 gram 路径生效**（搜索框的书名/作者搜索从此全库），chapters 保持窗口路径。
+`sync_book_kinds` 则只删那 3 427 个孤儿，不再重写全库。
+
+**验证**：`cd backend && python -m pytest -q` → **1039 passed**。
+

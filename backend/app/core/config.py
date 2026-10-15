@@ -76,6 +76,16 @@ class Settings(BaseSettings):
     # the library outgrows it; it is an index *setting*, applied on startup, so
     # no reindex is needed.
     MEILI_MAX_TOTAL_HITS:int=200000
+    # Whether the gram backfill also rewrites the chapters index.  Off by default
+    # because it is not a metadata tweak: Meilisearch re-tokenises the whole
+    # document on every update and a chapter carries up to CONTENT_INDEX_LIMIT
+    # (100 000) characters of body, so gramming 732k chapters is a near-full
+    # re-index of a 94 GB store -- measured on production as a single batch still
+    # running after 19 minutes with 11 of the container's 12 GB in use.
+    # ``books`` carry no body, so their backfill is cheap and is what the search
+    # box needs.  Until this is enabled, a chapter-scoped title/author condition
+    # keeps its windowed candidate path: correct, just bounded.
+    MEILI_GRAM_BACKFILL_CHAPTERS:bool=False
 
     SYNC_CHAPTER_CONCURRENCY:int=9
     SYNC_BOOK_CONCURRENCY:int=3

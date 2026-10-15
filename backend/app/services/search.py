@@ -652,11 +652,7 @@ class SearchService:
         probe and then hide every chapter from a chapter-scoped title search.
         """
         self._ensure_index(index_name)
-        # One clause per gram field, OR-ed: a document counts as covered only
-        # when it carries *all* of them.
-        missing = " OR ".join(
-            f"{field} NOT EXISTS" for field in self.gram_fields(index_name)
-        )
+        missing = self.gram_missing_filter(index_name)
         try:
             result = self.client.index(index_name).search("", {
                 "limit": 1,
@@ -2226,6 +2222,104 @@ class SearchService:
         return result
 
     KIND_BACKFILL_BATCH = 1000
+    # Ids one ``NOT EXISTS`` sweep collects per request, and the ceiling on one
+    # sweep.  Meilisearch caps ``offset + limit`` at ``maxTotalHits``, so a sweep
+    # cannot page past the engine's own ceiling in a single run; a set larger than
+    # that converges over successive runs because each one fixes the ids it did
+    # see.
+    MISSING_SCAN_CHUNK = 1000
+    MISSING_SCAN_MAX = 200_000
+
+    def missing_document_ids(self, index_name: str, missing_filter: str) -> list[str]:
+        """Ids of documents in ``index_name`` matching ``missing_filter``.
+
+        ``missing_filter`` is a Meilisearch filter expression such as
+        ``kind NOT EXISTS`` or the OR of every gram field (see
+        ``gram_missing_filter``).
+
+        ``index_missing_kind`` answers the same question well enough to *decide*
+        whether a backfill is needed, but acting on that decision used to mean
+        rewriting the whole library -- 718k chapters on the production index,
+        which is a near-full re-index because every chapter update re-tokenises
+        the chapter body.  Collecting the ids instead turns it into an update of
+        exactly the documents that need one, and it is also what makes the stale
+        documents visible: an id here that has no row in Postgres is an orphan
+        that no backfill can ever satisfy, so the probe would otherwise report
+        "missing" on every single startup, forever.
+        """
+        self._ensure_index(index_name)
+        ids: list[str] = []
+        offset = 0
+        index = self.client.index(index_name)
+        while offset < self.MISSING_SCAN_MAX:
+            result = index.search("", {
+                "limit": self.MISSING_SCAN_CHUNK,
+                "offset": offset,
+                "filter": missing_filter,
+                "attributesToRetrieve": ["id"],
+            })
+            hits = result.get("hits") or []
+            for hit in hits:
+                doc_id = hit.get("id")
+                if doc_id is not None:
+                    ids.append(str(doc_id))
+            if len(hits) < self.MISSING_SCAN_CHUNK:
+                break
+            offset += len(hits)
+        return ids
+
+    async def _ids_present_in_db(self, db, index_name: str, ids: list[str]) -> set[str]:
+        """Which of ``ids`` still have a source row (the rest are stale documents)."""
+        from sqlalchemy import select
+
+        from app.models import Book, Chapter
+
+        model = Book if index_name == self.INDEX_BOOKS else Chapter
+        present: set[str] = set()
+        for start in range(0, len(ids), self.KIND_BACKFILL_BATCH):
+            chunk = ids[start : start + self.KIND_BACKFILL_BATCH]
+            rows = (await db.execute(select(model.id).where(model.id.in_(chunk)))).all()
+            present.update(str(row[0]) for row in rows)
+        return present
+
+    async def purge_orphan_documents(
+        self, db, index_name: str, missing_filter: str
+    ) -> int:
+        """Drop index documents that have no source row any more.
+
+        An orphan can never be given the field -- both backfills read Postgres --
+        so ``missing_filter`` keeps matching it forever.  That is what made the
+        completeness probes report a stale index on every startup (measured on
+        the production index: 3 400 chapter documents whose rows were deleted,
+        which queued 718k chapter rewrites per restart that could not change
+        anything) and it would equally block the gram gate, since an orphan can
+        never receive grams.  It is also simply wrong for search: an orphan is a
+        hit the reader cannot open.
+        """
+        ids = self.missing_document_ids(index_name, missing_filter)
+        if not ids:
+            return 0
+        present = await self._ids_present_in_db(db, index_name, ids)
+        orphans = [doc_id for doc_id in ids if doc_id not in present]
+        if not orphans:
+            return 0
+        if index_name == self.INDEX_BOOKS:
+            self.delete_books_from_index(orphans)
+        else:
+            self.delete_chapters_from_index(orphans)
+        logger.warning(
+            "{}: dropped {} stale documents that no longer have a source row",
+            index_name,
+            len(orphans),
+        )
+        return len(orphans)
+
+    @classmethod
+    def gram_missing_filter(cls, index_name: str) -> str:
+        """The Meilisearch filter matching documents short of any gram field."""
+        return " OR ".join(
+            f"{field} NOT EXISTS" for field in cls.gram_fields(index_name)
+        )
 
     def index_missing_kind(self, index_name: str) -> bool:
         """Whether an index still holds documents without the ``kind`` field.
@@ -2234,6 +2328,10 @@ class SearchService:
         and a document without it matches neither ``kind = "novel"`` nor
         ``kind = "comic"`` -- so ``/novels`` and ``/comics`` search would return
         nothing until it is backfilled.
+
+        Only used to *decide*; the repair itself goes through
+        ``missing_document_ids`` so it touches those documents and not the
+        library.
         """
         self._ensure_index(index_name)
         try:
@@ -2262,8 +2360,18 @@ class SearchService:
         * ``book_ids`` given (after ``/books/reclassify``) -- refresh only the
           books whose kind actually changed, plus their chapters;
         * ``force=True`` -- rewrite the whole library;
-        * default (the startup path) -- skip an index whose probe finds nothing
-          missing, so a normal restart never re-indexes the whole library.
+        * default (the startup path) -- collect the documents the engine reports
+          as missing the field and repair **only those**, deleting the ones that
+          no longer exist in Postgres.
+
+        That last shape used to be "probe; if anything is missing, rewrite the
+        whole library".  On the production index the probe is *always* true --
+        the chapters index holds ~3 400 documents whose rows were deleted from
+        Postgres and which no backfill can ever satisfy -- so every restart
+        enqueued 718k chapter rewrites (a near-full re-index) that could not
+        change anything, and it ran twice per start.  Repairing by id is both
+        correct and orders of magnitude smaller, and dropping the orphans is what
+        lets the probe finally report an index as complete.
 
         Chapters need the field too: a ``content`` search runs against the
         chapters index, so without it a search started on /novels or /comics
@@ -2272,15 +2380,31 @@ class SearchService:
         self._ensure_index(self.INDEX_BOOKS)
         self._ensure_index(self.INDEX_CHAPTERS)
         targets = None
+        missing: dict[str, list[str]] = {}
         if book_ids is not None:
             targets = [str(book_id) for book_id in book_ids if book_id]
             if not targets:
                 return {"books": 0, "chapters": 0, "skipped": True}
             need_books = need_chapters = True
+        elif force:
+            need_books = need_chapters = True
         else:
-            need_books = force or self.index_missing_kind(self.INDEX_BOOKS)
-            need_chapters = force or self.index_missing_kind(self.INDEX_CHAPTERS)
-        result = {"books": 0, "chapters": 0, "skipped": not (need_books or need_chapters)}
+            missing = {
+                self.INDEX_BOOKS: self.missing_document_ids(
+                    self.INDEX_BOOKS, "kind NOT EXISTS"
+                ),
+                self.INDEX_CHAPTERS: self.missing_document_ids(
+                    self.INDEX_CHAPTERS, "kind NOT EXISTS"
+                ),
+            }
+            need_books = bool(missing[self.INDEX_BOOKS])
+            need_chapters = bool(missing[self.INDEX_CHAPTERS])
+        result = {
+            "books": 0,
+            "chapters": 0,
+            "orphans": 0,
+            "skipped": not (need_books or need_chapters),
+        }
         if result["skipped"]:
             return result
 
@@ -2313,7 +2437,49 @@ class SearchService:
                     for chapter_id, kind in rows
                 ]
 
-            if batches is not None:
+            if missing:
+                # Startup repair: touch the documents the engine reported, and
+                # nothing else.  An id with no row is an index document whose
+                # source is gone -- it can never be repaired, and leaving it in
+                # place is what made the probe report "missing" forever.
+                for index_name, ids in missing.items():
+                    if not ids:
+                        continue
+                    is_books = index_name == self.INDEX_BOOKS
+                    present = await self._ids_present_in_db(db, index_name, ids)
+                    orphans = [doc_id for doc_id in ids if doc_id not in present]
+                    for start in range(0, len(present), self.KIND_BACKFILL_BATCH):
+                        chunk = sorted(present)[start : start + self.KIND_BACKFILL_BATCH]
+                        if is_books:
+                            docs = await _book_docs(
+                                select(Book.id, Book.kind).where(Book.id.in_(chunk))
+                            )
+                        else:
+                            # ``outerjoin``: a chapter whose book row is missing
+                            # still gets a kind, otherwise it stays "missing"
+                            # forever just like an orphan.
+                            docs = await _chapter_docs(
+                                select(Chapter.id, Book.kind)
+                                .outerjoin(Book, Book.id == Chapter.book_id)
+                                .where(Chapter.id.in_(chunk))
+                            )
+                        if docs:
+                            (books_index if is_books else chapters_index).update_documents(docs)
+                            result["books" if is_books else "chapters"] += len(docs)
+                    if orphans:
+                        if is_books:
+                            self.delete_books_from_index(orphans)
+                        else:
+                            self.delete_chapters_from_index(orphans)
+                        result["orphans"] += len(orphans)
+                        logger.warning(
+                            "{}: dropped {} index documents whose row no longer "
+                            "exists (they were unfixable by any backfill and kept "
+                            "the completeness probe failing)",
+                            index_name,
+                            len(orphans),
+                        )
+            elif batches is not None:
                 # Targeted refresh: one round trip per batch for books and for
                 # their chapters.
                 for batch in batches:
@@ -2327,7 +2493,7 @@ class SearchService:
                     if need_chapters:
                         docs = await _chapter_docs(
                             select(Chapter.id, Book.kind)
-                            .join(Book, Book.id == Chapter.book_id)
+                            .outerjoin(Book, Book.id == Chapter.book_id)
                             .where(Chapter.book_id.in_(batch))
                         )
                         if docs:
@@ -2396,23 +2562,51 @@ class SearchService:
         Books are read from Postgres; a chapter's ``book_title``/``book_author``
         come from its book row, which ``Chapter`` can be joined to, so no storage
         read is involved either.
+
+        **Chapters are not backfilled by default.**  Meilisearch re-tokenises the
+        whole document on every update, and a chapter document carries up to
+        ``CONTENT_INDEX_LIMIT`` (100 000) characters of body -- so gramming 732k
+        chapters is a near-full re-index of a 94 GB store, measured on production
+        as a single batch still running after 19 minutes with 11 of the 12 GB
+        container's memory in use.  Books carry no body, so their backfill is
+        cheap and is what the search box mostly needs.  Set
+        ``MEILI_GRAM_BACKFILL_CHAPTERS=true`` to pay for the chapters too; until
+        it completes they simply keep their windowed candidate path.
         """
         self._ensure_index(self.INDEX_BOOKS)
         self._ensure_index(self.INDEX_CHAPTERS)
-        need_books = force or self.index_missing_grams(self.INDEX_BOOKS)
-        need_chapters = force or self.index_missing_grams(self.INDEX_CHAPTERS)
-        # The probes above have just answered for both indexes, so an index with
+        wants = {
+            self.INDEX_BOOKS: True,
+            self.INDEX_CHAPTERS: bool(
+                getattr(settings, "MEILI_GRAM_BACKFILL_CHAPTERS", False)
+            ),
+        }
+        # A disabled index must never be reported ready: searches would then take
+        # the gram filter on documents that were never grammed and answer with
+        # nothing at all.
+        for index_name, enabled in wants.items():
+            if not enabled:
+                self._gram_ready.pop(index_name, None)
+        need_books = wants[self.INDEX_BOOKS] and (
+            force or self.index_missing_grams(self.INDEX_BOOKS)
+        )
+        need_chapters = wants[self.INDEX_CHAPTERS] and (
+            force or self.index_missing_grams(self.INDEX_CHAPTERS)
+        )
+        # The probes above have just answered for the enabled indexes, so one with
         # nothing missing is ready *right now* -- this is also how a process that
         # starts after an earlier backfill (or after ``rebuild_index``) learns it
         # may take the gram path without paying a per-search probe.
-        if not need_books:
+        if wants[self.INDEX_BOOKS] and not need_books:
             self._mark_gram_ready(self.INDEX_BOOKS)
-        if not need_chapters:
+        if wants[self.INDEX_CHAPTERS] and not need_chapters:
             self._mark_gram_ready(self.INDEX_CHAPTERS)
         result = {
             "books": 0,
             "chapters": 0,
+            "orphans": 0,
             "skipped": not (need_books or need_chapters),
+            "enabled": [name for name, on in wants.items() if on],
         }
         if result["skipped"]:
             return result
@@ -2496,15 +2690,30 @@ class SearchService:
         # missing may take the gram path: a backfill interrupted halfway would
         # otherwise hide exactly the documents it never reached, and a search
         # that silently loses books is worse than one that is merely truncated.
-        for index_name in (self.INDEX_BOOKS, self.INDEX_CHAPTERS):
-            if self.index_missing_grams(index_name):
-                self._gram_ready.pop(index_name, None)
-            else:
-                self._mark_gram_ready(index_name)
+        #
+        # Any document still missing the fields is either not yet written or an
+        # orphan with no source row.  An orphan can never be grammed by a backfill
+        # that reads Postgres, so leaving it would fail this check on every
+        # startup forever -- which is exactly what the kind probe did for a day.
+        # Drop the orphans, then judge the index.
+        async with SessionLocal() as db:
+            for index_name, enabled in wants.items():
+                if not enabled:
+                    continue
+                result["orphans"] += await self.purge_orphan_documents(
+                    db, index_name, self.gram_missing_filter(index_name)
+                )
+                if self.index_missing_grams(index_name):
+                    self._gram_ready.pop(index_name, None)
+                else:
+                    self._mark_gram_ready(index_name)
         logger.info(
-            "Backfilled search grams: {} books, {} chapters",
+            "Backfilled search grams: {} books, {} chapters ({} stale documents "
+            "dropped); enabled indexes: {}",
             result["books"],
             result["chapters"],
+            result["orphans"],
+            result["enabled"],
         )
         return result
 
