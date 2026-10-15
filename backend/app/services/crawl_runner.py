@@ -46,6 +46,10 @@ _TRANSIENT_TASK_MARKERS = (
     "proxyerror",
     "connection reset",
     "connection closed",
+    "connection is closed",
+    "connection was closed",
+    "connection is already closed",
+    "server closed the connection",
     "connection refused",
     "connection aborted",
     "temporarily unavailable",
@@ -77,26 +81,58 @@ _NON_TRANSIENT_TASK_MARKERS = (
 
 
 def _is_transient_task_error(exc: BaseException) -> bool:
-    """Whether a failed crawl task should be retried automatically."""
-    name = type(exc).__name__.lower()
-    message = str(exc).lower()
-    if any(marker in message for marker in _NON_TRANSIENT_TASK_MARKERS):
-        return False
-    if any(marker in message for marker in _TRANSIENT_TASK_MARKERS):
-        return True
-    # httpx.RequestError and asyncio.TimeoutError often stringify to "".
-    return name in {
-        "connecttimeout",
-        "readtimeout",
-        "writetimeout",
-        "pooltimeout",
-        "connecterror",
-        "readerror",
-        "writeerror",
-        "proxyerror",
-        "remoteprotocolerror",
-        "timeouterror",
-    }
+    """Whether a failed crawl task should be retried automatically.
+
+    A dropped database connection surfaces two layers up: the asyncpg
+    ``InterfaceError`` ("the underlying connection is closed") is the real cause,
+    and SQLAlchemy wraps it in a ``PendingRollbackError`` whose own name and
+    message only *embed* the original as text.  Reading just the wrapper missed
+    exactly that case on 2026-10-13: a three-day task was marked ``failed``
+    (its counters read "成功 1147 / 找到 1168") because the final progress write
+    hit a connection the server had closed.  Walk the explicit cause chain
+    (``__cause__`` / ``.orig``, deliberately not the implicit ``__context__``)
+    so the actual failure is what gets classified.
+    """
+
+    def _nodes():
+        seen: set[int] = set()
+        node: BaseException | None = exc
+        while node is not None and id(node) not in seen:
+            seen.add(id(node))
+            yield node
+            node = getattr(node, "orig", None) or node.__cause__
+
+    for node in _nodes():
+        name = type(node).__name__.lower()
+        message = str(node).lower()
+        if any(marker in message for marker in _NON_TRANSIENT_TASK_MARKERS):
+            return False
+        if any(marker in message for marker in _TRANSIENT_TASK_MARKERS):
+            return True
+        # httpx.RequestError and asyncio.TimeoutError often stringify to "".
+        if name in {
+            "connecttimeout",
+            "readtimeout",
+            "writetimeout",
+            "pooltimeout",
+            "connecterror",
+            "readerror",
+            "writeerror",
+            "proxyerror",
+            "remoteprotocolerror",
+            "timeouterror",
+        }:
+            return True
+        # asyncpg ``InterfaceError`` / SQLAlchemy ``DBAPIError`` normally already
+        # carry "connection is closed" in the message (matched above); this name
+        # gate is the fallback for a future wording that still means "the
+        # connection died", while excluding the *other* ``InterfaceError``
+        # ("another operation is in progress"), which is not a dropped link.
+        if name in {"interfaceerror", "dbapierror"} and (
+            "connection" in message or "closed" in message
+        ):
+            return True
+    return False
 
 
 def _task_retry_delay_seconds(retries: int) -> int:

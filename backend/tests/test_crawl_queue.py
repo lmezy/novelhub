@@ -440,6 +440,48 @@ def test_is_transient_task_error_classification():
     ) is False
 
 
+def test_dropped_database_connection_is_a_transient_task_error():
+    """A closed DB connection must retry from the checkpoint, not fail the task.
+
+    On 2026-10-13 a three-day discover task ended "failed" with 成功 1147 / 找到
+    1168: the postgres connection died under it, the final progress write raised
+    asyncpg's "underlying connection is closed", and it was not classified as
+    transient.  Both the raw asyncpg wording and the SQLAlchemy wrapper that
+    embeds it must now retry.
+    """
+    from app.services.crawl_runner import _is_transient_task_error
+
+    # The raw asyncpg InterfaceError wording.
+    assert _is_transient_task_error(
+        RuntimeError("cannot call PreparedStatement.fetch(): the underlying connection is closed")
+    ) is True
+
+    # The SQLAlchemy wrapper embeds the original as text (no real ``__cause__``
+    # on a PendingRollbackError, so the marker path has to catch it too).
+    assert _is_transient_task_error(
+        RuntimeError(
+            "This Session's transaction has been rolled back due to a previous "
+            "exception during flush. To begin a new transaction with this "
+            "Session, first issue Session.rollback(). Original exception was: "
+            "(sqlalchemy.dialects.postgresql.asyncpg.InterfaceError) cannot call "
+            "PreparedStatement.fetch(): the underlying connection is closed"
+        )
+    ) is True
+
+    # A generic wrapper whose cause is the connection drop is caught by walking
+    # the explicit cause chain even though the wrapper itself says nothing.
+    inner = RuntimeError("the underlying connection is closed")
+    outer = RuntimeError("worker failed unexpectedly")
+    outer.__cause__ = inner
+    assert _is_transient_task_error(outer) is True
+
+    # asyncpg's *other* InterfaceError is a concurrent-use bug, not a dropped
+    # link, and must not be silently retried forever.
+    assert _is_transient_task_error(
+        RuntimeError("another operation is in progress")
+    ) is False
+
+
 @pytest.mark.asyncio
 async def test_run_crawl_task_async_retries_transient_network_failure():
     """A short proxy/network outage must not mark the whole task failed."""
