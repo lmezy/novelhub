@@ -1998,8 +1998,8 @@ launch 级 proxy）、yuedu HTTP（`transport.py`）、jsoup shim 的 curl、后
   那本书当场从 /novels、/comics 搜索里消失，直到重启触发 `sync_book_kinds` 回填。改 `update_documents`
   （HTTP **PUT = 合并**）。
 - `routes/search.py`：`advanced_search` / `search_books` 是**同步** Meilisearch 客户端，原来直接
-  在 `async def` 里调用，而 backend 是单 worker——一次正文搜索（线上实测 105s）等于**全站 API 停摆
-  105 秒**。改 `run_in_threadpool`。
+  在 `async def` 里调用。backend 部署为 2 个 worker（NAS 侧 `--workers 2 --port 18000`，见第 55 节），
+  但一次正文搜索（线上实测 105s）仍会**占死其中一个 worker 105 秒**、容量减半。改 `run_in_threadpool`。
 - **前端不用改**：页数完全由后端报的 `total` 驱动（`totalPages()` / 「跳至 __ 页」的 `:max`），
   `total` 报对了页数自然就够。顺带记两条容易踩的接线事实：书库页的**搜索框**并不是走
   `GET /api/search`，而是 `loadSearch()` → `POST /search/advanced` 发**一个**条件；`GET /api/search`
