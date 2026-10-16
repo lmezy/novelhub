@@ -122,6 +122,10 @@ class SearchService:
     # re-verified.  See ``gram_index_ready``: the check exists so that a writer
     # left on older code cannot silently hide its documents from search.
     GRAM_READY_TTL_SECONDS = 600
+    # Postgres advisory-lock key that serialises the gram backfill across the
+    # backend's two uvicorn workers (each fires the startup backfill; a duplicate
+    # would re-tokenise the whole index twice).
+    GRAM_BACKFILL_ADVISORY_LOCK_KEY = 834_265_817
     # Complete small exact result sets are verified before paging; larger sets
     # are checked page by page because verification retrieves stored text.
     CONJUNCTION_VERIFY_MAX_HITS = 200
@@ -781,6 +785,20 @@ class SearchService:
             limit if limit is not None
             else self._candidate_window(index_name, attr)
         )
+        # A fuzzy 正文 condition inside a multi-condition search is answered
+        # natively over the whole index (the engine's "all" gate *is* the fuzzy
+        # test), so it is no longer cut at the 10 000-candidate window.  This is
+        # the OR / 正文+标签 / 正文+简介 residue the native AND path above does not
+        # already cover.
+        if (
+            limit is None
+            and index_name == self.INDEX_CHAPTERS
+            and attr == "content"
+            and mode == "fuzzy"
+        ):
+            native = self._collect_fuzzy_content_native(value, filters)
+            if native is not None:
+                return native
         # A gram-narrowed condition behaves like a 正文 scan: the engine has
         # already discarded the non-matches, so the window only bounds the walk
         # and the chunks stay small.  This is what lifts the 1 000-candidate
@@ -879,6 +897,55 @@ class SearchService:
             self.CONDITION_CACHE_MAX_ENTRIES,
             self.CONDITION_CACHE_MAX_ROWS,
         )
+        return candidates
+
+    def _collect_fuzzy_content_native(
+        self,
+        value: str,
+        filters: str | None,
+    ) -> dict[str, tuple[int, dict]] | None:
+        """Fuzzy 正文 candidates for a multi-condition search, whole index.
+
+        Returns ``{doc_id: (score, hit)}`` with light chapter fields only -- the
+        engine's "all" gate *is* the fuzzy test, so no body is fetched and no
+        Python re-score is needed.  The native ranking is folded into the score
+        so the surrounding intersection still ranks by relevance.  ``None`` means
+        the engine could not answer it and the caller keeps its scanned path.
+        """
+        window = self.max_total_hits()
+        candidates: dict[str, tuple[int, dict]] = {}
+        fetched = 0
+        step = self.METADATA_SCAN_CHUNK
+        while fetched < window:
+            chunk = min(step, window - fetched)
+            options = {
+                "limit": chunk,
+                "offset": fetched,
+                "attributesToSearchOn": ["content"],
+                "attributesToRetrieve": list(self.CHAPTER_RETRIEVE_ATTRS),
+                "showRankingScore": True,
+            }
+            if filters:
+                options["filter"] = filters
+            if len(value) > 1:
+                options["matchingStrategy"] = "all"
+            try:
+                result = self.client.index(self.INDEX_CHAPTERS).search(
+                    value, options,
+                )
+            except meilisearch.errors.MeilisearchApiError as exc:
+                logger.warning("Native 正文 collect fell back: {}", exc)
+                return None
+            page_hits = result.get("hits", []) or []
+            for hit in page_hits:
+                ranking = float(hit.get("_rankingScore") or 0.0)
+                score = 10_000 + int(max(0.0, min(ranking, 1.0)) * 1000)
+                doc_id = str(hit.get("id"))
+                if doc_id not in candidates:
+                    candidates[doc_id] = (score, hit)
+            fetched += len(page_hits)
+            if len(page_hits) < chunk:
+                break
         return candidates
 
     @classmethod
@@ -1186,14 +1253,16 @@ class SearchService:
         return self.CHAPTER_BOOK_FIELD_ATTRS.get(field)
 
     def _content_window_for(self, offset: int) -> int:
-        """Scan all candidates available to a single-condition 正文 search.
+        """How far a single-condition 正文 scan walks, in candidates.
 
-        Returning only the requested page's candidate window made ``total`` an
-        underestimate, so the frontend disabled its next-page control at 300.
-        The complete engine window is now scored and cached once, then all pages
-        use that same ranking. The offset is intentionally irrelevant.
+        Only ``exact`` 正文 reaches this path now (fuzzy 正文 is served natively),
+        and an exact match is a *contiguous* substring -- a strict subset of the
+        engine's "all characters present" set.  Walking up to the engine ceiling
+        removes the 10 000-candidate cut that hid most exact matches, while the
+        chunked scan keeps memory bounded.  The offset is intentionally
+        irrelevant: every page reuses one cached ranking.
         """
-        return self.CONTENT_SEARCH_LIMIT
+        return self.max_total_hits()
 
     def _scan_condition(
         self,
@@ -1492,14 +1561,15 @@ class SearchService:
         limit: int,
         scope: str,
     ) -> dict | None:
-        """One fuzzy 正文 condition AND-ed with gram-narrowable metadata.
+        """One fuzzy 正文 condition AND-ed with filterable metadata.
 
         ``正文 A AND 作者 B`` is one native "all" query (A) restricted by the
-        author's gram filter, so the engine answers the full intersection without
-        the 10 000-candidate window and without transferring bodies.  Returns
-        ``None`` when the shape does not qualify -- not exactly one fuzzy content
-        condition, or a partner whose field has no gram filter (description,
-        tags, category) -- and the caller keeps the bounded windowed path.
+        author's gram filter, and ``正文 A AND 标签 X`` by a ``tags = X`` filter,
+        so the engine answers the full intersection without the 10 000-candidate
+        window and without transferring bodies.  Returns ``None`` when the shape
+        does not qualify -- not exactly one fuzzy content condition, or a partner
+        whose field is neither grammed nor filterable (description, category) --
+        and the caller keeps the bounded windowed path.
         """
         index_name = self._scope_index(scope)
         content_index: int | None = None
@@ -1521,12 +1591,18 @@ class SearchService:
             attr = self._field_attr(index_name, cond["field"])
             if not attr:
                 return None
-            narrowing = self.gram_narrowing(
-                index_name, attr, cond["value"], cond.get("mode") or "exact",
-            )
-            if not narrowing:
-                return None
-            extra.append(narrowing)
+            mode = cond.get("mode") or "exact"
+            narrowing = self.gram_narrowing(index_name, attr, cond["value"], mode)
+            if narrowing:
+                extra.append(narrowing)
+                continue
+            # ``tags`` is not grammed but is filterable as exact membership, so
+            # ``正文 A AND 标签 X`` still collapses into one native query.
+            if attr == "tags" and mode == "exact":
+                safe = cond["value"].replace("\\", "\\\\").replace('"', '\\"')
+                extra.append(f'tags = "{safe}"')
+                continue
+            return None
         combined = self._combine_filters(filters, *extra)
         return self._native_content_search(
             active[content_index]["value"],
@@ -2767,12 +2843,36 @@ class SearchService:
         if result["skipped"]:
             return result
 
-        from sqlalchemy import select
+        from sqlalchemy import select, text
 
         from app.core.database import SessionLocal
         from app.models import Author, Book, Chapter
 
         async with SessionLocal() as db:
+            # The backend runs two uvicorn workers that each fire this startup
+            # backfill; without a lock both would re-tokenise the whole index
+            # twice.  ``pg_try_advisory_lock`` is session-scoped, so it stays held
+            # for as long as this session's connection is open (the whole
+            # backfill) and is released automatically on close -- even on a crash,
+            # restart or the process being killed.  The key is a constant integer,
+            # so it is inlined rather than bound, which keeps the statement
+            # executable by every session shim (see the backfill test).
+            acquired = (
+                await db.execute(
+                    text(
+                        "SELECT pg_try_advisory_lock("
+                        f"{self.GRAM_BACKFILL_ADVISORY_LOCK_KEY})"
+                    )
+                )
+            ).scalar()
+            if not acquired:
+                result["skipped"] = True
+                result["locked"] = True
+                logger.info(
+                    "Gram backfill is already running in another worker; skipping"
+                )
+                return result
+
             books_index = self.client.index(self.INDEX_BOOKS)
             chapters_index = self.client.index(self.INDEX_CHAPTERS)
             if need_books:
@@ -2812,10 +2912,10 @@ class SearchService:
                     rows = (
                         await db.execute(
                             # ``outerjoin``, not ``join``: a chapter whose book row
-                            # is missing must still receive its own
-                            # ``title_grams``, otherwise it stays "missing" for the
-                            # probe forever and the gram path can never switch on.
-                            # Such a chapter simply gets empty book-title grams.
+                            # is missing must still receive its own ``title_grams``,
+                            # otherwise it stays "missing" for the probe forever and
+                            # the gram path can never switch on.  Such a chapter
+                            # simply gets empty book-title grams.
                             select(
                                 Chapter.id, Chapter.title,
                                 Book.title, Author.name,

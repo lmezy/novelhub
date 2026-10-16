@@ -286,7 +286,7 @@ def test_exact_content_search_scans_the_full_engine_window_in_chunks():
     )
 
     scan_options = chapters_index.search.call_args.args[1]
-    assert service._content_window_for(0) == SearchService.CONTENT_SEARCH_LIMIT
+    assert service._content_window_for(0) == service.max_total_hits()
     assert scan_options["limit"] == SearchService._SCAN_CHUNK
 
 
@@ -651,9 +651,9 @@ def test_content_window_covers_the_full_content_candidate_limit():
     """All content-search pages use one fully scanned ranking window."""
     service, _ = _make_service()
 
-    assert service._content_window_for(0) == SearchService.CONTENT_SEARCH_LIMIT
-    assert service._content_window_for(320) == SearchService.CONTENT_SEARCH_LIMIT
-    assert service._content_window_for(5000) == SearchService.CONTENT_SEARCH_LIMIT
+    assert service._content_window_for(0) == service.max_total_hits()
+    assert service._content_window_for(320) == service.max_total_hits()
+    assert service._content_window_for(5000) == service.max_total_hits()
 
 
 def test_content_window_only_applies_to_the_body():
@@ -959,6 +959,42 @@ def test_fuzzy_content_and_author_is_served_natively_full_index():
     assert options["filter"] and "book_author_grams" in options["filter"]
     assert result["total"] == 5
     assert result["hits"][0]["matched_fields"] == ["content", "author"]
+
+
+def test_fuzzy_content_and_tags_is_served_natively():
+    """``正文 A AND 标签 X`` collapses into one native query + a tags filter."""
+    service, _, chapters_index = _service_with_indexes()
+
+    def fake_search(query, options):
+        if options.get("attributesToCrop"):
+            return {"hits": [
+                {"id": "c1", "title": "第1章", "book_title": "西游记",
+                 "_formatted": {"content": "…铃铛…"}},
+            ]}
+        return {
+            "hits": [
+                {"id": "c1", "book_id": "b1", "title": "第1章",
+                 "book_title": "西游记", "_rankingScore": 0.7},
+            ],
+            "estimatedTotalHits": 3,
+        }
+
+    chapters_index.search.side_effect = fake_search
+
+    result = service.advanced_search(
+        [
+            {"field": "content", "mode": "fuzzy", "value": "铃铛"},
+            {"field": "tags", "mode": "exact", "value": "调教"},
+        ],
+        match="and",
+        scope="chapters",
+    )
+
+    native_call = chapters_index.search.call_args_list[0]
+    options = native_call.args[1]
+    assert options["filter"] == 'tags = "调教"'
+    assert result["total"] == 3
+    assert result["hits"][0]["matched_fields"] == ["content", "tags"]
 
 
 def test_deep_page_of_a_single_condition_reuses_the_scanned_ranking():
@@ -1594,6 +1630,11 @@ class _FakeResult:
     def all(self):
         return list(self._rows)
 
+    def scalar(self):
+        # Only the gram-backfill advisory lock reads a scalar; in tests the lock
+        # is always acquired so the backfill proceeds.
+        return True
+
 
 class _FakeSession:
     """Async-session stand-in that records the statements it is asked to run.
@@ -1777,6 +1818,65 @@ async def test_gram_backfill_statements_are_executable():
     assert "author_name" not in " ".join(compiled)
     assert any("chapters" in sql for sql in compiled)
     assert any("books" in sql for sql in compiled)
+
+
+@pytest.mark.asyncio
+async def test_gram_backfill_skips_when_another_worker_holds_the_lock():
+    """The second uvicorn worker must not re-tokenise the index a second time."""
+    from app.core import database as database_module
+
+    captured: list = []
+    service, client = _make_service()
+    client.index.return_value.search.return_value = {"hits": [{"id": "x"}]}
+
+    class _LockedResult(_FakeResult):
+        def scalar(self):
+            return False
+
+    class _LockedSession(_FakeSession):
+        async def execute(self, statement):
+            self.captured.append(statement)
+            return _LockedResult(None)
+
+    with patch.object(
+        database_module, "SessionLocal", lambda: _LockedSession(captured)
+    ), patch.object(settings, "MEILI_GRAM_BACKFILL_CHAPTERS", True):
+        result = await service.sync_book_grams()
+
+    assert result["skipped"] is True
+    assert result["locked"] is True
+    assert result["chapters"] == 0
+    assert result["books"] == 0
+    # No ``update_documents`` batch may be submitted by the losing worker.
+    assert client.index.return_value.update_documents.call_count == 0
+
+
+def test_multi_condition_fuzzy_content_collects_natively_over_the_whole_index():
+    """A fuzzy 正文 condition in a multi-condition search is not cut at 10 000."""
+    service, _, chapters_index = _service_with_indexes()
+
+    def fake_search(query, options):
+        return {
+            "hits": [
+                {"id": "c1", "book_id": "b1", "title": "第1章", "book_title": "西游记",
+                 "_rankingScore": 0.7},
+            ],
+            "estimatedTotalHits": 42,
+        }
+
+    chapters_index.search.side_effect = fake_search
+
+    candidates = service._collect_condition(
+        "chapters", "content", "铃铛", "fuzzy", None,
+    )
+
+    native_call = chapters_index.search.call_args_list[0]
+    options = native_call.args[1]
+    assert options["matchingStrategy"] == "all"
+    assert options["attributesToSearchOn"] == ["content"]
+    assert "content" not in options["attributesToRetrieve"]
+    assert "c1" in candidates
+    assert candidates["c1"][0] > 0
 
 
 def test_gram_probe_finds_an_index_that_still_lacks_the_fields():
