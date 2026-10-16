@@ -831,6 +831,48 @@ def test_advanced_search_fuzzy_single_condition_is_scored_not_engine_paged():
     assert result["hits"][0]["type"] == "chapter"
 
 
+def test_fuzzy_content_single_condition_is_served_natively_full_index():
+    """A fuzzy 正文 condition is answered natively, over the whole index.
+
+    ``matchingStrategy: "all"`` is the fuzzy gate, so the engine returns the
+    complete candidate set -- no 10 000-candidate window -- and, crucially,
+    without transferring chapter bodies: the native query retrieves the display
+    fields only, and just the requested page is hydrated (bodies cropped around
+    the match).
+    """
+    service, _, chapters_index = _service_with_indexes()
+
+    def fake_search(query, options):
+        if options.get("attributesToCrop"):
+            return {"hits": [
+                {"id": "c1", "title": "第1章 小铃铛", "book_title": "西游记",
+                 "_formatted": {"content": "…村口挂着一只小铃铛…"}},
+            ]}
+        return {
+            "hits": [
+                {"id": "c1", "book_id": "b1", "title": "第1章 小铃铛",
+                 "book_title": "西游记", "_rankingScore": 0.8},
+            ],
+            "estimatedTotalHits": 42,
+        }
+
+    chapters_index.search.side_effect = fake_search
+
+    result = service.advanced_search(
+        [{"field": "content", "mode": "fuzzy", "value": "铃铛"}],
+        scope="chapters",
+    )
+
+    native_call = chapters_index.search.call_args_list[0]
+    options = native_call.args[1]
+    assert options["matchingStrategy"] == "all"
+    assert options["attributesToSearchOn"] == ["content"]
+    assert "content" not in options["attributesToRetrieve"]
+    assert result["total"] == 42
+    assert result["hits"][0]["type"] == "chapter"
+    assert "铃铛" in result["hits"][0]["snippet"]
+
+
 def test_deep_page_of_a_single_condition_reuses_the_scanned_ranking():
     service, books_index, _ = _service_with_indexes()
     scan_hits = [

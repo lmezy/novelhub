@@ -1417,6 +1417,69 @@ class SearchService:
             "matched_fields": [field],
         }
 
+    def _fuzzy_content_search(
+        self,
+        value: str,
+        filters: str | None,
+        offset: int,
+        limit: int,
+    ) -> dict | None:
+        """Serve a fuzzy 正文 search natively across the whole chapter index.
+
+        Meilisearch's ``matchingStrategy: "all"`` is exactly the fuzzy gate --
+        every character of the query must appear -- and its proximity ranking
+        puts chapters that hold the query as one piece first, so the engine
+        answers the complete candidate set without transferring a single body.
+        Only the requested page is hydrated (bodies cropped around the match).
+
+        Returns ``None`` when the engine cannot answer it (settings still
+        applying, attribute not searchable yet), so the caller keeps the scanned
+        fallback instead of failing the whole search.
+        """
+        index = self.client.index(self.INDEX_CHAPTERS)
+        options = {
+            "limit": limit,
+            "offset": offset,
+            "attributesToSearchOn": ["content"],
+            # Display fields only -- fetching ``content`` for every hit is what
+            # made a 正文 search move hundreds of MB and take tens of seconds.
+            "attributesToRetrieve": list(self.CHAPTER_RETRIEVE_ATTRS),
+            "showRankingScore": True,
+        }
+        if filters:
+            options["filter"] = filters
+        if len(value) > 1:
+            options["matchingStrategy"] = "all"
+        try:
+            result = index.search(value, options)
+        except meilisearch.errors.MeilisearchApiError as exc:
+            logger.warning("Native 正文 search fell back: {}", exc)
+            return None
+
+        hits = result.get("hits", []) or []
+        ids = [str(hit.get("id")) for hit in hits if hit.get("id") is not None]
+        hydrated = (
+            self._hydrate_around(self.INDEX_CHAPTERS, ids, value, "content")
+            if ids else {}
+        )
+        serialized: list[dict] = []
+        for hit in hits:
+            doc = dict(hydrated.get(str(hit.get("id"))) or hit)
+            # ``_hydrate_around`` does not request the ranking score, so carry it
+            # over from the native hit (which did).
+            if doc.get("_rankingScore") is None:
+                doc["_rankingScore"] = hit.get("_rankingScore")
+            serialized.append(
+                self._serialize_engine_hit(doc, "content", "chapters")
+            )
+        total = result.get("estimatedTotalHits")
+        return {
+            "hits": serialized,
+            "total": int(total) if isinstance(total, int) else len(hits),
+            "offset": offset,
+            "limit": limit,
+        }
+
     def _single_condition_search(
         self,
         cond: dict,
@@ -1441,6 +1504,17 @@ class SearchService:
         attr = self._field_attr(index_name, cond["field"])
         if not attr:
             return None
+
+        # A fuzzy 正文 condition is answered natively by ``matchingStrategy:
+        # "all"`` over the whole chapter index -- no 10 000-candidate window, no
+        # body transfer.  ``exact`` 正文 still needs the Python scan below, because
+        # a bare contiguous substring is the one thing the engine cannot express.
+        if attr == "content" and (cond.get("mode") or "exact") == "fuzzy":
+            native = self._fuzzy_content_search(
+                cond["value"], filters, offset, limit,
+            )
+            if native is not None:
+                return native
 
         window = (
             self._content_window_for(offset) if attr == "content"
