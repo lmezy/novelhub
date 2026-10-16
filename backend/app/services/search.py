@@ -1417,12 +1417,13 @@ class SearchService:
             "matched_fields": [field],
         }
 
-    def _fuzzy_content_search(
+    def _native_content_search(
         self,
-        value: str,
+        query: str,
         filters: str | None,
         offset: int,
         limit: int,
+        matched_fields: list[str] | None = None,
     ) -> dict | None:
         """Serve a fuzzy 正文 search natively across the whole chapter index.
 
@@ -1431,6 +1432,8 @@ class SearchService:
         puts chapters that hold the query as one piece first, so the engine
         answers the complete candidate set without transferring a single body.
         Only the requested page is hydrated (bodies cropped around the match).
+        ``query`` may be a single value or the space-joined terms of a same-field
+        AND; ``matched_fields`` names the conditions for the served hit.
 
         Returns ``None`` when the engine cannot answer it (settings still
         applying, attribute not searchable yet), so the caller keeps the scanned
@@ -1448,10 +1451,10 @@ class SearchService:
         }
         if filters:
             options["filter"] = filters
-        if len(value) > 1:
+        if len(query.strip()) > 1:
             options["matchingStrategy"] = "all"
         try:
-            result = index.search(value, options)
+            result = index.search(query, options)
         except meilisearch.errors.MeilisearchApiError as exc:
             logger.warning("Native 正文 search fell back: {}", exc)
             return None
@@ -1459,7 +1462,7 @@ class SearchService:
         hits = result.get("hits", []) or []
         ids = [str(hit.get("id")) for hit in hits if hit.get("id") is not None]
         hydrated = (
-            self._hydrate_around(self.INDEX_CHAPTERS, ids, value, "content")
+            self._hydrate_around(self.INDEX_CHAPTERS, ids, query, "content")
             if ids else {}
         )
         serialized: list[dict] = []
@@ -1469,9 +1472,10 @@ class SearchService:
             # over from the native hit (which did).
             if doc.get("_rankingScore") is None:
                 doc["_rankingScore"] = hit.get("_rankingScore")
-            serialized.append(
-                self._serialize_engine_hit(doc, "content", "chapters")
-            )
+            payload = self._serialize_engine_hit(doc, "content", "chapters")
+            if matched_fields:
+                payload["matched_fields"] = matched_fields
+            serialized.append(payload)
         total = result.get("estimatedTotalHits")
         return {
             "hits": serialized,
@@ -1479,6 +1483,58 @@ class SearchService:
             "offset": offset,
             "limit": limit,
         }
+
+    def _native_content_and_metadata_search(
+        self,
+        active: list[dict],
+        filters: str | None,
+        offset: int,
+        limit: int,
+        scope: str,
+    ) -> dict | None:
+        """One fuzzy 正文 condition AND-ed with gram-narrowable metadata.
+
+        ``正文 A AND 作者 B`` is one native "all" query (A) restricted by the
+        author's gram filter, so the engine answers the full intersection without
+        the 10 000-candidate window and without transferring bodies.  Returns
+        ``None`` when the shape does not qualify -- not exactly one fuzzy content
+        condition, or a partner whose field has no gram filter (description,
+        tags, category) -- and the caller keeps the bounded windowed path.
+        """
+        index_name = self._scope_index(scope)
+        content_index: int | None = None
+        for i, cond in enumerate(active):
+            if cond["field"] != "content":
+                continue
+            if content_index is not None:
+                return None
+            if (cond.get("mode") or "exact") != "fuzzy":
+                return None
+            content_index = i
+        if content_index is None:
+            return None
+
+        extra: list[str] = []
+        for i, cond in enumerate(active):
+            if i == content_index:
+                continue
+            attr = self._field_attr(index_name, cond["field"])
+            if not attr:
+                return None
+            narrowing = self.gram_narrowing(
+                index_name, attr, cond["value"], cond.get("mode") or "exact",
+            )
+            if not narrowing:
+                return None
+            extra.append(narrowing)
+        combined = self._combine_filters(filters, *extra)
+        return self._native_content_search(
+            active[content_index]["value"],
+            combined,
+            offset,
+            limit,
+            matched_fields=[cond["field"] for cond in active],
+        )
 
     def _single_condition_search(
         self,
@@ -1510,7 +1566,7 @@ class SearchService:
         # body transfer.  ``exact`` 正文 still needs the Python scan below, because
         # a bare contiguous substring is the one thing the engine cannot express.
         if attr == "content" and (cond.get("mode") or "exact") == "fuzzy":
-            native = self._fuzzy_content_search(
+            native = self._native_content_search(
                 cond["value"], filters, offset, limit,
             )
             if native is not None:
@@ -1777,6 +1833,21 @@ class SearchService:
         """
         if attr not in self.CHAPTER_FIELD_ATTRS.values():
             return None
+        # A fuzzy 正文 AND is one native "all" query (every character of every
+        # condition must appear), so it inherits the single-condition fast path:
+        # whole index, no body transfer, no 10 000-candidate window.
+        if attr == "content" and all(
+            (cond.get("mode") or "exact") == "fuzzy" for cond in active
+        ):
+            native = self._native_content_search(
+                self._conjunction_query(active),
+                filters,
+                offset,
+                limit,
+                matched_fields=[cond["field"] for cond in active],
+            )
+            if native is not None:
+                return native
         cache_key = "|".join((
             "conj", index_name, attr, self._conjunction_query(active),
             filters or "",
@@ -2034,6 +2105,17 @@ class SearchService:
             )
             if single is not None:
                 return single
+
+        # One fuzzy 正文 condition AND-ed with gram-narrowable metadata
+        # (author/title/chapter title) is one native "all" query plus filters,
+        # so it too reaches the whole index instead of the 10 000-candidate
+        # window the detached per-condition maps below are bound to.
+        if match == "and" and effective_scope == "chapters":
+            native_multi = self._native_content_and_metadata_search(
+                active, filters, offset, limit, effective_scope,
+            )
+            if native_multi is not None:
+                return native_multi
 
         book_cond_maps: dict[int, dict[str, tuple[int, dict]]] = {}
         chapter_cond_maps: dict[int, dict[str, tuple[int, dict]]] = {}

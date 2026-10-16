@@ -873,6 +873,94 @@ def test_fuzzy_content_single_condition_is_served_natively_full_index():
     assert "铃铛" in result["hits"][0]["snippet"]
 
 
+def test_fuzzy_content_and_is_served_natively_full_index():
+    """A same-field fuzzy 正文 AND inherits the native fast path.
+
+    ``铃铛 AND 仙`` is one "all" query over the whole index, so it must not fall
+    back to the 10 000-candidate conjunction window, and must not transfer
+    chapter bodies.  ``matched_fields`` names every condition.
+    """
+    service, _, chapters_index = _service_with_indexes()
+
+    def fake_search(query, options):
+        if options.get("attributesToCrop"):
+            return {"hits": [
+                {"id": "c1", "title": "第一章", "book_title": "西游记",
+                 "_formatted": {"content": "…铃铛…仙人…"}},
+            ]}
+        return {
+            "hits": [
+                {"id": "c1", "book_id": "b1", "title": "第一章",
+                 "book_title": "西游记", "_rankingScore": 0.7},
+            ],
+            "estimatedTotalHits": 9,
+        }
+
+    chapters_index.search.side_effect = fake_search
+
+    result = service.advanced_search(
+        [
+            {"field": "content", "mode": "fuzzy", "value": "铃铛"},
+            {"field": "content", "mode": "fuzzy", "value": "仙"},
+        ],
+        match="and",
+        scope="chapters",
+    )
+
+    native_call = chapters_index.search.call_args_list[0]
+    options = native_call.args[1]
+    assert native_call.args[0] == "铃铛 仙"
+    assert options["matchingStrategy"] == "all"
+    assert "content" not in options["attributesToRetrieve"]
+    assert result["total"] == 9
+    assert result["hits"][0]["matched_fields"] == ["content", "content"]
+
+
+def test_fuzzy_content_and_author_is_served_natively_full_index():
+    """One fuzzy 正文 condition AND-ed with author is one native query + filter.
+
+    ``正文 铃铛 AND 作者 吴承恩`` must reach the whole index instead of the
+    10 000-candidate window, by asking the engine for ``铃铛`` (all terms)
+    restricted to the author's gram filter.
+    """
+    service, _, chapters_index = _service_with_indexes()
+    service._mark_gram_ready("chapters")
+
+    def fake_search(query, options):
+        if options.get("attributesToCrop"):
+            return {"hits": [
+                {"id": "c1", "title": "第1章 小铃铛", "book_title": "西游记",
+                 "_formatted": {"content": "…村口挂着一只小铃铛…"}},
+            ]}
+        return {
+            "hits": [
+                {"id": "c1", "book_id": "b1", "title": "第1章 小铃铛",
+                 "book_title": "西游记", "_rankingScore": 0.7},
+            ],
+            "estimatedTotalHits": 5,
+        }
+
+    chapters_index.search.side_effect = fake_search
+
+    result = service.advanced_search(
+        [
+            {"field": "content", "mode": "fuzzy", "value": "铃铛"},
+            {"field": "author", "mode": "fuzzy", "value": "吴承恩"},
+        ],
+        match="and",
+        scope="chapters",
+    )
+
+    native_call = chapters_index.search.call_args_list[0]
+    options = native_call.args[1]
+    assert native_call.args[0] == "铃铛"
+    assert options["matchingStrategy"] == "all"
+    assert "content" not in options["attributesToRetrieve"]
+    assert options["filter"] and "book_author_grams" in options["filter"]
+    assert result["total"] == 5
+    assert result["hits"][0]["matched_fields"] == ["content", "author"]
+
+
 def test_deep_page_of_a_single_condition_reuses_the_scanned_ranking():
     service, books_index, _ = _service_with_indexes()
     scan_hits = [
