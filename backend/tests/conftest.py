@@ -3,6 +3,16 @@ import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 from httpx import AsyncClient, ASGITransport
 from app.main import app
+from app.services.rate_limit import login_limiter, register_limiter
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limiters():
+    # The limiters are module-level singletons; without a reset, tests that
+    # exercise register/login repeatedly from the same fake IP would hit 429.
+    login_limiter.reset()
+    register_limiter.reset()
+    yield
 
 
 @pytest_asyncio.fixture

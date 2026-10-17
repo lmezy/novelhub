@@ -14,7 +14,7 @@ from app.core.database import SessionLocal
 from app.crawler.registry import get_plugin
 from app.models import Cookie
 from app.models.source_credential import SourceCredential
-from app.services.cookie_crypto import safe_decrypt_cookie, encrypt_cookie
+from app.services.cookie_crypto import safe_decrypt_cookie, decrypt_cookie, encrypt_cookie
 from app.core.config import settings
 
 
@@ -141,7 +141,8 @@ class CookieHealthService:
             return {"success": False, "error": "No credentials available for refresh"}
         try:
             plugin = get_plugin(source)
-            new_cookie_str = await plugin.auto_login(cred.username, cred.password)
+            password = decrypt_cookie(cred.password_encrypted)
+            new_cookie_str = await plugin.auto_login(cred.username, password)
             if new_cookie_str:
                 record.cookie_data = encrypt_cookie(new_cookie_str)
                 record.expired_at = None

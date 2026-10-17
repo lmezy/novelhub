@@ -10,10 +10,14 @@ from celery.schedules import crontab
 
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = os.getenv("REDIS_PORT", "6379")
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
+
+_auth = f":{REDIS_PASSWORD}@" if REDIS_PASSWORD else ""
+REDIS_URL = f"redis://{_auth}{REDIS_HOST}:{REDIS_PORT}/0"
 
 app = Celery(
     "novelhub",
-    broker=f"redis://{REDIS_HOST}:{REDIS_PORT}/0",
+    broker=REDIS_URL,
 )
 
 app.conf.update(

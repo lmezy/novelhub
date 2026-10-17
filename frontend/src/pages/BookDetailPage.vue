@@ -5,6 +5,7 @@ import { useBooksStore, type Book, type Chapter, type CustomTagOnBook, type Shel
 import { useAuthStore } from "../stores/auth"
 import { useI18nStore } from "../stores/i18n"
 import { api } from "../api/client"
+import { useChunkedList } from "../utils/useChunkedList"
 import NavBar from "../components/NavBar.vue"
 
 const route = useRoute()
@@ -15,6 +16,9 @@ const i18n = useI18nStore()
 
 const book = ref<Book | null>(null)
 const chapters = ref<Chapter[]>([])
+// Long books mount chapters in chunks of 200 as the list scrolls into view.
+const { visible: visibleChapters, hasMore: hasMoreChapters, sentinel: chaptersSentinel } =
+  useChunkedList(chapters)
 const loading = ref(true)
 const error = ref("")
 const savedChapterId = ref<string | null>(null)
@@ -722,7 +726,7 @@ onMounted(async () => {
 
           <div class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900">
             <router-link
-              v-for="ch in chapters"
+              v-for="ch in visibleChapters"
               :key="ch.id"
               :to="'/books/' + book.id + '/chapters/' + ch.id"
               class="flex items-center justify-between px-4 py-3 hover:bg-accent/5 transition-colors no-underline"
@@ -733,6 +737,9 @@ onMounted(async () => {
               </span>
               <span class="text-xs text-muted dark:text-gray-400">&rarr;</span>
             </router-link>
+            <div v-if="hasMoreChapters" ref="chaptersSentinel" class="px-4 py-3 text-center text-xs text-muted dark:text-gray-400">
+              {{ i18n.t('book_chapters_more', { n: chapters.length - visibleChapters.length }) }}
+            </div>
           </div>
         </section>
       </template>

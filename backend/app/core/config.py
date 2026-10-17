@@ -36,6 +36,12 @@ class Settings(BaseSettings):
 
 
 
+    # Password for the Redis container's ``requirepass``. Empty means no auth
+    # (acceptable only while the port is not published to the host).
+    REDIS_PASSWORD:str=""
+
+
+
     MEILI_HOST:str="http://meilisearch:7700"
 
 

@@ -19,8 +19,9 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    ports:
-      - "5432:5432"
+    # Not published to the host on purpose: only containers on the compose
+    # network may reach the database. Use `docker compose exec postgres psql`
+    # for local access.
     deploy:
       resources:
         limits:
@@ -32,7 +33,7 @@ services:
       -c effective_cache_size=768MB
       -c maintenance_work_mem=64MB
       -c wal_buffers=16MB
-      -c max_connections=20
+      -c max_connections=100
       -c random_page_cost=1.1
       -c effective_io_concurrency=200
 
@@ -40,12 +41,17 @@ services:
     image: redis:7-alpine
     container_name: novelhub-redis
     restart: always
-    ports:
-      - "6379:6379"
+    # Internal-only (no host port published); requirepass protects against
+    # anything else on the compose/LAN network. appendonly keeps the Celery
+    # queue across restarts.
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --appendonly yes
     volumes:
       - ./data/redis:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
       interval: 10s
       timeout: 3s
       retries: 5
@@ -54,8 +60,7 @@ services:
     image: getmeili/meilisearch:v1.10
     container_name: novelhub-search
     restart: always
-    ports:
-      - "7700:7700"
+    # Internal-only: the backend talks to it over the compose network.
     environment:
       MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
       TZ: ${TZ}

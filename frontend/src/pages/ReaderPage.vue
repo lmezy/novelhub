@@ -5,6 +5,7 @@ import { useBooksStore, type Chapter, type ChapterContent } from "../stores/book
 import { useAuthStore } from "../stores/auth"
 import { useI18nStore } from "../stores/i18n"
 import { api } from "../api/client"
+import { useChunkedList } from "../utils/useChunkedList"
 import AIChat from "../components/AIChat.vue"
 import AISelectionToolbar from "../components/AISelectionToolbar.vue"
 import {
@@ -34,6 +35,9 @@ const i18n = useI18nStore()
 
 const chapter = ref<ChapterContent | null>(null)
 const chapters = ref<Chapter[]>([])
+// The TOC drawer mounts chapters in chunks of 200 instead of all at once.
+const { visible: visibleTocChapters, hasMore: hasMoreTocChapters, sentinel: tocSentinel } =
+  useChunkedList(chapters)
 const loading = ref(true)
 const error = ref("")
 const fontSize = ref(18)
@@ -218,12 +222,33 @@ const readerFontStyle = computed(() => {
   }
 })
 
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+}
+
+// Only real image URLs are allowed through; anything scheme-relative or
+// javascript:-like is dropped before it can reach v-html.
+function safeImageUrl(url: string): string | null {
+  if (/^(https?:\/\/|\/)/i.test(url)) return url
+  return null
+}
+
 const chapterBodyHtml = computed(() => {
   if (!chapter.value) return ""
-  let html = chapter.value.content
+  // Escape FIRST: chapter content is crawled from third-party sites, and
+  // without this a source can inject markup (XSS) into the reader.
+  let html = escapeHtml(chapter.value.content)
     .replace(
       /!\[([^\]]*)\]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)/g,
-      '<img src="$2" alt="$1" loading="lazy">',
+      (_match, alt: string, url: string) => {
+        const safe = safeImageUrl(url)
+        return safe ? `<img src="${safe}" alt="${alt}" loading="lazy">` : ""
+      },
     )
   html = html
     .replace(/\n\n/g, "</p><p>")
@@ -1425,7 +1450,7 @@ onUnmounted(() => {
 
           <template v-if="tocTab === 'toc'">
             <button
-              v-for="ch in chapters"
+              v-for="ch in visibleTocChapters"
               :key="ch.id"
               @click="openChapter(ch.id)"
               class="block w-full text-left py-1.5 text-sm truncate"
@@ -1435,6 +1460,9 @@ onUnmounted(() => {
                   : isDark ? 'text-gray-400 hover:text-gray-200' : 'text-muted hover:text-ink'
               "
             >{{ ch.chapter_number }}. {{ ch.title || i18n.t('reader_chapter_fallback', { n: ch.chapter_number }) }}</button>
+            <div v-if="hasMoreTocChapters" ref="tocSentinel" class="py-2 text-center text-xs text-muted dark:text-gray-400">
+              {{ i18n.t('book_chapters_more', { n: chapters.length - visibleTocChapters.length }) }}
+            </div>
           </template>
 
           <template v-else>

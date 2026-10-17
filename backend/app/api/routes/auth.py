@@ -30,6 +30,7 @@ from app.services.settings import get_registration_approval_enabled
 from app.services.account import email_available, username_available
 from app.services.invite import generate_invite_code, generate_nickname
 from app.services.validation import password_error
+from app.services.rate_limit import client_ip, login_limiter, register_limiter
 
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -64,9 +65,11 @@ def _bearer_token(request: Request) -> str:
 @router.post("/register", response_model=RegisterResult, status_code=201)
 async def register(
     payload: UserCreate,
+    request: Request,
     response: Response,
     db: AsyncSession = Depends(get_db),
 ):
+    register_limiter.check(client_ip(request))
     if not payload.invite_code:
         raise HTTPException(status_code=400, detail="Invite code is required")
     now = naive_now()
@@ -124,9 +127,11 @@ async def register(
 @router.post("/login", response_model=TokenOut)
 async def login(
     payload: UserLogin,
+    request: Request,
     response: Response,
     db: AsyncSession = Depends(get_db),
 ):
+    login_limiter.check(client_ip(request))
     identifier = (payload.username or "").strip()
     user = await db.scalar(
         select(User).where(

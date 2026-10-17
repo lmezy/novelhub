@@ -31,7 +31,10 @@ async def detailed_health(db: AsyncSession = Depends(get_db)):
     # Redis
     try:
         import redis.asyncio as aioredis
-        r = aioredis.from_url(f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}")
+        r = aioredis.from_url(
+            f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}",
+            password=settings.REDIS_PASSWORD or None,
+        )
         await r.ping()
         await r.close()
         result["checks"]["redis"] = "ok"

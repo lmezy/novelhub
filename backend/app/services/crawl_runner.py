@@ -29,6 +29,28 @@ from app.core.heartbeat import mark_alive
 from app.models import CrawlTask
 
 
+# ``crawl_tasks.result`` is one JSONB row rewritten on every batch.  Letting
+# ``details`` grow with every synced book turned a 30k-book full-site task
+# into a multi-MB row rewritten hundreds of times, so keep only what the UI
+# and AI diagnosis actually need: every failure plus a tail of successes.
+_TASK_DETAILS_LIMIT = 200
+
+
+def _cap_task_details(details: list[dict], limit: int = _TASK_DETAILS_LIMIT) -> list[dict]:
+    if len(details) <= limit:
+        return details
+    failures = [d for d in details if d.get("error")]
+    successes = [d for d in details if not d.get("error")]
+    keep_successes = max(0, limit - len(failures))
+    capped = [*failures[:limit], *successes[-keep_successes:]] if keep_successes else failures[:limit]
+    capped.append({
+        "title": f"…另有 {len(details) - len(capped)} 条成功记录已省略…",
+        "synced": True,
+        "truncated": True,
+    })
+    return capped
+
+
 # Failures that are worth retrying on their own: the proxy/upstream was
 # momentarily unreachable, not the source rules or a captcha gate.  A short
 # outage used to mark the whole task failed (and the UI then showed a
@@ -432,7 +454,9 @@ async def run_crawl_task_async(task_id: str) -> dict:
             for key in ("books_found", "books_synced", "books_failed", "books_filtered", "chapters_created", "chapters_skipped", "chapters_failed"):
                 merged[key] = int(previous.get(key, 0) or 0) + int(result.get(key, 0) or 0)
             merged["pages_checked"] = max(int(previous.get("pages_checked", 0) or 0), int(result.get("pages_checked", 0) or 0))
-            merged["details"] = [*(previous.get("details") or []), *(result.get("details") or [])]
+            merged["details"] = _cap_task_details(
+                [*(previous.get("details") or []), *(result.get("details") or [])]
+            )
             merged["done"] = bool(result.get("done"))
             batch_size = int(getattr(settings, "SYNC_PAGE_BATCH_SIZE", 0) or 0)
             if batch_size > 0 and not result.get("done"):

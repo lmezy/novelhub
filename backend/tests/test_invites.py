@@ -11,6 +11,11 @@ from app.api.routes.admin import list_users
 from app.schemas.user import UserCreate
 
 
+def _fake_request():
+    # Minimal stand-in for starlette.Request as used by the rate limiter.
+    return SimpleNamespace(headers={}, client=SimpleNamespace(host="testclient"))
+
+
 def _now() -> datetime:
     # Invite expiry follows the DB convention: naive *local* wall clock.
     return datetime.now()
@@ -109,6 +114,7 @@ async def test_register_consumes_one_time_invite():
             password="New_pass1",
             invite_code="ABC123",
         ),
+        _fake_request(),
         Response(),
         db,
     )

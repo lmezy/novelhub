@@ -10,6 +10,8 @@ class Book(Base):
     __table_args__ = (
         UniqueConstraint("source_id", "source_book_id", name="uq_books_source_external_id"),
         Index("ix_books_kind", "kind"),
+        Index("ix_books_source_id", "source_id"),
+        Index("ix_books_updated_at", "updated_at"),
     )
 
     id = Column(String, primary_key=True)
