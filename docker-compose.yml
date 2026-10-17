@@ -1,9 +1,18 @@
+# Default container log policy: without a cap the docker json-file driver
+# grows forever and eventually fills the NAS disk.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
 
   postgres:
     image: postgres:17
     container_name: novelhub-postgres
     restart: always
+    logging: *default-logging
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
@@ -41,6 +50,7 @@ services:
     image: redis:7-alpine
     container_name: novelhub-redis
     restart: always
+    logging: *default-logging
     # Internal-only (no host port published); requirepass protects against
     # anything else on the compose/LAN network. appendonly keeps the Celery
     # queue across restarts.
@@ -60,6 +70,7 @@ services:
     image: getmeili/meilisearch:v1.10
     container_name: novelhub-search
     restart: always
+    logging: *default-logging
     # Internal-only: the backend talks to it over the compose network.
     environment:
       MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
@@ -72,6 +83,7 @@ services:
       context: ./backend
     container_name: novelhub-backend
     restart: always
+    logging: *default-logging
     env_file:
       - .env
     environment:
@@ -107,6 +119,7 @@ services:
       dockerfile: ./crawler/Dockerfile
     container_name: novelhub-crawler
     restart: always
+    logging: *default-logging
     env_file:
       - .env
     environment:
@@ -128,6 +141,7 @@ services:
       dockerfile: ./scheduler/Dockerfile
     container_name: novelhub-scheduler
     restart: always
+    logging: *default-logging
     env_file:
       - .env
     environment:
@@ -138,6 +152,7 @@ services:
       context: ./frontend
     container_name: novelhub-frontend
     restart: always
+    logging: *default-logging
     ports:
       - "${FRONTEND_PORT:-5173}:5173"
 
@@ -145,6 +160,7 @@ services:
     image: nginx:latest
     container_name: novelhub-nginx
     restart: always
+    logging: *default-logging
     ports:
       - "${NGINX_PORT:-8088}:80"
     volumes:
@@ -157,6 +173,7 @@ services:
     image: postgres:17
     container_name: novelhub-backup
     restart: always
+    logging: *default-logging
     environment:
       PGHOST: postgres
       PGPORT: 5432

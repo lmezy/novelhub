@@ -23,13 +23,26 @@ def safe_decrypt_cookie(value: str) -> str:
         return value
 
 
+_derived_key_cache: bytes | None = None
+
+
 def _derive_key() -> bytes:
-    """Derive a 256-bit AES key from COOKIE_SECRET."""
-    salt = b"novelhub_cookie_salt"
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100000,
-    )
-    return kdf.derive(settings.COOKIE_SECRET.encode("utf-8"))
+    """Derive a 256-bit AES key from COOKIE_SECRET.
+
+    PBKDF2 with 100k iterations costs ~50-100ms; every synced chapter used to
+    pay it on each encrypt/decrypt.  The inputs (secret + fixed salt) never
+    change within a process, so the derived key is cached module-level.  The
+    salt is a fixed domain-separation constant, not a per-record secret, so
+    caching it carries no cryptographic downside.
+    """
+    global _derived_key_cache
+    if _derived_key_cache is None:
+        salt = b"novelhub_cookie_salt"
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100000,
+        )
+        _derived_key_cache = kdf.derive(settings.COOKIE_SECRET.encode("utf-8"))
+    return _derived_key_cache
 
 
 def encrypt_cookie(plaintext: str) -> str:

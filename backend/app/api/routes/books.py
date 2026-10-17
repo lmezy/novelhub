@@ -740,6 +740,8 @@ async def convert_book_to_r18(
         "source_id": book.source_id or "",
         "author_id": book.author_id or "",
         "is_r18": book.is_r18,
+        "owner_id": book.owner_id or None,
+        "is_public": bool(book.is_public),
         "tags": list(book.tag_names),
         "category_names": list(book.category_names),
         "kind": normalize_kind(getattr(book, "kind", None)),

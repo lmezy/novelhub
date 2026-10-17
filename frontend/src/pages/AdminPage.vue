@@ -1,10 +1,17 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue"
+import { computed, defineAsyncComponent, onMounted, onUnmounted, ref } from "vue"
 import { useRoute, useRouter } from "vue-router"
 import { api } from "../api/client"
 import { useI18nStore } from "../stores/i18n"
 import { useCrawlStore } from "../stores/crawl"
 import { useAuthStore } from "../stores/auth"
+import { useAdminSourcesStore } from "../stores/adminSources"
+import { useAdminCookiesStore } from "../stores/adminCookies"
+import { useAdminCredsStore } from "../stores/adminCreds"
+import { useAdminImportStore } from "../stores/adminImport"
+import { useAdminUsersStore } from "../stores/adminUsers"
+import { useAdminApprovalsStore } from "../stores/adminApprovals"
+import { useAdminAIStore } from "../stores/adminAI"
 import NavBar from "../components/NavBar.vue"
 import {
   DEFAULT_TAP_ACTIONS,
@@ -13,35 +20,25 @@ import {
   normalizeTapActions,
 } from "../utils/readerTapAreas"
 
+// The heaviest panels are split out and only fetched when their tab opens.
+const SourcesPanel = defineAsyncComponent(() => import("../components/admin/SourcesPanel.vue"))
+const AddPanel = defineAsyncComponent(() => import("../components/admin/AddPanel.vue"))
+const UsersPanel = defineAsyncComponent(() => import("../components/admin/UsersPanel.vue"))
+const ApprovalsPanel = defineAsyncComponent(() => import("../components/admin/ApprovalsPanel.vue"))
+const AiPanel = defineAsyncComponent(() => import("../components/admin/AiPanel.vue"))
+
 const i18n = useI18nStore()
 const crawlStore = useCrawlStore()
 const auth = useAuthStore()
 const router = useRouter()
 const route = useRoute()
-
-interface Source {
-  id: string
-  name: string
-  url: string | null
-  plugin_name: string
-  enabled: boolean
-  is_r18: boolean
-  config?: any
-  owner_id?: string | null
-  submitter_id?: string | null
-  submitter_username?: string | null
-  show_contributor?: boolean
-  sync_interval_seconds?: number | null
-}
-
-interface CookieItem {
-  id: string
-  source: string
-  cookie_data: string
-  expired_at: string | null
-  created_at?: string | null
-  updated_at?: string | null
-}
+const sourcesStore = useAdminSourcesStore()
+const cookiesStore = useAdminCookiesStore()
+const credsStore = useAdminCredsStore()
+const importStore = useAdminImportStore()
+const usersStore = useAdminUsersStore()
+const approvalsStore = useAdminApprovalsStore()
+const aiStore = useAdminAIStore()
 
 const tab = ref<"sources" | "cookies" | "sync" | "logs" | "tokens" | "index" | "status" | "yuedu" | "add" | "creds" | "users" | "approvals" | "proxy" | "ai" | "prefs">("yuedu")
 
@@ -59,12 +56,6 @@ const availableTabs = computed(() => {
     "ai",
   ] as const
 })
-
-const sources = ref<Source[]>([])
-const sourceForm = ref({ id: "", name: "", url: "", plugin_name: "yuedu", enabled: true, is_r18: false, scope: "personal", sync_interval_seconds: "" })
-const sourceConfigText = ref("")
-const sourceEditingId = ref("")
-const sourceError = ref("")
 
 const prefs = ref({
   font: "sans",
@@ -166,257 +157,6 @@ async function saveNickname() {
   }
 }
 
-async function loadSources() {
-  sources.value = await api.get<Source[]>("/sources")
-}
-
-
-async function deleteSource(id: string) {
-  if (!confirm(i18n.t('admin_delete_source_confirm', { id }))) return
-  try {
-    await api.delete("/sources/" + id)
-    await loadSources()
-  } catch (e) {
-    sourceError.value = e instanceof Error ? e.message : i18n.t('admin_delete_source_failed')
-  }
-}
-
-function parseSourceConfig(value: string): any {
-  let parsed: any = JSON.parse(value)
-  // Some old source records were serialized twice before being written to
-  // JSONB. Unwrap those values so editing does not save a quoted JSON blob.
-  for (let i = 0; i < 2 && typeof parsed === "string"; i += 1) {
-    parsed = JSON.parse(parsed)
-  }
-  return parsed
-}
-
-async function createSource() {
-  sourceError.value = ""
-  if (!sourceForm.value.name.trim()) {
-    sourceError.value = i18n.t('admin_source_name_required')
-    return
-  }
-  let config: any = null
-  if (sourceConfigText.value.trim()) {
-    try {
-      config = parseSourceConfig(sourceConfigText.value)
-      if (!config || typeof config !== "object" || Array.isArray(config)) {
-        throw new Error("source config must be a JSON object")
-      }
-    } catch {
-      sourceError.value = i18n.t('admin_config_json_invalid')
-      return
-    }
-  }
-  // 拉取间隔: how many seconds must pass between two upstream requests.
-  // Blank means "not configured" -> the source's own concurrentRate decides.
-  const intervalText = String(sourceForm.value.sync_interval_seconds ?? "").trim()
-  let syncInterval: number | null = null
-  if (intervalText !== "") {
-    const parsedInterval = Number(intervalText)
-    if (!Number.isFinite(parsedInterval) || parsedInterval < 0 || parsedInterval > 3600) {
-      sourceError.value = i18n.t('admin_sync_interval_invalid')
-      return
-    }
-    syncInterval = Math.floor(parsedInterval)
-  }
-  try {
-    const body: any = {
-      ...sourceForm.value,
-      url: sourceForm.value.url || null,
-      config,
-      sync_interval_seconds: syncInterval,
-    }
-    if (sourceEditingId.value) {
-      // Editing an existing source must use update semantics. POST-ing the
-      // same id that is already in the table is what produced the confusing
-      // "Source already exists" (409) when a user simply changed scope.
-      // The backend PUT now accepts `scope` and reassigns ownership in place,
-      // so a scope change never creates a colliding duplicate row.
-      await api.put("/sources/" + sourceEditingId.value, body)
-    } else {
-      await api.post("/sources", body)
-    }
-    await loadSources()
-    resetSourceForm()
-  } catch (e) {
-    sourceError.value = e instanceof Error ? e.message : i18n.t('admin_failed')
-  }
-}
-
-function editSource(s: Source) {
-  sourceEditingId.value = s.id
-  sourceForm.value = {
-    id: s.id,
-    name: s.name,
-    url: s.url || "",
-    plugin_name: s.plugin_name || "yuedu",
-    enabled: s.enabled,
-    is_r18: s.is_r18,
-    scope: s.owner_id ? "personal" : "global",
-    sync_interval_seconds: s.sync_interval_seconds == null ? "" : String(s.sync_interval_seconds),
-  }
-  if (!auth.isAdmin && !s.owner_id) {
-    sourceForm.value.scope = "personal"
-  }
-  // Older records may contain the JSONB config as a serialized string.
-  // Normalize it before putting it in the editor so editing never produces
-  // invalid JSON such as a quoted JSON document.
-  if (typeof s.config === "string") {
-    try {
-      sourceConfigText.value = JSON.stringify(parseSourceConfig(s.config), null, 2)
-    } catch {
-      sourceConfigText.value = s.config
-    }
-  } else {
-    sourceConfigText.value = s.config ? JSON.stringify(s.config, null, 2) : ""
-  }
-  window.scrollTo({ top: 0, behavior: "smooth" })
-}
-
-function resetSourceForm() {
-  sourceEditingId.value = ""
-  sourceForm.value = { id: "", name: "", url: "", plugin_name: "yuedu", enabled: true, is_r18: false, scope: "personal", sync_interval_seconds: "" }
-  sourceConfigText.value = ""
-}
-
-function canManageSource(s: Source) {
-  return auth.isAdmin || s.owner_id === auth.user?.id
-}
-
-function sourceCookies(sourceId: string) {
-  return cookies.value.filter((c) => c.source === sourceId)
-}
-
-function cookieExpired(c: CookieItem) {
-  return !!c.expired_at && new Date(c.expired_at) < new Date()
-}
-
-/** When the stored Cookie was last written; ``created_at`` is only the fallback
- *  for rows that predate the ``updated_at`` column. */
-function cookieWrittenAt(c: CookieItem) {
-  return c.updated_at || c.created_at || ""
-}
-
-/** ``datetime-local`` wants ``YYYY-MM-DDTHH:mm``. */
-function toDateTimeLocal(value: string | null | undefined) {
-  return value ? String(value).slice(0, 16) : ""
-}
-
-function sourceCreds(sourceId: string) {
-  return creds.value.filter((c) => c.source === sourceId)
-}
-
-function toggleSourceDetails(s: Source) {
-  if (expandedSourceId.value === s.id) {
-    expandedSourceId.value = ""
-    return
-  }
-  expandedSourceId.value = s.id
-  // Prefill from the stored Cookie: the panel sat next to an existing Cookie
-  // while showing an empty expiry field, so saving replaced the value *and*
-  // silently nulled ``expired_at`` nobody had touched.
-  const existing = sourceCookies(s.id)[0]
-  cookieForm.value = {
-    source: s.id,
-    cookie_data: "",
-    expired_at: toDateTimeLocal(existing?.expired_at),
-  }
-  cookieEditingId.value = ""
-  cookieError.value = ""
-  cookieTestResult.value = null
-  cookieTestError.value = ""
-  credForm.value = { source: s.id, username: "", password: "" }
-  credError.value = ""
-}
-
-async function saveSourceCookie(s: Source) {
-  cookieForm.value.source = s.id
-  const existing = sourceCookies(s.id)[0]
-  if (existing) {
-    cookieEditingId.value = existing.id
-  }
-  await createCookie()
-}
-
-async function testSourceCookie(s: Source) {
-  cookieForm.value.source = s.id
-  await testCookie()
-}
-
-async function saveSourceCred(s: Source) {
-  credForm.value.source = s.id
-  await createCred()
-}
-
-const cookies = ref<CookieItem[]>([])
-const cookieForm = ref({ source: "", cookie_data: "", expired_at: "" })
-const cookieEditingId = ref("")
-const cookieError = ref("")
-const cookieTesting = ref(false)
-const cookieTestResult = ref<any>(null)
-const cookieTestError = ref("")
-
-async function testCookie() {
-  cookieTestError.value = ""
-  cookieTestResult.value = null
-  cookieTesting.value = true
-  try {
-    cookieTestResult.value = await api.post("/cookies/test", {
-      source: cookieForm.value.source,
-      cookie_data: cookieForm.value.cookie_data,
-    })
-  } catch (e) {
-    cookieTestError.value = e instanceof Error ? e.message : i18n.t('admin_test_failed')
-  } finally {
-    cookieTesting.value = false
-  }
-}
-
-async function loadCookies() {
-  cookies.value = await api.get<CookieItem[]>("/cookies")
-}
-
-async function createCookie() {
-  cookieError.value = ""
-  try {
-    const body: any = { source: cookieForm.value.source, cookie_data: cookieForm.value.cookie_data }
-    if (cookieForm.value.expired_at) body.expired_at = cookieForm.value.expired_at
-    if (cookieEditingId.value) {
-      const updateBody: any = {
-        expired_at: cookieForm.value.expired_at || null,
-      }
-      if (cookieForm.value.cookie_data.trim()) {
-        updateBody.cookie_data = cookieForm.value.cookie_data
-      }
-      await api.put("/cookies/" + cookieEditingId.value, updateBody)
-    } else {
-      await api.post("/cookies", body)
-    }
-    await loadCookies()
-    cookieEditingId.value = ""
-    cookieForm.value = { source: "", cookie_data: "", expired_at: "" }
-  } catch (e) {
-    cookieError.value = e instanceof Error ? e.message : i18n.t('admin_failed')
-  }
-}
-
-function editCookie(c: CookieItem) {
-  cookieEditingId.value = c.id
-  cookieForm.value = {
-    source: c.source,
-    cookie_data: "",
-    expired_at: toDateTimeLocal(c.expired_at),
-  }
-  window.scrollTo({ top: 0, behavior: "smooth" })
-}
-
-async function deleteCookie(id: string) {
-  await api.delete("/cookies/" + id)
-  await loadCookies()
-}
-
 const syncSourceId = ref("")
 const syncUrl = ref("")
 const syncResult = ref<any>(null)
@@ -459,106 +199,16 @@ const yueduExcludeTags = ref("耽美, BL")
 const yueduExcludeCategories = ref("")
 const yueduSyncResult = ref<any>(null)
 const yueduSyncError = ref("")
-const expandedSourceId = ref("")
 
 function splitFilterText(value: string): string[] {
   return [...new Set(value.split(/[,，、;；\n]+/).map((item) => item.trim()).filter(Boolean))]
 }
-
-const localPath = ref("")
-const localImporting = ref(false)
-const localResult = ref<any>(null)
-const localError = ref("")
-const localScan = ref<any[]>([])
-const localScanRoot = ref("")
-const localSelected = ref<string[]>([])
-const localScanning = ref(false)
-const localDirectResult = ref<any>(null)
-const localRoots = ref<any[]>([])
-const localClass = ref<"auto" | "all" | "r18">("auto")
-const localBrowserOpen = ref(false)
-const localBrowserPath = ref("")
-const localBrowserName = ref("")
-const localBrowserParent = ref<string | null>(null)
-const localBrowserDirs = ref<any[]>([])
-const localBrowsing = ref(false)
-
-const manualTitle = ref("")
-const manualAuthor = ref("")
-const manualStatus = ref("ongoing")
-const manualDescription = ref("")
-const manualTags = ref("")
-const manualChaptersText = ref("")
-const manualImporting = ref(false)
-const manualAnalyzing = ref(false)
-const manualAnalyzeResult = ref<any>(null)
-const manualResult = ref<any>(null)
-const manualError = ref("")
-const manualClass = ref<"auto" | "all" | "r18">("auto")
-
-function classificationValue(value: "auto" | "all" | "r18"): boolean | null {
-  if (value === "all") return false
-  if (value === "r18") return true
-  return null
-}
-
-const creds = ref<any[]>([])
-const credForm = ref({ source: "", username: "", password: "" })
-const credError = ref("")
-const credLoggingIn = ref<Record<string, boolean>>({})
-
-// Manual login state
-const manualLoginActive = ref(false)
-const manualLoginSessionId = ref("")
-const manualLoginScreenshot = ref("")
-const manualLoginSourceName = ref("")
-const manualLoginLoading = ref(false)
-const manualLoginInput = ref("")
-const manualLoginError = ref("")
 
 // Proxy config
 const proxyEnabled = ref(false)
 const proxyHttps = ref("")
 const proxyHttp = ref("")
 const proxySaving = ref(false)
-const credLoginResult = ref<Record<string, any>>({})
-const credLoginError = ref<Record<string, string>>({})
-
-async function loadCreds() {
-  try {
-    creds.value = await api.get<any[]>("/credentials")
-  } catch { creds.value = [] }
-}
-
-async function createCred() {
-  credError.value = ""
-  try {
-    await api.post("/credentials", credForm.value)
-    await loadCreds()
-    credForm.value = { source: "", username: "", password: "" }
-  } catch (e) {
-    credError.value = e instanceof Error ? e.message : i18n.t('admin_failed')
-  }
-}
-
-async function deleteCred(id: string) {
-  await api.delete("/credentials/" + id)
-  await loadCreds()
-}
-
-async function autoLogin(id: string) {
-  credLoggingIn.value[id] = true
-  credLoginResult.value[id] = null
-  credLoginError.value[id] = ""
-  try {
-    credLoginResult.value[id] = await api.post("/credentials/" + id + "/auto-login")
-    await loadCookies()
-  } catch (e) {
-    credLoginError.value[id] = e instanceof Error ? e.message : i18n.t('admin_login_failed')
-  } finally {
-    credLoggingIn.value[id] = false
-  }
-}
 
 async function loadProxyConfig() {
   try {
@@ -587,268 +237,6 @@ async function saveProxyConfig() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// AI provider settings + RAG index maintenance
-// ---------------------------------------------------------------------------
-const aiConfig = ref<any>(null)
-const aiForm = ref<Record<string, any>>({})
-const aiLoading = ref(false)
-const aiSaving = ref(false)
-const aiError = ref("")
-const aiSaved = ref(false)
-const aiTesting = ref(false)
-const aiTestResult = ref<any>(null)
-const aiApiKeyInput = ref("")
-const aiEmbeddingKeyInput = ref("")
-const aiModels = ref<string[]>([])
-const aiModelsLoading = ref(false)
-const aiModelsError = ref("")
-
-const EMBEDDING_HINT_RE = /embed|bge|gte|m3|rerank/i
-const chatModelOptions = computed(() =>
-  aiModels.value.filter((m) => !EMBEDDING_HINT_RE.test(m)),
-)
-const embeddingModelOptions = computed(() => {
-  const picked = aiModels.value.filter((m) => EMBEDDING_HINT_RE.test(m))
-  return picked.length ? picked : aiModels.value
-})
-
-const aiIndexBookId = ref("")
-const aiIndexBusy = ref(false)
-const aiIndexError = ref("")
-const aiIndexResult = ref<any>(null)
-const aiIndexedBooks = ref<any[]>([])
-const aiIndexedLoading = ref(false)
-
-async function loadAIConfig() {
-  aiLoading.value = true
-  aiError.value = ""
-  try {
-    const res = await api.get<any>("/admin/ai")
-    aiConfig.value = res
-    aiForm.value = {
-      enabled: res.enabled,
-      provider: res.provider,
-      base_url: res.base_url || "",
-      model: res.model || "",
-      temperature: res.temperature,
-      max_tokens: res.max_tokens,
-      timeout: res.timeout,
-      use_proxy: res.use_proxy,
-      proxy_url: res.proxy_url || "",
-      context_chars: res.context_chars,
-      rag_enabled: res.rag_enabled,
-      rag_top_k: res.rag_top_k,
-      embedding_provider: res.embedding_provider || "",
-      embedding_base_url: res.embedding_base_url || "",
-      embedding_model: res.embedding_model || "",
-      auto_diagnose: res.auto_diagnose !== false,
-    }
-    aiApiKeyInput.value = ""
-    aiEmbeddingKeyInput.value = ""
-  } catch (e) {
-    aiError.value = e instanceof Error ? e.message : i18n.t('admin_failed')
-  } finally {
-    aiLoading.value = false
-  }
-}
-
-function applyProviderPreset(name: string) {
-  const preset = (aiConfig.value?.providers || []).find((p: any) => p.value === name)
-  if (!preset) return
-  aiForm.value.base_url = preset.base_url || ""
-  aiForm.value.model = preset.model || ""
-  aiForm.value.embedding_model = ""
-}
-
-async function saveAIConfig() {
-  aiSaving.value = true
-  aiError.value = ""
-  aiSaved.value = false
-  try {
-    const body: any = { ...aiForm.value }
-    if (aiApiKeyInput.value) body.api_key = aiApiKeyInput.value
-    if (aiEmbeddingKeyInput.value) body.embedding_api_key = aiEmbeddingKeyInput.value
-    const res = await api.put<any>("/admin/ai", body)
-    aiConfig.value = { ...aiConfig.value, ...res }
-    aiApiKeyInput.value = ""
-    aiEmbeddingKeyInput.value = ""
-    aiSaved.value = true
-    window.setTimeout(() => (aiSaved.value = false), 2000)
-  } catch (e) {
-    aiError.value = e instanceof Error ? e.message : i18n.t('admin_ai_save_failed')
-  } finally {
-    aiSaving.value = false
-  }
-}
-
-async function testAIConfig() {
-  aiTesting.value = true
-  aiTestResult.value = null
-  aiError.value = ""
-  try {
-    aiTestResult.value = await api.post<any>("/admin/ai/test", {})
-    if (aiTestResult.value?.available_models?.length) {
-      aiModels.value = aiTestResult.value.available_models
-    }
-  } catch (e) {
-    aiError.value = e instanceof Error ? e.message : i18n.t('admin_ai_test_failed')
-  } finally {
-    aiTesting.value = false
-  }
-}
-
-async function loadAIModels() {
-  aiModelsLoading.value = true
-  aiModelsError.value = ""
-  try {
-    const body: any = {
-      provider: aiForm.value.provider,
-      base_url: aiForm.value.base_url,
-    }
-    // Use the key the admin just typed, otherwise the stored one.
-    if (aiApiKeyInput.value) body.api_key = aiApiKeyInput.value
-    const res = await api.post<any>("/admin/ai/models", body)
-    aiModels.value = res.models || []
-    if (!res.ok) {
-      aiModelsError.value = res.error || i18n.t('admin_ai_models_failed')
-      return
-    }
-    // Fill an empty field with a model the server just confirmed it accepts,
-    // preferring a chat model for the chat field.
-    const chat = res.models.find((m: string) => !EMBEDDING_HINT_RE.test(m))
-    if (!aiForm.value.model && chat) aiForm.value.model = chat
-  } catch (e) {
-    aiModelsError.value = e instanceof Error ? e.message : i18n.t('admin_ai_models_failed')
-  } finally {
-    aiModelsLoading.value = false
-  }
-}
-
-function applyModel(target: "model" | "embedding_model", value: string) {
-  aiForm.value[target] = value
-}
-
-async function loadIndexedBooks() {
-  aiIndexedLoading.value = true
-  try {
-    aiIndexedBooks.value = await api.get<any[]>("/rag/index?limit=50")
-  } catch {
-    aiIndexedBooks.value = []
-  } finally {
-    aiIndexedLoading.value = false
-  }
-}
-
-async function indexBookForRAG() {
-  const id = aiIndexBookId.value.trim()
-  if (!id) return
-  aiIndexBusy.value = true
-  aiIndexError.value = ""
-  aiIndexResult.value = null
-  try {
-    aiIndexResult.value = await api.post<any>("/rag/index/" + encodeURIComponent(id))
-    await loadIndexedBooks()
-  } catch (e) {
-    aiIndexError.value = e instanceof Error ? e.message : i18n.t('admin_ai_index_failed')
-  } finally {
-    aiIndexBusy.value = false
-  }
-}
-
-async function deleteRAGIndex(bookId: string) {
-  if (!confirm(i18n.t('admin_ai_index_delete_confirm'))) return
-  try {
-    await api.delete("/rag/index/" + encodeURIComponent(bookId))
-    await loadIndexedBooks()
-  } catch (e) {
-    aiIndexError.value = e instanceof Error ? e.message : i18n.t('admin_ai_index_failed')
-  }
-}
-
-async function startManualLogin(credId: string) {
-  manualLoginLoading.value = true
-  manualLoginError.value = ""
-  try {
-    const res = await api.post("/credentials/" + credId + "/manual-login/start") as any
-    manualLoginSessionId.value = res.session_id
-    manualLoginScreenshot.value = res.screenshot
-    manualLoginSourceName.value = res.source_name
-    manualLoginActive.value = true
-    if (res.error) {
-      manualLoginError.value = res.error
-    }
-  } catch (e) {
-    manualLoginError.value = e instanceof Error ? e.message : "Failed to start manual login"
-  } finally {
-    manualLoginLoading.value = false
-  }
-}
-
-function handleManualClick(e: MouseEvent) {
-  if (!manualLoginActive.value) return
-  const img = e.currentTarget as HTMLImageElement
-  const rect = img.getBoundingClientRect()
-  const scaleX = img.naturalWidth / rect.width
-  const scaleY = img.naturalHeight / rect.height
-  const x = Math.round((e.clientX - rect.left) * scaleX)
-  const y = Math.round((e.clientY - rect.top) * scaleY)
-  manualLoginLoading.value = true
-  api.post("/manual-login/" + manualLoginSessionId.value + "/click", { x, y }).then((res: any) => {
-    manualLoginScreenshot.value = res.screenshot
-  }).catch(e => {
-    manualLoginError.value = e instanceof Error ? e.message : i18n.t('admin_click_failed')
-  }).finally(() => {
-    manualLoginLoading.value = false
-  })
-}
-
-async function handleManualType() {
-  if (!manualLoginInput.value) return
-  manualLoginLoading.value = true
-  try {
-    const res = await api.post("/manual-login/" + manualLoginSessionId.value + "/type", { text: manualLoginInput.value }) as any
-    manualLoginScreenshot.value = res.screenshot
-    manualLoginInput.value = ""
-  } catch (e) {
-    manualLoginError.value = e instanceof Error ? e.message : i18n.t('admin_type_failed')
-  } finally {
-    manualLoginLoading.value = false
-  }
-}
-
-async function handleManualKey(key: string) {
-  manualLoginLoading.value = true
-  try {
-    const res = await api.post("/manual-login/" + manualLoginSessionId.value + "/key", { key }) as any
-    manualLoginScreenshot.value = res.screenshot
-  } catch (e) {
-    manualLoginError.value = e instanceof Error ? e.message : i18n.t('admin_key_failed')
-  } finally {
-    manualLoginLoading.value = false
-  }
-}
-
-async function finishManualLogin() {
-  manualLoginLoading.value = true
-  try {
-    await api.post("/manual-login/" + manualLoginSessionId.value + "/finish")
-    manualLoginActive.value = false
-    await loadCookies()
-  } catch (e) {
-    manualLoginError.value = e instanceof Error ? e.message : i18n.t('admin_cookie_save_failed')
-  } finally {
-    manualLoginLoading.value = false
-  }
-}
-
-async function cancelManualLogin() {
-  try {
-    await api.post("/manual-login/" + manualLoginSessionId.value + "/cancel")
-  } catch {}
-  manualLoginActive.value = false
-}
-
 const yueduPreviewing = ref(false)
 const yueduResult = ref<any>(null)
 const yueduError = ref("")
@@ -867,15 +255,15 @@ async function yueduImport() {
     body.show_contributor = yueduShowContributor.value
     if (yueduCookie.value.trim()) body.cookie = yueduCookie.value.trim()
     yueduResult.value = await api.post("/yuedu/import", body)
-    await loadSources()
-    await loadCreds()
-    await loadCookies()
+    await sourcesStore.loadSources()
+    await credsStore.loadCreds()
+    await cookiesStore.loadCookies()
     if (
       yueduResult.value.status !== "pending_approval" &&
       yueduResult.value.sources?.length
     ) {
       tab.value = "sources"
-      expandedSourceId.value = yueduResult.value.sources[0].id
+      sourcesStore.expandedSourceId = yueduResult.value.sources[0].id
       window.scrollTo({ top: 0, behavior: "smooth" })
     }
   } catch (e) {
@@ -899,8 +287,8 @@ async function yueduImportAndSync() {
     if (yueduJsonText.value) body.json_text = yueduJsonText.value
     if (yueduCookie.value.trim()) body.cookie = yueduCookie.value.trim()
     yueduSyncResult.value = await api.post("/yuedu/import-task", body)
-    await loadSources()
-    await loadCookies()
+    await sourcesStore.loadSources()
+    await cookiesStore.loadCookies()
     if (yueduSyncResult.value?.tasks?.length) {
       await crawlStore.setTask(yueduSyncResult.value.tasks[0])
       router.push("/sync")
@@ -927,299 +315,6 @@ async function yueduPreviewAction() {
     yueduError.value = e instanceof Error ? e.message : i18n.t('admin_preview_failed')
   } finally {
     yueduPreviewing.value = false
-  }
-}
-
-async function importLocal() {
-  localError.value = ""
-  localResult.value = null
-  if (!localPath.value.trim()) {
-    localError.value = i18n.t('admin_local_path_required')
-    return
-  }
-  localImporting.value = true
-  try {
-    localResult.value = await api.post<any>("/sync/local", {
-      path: localPath.value.trim(),
-      is_r18: classificationValue(localClass.value),
-    })
-    await loadSources()
-  } catch (e) {
-    localError.value = e instanceof Error ? e.message : i18n.t('admin_local_import_failed')
-  } finally {
-    localImporting.value = false
-  }
-}
-
-async function loadLocalRoots() {
-  try {
-    localRoots.value = await api.get<any[]>("/sync/local/roots")
-  } catch {}
-}
-
-async function openLocalBrowser(root?: any) {
-  localBrowserOpen.value = true
-  localError.value = ""
-  if (root) {
-    await browseLocalDirectory(root.path)
-  } else if (localRoots.value.length) {
-    await browseLocalDirectory(localRoots.value[0].path)
-  } else {
-    localBrowserPath.value = ""
-    localBrowserName.value = ""
-    localBrowserParent.value = null
-    localBrowserDirs.value = []
-  }
-}
-
-async function browseLocalDirectory(path: string) {
-  localBrowsing.value = true
-  localError.value = ""
-  try {
-    const res = await api.post<any>("/sync/local/list", { path })
-    localBrowserPath.value = res.path
-    localBrowserName.value = res.name
-    localBrowserParent.value = res.parent
-    localBrowserDirs.value = res.directories || []
-  } catch (e) {
-    localError.value = e instanceof Error ? e.message : i18n.t('admin_local_browse_failed')
-  } finally {
-    localBrowsing.value = false
-  }
-}
-
-function chooseLocalDirectory(path: string) {
-  if (!path) return
-  localPath.value = path
-  localBrowserOpen.value = false
-}
-
-async function scanLocal() {
-  localError.value = ""
-  localResult.value = null
-  localDirectResult.value = null
-  localScan.value = []
-  localSelected.value = []
-  if (!localPath.value.trim()) {
-    localError.value = i18n.t('admin_local_path_required')
-    return
-  }
-  localScanning.value = true
-  try {
-    const res = await api.post<any>("/sync/local/scan", {
-      path: localPath.value.trim(),
-      max_depth: 3,
-      is_r18: classificationValue(localClass.value),
-    })
-    localScanRoot.value = res.root || ""
-    localScan.value = res.books || []
-  } catch (e) {
-    localError.value = e instanceof Error ? e.message : i18n.t('admin_local_import_failed')
-  } finally {
-    localScanning.value = false
-  }
-}
-
-function toggleLocalBook(path: string) {
-  const idx = localSelected.value.indexOf(path)
-  if (idx === -1) {
-    localSelected.value.push(path)
-  } else {
-    localSelected.value.splice(idx, 1)
-  }
-}
-
-const allLocalSelected = computed(() =>
-  localScan.value.length > 0 && localSelected.value.length === localScan.value.length
-)
-
-function toggleAllLocalBooks() {
-  if (allLocalSelected.value) {
-    localSelected.value = []
-  } else {
-    localSelected.value = localScan.value.map(book => book.path)
-  }
-}
-
-function invertLocalBooks() {
-  const selected = new Set(localSelected.value)
-  localSelected.value = localScan.value
-    .map(book => book.path)
-    .filter(path => !selected.has(path))
-}
-
-function clearLocalBooks() {
-  localSelected.value = []
-}
-
-async function importLocalSelected() {
-  localError.value = ""
-  localResult.value = null
-  if (localSelected.value.length === 0) {
-    localError.value = i18n.t('admin_local_select_required')
-    return
-  }
-  localImporting.value = true
-  try {
-    localResult.value = await api.post<any>("/sync/local/import", {
-      path: localPath.value.trim(),
-      book_paths: localSelected.value,
-      is_r18: classificationValue(localClass.value),
-    })
-    await loadSources()
-  } catch (e) {
-    localError.value = e instanceof Error ? e.message : i18n.t('admin_local_import_failed')
-  } finally {
-    localImporting.value = false
-  }
-}
-
-async function importLocalAll() {
-  localError.value = ""
-  localResult.value = null
-  if (localScan.value.length === 0) {
-    localError.value = i18n.t('admin_local_select_required')
-    return
-  }
-  localImporting.value = true
-  try {
-    localResult.value = await api.post<any>("/sync/local/import", {
-      path: localPath.value.trim(),
-      book_paths: localScan.value.map(book => book.path),
-      is_r18: classificationValue(localClass.value),
-    })
-    await loadSources()
-  } catch (e) {
-    localError.value = e instanceof Error ? e.message : i18n.t('admin_local_import_failed')
-  } finally {
-    localImporting.value = false
-  }
-}
-
-async function directLocalSelected() {
-  localError.value = ""
-  localResult.value = null
-  localDirectResult.value = null
-  if (localSelected.value.length === 0) {
-    localError.value = i18n.t('admin_local_select_required')
-    return
-  }
-  localImporting.value = true
-  try {
-    localDirectResult.value = await api.post<any>("/sync/local/direct", {
-      path: localPath.value.trim(),
-      book_paths: localSelected.value,
-      is_r18: classificationValue(localClass.value),
-    })
-  } catch (e) {
-    localError.value = e instanceof Error ? e.message : i18n.t('admin_local_import_failed')
-  } finally {
-    localImporting.value = false
-  }
-}
-
-async function onManualFile(e: Event) {
-  const input = e.target as HTMLInputElement
-  const file = input.files?.[0]
-  if (!file) return
-  const text = await file.text()
-  manualChaptersText.value = text
-  await analyzeManualText(text, file.name)
-}
-
-async function analyzeManualText(sourceText?: string, filename?: string) {
-  const text = (sourceText ?? manualChaptersText.value).trim()
-  if (!text) {
-    manualError.value = ""
-    manualAnalyzeResult.value = null
-    return
-  }
-  manualAnalyzing.value = true
-  manualError.value = ""
-  manualAnalyzeResult.value = null
-  try {
-    const res = await api.post<any>("/books/manual/analyze", {
-      text,
-      filename: filename || null,
-      is_r18: classificationValue(manualClass.value),
-    })
-    manualAnalyzeResult.value = res
-    if (res.title) manualTitle.value = res.title
-    if (res.author && res.author !== i18n.t('admin_unknown_author')) {
-      manualAuthor.value = res.author
-    }
-    if (res.description) manualDescription.value = res.description
-    if (res.status) manualStatus.value = res.status
-    if (res.tags?.length) manualTags.value = res.tags.join(", ")
-  } catch (e) {
-    manualError.value = e instanceof Error ? e.message : i18n.t('admin_manual_analyze_failed')
-  } finally {
-    manualAnalyzing.value = false
-  }
-}
-
-function parseManualChapters() {
-  const text = manualChaptersText.value.trim()
-  if (!text) return []
-  const chapters: { title: string; content: string }[] = []
-  let title = i18n.t('admin_default_chapter_title')
-  let lines: string[] = []
-
-  const push = () => {
-    const content = lines.join("\n").trim()
-    if (content || chapters.length === 0) {
-      chapters.push({ title, content })
-    }
-  }
-
-  for (const line of text.split(/\r?\n/)) {
-    const match = line.match(/^##\s+(.+)/)
-    if (match) {
-      push()
-      title = match[1].trim()
-      lines = []
-    } else {
-      lines.push(line)
-    }
-  }
-  push()
-  return chapters
-}
-
-async function submitManualBook() {
-  manualError.value = ""
-  manualResult.value = null
-  if (!manualTitle.value.trim()) {
-    manualError.value = i18n.t('admin_manual_title_required')
-    return
-  }
-  const chapters = parseManualChapters()
-  if (!chapters.length) {
-    manualError.value = i18n.t('admin_manual_chapter_required')
-    return
-  }
-  manualImporting.value = true
-  try {
-    manualResult.value = await api.post<any>("/books/manual", {
-      title: manualTitle.value.trim(),
-      author: manualAuthor.value.trim() || i18n.t('admin_unknown_author'),
-      status: manualStatus.value,
-      description: manualDescription.value.trim() || null,
-      tags: manualTags.value.split(/[,，\s]+/).filter(Boolean),
-      is_r18: classificationValue(manualClass.value),
-      chapters,
-    })
-    manualTitle.value = ""
-    manualAuthor.value = ""
-    manualDescription.value = ""
-    manualTags.value = ""
-    manualChaptersText.value = ""
-    manualStatus.value = "ongoing"
-    manualAnalyzeResult.value = null
-  } catch (e) {
-    manualError.value = e instanceof Error ? e.message : i18n.t('admin_manual_upload_failed')
-  } finally {
-    manualImporting.value = false
   }
 }
 
@@ -1415,150 +510,6 @@ async function loadLogs() {
   }
 }
 
-const users = ref<any[]>([])
-const userError = ref("")
-const registrationApprovalEnabled = ref(false)
-const userCreateForm = ref({ username: "", email: "", password: "", role: "user" })
-const showUserCreate = ref(true)
-const userCreating = ref(false)
-const userCreateError = ref("")
-const passwordChanging = ref<Record<string, boolean>>({})
-
-const USERNAME_RE = /^[A-Za-z0-9]+$/
-
-function passwordStrengthOk(value: string): boolean {
-  let categories = 0
-  if (/[A-Za-z]/.test(value)) categories++
-  if (/\d/.test(value)) categories++
-  if (value.includes("_")) categories++
-  if (/[^A-Za-z0-9_]/.test(value)) categories++
-  return categories >= 2
-}
-
-const approvals = ref<any[]>([])
-const approvalError = ref("")
-const approvalReviewing = ref<Record<string, boolean>>({})
-
-async function loadUsers() {
-  userError.value = ""
-  try { users.value = await api.get<any[]>("/admin/users") } catch (e) { userError.value = e instanceof Error ? e.message : i18n.t('admin_failed') }
-}
-
-async function loadRegistrationApproval() {
-  try {
-    const res = await api.get<any>("/admin/settings/registration-approval")
-    registrationApprovalEnabled.value = res.enabled
-  } catch {
-    registrationApprovalEnabled.value = false
-  }
-}
-
-async function toggleRegistrationApproval() {
-  try {
-    const res = await api.put<any>("/admin/settings/registration-approval", {
-      enabled: !registrationApprovalEnabled.value,
-    })
-    registrationApprovalEnabled.value = res.enabled
-  } catch (e) {
-    alert(e instanceof Error ? e.message : i18n.t('admin_failed'))
-  }
-}
-
-async function createUser() {
-  userCreateError.value = ""
-  if (!userCreateForm.value.username.trim() || !userCreateForm.value.password) {
-    userCreateError.value = i18n.t('admin_create_user_required')
-    return
-  }
-  if (!USERNAME_RE.test(userCreateForm.value.username.trim())) {
-    userCreateError.value = i18n.t('admin_username_invalid')
-    return
-  }
-  if (!passwordStrengthOk(userCreateForm.value.password)) {
-    userCreateError.value = i18n.t('admin_password_weak')
-    return
-  }
-  userCreating.value = true
-  try {
-    const body: any = {
-      username: userCreateForm.value.username.trim(),
-      password: userCreateForm.value.password,
-      role: userCreateForm.value.role,
-    }
-    if (userCreateForm.value.email.trim()) {
-      body.email = userCreateForm.value.email.trim()
-    }
-    await api.post("/admin/users", body)
-    await loadUsers()
-    userCreateForm.value = { username: "", email: "", password: "", role: "user" }
-  } catch (e) {
-    userCreateError.value = e instanceof Error ? e.message : i18n.t('admin_failed')
-  } finally {
-    userCreating.value = false
-  }
-}
-
-async function approveUser(id: string) {
-  try {
-    await api.put("/admin/users/" + id + "/approve")
-    await loadUsers()
-  } catch (e) {
-    alert(e instanceof Error ? e.message : i18n.t('admin_failed'))
-  }
-}
-
-async function changeUserPassword(u: any) {
-  const pwd = prompt(i18n.t('admin_password_prompt'))
-  if (!pwd) return
-  if (!passwordStrengthOk(pwd)) {
-    alert(i18n.t('admin_password_weak'))
-    return
-  }
-  passwordChanging.value[u.id] = true
-  try {
-    await api.put("/admin/users/" + u.id + "/password", { password: pwd })
-    alert(i18n.t('admin_password_changed'))
-  } catch (e) {
-    alert(e instanceof Error ? e.message : i18n.t('admin_failed'))
-  } finally {
-    passwordChanging.value[u.id] = false
-  }
-}
-
-async function deleteUser(id: string, username: string) {
-  if (!confirm(i18n.t('admin_delete_user_confirm', { username }))) return
-  try { await api.delete("/admin/users/" + id); await loadUsers() } catch (e) { alert(e instanceof Error ? e.message : i18n.t('admin_failed')) }
-}
-
-async function changeUserRole(id: string, role: string) {
-  try { await api.put("/admin/users/" + id + "/role", { role }); await loadUsers() } catch (e) { alert(e instanceof Error ? e.message : i18n.t('admin_failed')) }
-}
-
-async function toggleUserVisibility(
-  u: any,
-  key: "r18_enabled" | "non_r18_enabled" | "can_manage_visibility",
-) {
-  try {
-    const body: any = {}
-    body[key] = !u[key]
-    await api.put("/admin/users/" + u.id + "/visibility", body)
-    await loadUsers()
-  } catch (e) {
-    alert(e instanceof Error ? e.message : i18n.t('admin_failed'))
-  }
-}
-
-async function loadApprovals() {
-  approvalError.value = ""
-  try { approvals.value = await api.get<any[]>("/source-changes?status=pending") } catch (e) { approvalError.value = e instanceof Error ? e.message : i18n.t('admin_failed') }
-}
-
-async function reviewChange(id: string, action: string) {
-  approvalReviewing.value[id] = true
-  try { await api.post("/source-changes/" + id + "/review", { action }); await loadApprovals(); await loadSources() } catch (e) { alert(e instanceof Error ? e.message : i18n.t('admin_failed')) }
-  finally { approvalReviewing.value[id] = false }
-}
-
 onMounted(async () => {
   // Deep link: the reader's "open AI settings" button navigates to
   // /admin?tab=ai so the user lands on the right panel.
@@ -1566,21 +517,21 @@ onMounted(async () => {
   if (typeof requested === "string" && (availableTabs.value as readonly string[]).includes(requested)) {
     tab.value = requested as typeof tab.value
   }
-  await loadSources()
+  await sourcesStore.loadSources()
   await loadPrefs()
   accountForm.value.nickname = auth.user?.nickname || ""
-  await loadCreds()
-  await loadCookies()
+  await credsStore.loadCreds()
+  await cookiesStore.loadCookies()
   if (auth.isAdmin) {
     await loadStatus()
     await loadIndexStats()
-    await loadUsers()
-    await loadRegistrationApproval()
-    await loadApprovals()
-    await loadLocalRoots()
+    await usersStore.loadUsers()
+    await usersStore.loadRegistrationApproval()
+    await approvalsStore.loadApprovals()
+    await importStore.loadLocalRoots()
     loadProxyConfig()
-    await loadAIConfig()
-    await loadIndexedBooks()
+    await aiStore.loadAIConfig()
+    await aiStore.loadIndexedBooks()
   }
   await loadTokens()
   await loadLogs()
@@ -1613,188 +564,7 @@ onUnmounted(() => {
         >{{ i18n.t('admin_tab_' + t) }}</button>
       </div>
 
-      <section v-if="tab === 'sources'" class="space-y-6">
-        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
-          <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_add_source') }}</h2>
-          <div class="grid grid-cols-2 gap-3 mb-3">
-            <input v-model="sourceForm.id" :disabled="!!sourceEditingId" :placeholder="i18n.t('admin_placeholder_id')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 disabled:opacity-60" />
-            <input v-model="sourceForm.name" :placeholder="i18n.t('admin_placeholder_name')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-            <input v-model="sourceForm.url" :placeholder="i18n.t('admin_placeholder_url')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-            <input v-model="sourceForm.plugin_name" :placeholder="i18n.t('admin_placeholder_plugin')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-          </div>
-          <div class="flex flex-wrap items-center gap-4 mb-3">
-            <label v-if="auth.isAdmin" class="inline-flex items-center gap-2 text-xs text-muted dark:text-gray-400">
-              <span>{{ i18n.t('admin_scope_label') }}</span>
-              <select v-model="sourceForm.scope" class="px-2 py-1 rounded border border-border dark:border-gray-700 text-xs bg-paper dark:bg-gray-800">
-                <option value="personal">{{ i18n.t('admin_source_personal') }}</option>
-                <option value="global">{{ i18n.t('admin_source_global') }}</option>
-              </select>
-            </label>
-            <label class="inline-flex items-center gap-2 text-xs text-muted dark:text-gray-400 cursor-pointer">
-              <input type="checkbox" v-model="sourceForm.enabled" class="rounded" />
-              {{ i18n.t('admin_source_enabled') }}
-            </label>
-            <label class="inline-flex items-center gap-2 text-xs text-muted dark:text-gray-400 cursor-pointer">
-              <input type="checkbox" v-model="sourceForm.is_r18" class="rounded" />
-              {{ i18n.t('admin_r18_label') }}
-            </label>
-          </div>
-          <div class="flex flex-wrap items-center gap-4 mb-3">
-            <label class="text-xs text-muted dark:text-gray-400">
-              <span class="block mb-1">{{ i18n.t('admin_sync_interval_label') }}</span>
-              <input
-                v-model="sourceForm.sync_interval_seconds"
-                type="number"
-                min="0"
-                max="3600"
-                step="1"
-                :placeholder="i18n.t('admin_sync_interval_placeholder')"
-                class="w-32 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
-              />
-            </label>
-            <p class="text-xs text-muted dark:text-gray-400 max-w-xl leading-relaxed">{{ i18n.t('admin_sync_interval_hint') }}</p>
-          </div>
-          <textarea
-            v-model="sourceConfigText"
-            :placeholder="i18n.t('admin_source_config_placeholder')"
-            rows="6"
-            class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-xs font-mono bg-paper dark:bg-gray-800 resize-y mb-3"
-          />
-          <p v-if="sourceError" class="text-sm text-red-600 mb-2">{{ sourceError }}</p>
-          <div class="flex items-center gap-2">
-            <button @click="createSource" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90">
-              {{ sourceEditingId ? i18n.t('admin_save') : i18n.t('admin_create_source') }}
-            </button>
-            <button v-if="sourceEditingId" @click="resetSourceForm" class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm hover:bg-accent/5">{{ i18n.t('admin_cancel') }}</button>
-          </div>
-        </div>
-
-        <div class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900">
-          <div v-for="s in sources" :key="s.id" class="px-4 py-3">
-            <div class="flex items-center justify-between flex-wrap gap-2">
-              <div>
-                <span class="text-sm font-medium">{{ s.name }}</span>
-                <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ s.id }} ({{ s.plugin_name }})</span>
-                <span v-if="s.owner_id" class="text-xs px-1.5 py-0.5 rounded ml-2 bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300">{{ i18n.t('admin_source_personal') }}</span>
-                <span v-else class="text-xs px-1.5 py-0.5 rounded ml-2 bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300">{{ i18n.t('admin_source_global') }}</span>
-                <span v-if="s.is_r18" class="text-xs px-1.5 py-0.5 rounded ml-2 bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-300">R18</span>
-                <span
-                  v-if="s.sync_interval_seconds != null"
-                  class="text-xs px-1.5 py-0.5 rounded ml-2 bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-200"
-                >{{ s.sync_interval_seconds > 0 ? i18n.t('admin_sync_interval_badge', { seconds: s.sync_interval_seconds }) : i18n.t('admin_sync_interval_off') }}</span>
-                <span
-                  v-if="sourceCookies(s.id).length"
-                  class="text-xs px-1.5 py-0.5 rounded ml-2"
-                  :class="cookieExpired(sourceCookies(s.id)[0]) ? 'bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300' : 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300'"
-                >{{ cookieExpired(sourceCookies(s.id)[0]) ? i18n.t('admin_cookie_expired') : i18n.t('admin_cookie_saved') }}</span>
-                <span v-else class="text-xs px-1.5 py-0.5 rounded ml-2 bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400">{{ i18n.t('admin_cookie_not_saved') }}</span>
-                <span
-                  v-if="!s.owner_id && s.show_contributor && s.submitter_username"
-                  class="text-xs text-muted dark:text-gray-400 ml-2"
-                >{{ i18n.t('admin_source_contributor', { name: s.submitter_username }) }}</span>
-              </div>
-              <div class="flex items-center gap-3">
-                <span class="text-xs" :class="s.enabled ? 'text-green-600' : 'text-red-500'">{{ s.enabled ? i18n.t('admin_enabled') : i18n.t('admin_disabled') }}</span>
-                <button v-if="canManageSource(s)" @click="toggleSourceDetails(s)" class="text-xs text-accent hover:underline">
-                  {{ i18n.t('admin_tab_cookies') }} / {{ i18n.t('admin_tab_creds') }}
-                </button>
-                <button v-if="canManageSource(s)" @click="editSource(s)" class="text-xs text-accent hover:underline">{{ i18n.t('admin_edit') }}</button>
-                <button v-if="canManageSource(s)" @click="deleteSource(s.id)" class="text-xs text-red-500 hover:text-red-700">{{ i18n.t('admin_delete') }}</button>
-              </div>
-            </div>
-
-            <div v-if="expandedSourceId === s.id && canManageSource(s)" class="mt-4 grid gap-4 lg:grid-cols-2">
-              <div class="rounded-lg border border-border dark:border-gray-700 p-3">
-                <h3 class="text-xs font-semibold mb-3">{{ i18n.t('admin_tab_cookies') }}</h3>
-                <div v-if="sourceCookies(s.id).length" class="space-y-2 mb-3">
-                  <div
-                    v-for="c in sourceCookies(s.id)"
-                    :key="c.id"
-                    class="flex items-center justify-between gap-2 text-xs"
-                  >
-                    <div class="min-w-0">
-                      <div class="truncate">{{ c.source }}</div>
-                      <div v-if="cookieWrittenAt(c)" class="text-muted dark:text-gray-400 text-[11px]">
-                        {{ i18n.t('admin_cookie_written_at') }} {{ new Date(cookieWrittenAt(c)).toLocaleString() }}
-                      </div>
-                    </div>
-                    <div class="flex items-center gap-2">
-                      <button @click="editCookie(c)" class="text-accent hover:underline">{{ i18n.t('admin_edit') }}</button>
-                      <button @click="deleteCookie(c.id)" class="text-red-500 hover:underline">{{ i18n.t('admin_delete') }}</button>
-                    </div>
-                  </div>
-                </div>
-                <p v-else class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('admin_no_cookies') }}</p>
-                <p
-                  v-if="sourceCookies(s.id).length && cookieExpired(sourceCookies(s.id)[0])"
-                  class="text-xs text-red-600 mb-2"
-                >{{ i18n.t('admin_cookie_expired_hint') }}</p>
-                <textarea
-                  v-model="cookieForm.cookie_data"
-                  :placeholder="i18n.t('admin_placeholder_cookie')"
-                  rows="3"
-                  class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-xs font-mono bg-paper dark:bg-gray-800 resize-y mb-2"
-                />
-                <input
-                  v-model="cookieForm.expired_at"
-                  type="datetime-local"
-                  class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-xs bg-paper dark:bg-gray-800 mb-2"
-                />
-                <div class="flex gap-2">
-                  <button @click="saveSourceCookie(s)" class="px-3 py-1.5 rounded bg-accent text-white text-xs font-medium">
-                    {{ sourceCookies(s.id).length ? i18n.t('admin_update_cookie') : i18n.t('admin_save_cookie') }}
-                  </button>
-                  <button @click="testSourceCookie(s)" :disabled="cookieTesting" class="px-3 py-1.5 rounded border border-accent text-accent text-xs font-medium disabled:opacity-50">
-                    {{ cookieTesting ? i18n.t('admin_testing') : i18n.t('admin_test_cookie') }}
-                  </button>
-                </div>
-                <p v-if="cookieError" class="text-xs text-red-600 mt-2">{{ cookieError }}</p>
-                <div v-if="cookieTestResult" class="mt-2 text-xs text-green-700 dark:text-green-400">{{ cookieTestResult.message }}</div>
-                <p v-if="cookieTestError" class="text-xs text-red-600 mt-2">{{ cookieTestError }}</p>
-              </div>
-
-              <div class="rounded-lg border border-border dark:border-gray-700 p-3">
-                <h3 class="text-xs font-semibold mb-3">{{ i18n.t('admin_tab_creds') }}</h3>
-                <div v-if="sourceCreds(s.id).length" class="space-y-2 mb-3">
-                  <div
-                    v-for="c in sourceCreds(s.id)"
-                    :key="c.id"
-                    class="flex items-center justify-between gap-2 text-xs"
-                  >
-                    <span>{{ c.username }}</span>
-                    <div class="flex items-center gap-2">
-                      <button @click="autoLogin(c.id)" :disabled="credLoggingIn[c.id]" class="text-green-600 hover:underline disabled:opacity-50">
-                        {{ credLoggingIn[c.id] ? i18n.t('admin_logging_in') : i18n.t('admin_auto_login') }}
-                      </button>
-                      <button @click="startManualLogin(c.id)" :disabled="manualLoginLoading" class="text-blue-600 hover:underline disabled:opacity-50">
-                        {{ i18n.t('admin_manual_login') }}
-                      </button>
-                      <button @click="deleteCred(c.id)" class="text-red-500 hover:underline">{{ i18n.t('admin_delete') }}</button>
-                    </div>
-                    <p v-if="credLoginResult[c.id]" class="w-full text-green-700 dark:text-green-400">{{ credLoginResult[c.id].message }}</p>
-                    <p v-if="credLoginError[c.id]" class="w-full text-red-600">{{ credLoginError[c.id] }}</p>
-                  </div>
-                </div>
-                <p v-else class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('admin_no_creds') }}</p>
-                <input
-                  v-model="credForm.username"
-                  :placeholder="i18n.t('admin_placeholder_username')"
-                  class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-xs bg-paper dark:bg-gray-800 mb-2"
-                />
-                <input
-                  v-model="credForm.password"
-                  type="password"
-                  :placeholder="i18n.t('admin_placeholder_password')"
-                  class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-xs bg-paper dark:bg-gray-800 mb-2"
-                />
-                <button @click="saveSourceCred(s)" class="px-3 py-1.5 rounded bg-accent text-white text-xs font-medium">{{ i18n.t('admin_save_cred') }}</button>
-                <p v-if="credError" class="text-xs text-red-600 mt-2">{{ credError }}</p>
-              </div>
-            </div>
-          </div>
-          <p v-if="sources.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">{{ i18n.t('admin_no_sources') }}</p>
-        </div>
-      </section>
+      <SourcesPanel v-if="tab === 'sources'" />
 
       <section v-if="tab === 'cookies'" class="space-y-6">
         <div class="mb-4 p-4 rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950 text-sm">
@@ -1812,29 +582,29 @@ onUnmounted(() => {
         <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
           <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_add_cookie') }}</h2>
           <div class="space-y-3 mb-3">
-            <input v-model="cookieForm.source" :placeholder="i18n.t('admin_placeholder_source')" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-            <input v-model="cookieForm.expired_at" type="datetime-local" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-            <textarea v-model="cookieForm.cookie_data" :placeholder="i18n.t('admin_placeholder_cookie')" rows="3" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 resize-y" />
+            <input v-model="cookiesStore.cookieForm.source" :placeholder="i18n.t('admin_placeholder_source')" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            <input v-model="cookiesStore.cookieForm.expired_at" type="datetime-local" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            <textarea v-model="cookiesStore.cookieForm.cookie_data" :placeholder="i18n.t('admin_placeholder_cookie')" rows="3" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 resize-y" />
           </div>
-          <p v-if="cookieError" class="text-sm text-red-600 mb-2">{{ cookieError }}</p>
+          <p v-if="cookiesStore.cookieError" class="text-sm text-red-600 mb-2">{{ cookiesStore.cookieError }}</p>
           <div class="flex gap-3">
-            <button @click="createCookie" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90">{{ i18n.t('admin_save_cookie') }}</button>
-            <button @click="testCookie" :disabled="cookieTesting" class="px-4 py-2 rounded border border-accent text-accent text-sm font-medium hover:bg-accent/10 disabled:opacity-50">
-              {{ cookieTesting ? i18n.t('admin_testing') : i18n.t('admin_test_cookie') }}
+            <button @click="cookiesStore.createCookie" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90">{{ i18n.t('admin_save_cookie') }}</button>
+            <button @click="cookiesStore.testCookie" :disabled="cookiesStore.cookieTesting" class="px-4 py-2 rounded border border-accent text-accent text-sm font-medium hover:bg-accent/10 disabled:opacity-50">
+              {{ cookiesStore.cookieTesting ? i18n.t('admin_testing') : i18n.t('admin_test_cookie') }}
             </button>
-            <button v-if="cookieEditingId" @click="cookieEditingId = ''; cookieForm = { source: '', cookie_data: '', expired_at: '' }" class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm hover:bg-accent/5">{{ i18n.t('admin_cancel') }}</button>
+            <button v-if="cookiesStore.cookieEditingId" @click="cookiesStore.cookieEditingId = ''; cookiesStore.cookieForm = { source: '', cookie_data: '', expired_at: '' }" class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm hover:bg-accent/5">{{ i18n.t('admin_cancel') }}</button>
           </div>
-          <div v-if="cookieTestResult" class="mt-3 p-3 rounded bg-green-50 dark:bg-green-950 text-sm">
-            <p class="font-medium text-green-700 dark:text-green-400">{{ cookieTestResult.message }}</p>
-            <div v-if="cookieTestResult.sample_books" class="mt-2 space-y-1 text-xs text-muted dark:text-gray-400">
-              <p v-for="b in cookieTestResult.sample_books" :key="b.title">{{ b.title }} &mdash; {{ b.author }}</p>
+          <div v-if="cookiesStore.cookieTestResult" class="mt-3 p-3 rounded bg-green-50 dark:bg-green-950 text-sm">
+            <p class="font-medium text-green-700 dark:text-green-400">{{ cookiesStore.cookieTestResult.message }}</p>
+            <div v-if="cookiesStore.cookieTestResult.sample_books" class="mt-2 space-y-1 text-xs text-muted dark:text-gray-400">
+              <p v-for="b in cookiesStore.cookieTestResult.sample_books" :key="b.title">{{ b.title }} &mdash; {{ b.author }}</p>
             </div>
           </div>
-          <p v-if="cookieTestError" class="text-sm text-red-600 mt-2">{{ cookieTestError }}</p>
+          <p v-if="cookiesStore.cookieTestError" class="text-sm text-red-600 mt-2">{{ cookiesStore.cookieTestError }}</p>
         </div>
 
         <div class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900">
-          <div v-for="c in cookies" :key="c.id" class="px-4 py-3 flex items-center justify-between">
+          <div v-for="c in cookiesStore.cookies" :key="c.id" class="px-4 py-3 flex items-center justify-between">
             <div class="flex items-center gap-3">
               <span class="text-sm font-medium">{{ c.source }}</span>
               <span v-if="c.expired_at" class="text-xs px-1.5 py-0.5 rounded-full" :class="new Date(c.expired_at) < new Date() ? 'bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300' : new Date(c.expired_at) < new Date(Date.now() + 3*86400000) ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900 dark:text-yellow-300' : 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300'">
@@ -1842,11 +612,11 @@ onUnmounted(() => {
               </span>
             </div>
             <div class="flex items-center gap-3">
-              <button @click="editCookie(c)" class="text-xs text-accent hover:underline">{{ i18n.t('admin_edit') }}</button>
-              <button @click="deleteCookie(c.id)" class="text-xs text-red-500 hover:text-red-700">{{ i18n.t('admin_delete') }}</button>
+              <button @click="cookiesStore.editCookie(c)" class="text-xs text-accent hover:underline">{{ i18n.t('admin_edit') }}</button>
+              <button @click="cookiesStore.deleteCookie(c.id)" class="text-xs text-red-500 hover:text-red-700">{{ i18n.t('admin_delete') }}</button>
             </div>
           </div>
-          <p v-if="cookies.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">{{ i18n.t('admin_no_cookies') }}</p>
+          <p v-if="cookiesStore.cookies.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">{{ i18n.t('admin_no_cookies') }}</p>
         </div>
       </section>
 
@@ -2292,454 +1062,47 @@ onUnmounted(() => {
         </div>
       </section>
 
-      <section v-if="tab === 'add'" class="space-y-6">
-        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 max-w-3xl">
-          <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_local_markdown') }}</h2>
-          <p class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('admin_local_hint') }}</p>
-          <div class="flex flex-col sm:flex-row gap-2">
-            <input
-              v-model="localPath"
-              :placeholder="i18n.t('admin_local_path_placeholder')"
-              list="local-import-roots"
-              class="flex-1 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
-            />
-            <datalist id="local-import-roots">
-              <option v-for="root in localRoots" :key="root.path" :value="root.path">{{ root.name }}</option>
-            </datalist>
-            <button
-              type="button"
-              @click="openLocalBrowser()"
-              class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm hover:bg-accent/5"
-            >{{ i18n.t('admin_local_choose_dir') }}</button>
-          </div>
-          <p v-if="localError" class="text-sm text-red-600 mt-2">{{ localError }}</p>
-          <div class="mt-3 flex flex-wrap items-center gap-2">
-            <label class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_import_classification') }}</label>
-            <select
-              v-model="localClass"
-              class="px-2 py-1.5 rounded border border-border dark:border-gray-700 text-xs bg-paper dark:bg-gray-800"
-            >
-              <option value="auto">{{ i18n.t('admin_classification_auto') }}</option>
-              <option value="all">{{ i18n.t('admin_classification_all_ages') }}</option>
-              <option value="r18">{{ i18n.t('admin_classification_r18') }}</option>
-            </select>
-          </div>
-          <div class="mt-3 flex flex-wrap gap-2">
-            <button
-              @click="scanLocal"
-              :disabled="localScanning"
-              class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50"
-            >{{ localScanning ? i18n.t('admin_importing_short') : i18n.t('admin_local_scan') }}</button>
-            <button
-              @click="importLocal"
-              :disabled="localImporting"
-              class="px-4 py-2 rounded border border-accent text-accent text-sm font-medium hover:bg-accent/10 disabled:opacity-50"
-            >{{ localImporting ? i18n.t('admin_importing_short') : i18n.t('admin_local_import') }}</button>
-          </div>
-          <p v-if="localScan.length" class="text-xs text-muted dark:text-gray-400 mt-3">
-            {{ i18n.t('admin_local_scan_count', { n: localScan.length }) }}: {{ localScanRoot }}
-          </p>
-          <div v-if="localScan.length" class="mt-2 flex flex-wrap items-center gap-2 text-xs">
-            <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                :checked="allLocalSelected"
-                @change="toggleAllLocalBooks"
-                class="rounded"
-              />
-              <span>{{ i18n.t('admin_local_select_all') }}</span>
-            </label>
-            <button
-              type="button"
-              @click="invertLocalBooks"
-              class="px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5"
-            >{{ i18n.t('admin_local_select_invert') }}</button>
-            <button
-              type="button"
-              @click="clearLocalBooks"
-              class="px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5"
-            >{{ i18n.t('admin_local_select_none') }}</button>
-            <span class="text-muted dark:text-gray-400">{{ i18n.t('admin_local_selected_count', { n: localSelected.length }) }}</span>
-          </div>
-          <div v-if="localScan.length" class="mt-3 max-h-64 overflow-y-auto divide-y divide-border border border-border dark:border-gray-700 rounded">
-            <label
-              v-for="book in localScan"
-              :key="book.path"
-              class="flex items-start gap-2 px-3 py-2 cursor-pointer hover:bg-accent/5"
-            >
-              <input
-                type="checkbox"
-                :checked="localSelected.includes(book.path)"
-                @change="toggleLocalBook(book.path)"
-                class="mt-1 rounded"
-              />
-              <span class="min-w-0">
-                <span class="block text-sm font-medium truncate">{{ book.title }}</span>
-                <span class="block text-xs text-muted dark:text-gray-400 truncate">
-                  {{ book.author }} · {{ book.chapter_count }} chapters · {{ book.format }}
-                  <span v-if="book.is_r18" class="ml-1 px-1.5 py-0.5 rounded bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300">R18</span>
-                  <span v-if="book.categories?.length" class="ml-1">{{ book.categories.join(' / ') }}</span>
-                  <span v-if="book.tags?.length" class="ml-1">{{ book.tags.slice(0, 6).join(', ') }}</span>
-                </span>
-                <span class="block text-xs text-muted dark:text-gray-400 truncate">{{ book.path }}</span>
-              </span>
-            </label>
-          </div>
-          <div v-if="localScan.length" class="mt-3 flex flex-wrap gap-2">
-            <button
-              @click="importLocalAll"
-              :disabled="localImporting || localScan.length === 0"
-              class="px-4 py-2 rounded border border-accent text-accent text-sm font-medium hover:bg-accent/10 disabled:opacity-50"
-            >{{ i18n.t('admin_local_import_all') }}</button>
-            <button
-              @click="importLocalSelected"
-              :disabled="localImporting || localSelected.length === 0"
-              class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50"
-            >{{ i18n.t('admin_local_import_selected') }}</button>
-            <button
-              @click="directLocalSelected"
-              :disabled="localImporting || localSelected.length === 0"
-              class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm hover:bg-accent/5 disabled:opacity-50"
-            >{{ i18n.t('admin_local_direct') }}</button>
-          </div>
-          <div v-if="localResult" class="mt-3 p-3 rounded bg-green-50 dark:bg-green-950 text-sm">
-            <p v-if="localResult.book_id">{{ i18n.t('admin_book_id') }}: {{ localResult.book_id }}</p>
-            <p v-for="item in localResult.results || []" :key="item.path">
-              {{ item.path }}: {{ item.status }} {{ item.book_id || item.error || '' }}
-            </p>
-          </div>
-          <div v-if="localDirectResult" class="mt-3 p-3 rounded bg-blue-50 dark:bg-blue-950 text-sm">
-            <p v-for="book in localDirectResult.books || []" :key="book.path">
-              {{ book.title }} · {{ book.chapter_count }} chapters · {{ book.path }}
-              <span v-if="book.is_r18" class="ml-1 px-1.5 py-0.5 rounded bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300">R18</span>
-              <span v-if="book.categories?.length" class="ml-1">{{ book.categories.join(' / ') }}</span>
-              <span v-if="book.tags?.length" class="ml-1">{{ book.tags.slice(0, 6).join(', ') }}</span>
-            </p>
-          </div>
-        </div>
-
-        <div v-if="localBrowserOpen" class="fixed inset-0 z-[90] bg-black/50 flex items-center justify-center p-4" @click.self="localBrowserOpen = false">
-          <div class="w-full max-w-lg rounded-lg border border-border bg-surface dark:bg-gray-900 p-4 shadow-xl">
-            <div class="flex items-center justify-between gap-3 mb-3">
-              <span class="text-sm font-medium truncate">{{ localBrowserName || localBrowserPath || i18n.t('admin_local_browse_title') }}</span>
-              <button
-                type="button"
-                class="w-8 h-8 shrink-0 flex items-center justify-center rounded hover:bg-black/10 dark:hover:bg-white/10"
-                @click="localBrowserOpen = false"
-              >×</button>
-            </div>
-            <div class="flex flex-wrap items-center gap-2 mb-3">
-              <button
-                v-for="root in localRoots"
-                :key="root.path"
-                type="button"
-                class="px-2 py-1 rounded border border-border dark:border-gray-700 text-xs hover:bg-accent/5"
-                @click="browseLocalDirectory(root.path)"
-              >{{ root.name }}</button>
-              <button
-                v-if="localBrowserParent"
-                type="button"
-                class="px-2 py-1 rounded border border-border dark:border-gray-700 text-xs hover:bg-accent/5"
-                @click="browseLocalDirectory(localBrowserParent)"
-              >{{ i18n.t('admin_local_browse_up') }}</button>
-              <button
-                v-if="localBrowserPath"
-                type="button"
-                class="px-2 py-1 rounded bg-accent text-white text-xs hover:opacity-90"
-                @click="chooseLocalDirectory(localBrowserPath)"
-              >{{ i18n.t('admin_local_browse_choose') }}</button>
-            </div>
-            <div class="max-h-64 overflow-y-auto divide-y divide-border border border-border dark:border-gray-700 rounded">
-              <button
-                v-for="dir in localBrowserDirs"
-                :key="dir.path"
-                type="button"
-                class="w-full text-left px-3 py-2 hover:bg-accent/5"
-                @click="browseLocalDirectory(dir.path)"
-              >
-                <span class="block text-sm font-medium truncate">{{ dir.name }}</span>
-                <span class="block text-xs text-muted dark:text-gray-400 truncate">{{ dir.path }}</span>
-              </button>
-              <p v-if="!localBrowsing && localBrowserDirs.length === 0" class="px-3 py-4 text-sm text-muted dark:text-gray-400">
-                {{ i18n.t('admin_local_browse_empty') }}
-              </p>
-              <p v-if="localBrowsing" class="px-3 py-4 text-sm text-muted dark:text-gray-400">
-                {{ i18n.t('admin_local_browse_loading') }}
-              </p>
-            </div>
-          </div>
-        </div>
-
-        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 max-w-3xl">
-          <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_manual_upload') }}</h2>
-          <p class="text-xs text-muted dark:text-gray-400 mb-3" v-html="i18n.t('admin_manual_hint')"></p>
-
-          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
-            <input v-model="manualTitle" :placeholder="i18n.t('admin_manual_title_placeholder')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-            <input v-model="manualAuthor" :placeholder="i18n.t('admin_manual_author_placeholder')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-          </div>
-          <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-3">
-            <select v-model="manualStatus" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800">
-              <option value="ongoing">{{ i18n.t('admin_manual_status_ongoing') }}</option>
-              <option value="completed">{{ i18n.t('admin_manual_status_completed') }}</option>
-            </select>
-            <input v-model="manualTags" :placeholder="i18n.t('admin_manual_tags_placeholder')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-            <select v-model="manualClass" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800">
-              <option value="auto">{{ i18n.t('admin_classification_auto') }}</option>
-              <option value="all">{{ i18n.t('admin_classification_all_ages') }}</option>
-              <option value="r18">{{ i18n.t('admin_classification_r18') }}</option>
-            </select>
-          </div>
-          <textarea
-            v-model="manualDescription"
-            rows="3"
-            :placeholder="i18n.t('admin_manual_desc_placeholder')"
-            class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 resize-y mb-3"
-          ></textarea>
-          <textarea
-            v-model="manualChaptersText"
-            rows="10"
-            :placeholder="i18n.t('admin_manual_chapters_placeholder')"
-            class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 resize-y font-mono mb-3"
-          ></textarea>
-
-          <div class="flex items-center gap-3 mb-3">
-            <button
-              type="button"
-              @click="analyzeManualText()"
-              :disabled="manualAnalyzing || !manualChaptersText.trim()"
-              class="px-3 py-2 rounded border border-accent text-accent text-sm hover:bg-accent/10 disabled:opacity-50"
-            >{{ manualAnalyzing ? i18n.t('admin_manual_analyzing') : i18n.t('admin_manual_auto_analyze') }}</button>
-            <label class="inline-flex px-3 py-2 rounded border border-border dark:border-gray-700 text-sm cursor-pointer hover:bg-accent/5">
-              {{ i18n.t('admin_manual_pick_file') }}
-              <input type="file" accept=".txt,.md,text/plain,text/markdown" class="hidden" @change="onManualFile" />
-            </label>
-            <span class="text-xs text-muted dark:text-gray-400" v-html="i18n.t('admin_manual_chapter_hint')"></span>
-          </div>
-          <div v-if="manualAnalyzeResult" class="mb-3 p-3 rounded bg-blue-50 dark:bg-blue-950 text-sm flex flex-wrap items-center gap-2">
-            <span
-              :class="manualAnalyzeResult.is_r18
-                ? 'px-1.5 py-0.5 rounded bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300'
-                : 'px-1.5 py-0.5 rounded bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300'"
-            >{{ manualAnalyzeResult.is_r18 ? 'R18' : 'All-Ages' }}</span>
-            <span v-if="manualAnalyzeResult.categories?.length" class="text-muted dark:text-gray-400">
-              {{ manualAnalyzeResult.categories.join(' / ') }}
-            </span>
-            <span v-if="manualAnalyzeResult.tags?.length" class="text-muted dark:text-gray-400">
-              {{ manualAnalyzeResult.tags.slice(0, 8).join(', ') }}
-            </span>
-          </div>
-
-          <p v-if="manualError" class="text-sm text-red-600 mb-2">{{ manualError }}</p>
-          <button
-            @click="submitManualBook"
-            :disabled="manualImporting"
-            class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50"
-          >{{ manualImporting ? i18n.t('admin_saving') : i18n.t('admin_save_book') }}</button>
-          <div v-if="manualResult" class="mt-3 p-3 rounded bg-green-50 dark:bg-green-950 text-sm">
-            <p>{{ i18n.t('admin_book_id') }}: {{ manualResult.book_id }}</p>
-            <p>{{ i18n.t('admin_created_chapters_label') }}: {{ manualResult.created_chapters }}</p>
-            <p v-if="manualResult.is_r18" class="mt-1 px-1.5 py-0.5 inline-block rounded bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300">R18</p>
-            <p v-if="manualResult.category_names?.length" class="mt-1 text-muted dark:text-gray-400">
-              {{ manualResult.category_names.join(' / ') }}
-            </p>
-            <p v-if="manualResult.tags?.length" class="mt-1 text-muted dark:text-gray-400">
-              {{ manualResult.tags.slice(0, 8).join(', ') }}
-            </p>
-          </div>
-        </div>
-
-      </section>
+      <AddPanel v-if="tab === 'add'" />
 
       <section v-if="tab === 'creds'" class="space-y-6">
         <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
           <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_add_cred') }}</h2>
           <p class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('admin_cred_hint') }}</p>
           <div class="grid grid-cols-3 gap-3 mb-3">
-            <input v-model="credForm.source" :placeholder="i18n.t('admin_placeholder_source')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-            <input v-model="credForm.username" :placeholder="i18n.t('admin_placeholder_username')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-            <input v-model="credForm.password" type="password" :placeholder="i18n.t('admin_placeholder_password')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            <input v-model="credsStore.credForm.source" :placeholder="i18n.t('admin_placeholder_source')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            <input v-model="credsStore.credForm.username" :placeholder="i18n.t('admin_placeholder_username')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            <input v-model="credsStore.credForm.password" type="password" :placeholder="i18n.t('admin_placeholder_password')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
           </div>
-          <p v-if="credError" class="text-sm text-red-600 mb-2">{{ credError }}</p>
-          <button @click="createCred" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90">{{ i18n.t('admin_save_cred') }}</button>
+          <p v-if="credsStore.credError" class="text-sm text-red-600 mb-2">{{ credsStore.credError }}</p>
+          <button @click="credsStore.createCred" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90">{{ i18n.t('admin_save_cred') }}</button>
         </div>
 
         <div class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900">
-          <div v-for="c in creds" :key="c.id" class="px-4 py-3 flex items-center justify-between flex-wrap gap-2">
+          <div v-for="c in credsStore.creds" :key="c.id" class="px-4 py-3 flex items-center justify-between flex-wrap gap-2">
             <div>
               <span class="text-sm font-medium">{{ c.source }}</span>
               <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ c.username }}</span>
             </div>
             <div class="flex items-center gap-3">
-              <button @click="autoLogin(c.id)" :disabled="credLoggingIn[c.id]" class="px-3 py-1.5 rounded border border-green-500 text-green-600 text-xs font-medium hover:bg-green-50 dark:hover:bg-green-950 disabled:opacity-50">
-                {{ credLoggingIn[c.id] ? i18n.t('admin_logging_in') : i18n.t('admin_auto_login') }}
+              <button @click="credsStore.autoLogin(c.id)" :disabled="credsStore.credLoggingIn[c.id]" class="px-3 py-1.5 rounded border border-green-500 text-green-600 text-xs font-medium hover:bg-green-50 dark:hover:bg-green-950 disabled:opacity-50">
+                {{ credsStore.credLoggingIn[c.id] ? i18n.t('admin_logging_in') : i18n.t('admin_auto_login') }}
               </button>
-              <button @click="startManualLogin(c.id)" :disabled="manualLoginLoading" class="px-3 py-1.5 rounded border border-blue-500 text-blue-600 text-xs font-medium hover:bg-blue-50 dark:hover:bg-blue-950 disabled:opacity-50">
+              <button @click="credsStore.startManualLogin(c.id)" :disabled="credsStore.manualLoginLoading" class="px-3 py-1.5 rounded border border-blue-500 text-blue-600 text-xs font-medium hover:bg-blue-50 dark:hover:bg-blue-950 disabled:opacity-50">
                 {{ i18n.t('admin_manual_login') }}
               </button>
-              <button @click="deleteCred(c.id)" class="text-xs text-red-500 hover:text-red-700">{{ i18n.t('admin_delete') }}</button>
+              <button @click="credsStore.deleteCred(c.id)" class="text-xs text-red-500 hover:text-red-700">{{ i18n.t('admin_delete') }}</button>
             </div>
-            <div v-if="credLoginResult[c.id]" class="w-full mt-1 p-2 rounded bg-green-50 dark:bg-green-950 text-xs text-green-700 dark:text-green-400">
-              {{ credLoginResult[c.id].message }}
+            <div v-if="credsStore.credLoginResult[c.id]" class="w-full mt-1 p-2 rounded bg-green-50 dark:bg-green-950 text-xs text-green-700 dark:text-green-400">
+              {{ credsStore.credLoginResult[c.id].message }}
             </div>
-            <p v-if="credLoginError[c.id]" class="w-full text-xs text-red-600 mt-1">{{ credLoginError[c.id] }}</p>
+            <p v-if="credsStore.credLoginError[c.id]" class="w-full text-xs text-red-600 mt-1">{{ credsStore.credLoginError[c.id] }}</p>
           </div>
-          <p v-if="creds.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">{{ i18n.t('admin_no_creds') }}</p>
+          <p v-if="credsStore.creds.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">{{ i18n.t('admin_no_creds') }}</p>
         </div>
       </section>
-      <section v-if="tab === 'users'" class="space-y-6">
-        <div class="flex items-center justify-between mb-4">
-          <h2 class="text-lg font-semibold">{{ i18n.t('admin_user_management') }}</h2>
-          <div class="flex items-center gap-2">
-            <button
-              @click="showUserCreate = !showUserCreate"
-              class="px-4 py-2 rounded bg-accent text-white text-sm hover:opacity-90 transition-opacity"
-            >{{ i18n.t('admin_create_user') }}</button>
-            <button @click="loadUsers" class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm hover:bg-surface transition-colors">{{ i18n.t('admin_refresh') }}</button>
-          </div>
-        </div>
-        <p v-if="userError" class="text-sm text-red-600 mb-3">{{ userError }}</p>
-        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
-          <div class="flex items-center justify-between flex-wrap gap-3">
-            <div>
-              <h3 class="text-sm font-semibold mb-1">{{ i18n.t('admin_registration_approval') }}</h3>
-              <p class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_registration_approval_hint') }}</p>
-            </div>
-            <button
-              @click="toggleRegistrationApproval"
-              class="text-xs px-3 py-1.5 rounded border"
-              :class="registrationApprovalEnabled ? 'bg-green-100 text-green-700 border-green-400 dark:bg-green-900 dark:text-green-300' : 'border-border dark:border-gray-700 text-muted dark:text-gray-400'"
-            >{{ registrationApprovalEnabled ? i18n.t('admin_enabled') : i18n.t('admin_disabled') }}</button>
-          </div>
-        </div>
+      <UsersPanel v-if="tab === 'users'" />
 
-        <div v-if="showUserCreate" class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
-          <h3 class="text-sm font-semibold mb-3">{{ i18n.t('admin_create_user') }}</h3>
-          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-            <input
-              v-model="userCreateForm.username"
-              :placeholder="i18n.t('admin_username_placeholder')"
-              class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
-            />
-            <input
-              v-model="userCreateForm.email"
-              type="email"
-              :placeholder="i18n.t('admin_email_placeholder')"
-              class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
-            />
-            <input
-              v-model="userCreateForm.password"
-              type="password"
-              :placeholder="i18n.t('admin_password_placeholder')"
-              class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
-            />
-            <select
-              v-model="userCreateForm.role"
-              class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
-            >
-              <option value="user">{{ i18n.t('admin_role_user') }}</option>
-              <option value="admin">{{ i18n.t('admin_role_admin') }}</option>
-              <option value="super_admin">{{ i18n.t('admin_role_super_admin') }}</option>
-            </select>
-          </div>
-          <p v-if="userCreateError" class="text-sm text-red-600 mt-2">{{ userCreateError }}</p>
-          <button
-            @click="createUser"
-            :disabled="userCreating"
-            class="mt-3 px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50"
-          >{{ userCreating ? i18n.t('admin_saving') : i18n.t('admin_create_user') }}</button>
-        </div>
-
-        <div class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900">
-          <div v-for="u in users" :key="u.id" class="px-4 py-3 flex items-center justify-between flex-wrap gap-2">
-            <div>
-              <span class="text-sm font-medium">{{ u.username }}</span>
-              <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ u.email || '' }}</span>
-              <span class="text-xs px-1.5 py-0.5 rounded-full ml-2" :class="u.role === 'super_admin' ? 'bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-300' : u.role === 'admin' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300' : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400'">{{ u.role === 'super_admin' ? i18n.t('admin_role_super_admin') : u.role === 'admin' ? i18n.t('admin_role_admin') : i18n.t('admin_role_user') }}</span>
-              <span v-if="!u.approved" class="text-xs px-1.5 py-0.5 rounded-full ml-2 bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-300">{{ i18n.t('admin_pending') }}</span>
-              <span v-if="auth.isSuperAdmin && u.invite_tag" class="text-xs px-1.5 py-0.5 rounded-full ml-2 bg-cyan-100 text-cyan-700 dark:bg-cyan-900 dark:text-cyan-300">{{ i18n.t('admin_invite_tag', { tag: u.invite_tag }) }}</span>
-            </div>
-            <div class="flex items-center gap-2">
-              <button @click="toggleUserVisibility(u, 'r18_enabled')" class="text-xs px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5" :class="u.r18_enabled ? 'text-purple-700 dark:text-purple-300 border-purple-500' : ''">
-                {{ u.r18_enabled ? i18n.t('admin_r18_on') : i18n.t('admin_r18_off') }}
-              </button>
-              <button @click="toggleUserVisibility(u, 'non_r18_enabled')" class="text-xs px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5" :class="u.non_r18_enabled ? 'text-green-700 dark:text-green-300 border-green-500' : ''">
-                {{ u.non_r18_enabled ? i18n.t('admin_all_ages_on') : i18n.t('admin_all_ages_off') }}
-              </button>
-              <button @click="toggleUserVisibility(u, 'can_manage_visibility')" class="text-xs px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5" :class="u.can_manage_visibility ? 'text-blue-700 dark:text-blue-300 border-blue-500' : ''">
-                {{ u.can_manage_visibility ? i18n.t('admin_controls_on') : i18n.t('admin_controls_off') }}
-              </button>
-              <button v-if="!u.approved" @click="approveUser(u.id)" class="text-xs px-2 py-1 rounded border border-green-500 text-green-600 hover:bg-green-50 dark:hover:bg-green-950">
-                {{ i18n.t('admin_approve_user') }}
-              </button>
-              <button v-if="auth.isSuperAdmin" @click="changeUserPassword(u)" :disabled="passwordChanging[u.id]" class="text-xs px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5 disabled:opacity-50">
-                {{ i18n.t('admin_change_password') }}
-              </button>
-              <select @change="(e: any) => changeUserRole(u.id, e.target.value)" class="text-xs px-2 py-1 rounded border border-border dark:border-gray-700 bg-paper dark:bg-gray-800">
-                <option value="" disabled selected>{{ i18n.t('admin_change_role') }}</option>
-                <option value="user">{{ i18n.t('admin_role_user') }}</option>
-                <option value="admin">{{ i18n.t('admin_role_admin') }}</option>
-                <option value="super_admin">{{ i18n.t('admin_role_super_admin') }}</option>
-              </select>
-              <button @click="deleteUser(u.id, u.username)" class="text-xs text-red-500 hover:text-red-700">{{ u.approved ? i18n.t('admin_delete') : i18n.t('admin_reject_user') }}</button>
-            </div>
-          </div>
-          <p v-if="users.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">{{ i18n.t('admin_no_users') }}</p>
-        </div>
-      </section>
-
-      <section v-if="tab === 'approvals'" class="space-y-6">
-        <div class="flex items-center justify-between mb-4">
-          <h2 class="text-lg font-semibold">{{ i18n.t('admin_pending_approvals') }}</h2>
-          <button @click="loadApprovals" class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm hover:bg-surface transition-colors">{{ i18n.t('admin_refresh') }}</button>
-        </div>
-        <p class="text-xs text-muted dark:text-gray-400 -mt-3 mb-3">{{ i18n.t('admin_approval_sync_hint') }}</p>
-        <p v-if="approvalError" class="text-sm text-red-600 mb-3">{{ approvalError }}</p>
-        <div class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900">
-          <div v-for="a in approvals" :key="a.id" class="px-4 py-3 flex items-start justify-between flex-wrap gap-2">
-            <div class="min-w-0 flex-1">
-              <div class="flex items-center flex-wrap gap-2">
-                <span class="text-xs px-1.5 py-0.5 rounded-full" :class="a.action === 'create' ? 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300' : a.action === 'confirm_r18' ? 'bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-300' : a.action === 'update' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300' : 'bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300'">{{ a.action === 'confirm_r18' ? i18n.t('admin_approval_r18_conflict') : a.action === 'update' ? i18n.t('admin_approval_update') : a.action }}</span>
-                <span v-if="a.source_data?.origin === 'ai'" class="text-[10px] px-1.5 py-0.5 rounded bg-accent/10 text-accent">{{ i18n.t('admin_approval_from_ai') }}</span>
-                <template v-if="a.action === 'create' && a.source_data">
-                  <span class="text-sm font-medium">{{ a.source_data.name }}</span>
-                  <span class="text-xs text-muted dark:text-gray-400">{{ a.source_data.id }} ({{ a.source_data.plugin_name }})</span>
-                </template>
-                <template v-else-if="a.action === 'update'">
-                  <span class="text-sm font-medium">{{ i18n.t('admin_approval_update_source', { id: a.source_id }) }}</span>
-                </template>
-                <template v-else-if="a.source_id">
-                  <span class="text-sm font-medium">{{ i18n.t('admin_delete_source', { id: a.source_id }) }}</span>
-                </template>
-                <template v-else-if="a.action === 'confirm_r18' && a.source_data">
-                  <span class="text-sm font-medium">{{ i18n.t('admin_approval_r18_conflict') }}</span>
-                  <span class="text-xs text-muted dark:text-gray-400">{{ a.source_data.title }}</span>
-                </template>
-                <span class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_by_user', { id: a.submitter_username || a.user_id?.slice(0, 8) }) }}</span>
-              </div>
-
-              <div v-if="a.action === 'update' && a.source_data?.diff?.length" class="mt-2 space-y-1.5">
-                <p v-if="a.source_data.summary" class="text-xs text-muted dark:text-gray-400">{{ a.source_data.summary }}</p>
-                <div v-for="(d, i) in a.source_data.diff" :key="i" class="p-2 rounded border border-border dark:border-gray-700 text-xs">
-                  <div class="flex items-center gap-2 mb-1">
-                    <code class="text-accent break-all">{{ d.path }}</code>
-                    <span class="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800">{{ d.risk }}</span>
-                    <span v-if="d.mismatch" class="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-300">{{ i18n.t('sync_ai_stale') }}</span>
-                  </div>
-                  <p class="text-muted dark:text-gray-400 break-words">{{ i18n.t('sync_ai_current') }}<code class="break-all">{{ d.current || '—' }}</code></p>
-                  <p class="text-muted dark:text-gray-400 break-words">{{ i18n.t('sync_ai_suggest') }}<code class="break-all">{{ d.new_text ?? d.new }}</code></p>
-                  <p v-if="d.reason" class="mt-1 text-muted dark:text-gray-400 break-words">{{ d.reason }}</p>
-                </div>
-              </div>
-            </div>
-            <div class="flex items-center gap-2 shrink-0">
-              <button @click="reviewChange(a.id, 'approve')" :disabled="approvalReviewing[a.id]" class="px-3 py-1 rounded bg-green-600 text-white text-xs font-medium hover:bg-green-700 disabled:opacity-50">{{ i18n.t('admin_approve') }}</button>
-              <button @click="reviewChange(a.id, 'reject')" :disabled="approvalReviewing[a.id]" class="px-3 py-1 rounded bg-red-500 text-white text-xs font-medium hover:bg-red-600 disabled:opacity-50">{{ i18n.t('admin_reject') }}</button>
-            </div>
-          </div>
-          <p v-if="approvals.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">{{ i18n.t('admin_no_approvals') }}</p>
-        </div>
-      </section>
+      <ApprovalsPanel v-if="tab === 'approvals'" />
 
       <section v-if="tab === 'proxy'" class="space-y-6">
         <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 max-w-lg">
@@ -2765,294 +1128,7 @@ onUnmounted(() => {
         </div>
       </section>
 
-      <section v-if="tab === 'ai'" class="space-y-6">
-        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
-          <div class="flex items-center justify-between mb-1">
-            <h2 class="text-sm font-semibold">{{ i18n.t('admin_ai_title') }}</h2>
-            <span
-              class="text-[11px] px-2 py-0.5 rounded"
-              :class="aiConfig?.configured
-                ? 'bg-green-500/10 text-green-600 dark:text-green-400'
-                : 'bg-amber-500/10 text-amber-600 dark:text-amber-400'"
-            >{{ aiConfig?.configured ? i18n.t('admin_ai_ready') : i18n.t('admin_ai_not_ready') }}</span>
-          </div>
-          <p class="text-xs text-muted dark:text-gray-400 mb-4">{{ i18n.t('admin_ai_hint') }}</p>
-
-          <p v-if="aiLoading" class="text-xs text-muted">{{ i18n.t('admin_loading') }}</p>
-          <p v-if="aiError" class="text-xs text-red-500 mb-3 break-words">{{ aiError }}</p>
-
-          <template v-if="!aiLoading && aiConfig">
-            <div class="flex items-center justify-between mb-4">
-              <span class="text-sm">{{ i18n.t('admin_ai_enable') }}</span>
-              <button @click="aiForm.enabled = !aiForm.enabled" :class="aiForm.enabled ? 'bg-green-500' : 'bg-gray-300 dark:bg-gray-600'" class="relative w-11 h-6 rounded-full transition-colors duration-200">
-                <span :class="aiForm.enabled ? 'translate-x-5' : 'translate-x-0.5'" class="absolute top-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform duration-200"></span>
-              </button>
-            </div>
-
-            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
-              <label class="block">
-                <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_provider') }}</span>
-                <select
-                  v-model="aiForm.provider"
-                  @change="applyProviderPreset(aiForm.provider)"
-                  class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
-                >
-                  <option v-for="p in aiConfig.providers" :key="p.value" :value="p.value">{{ p.label }}</option>
-                </select>
-              </label>
-              <label class="block">
-                <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_model') }}</span>
-                <div class="flex gap-2">
-                  <input v-model="aiForm.model" class="flex-1 min-w-0 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-                  <button
-                    type="button"
-                    @click="loadAIModels"
-                    :disabled="aiModelsLoading"
-                    class="px-2 py-2 rounded border border-border dark:border-gray-700 text-xs hover:bg-accent/10 disabled:opacity-50 shrink-0"
-                  >{{ aiModelsLoading ? i18n.t('admin_ai_models_fetching') : i18n.t('admin_ai_models_fetch') }}</button>
-                </div>
-              </label>
-            </div>
-
-            <p v-if="aiModelsError" class="text-xs text-amber-600 dark:text-amber-400 mb-2 break-words">{{ aiModelsError }}</p>
-            <div v-if="chatModelOptions.length" class="mb-3">
-              <span class="block text-[11px] text-muted dark:text-gray-400 mb-1">
-                {{ i18n.t('admin_ai_models_available', { n: chatModelOptions.length }) }}
-              </span>
-              <div class="flex flex-wrap gap-1.5">
-                <button
-                  v-for="model in chatModelOptions"
-                  :key="model"
-                  type="button"
-                  @click="applyModel('model', model)"
-                  class="text-[11px] px-2 py-0.5 rounded border transition-colors"
-                  :class="aiForm.model === model
-                    ? 'border-accent text-accent bg-accent/10'
-                    : 'border-border dark:border-gray-700 text-muted dark:text-gray-400 hover:text-accent'"
-                >{{ model }}</button>
-              </div>
-            </div>
-
-            <div class="mb-3">
-              <label class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_base_url') }}</label>
-              <input v-model="aiForm.base_url" :placeholder="aiConfig.effective_base_url" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-              <span class="block text-[11px] text-muted mt-1">{{ i18n.t('admin_ai_base_url_hint') }}</span>
-            </div>
-
-            <div class="mb-3">
-              <label class="block text-xs text-muted dark:text-gray-400 mb-1">
-                {{ i18n.t('admin_ai_api_key') }}
-                <span v-if="aiConfig.api_key_hint" class="text-green-600 dark:text-green-400">
-                  {{ i18n.t('admin_ai_key_saved', { hint: aiConfig.api_key_hint }) }}
-                </span>
-              </label>
-              <input
-                v-model="aiApiKeyInput"
-                type="password"
-                autocomplete="new-password"
-                :placeholder="aiConfig.api_key_set ? i18n.t('admin_ai_key_keep') : 'sk-...'"
-                class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
-              />
-              <span class="block text-[11px] text-muted mt-1">{{ i18n.t('admin_ai_key_hint') }}</span>
-            </div>
-
-            <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3">
-              <label class="block">
-                <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_temperature') }}</span>
-                <input v-model.number="aiForm.temperature" type="number" step="0.1" min="0" max="2" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-              </label>
-              <label class="block">
-                <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_max_tokens') }}</span>
-                <input v-model.number="aiForm.max_tokens" type="number" min="1" max="100000" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-              </label>
-              <label class="block">
-                <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_timeout') }}</span>
-                <input v-model.number="aiForm.timeout" type="number" min="5" max="900" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-              </label>
-              <label class="block">
-                <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_context_chars') }}</span>
-                <input v-model.number="aiForm.context_chars" type="number" min="2000" max="200000" step="1000" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-              </label>
-            </div>
-
-            <div class="flex items-center justify-between mb-3 p-3 rounded border border-border dark:border-gray-700">
-              <div>
-                <span class="text-sm block">{{ i18n.t('admin_ai_use_proxy') }}</span>
-                <span class="text-[11px] text-muted dark:text-gray-400">
-                  {{ i18n.t('admin_ai_use_proxy_hint') }}
-                  <template v-if="aiConfig.crawler_proxy?.url">{{ i18n.t('admin_ai_proxy_available', { url: aiConfig.crawler_proxy.url }) }}</template>
-                </span>
-              </div>
-              <button @click="aiForm.use_proxy = !aiForm.use_proxy" :class="aiForm.use_proxy ? 'bg-green-500' : 'bg-gray-300 dark:bg-gray-600'" class="relative w-11 h-6 rounded-full transition-colors duration-200 shrink-0">
-                <span :class="aiForm.use_proxy ? 'translate-x-5' : 'translate-x-0.5'" class="absolute top-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform duration-200"></span>
-              </button>
-            </div>
-            <div v-if="aiForm.use_proxy" class="mb-3">
-              <label class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_proxy_url') }}</label>
-              <input v-model="aiForm.proxy_url" :placeholder="aiConfig.crawler_proxy?.url || 'http://127.0.0.1:7890'" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-            </div>
-
-            <div class="flex flex-wrap gap-2 items-center">
-              <button @click="saveAIConfig" :disabled="aiSaving" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">
-                {{ aiSaving ? i18n.t('admin_saving') : i18n.t('admin_save') }}
-              </button>
-              <button @click="testAIConfig" :disabled="aiTesting" class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm hover:bg-accent/10 disabled:opacity-50">
-                {{ aiTesting ? i18n.t('admin_ai_testing') : i18n.t('admin_ai_test') }}
-              </button>
-              <span v-if="aiSaved" class="text-xs text-green-600 dark:text-green-400">{{ i18n.t('admin_ai_saved') }}</span>
-            </div>
-
-            <div v-if="aiTestResult" class="mt-4 space-y-2 text-xs">
-              <div class="p-3 rounded border" :class="aiTestResult.chat?.ok ? 'border-green-500/40 bg-green-500/5' : 'border-red-500/40 bg-red-500/5'">
-                <p class="font-medium mb-1">{{ i18n.t('admin_ai_test_chat') }}</p>
-                <p v-if="aiTestResult.chat?.ok" class="text-muted dark:text-gray-400 break-words">
-                  {{ i18n.t('admin_ai_test_ok', {
-                    model: aiTestResult.chat.model,
-                    ms: aiTestResult.chat.latency_ms,
-                  }) }}
-                  <br />{{ i18n.t('admin_ai_test_endpoint', { url: aiTestResult.chat.endpoint }) }}
-                  <span v-if="aiTestResult.chat.proxy"><br />{{ i18n.t('admin_ai_test_proxy', { url: aiTestResult.chat.proxy }) }}</span>
-                  <span v-else><br />{{ i18n.t('admin_ai_test_direct') }}</span>
-                </p>
-                <p v-else class="text-red-500 break-words">{{ aiTestResult.chat?.error }}</p>
-                <div v-if="!aiTestResult.chat?.ok && aiTestResult.available_models?.length" class="mt-2">
-                  <span class="block text-[11px] text-muted dark:text-gray-400 mb-1">
-                    {{ i18n.t('admin_ai_models_apply') }}
-                  </span>
-                  <div class="flex flex-wrap gap-1.5">
-                    <button
-                      v-for="model in aiTestResult.available_models"
-                      :key="model"
-                      type="button"
-                      @click="applyModel('model', model)"
-                      class="text-[11px] px-2 py-0.5 rounded border transition-colors"
-                      :class="aiForm.model === model
-                        ? 'border-accent text-accent bg-accent/10'
-                        : 'border-border dark:border-gray-700 text-muted dark:text-gray-400 hover:text-accent'"
-                    >{{ model }}</button>
-                  </div>
-                  <p class="text-[11px] text-muted dark:text-gray-400 mt-1">{{ i18n.t('admin_ai_models_apply_hint') }}</p>
-                </div>
-              </div>
-              <div v-if="aiTestResult.embeddings" class="p-3 rounded border" :class="aiTestResult.embeddings.ok ? 'border-green-500/40 bg-green-500/5' : 'border-amber-500/40 bg-amber-500/5'">
-                <p class="font-medium mb-1">{{ i18n.t('admin_ai_test_embeddings') }}</p>
-                <p v-if="aiTestResult.embeddings.ok" class="text-muted dark:text-gray-400 break-words">
-                  {{ i18n.t('admin_ai_test_embedding_ok', {
-                    model: aiTestResult.embeddings.model,
-                    dim: aiTestResult.embeddings.dimension,
-                  }) }}
-                </p>
-                <p v-else class="text-amber-600 dark:text-amber-400 break-words">{{ aiTestResult.embeddings.error }}</p>
-              </div>
-            </div>
-          </template>
-        </div>
-
-        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
-          <h2 class="text-sm font-semibold mb-1">{{ i18n.t('admin_ai_embedding_title') }}</h2>
-          <p class="text-xs text-muted dark:text-gray-400 mb-4">{{ i18n.t('admin_ai_embedding_hint') }}</p>
-
-          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
-            <label class="block">
-              <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_embedding_provider') }}</span>
-              <select v-model="aiForm.embedding_provider" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800">
-                <option value="">{{ i18n.t('admin_ai_embedding_same') }}</option>
-                <option v-for="p in (aiConfig?.providers || []).filter((p: any) => p.embeddings)" :key="p.value" :value="p.value">{{ p.label }}</option>
-              </select>
-            </label>
-            <label class="block">
-              <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_embedding_model') }}</span>
-              <input v-model="aiForm.embedding_model" :placeholder="aiConfig?.effective_embedding_model" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-            </label>
-          </div>
-          <div v-if="aiModels.length" class="mb-3">
-            <span class="block text-[11px] text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_models_embedding') }}</span>
-            <div class="flex flex-wrap gap-1.5">
-              <button
-                v-for="model in embeddingModelOptions"
-                :key="model"
-                type="button"
-                @click="applyModel('embedding_model', model)"
-                class="text-[11px] px-2 py-0.5 rounded border transition-colors"
-                :class="aiForm.embedding_model === model
-                  ? 'border-accent text-accent bg-accent/10'
-                  : 'border-border dark:border-gray-700 text-muted dark:text-gray-400 hover:text-accent'"
-              >{{ model }}</button>
-            </div>
-          </div>
-          <div class="mb-3">
-            <label class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_embedding_base_url') }}</label>
-            <input v-model="aiForm.embedding_base_url" :placeholder="aiConfig?.effective_embedding_base_url" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-          </div>
-          <div class="mb-3">
-            <label class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_embedding_key') }}</label>
-            <input v-model="aiEmbeddingKeyInput" type="password" autocomplete="new-password" :placeholder="aiConfig?.embedding_api_key_set ? i18n.t('admin_ai_key_keep') : i18n.t('admin_ai_embedding_key_same')" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-          </div>
-
-          <div class="flex items-center justify-between mb-3">
-            <div>
-              <span class="text-sm block">{{ i18n.t('admin_ai_rag_enable') }}</span>
-              <span class="text-[11px] text-muted dark:text-gray-400">{{ i18n.t('admin_ai_rag_hint') }}</span>
-            </div>
-            <button @click="aiForm.rag_enabled = !aiForm.rag_enabled" :class="aiForm.rag_enabled ? 'bg-green-500' : 'bg-gray-300 dark:bg-gray-600'" class="relative w-11 h-6 rounded-full transition-colors duration-200 shrink-0">
-              <span :class="aiForm.rag_enabled ? 'translate-x-5' : 'translate-x-0.5'" class="absolute top-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform duration-200"></span>
-            </button>
-          </div>
-          <div class="mb-3 max-w-[10rem]">
-            <label class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_rag_top_k') }}</label>
-            <input v-model.number="aiForm.rag_top_k" type="number" min="1" max="20" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-          </div>
-
-          <div class="flex items-center justify-between mb-3 p-3 rounded border border-border dark:border-gray-700">
-            <div>
-              <span class="text-sm block">{{ i18n.t('admin_ai_auto_diagnose') }}</span>
-              <span class="text-[11px] text-muted dark:text-gray-400">{{ i18n.t('admin_ai_auto_diagnose_hint') }}</span>
-            </div>
-            <button @click="aiForm.auto_diagnose = !aiForm.auto_diagnose" :class="aiForm.auto_diagnose ? 'bg-green-500' : 'bg-gray-300 dark:bg-gray-600'" class="relative w-11 h-6 rounded-full transition-colors duration-200 shrink-0">
-              <span :class="aiForm.auto_diagnose ? 'translate-x-5' : 'translate-x-0.5'" class="absolute top-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform duration-200"></span>
-            </button>
-          </div>
-
-          <button @click="saveAIConfig" :disabled="aiSaving" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">
-            {{ aiSaving ? i18n.t('admin_saving') : i18n.t('admin_save') }}
-          </button>
-        </div>
-
-        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
-          <h2 class="text-sm font-semibold mb-1">{{ i18n.t('admin_ai_index_title') }}</h2>
-          <p class="text-xs text-muted dark:text-gray-400 mb-4">{{ i18n.t('admin_ai_index_hint') }}</p>
-
-          <div class="flex gap-2 mb-3">
-            <input v-model="aiIndexBookId" :placeholder="i18n.t('admin_ai_index_placeholder')" class="flex-1 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-            <button @click="indexBookForRAG" :disabled="aiIndexBusy || !aiIndexBookId.trim()" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50 shrink-0">
-              {{ aiIndexBusy ? i18n.t('admin_ai_index_running') : i18n.t('admin_ai_index_run') }}
-            </button>
-          </div>
-          <p v-if="aiIndexError" class="text-xs text-red-500 mb-3 break-words">{{ aiIndexError }}</p>
-          <p v-if="aiIndexResult" class="text-xs text-muted dark:text-gray-400 mb-3">
-            {{ i18n.t('admin_ai_index_done', {
-              chapters: aiIndexResult.indexed_chapters ?? aiIndexResult.chapters ?? 0,
-              chunks: aiIndexResult.chunks ?? 0,
-              model: aiIndexResult.model || '',
-            }) }}
-            <span v-if="aiIndexResult.skipped">{{ i18n.t('admin_ai_index_skipped') }}</span>
-          </p>
-
-          <div class="flex items-center justify-between mb-2">
-            <span class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_ai_index_list') }}</span>
-            <button @click="loadIndexedBooks" class="text-[11px] text-accent hover:opacity-70">{{ i18n.t('admin_ai_index_refresh') }}</button>
-          </div>
-          <p v-if="aiIndexedLoading" class="text-xs text-muted">{{ i18n.t('admin_loading') }}</p>
-          <p v-else-if="!aiIndexedBooks.length" class="text-xs text-muted">{{ i18n.t('admin_ai_index_empty') }}</p>
-          <div v-else class="space-y-1.5 max-h-64 overflow-y-auto">
-            <div v-for="entry in aiIndexedBooks" :key="entry.book_id" class="flex items-center gap-3 text-xs p-2 rounded border border-border dark:border-gray-700">
-              <span class="flex-1 truncate">{{ entry.title || entry.book_id }}</span>
-              <span class="text-muted shrink-0">{{ i18n.t('admin_ai_index_entry', { chunks: entry.chunks, chapters: entry.chapters }) }}</span>
-              <button @click="deleteRAGIndex(entry.book_id)" class="text-red-400 hover:text-red-600 shrink-0">{{ i18n.t('admin_ai_index_delete') }}</button>
-            </div>
-          </div>
-        </div>
-      </section>
+      <AiPanel v-if="tab === 'ai'" />
     </main>
   </div>
 </template>

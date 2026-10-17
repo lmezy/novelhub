@@ -6,6 +6,7 @@ from uuid import uuid4
 from ebooklib import epub
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 from loguru import logger
 
 from app.models import Book, Chapter
@@ -27,16 +28,33 @@ class EpubService:
             .where(Chapter.book_id == book_id)
             .order_by(Chapter.chapter_number.asc())
         )
-        chapter_list = list(chapters)
+        # Snapshot plain data NOW: the packing stage runs in a worker thread,
+        # where touching ORM attributes on this session would be unsafe.
+        meta = {
+            "title": book.title,
+            "author_name": book.author_name,
+            "description": book.description or "",
+        }
+        chapter_data = [
+            (ch.chapter_number, ch.title, ch.content_path) for ch in chapters
+        ]
 
+        # Reading hundreds of chapter files, converting them and packing the
+        # EPUB are blocking CPU/disk work; doing it inline froze the event
+        # loop for tens of seconds on thousand-chapter books.
+        result = await run_in_threadpool(self._build_epub, meta, chapter_data)
+        logger.info("Generated EPUB for book={} chapters={}", book_id, len(chapter_data))
+        return result
+
+    def _build_epub(self, meta: dict, chapter_data: list[tuple]) -> bytes:
         epub_book = epub.EpubBook()
         epub_book.set_identifier(str(uuid4()))
-        epub_book.set_title(book.title)
+        epub_book.set_title(meta["title"])
         epub_book.set_language("zh")
-        if book.author_name:
-            epub_book.add_author(book.author_name)
+        if meta["author_name"]:
+            epub_book.add_author(meta["author_name"])
 
-        epub_book.add_metadata("DC", "description", book.description or "")
+        epub_book.add_metadata("DC", "description", meta["description"])
 
         # Default CSS
         style = epub.EpubItem(
@@ -50,17 +68,18 @@ class EpubService:
         spine = ["nav"]
         epub_chapters = []
 
-        for ch in chapter_list:
-            content = self.storage.read_chapter(ch.content_path)
+        for number, title, content_path in chapter_data:
+            content = self.storage.read_chapter(content_path)
             # Convert markdown-style to basic HTML
             html_content = self._markdown_to_html(content)
 
+            heading = title or f"Chapter {number}"
             c = epub.EpubHtml(
-                title=ch.title or f"Chapter {ch.chapter_number}",
-                file_name=f"chapter_{ch.chapter_number:04d}.xhtml",
+                title=heading,
+                file_name=f"chapter_{number:04d}.xhtml",
                 lang="zh",
             )
-            c.content = f"""<h1>{ch.title or f'Chapter {ch.chapter_number}'}</h1>
+            c.content = f"""<h1>{heading}</h1>
 {html_content}""".encode("utf-8")
             c.add_item(style)
             epub_book.add_item(c)
@@ -74,7 +93,6 @@ class EpubService:
 
         buf = io.BytesIO()
         epub.write_epub(buf, epub_book)
-        logger.info("Generated EPUB for book={} chapters={}", book_id, len(chapter_list))
         return buf.getvalue()
 
     @staticmethod

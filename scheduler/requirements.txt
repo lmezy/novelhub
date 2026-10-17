@@ -1,6 +1,7 @@
-﻿celery[redis]
-loguru
-sqlalchemy>=2.0
-asyncpg
-pydantic
-python-dotenv
+﻿# Scheduler image extras on top of backend/requirements.txt (installed first).
+celery[redis]==5.6.3
+loguru==0.7.3
+sqlalchemy==2.1.5
+asyncpg==0.32.0
+pydantic==2.14.1
+python-dotenv==1.2.4

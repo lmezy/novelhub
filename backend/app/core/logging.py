@@ -1,4 +1,5 @@
 ﻿import sys
+import os
 import logging
 
 from loguru import logger
@@ -52,11 +53,14 @@ def install_stdlib_logging_bridge(level: int = logging.INFO) -> None:
 
 
 def setup_logging() -> None:
+    # LOG_LEVEL env var overrides the stderr level (default INFO); the file
+    # sink stays at DEBUG so troubleshooting data is always on disk.
+    stderr_level = (os.getenv("LOG_LEVEL") or "INFO").upper()
     logger.remove()
     logger.add(
         sys.stderr,
         format=LOG_FORMAT,
-        level="INFO",
+        level=stderr_level,
         colorize=True,
     )
     logger.add(

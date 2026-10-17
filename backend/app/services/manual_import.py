@@ -115,6 +115,8 @@ class ManualImportService:
             "source_id": "",
             "author_id": book.author_id or "",
             "is_r18": book.is_r18,
+            "owner_id": book.owner_id or None,
+            "is_public": bool(book.is_public),
             "tags": book_tags,
             "category_names": book_category_names,
             "kind": normalize_kind(getattr(book, "kind", None)),
@@ -154,6 +156,8 @@ class ManualImportService:
                 "tags": book_tags,
                 "category_names": book_category_names,
                 "is_r18": book.is_r18,
+                "owner_id": book.owner_id or None,
+                "is_public": bool(book.is_public),
                 "kind": normalize_kind(getattr(book, "kind", None)),
             })
             created += 1

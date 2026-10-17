@@ -1,7 +1,8 @@
-﻿requests
-beautifulsoup4
-playwright
-pydantic
-loguru
-sqlalchemy>=2.0
-asyncpg
+﻿# Crawler image extras on top of backend/requirements.txt (installed first).
+# ``requests`` was dropped: production code uses httpx; only an old test used it.
+beautifulsoup4==4.15.0
+playwright==1.52.0
+pydantic==2.14.1
+loguru==0.7.3
+sqlalchemy==2.1.5
+asyncpg==0.32.0

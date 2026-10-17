@@ -175,6 +175,9 @@ async def search(
             allow_all_ages=allow_all_ages,
             tag=tag,
             kind=kind,
+            owner_clause=search_service.owner_visibility_clause(
+                user.id, user.role in ("admin", "super_admin")
+            ),
         )
     else:
         result = await run_in_threadpool(
@@ -186,6 +189,9 @@ async def search(
             allow_all_ages=allow_all_ages,
             tag=tag,
             kind=kind,
+            owner_clause=search_service.owner_visibility_clause(
+                user.id, user.role in ("admin", "super_admin")
+            ),
         )
 
     hits = await _filter_visible_hits(user, db, result["hits"])
@@ -222,6 +228,9 @@ async def advanced_search(
         limit=payload.limit,
         allow_r18=allow_r18,
         allow_all_ages=allow_all_ages,
+        owner_clause=search_service.owner_visibility_clause(
+            user.id, user.role in ("admin", "super_admin")
+        ),
     )
     result["hits"] = await _filter_visible_hits(user, db, result["hits"])
     # The total is served to everyone.  It used to be blanked to ``len(hits)``
