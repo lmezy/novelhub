@@ -17,9 +17,13 @@ RUN npm run build
 # ---- Run stage: serve the static bundle with nginx ----
 FROM nginx:alpine
 
-COPY --from=build /app/dist /usr/share/nginx/html
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+# Listen port is templated into nginx.conf at container start (the nginx
+# entrypoint runs envsubst on /etc/nginx/templates/*.template). Default keeps
+# the historical port 5173 so the local bridge-network compose is unchanged;
+# the NAS host-network deployment sets FRONTEND_PORT=15173.
+ENV FRONTEND_PORT=5173
 
-# Keep the historical container port so docker-compose and the gateway
-# upstream (frontend:5173) do not change.
+COPY --from=build /app/dist /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/templates/default.conf.template
+
 EXPOSE 5173
