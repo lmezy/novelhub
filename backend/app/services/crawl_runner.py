@@ -303,6 +303,32 @@ async def _reset_stale_running_tasks() -> None:
 #: image at a time over hours, so a time bound is what keeps the row moving.
 _CHAPTER_PROGRESS_COMMIT_SECONDS = 30.0
 
+#: How often the per-chapter checkpoint may touch the database.  It is called
+#: once per chapter (``checkpoint_cb``) and used to ``db.refresh`` the task row
+#: every time -- a SELECT per chapter, plus a trip through the same lock the
+#: progress writer holds.  Pause and cancel are human actions, so noticing them
+#: up to a second late costs nothing.
+_CHECKPOINT_REFRESH_SECONDS = 1.0
+
+
+class CheckpointThrottle:
+    """Rate limiter for the per-chapter pause/cancel check.
+
+    Kept as a class rather than a closure so the rate limiting is testable on
+    its own: the chapter loop is the hot path of a whole-site sync.
+    """
+
+    def __init__(self, seconds: float = _CHECKPOINT_REFRESH_SECONDS) -> None:
+        self.seconds = max(0.0, float(seconds))
+        self.last = 0.0
+
+    def should_refresh(self, now: float | None = None) -> bool:
+        current = time.monotonic() if now is None else now
+        if current - self.last < self.seconds:
+            return False
+        self.last = current
+        return True
+
 
 async def run_crawl_task_async(task_id: str) -> dict:
     """Execute one pending crawl task with pause/cancel/progress support."""
@@ -351,9 +377,12 @@ async def run_crawl_task_async(task_id: str) -> dict:
         start_page = int(progress_state.get("next_page") or 1)
         chapter_progress_updates = 0
         chapter_progress_committed_at = time.monotonic()
+        checkpoint_throttle = CheckpointThrottle()
         db_lock = asyncio.Lock()
 
         async def _wait_if_paused() -> None:
+            if not checkpoint_throttle.should_refresh():
+                return
             async with db_lock:
                 await db.refresh(task_obj)
                 if task_obj.status == "cancelled":

@@ -461,21 +461,34 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         if not refs:
             return content
         refs = refs[:content_image_limit()]
-
         replaced: dict[str, str] = {}
         total_images = len(refs)
-        for handled, (original, src, alt) in enumerate(refs, start=1):
-            # Reported before the fetch, so the counter advances for every image
-            # (including the inlined ``data:`` ones) and stops exactly when one
-            # really hangs.
-            if image_progress_cb is not None:
-                await image_progress_cb(handled, total_images)
-            if src.startswith("data:"):
-                continue
-            abs_url = urljoin(base_url or "", src).split("#", 1)[0]
-            if abs_url in replaced:
-                replacement = replaced[abs_url]
-            else:
+
+        # Images are fetched a few at a time.  They are pure network waits and an
+        # album chapter can hold hundreds of them: one at a time, a single comic
+        # chapter spent minutes doing nothing but waiting for the image host
+        # (``image_progress_cb`` used to be the *reason* for the sequential loop,
+        # and it still fires once per image -- before that image's fetch -- so
+        # the stall watchdog keeps seeing movement).
+        concurrency = max(
+            1, int(getattr(settings, "SYNC_IMAGE_CONCURRENCY", 3) or 3)
+        )
+        semaphore = asyncio.Semaphore(concurrency)
+        progress_lock = asyncio.Lock()
+        progress: list[int] = [0]
+
+        async def fetch_one(original: str, src: str, alt: str) -> None:
+            async with semaphore:
+                if image_progress_cb is not None:
+                    async with progress_lock:
+                        progress[0] += 1
+                        handled = progress[0]
+                    await image_progress_cb(handled, total_images)
+                if src.startswith("data:"):
+                    return
+                abs_url = urljoin(base_url or "", src).split("#", 1)[0]
+                if abs_url in replaced:
+                    return
                 replacement = ""
                 try:
                     result = await fetcher(abs_url, referer=base_url or None)
@@ -501,7 +514,18 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                         f'<img src="{abs_url}" alt="{alt}" loading="lazy">'
                     )
                 replaced[abs_url] = replacement
-            content = content.replace(original, replacement, 1)
+
+        await asyncio.gather(*(fetch_one(*ref) for ref in refs))
+        # The rewriting pass stays sequential: ``content.replace(..., 1)`` in
+        # order is what keeps the first occurrence of each reference mapped to
+        # its own fetch, exactly like the sequential loop did.
+        for original, src, alt in refs:
+            if src.startswith("data:"):
+                continue
+            abs_url = urljoin(base_url or "", src).split("#", 1)[0]
+            replacement = replaced.get(abs_url)
+            if replacement:
+                content = content.replace(original, replacement, 1)
         return content
 
     async def sync_book(

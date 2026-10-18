@@ -109,6 +109,12 @@ class Settings(BaseSettings):
     # chapters -- their files are already written and the next sync refetches
     # the rows -- which is why the default stays small.
     SYNC_CHAPTER_COMMIT_BATCH:int=25
+    # Images inside one chapter are downloaded this many at a time.  They are
+    # pure network waits and an album chapter can hold hundreds of them: one at
+    # a time, a single comic chapter spent minutes waiting for the image host
+    # while the rest of the sync sat idle.  Keep it small -- the image host is
+    # usually the same origin the chapter fetches are already rate-limited on.
+    SYNC_IMAGE_CONCURRENCY:int=3
     SYNC_BOOK_CONCURRENCY:int=3
     SYNC_BOOK_CONTINUOUS:bool=False
     # Stop a book early when the upstream keeps returning transient 5xx

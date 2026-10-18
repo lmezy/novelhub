@@ -315,6 +315,85 @@ def test_content_image_limit_defaults_above_manga_album_size(monkeypatch):
     assert content_image_limit() == 7
 
 
+def test_checkpoint_throttle_rate_limits_the_database_refresh():
+    """The per-chapter pause/cancel check must not SELECT on every chapter.
+
+    ``checkpoint_cb`` runs once per chapter and used to ``db.refresh`` the task
+    row every time -- a query per chapter on the hot path of a whole-site sync,
+    plus a trip through the lock the progress writer holds.
+    """
+    from app.services.crawl_runner import CheckpointThrottle
+
+    throttle = CheckpointThrottle(1.0)
+
+    assert throttle.should_refresh(100.0) is True
+    assert throttle.should_refresh(100.5) is False
+    assert throttle.should_refresh(100.999) is False
+    assert throttle.should_refresh(101.0) is True
+    assert throttle.should_refresh(101.2) is False
+    # 0 disables the throttle (every chapter is checked, the old behaviour).
+    assert CheckpointThrottle(0.0).should_refresh(5.0) is True
+    assert CheckpointThrottle(0.0).should_refresh(5.0) is True
+
+
+@pytest.mark.asyncio
+async def test_content_images_are_fetched_in_parallel(monkeypatch):
+    """Album chapters fetch several images at once, and still rewrite in order.
+
+    Sequential downloads meant one comic chapter (hundreds of images) spent
+    minutes waiting for the image host while the sync did nothing else.
+    """
+    from app.core.config import settings
+    from app.services.sync import SyncService
+
+    monkeypatch.setattr(settings, "SYNC_IMAGE_CONCURRENCY", 4, raising=False)
+
+    active = 0
+    peak = 0
+    fetched: list[str] = []
+
+    class FakePlugin:
+        async def fetch_content_image(self, url, referer=None):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            try:
+                await asyncio.sleep(0.05)
+                fetched.append(url)
+                return (b"image-bytes", "image/jpeg")
+            finally:
+                active -= 1
+
+    storage = MagicMock()
+    storage.save_chapter_image = MagicMock(
+        side_effect=lambda book_id, url, data: "images/" + url.rsplit("/", 1)[-1]
+    )
+    service = SyncService(AsyncMock())
+    service.storage = storage
+
+    content = "".join(
+        f'<img src="https://img.example.com/{index}.jpg" alt="p{index}">'
+        for index in range(1, 9)
+    )
+    progress: list[tuple[int, int]] = []
+
+    async def report(handled: int, total: int) -> None:
+        progress.append((handled, total))
+
+    book = SimpleNamespace(id="book-1")
+    result = await service._process_content_images(
+        book, "chapter-1", content, "https://example.com/book/1", FakePlugin(),
+        image_progress_cb=report,
+    )
+
+    assert peak > 1, "images were fetched one at a time"
+    assert len(fetched) == 8
+    assert result.count('/api/chapters/chapter-1/images/') == 8
+    # The progress counter still advances for every image, exactly once each.
+    assert [handled for handled, _ in progress] == list(range(1, 9))
+    assert all(total == 8 for _, total in progress)
+
+
 def test_empty_catalog_error_reports_what_the_site_answered():
     """A Cloudflare 520 must not look like a book source whose rules broke."""
     from app.services.sync import _last_explore_diagnosis
