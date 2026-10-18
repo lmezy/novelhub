@@ -103,6 +103,12 @@ class Settings(BaseSettings):
     MEILI_CONTENT_INDEX_LIMIT:int=20000
 
     SYNC_CHAPTER_CONCURRENCY:int=9
+    # Chapter rows are committed in batches of this size instead of one commit
+    # per chapter (a commit is a WAL fsync; a 3 000-chapter book used to spend
+    # thousands of them).  A crash mid-book loses at most this many fetched
+    # chapters -- their files are already written and the next sync refetches
+    # the rows -- which is why the default stays small.
+    SYNC_CHAPTER_COMMIT_BATCH:int=25
     SYNC_BOOK_CONCURRENCY:int=3
     SYNC_BOOK_CONTINUOUS:bool=False
     # Stop a book early when the upstream keeps returning transient 5xx

@@ -1235,7 +1235,13 @@ async def test_sync_book_reports_chapter_progress():
 
 
 @pytest.mark.asyncio
-async def test_sync_book_continues_after_database_error():
+async def test_sync_book_continues_after_database_error(monkeypatch):
+    from app.core.config import settings as real_settings
+
+    # One commit per chapter reproduces the failure mode this test is about: a
+    # single chapter's write failing must not abort the book.
+    monkeypatch.setattr(real_settings, "SYNC_CHAPTER_COMMIT_BATCH", 1, raising=False)
+
     db = _mock_db()
     db.get.return_value = _source()
     db.scalar.return_value = None
@@ -1305,6 +1311,75 @@ async def test_sync_book_continues_after_database_error():
     assert len(result["failed_chapters"]) == 1
     assert "fk" in result["failed_chapters"][0]["error"]
     assert plugin.fetch_chapter_content.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_sync_book_commits_chapter_rows_in_batches(monkeypatch):
+    """Chapter rows are written in batches, not with one commit each.
+
+    A commit is a WAL fsync; a 3 000-chapter book used to spend thousands of
+    them on a 4-core NAS whose disk is also serving the crawler and the search
+    index.  The batch flushes only at the boundary (and once at the end).
+    """
+    from app.core.config import settings as real_settings
+
+    monkeypatch.setattr(real_settings, "SYNC_CHAPTER_COMMIT_BATCH", 25, raising=False)
+
+    db = _mock_db()
+    db.get.return_value = _source()
+    db.scalar.return_value = None
+    db.rollback = AsyncMock()
+    db.flush = AsyncMock()
+    db.add = MagicMock()
+
+    remote_book = RemoteBook(
+        source_book_id="https://example.com/book/1",
+        title="Book",
+        author="Author",
+        description=None,
+        status=None,
+        chapters=[
+            RemoteChapter(
+                source_chapter_id=str(n),
+                title=f"Chapter {n}",
+                url=f"https://example.com/book/{n}.html",
+                chapter_number=n,
+            )
+            for n in (1, 2, 3)
+        ],
+        tags=["remote"],
+    )
+    plugin = AsyncMock()
+    plugin.fetch_book.return_value = remote_book
+    plugin.fetch_chapter_content.return_value = "content"
+
+    service = SyncService(db)
+    service.storage = MagicMock()
+    service.storage.write_metadata = MagicMock()
+    service.storage.write_chapter.return_value = ("path", "hash")
+    flushes: list[int] = []
+
+    async def spy(pending_index_docs):
+        flushes.append(len(pending_index_docs))
+        pending_index_docs.clear()
+
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.search_service"),
+        patch("app.services.auto_categorize.AutoCategorizationService"),
+        patch.object(service, "_get_or_create_author", AsyncMock(return_value=MagicMock(id="author-1"))),
+        patch.object(service, "_get_or_create_book", AsyncMock(return_value=(MagicMock(id="book-1", title="Book", is_r18=False), True))),
+        patch.object(service, "_find_same_title_books", AsyncMock(return_value=[])),
+        patch.object(service, "_book_tag_names", AsyncMock(return_value=[])),
+        patch.object(service, "_save_tags", AsyncMock()),
+        patch.object(service, "_flush_chapter_writes", spy),
+    ):
+        result = await service.sync_book("src1", "https://example.com/book/1")
+
+    assert result["created_chapters"] == 3
+    # Three chapters, one batch: the batch boundary never filled, so the only
+    # flush is the final one.
+    assert flushes == [3]
 
 
 @pytest.mark.asyncio
@@ -1512,6 +1587,246 @@ async def test_reconcile_chapter_ids_drops_anti_bot_junk_chapters():
 
     assert result == {"https://example.com/book/1/b.html"}
     assert db.delete.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_reads_each_chapter_file_once(monkeypatch):
+    """A routine re-sync must not read every chapter file twice.
+
+    The health check read the file and then ``_chapter_file_is_ours`` read it
+    again to hash it.  On the live library that is 718k chapters x 2 reads per
+    full-site sync, on spinning disks.  The digest now comes from the text the
+    check already holds.
+    """
+    from app.services.storage import chapter_markdown, text_digest
+
+    healthy = Chapter(
+        id="c1",
+        book_id="book-1",
+        chapter_number=1,
+        source_chapter_id="https://example.com/book/1/a.html",
+        title="第一章",
+        content_path="/real/000001.md",
+    )
+    text = chapter_markdown("第一章", "这是一段足够长的真实正文内容，用来通过健康检查。")
+    healthy.hash = text_digest(text)
+    remote_chapters = [
+        RemoteChapter(
+            source_chapter_id="https://example.com/book/1/a.html",
+            title="第一章",
+            url="https://example.com/book/1/a.html",
+            chapter_number=1,
+        ),
+    ]
+
+    db = AsyncMock()
+    db.scalars = AsyncMock(return_value=SimpleNamespace(all=lambda: [healthy]))
+    db.flush = AsyncMock()
+    db.delete = AsyncMock()
+
+    service = SyncService(db)
+    service.storage = MagicMock()
+    service.storage.read_chapter = MagicMock(return_value=text)
+
+    kept = await service._reconcile_chapter_ids("book-1", remote_chapters)
+
+    assert kept == {"https://example.com/book/1/a.html"}
+    assert service.storage.read_chapter.call_count == 1
+    # The digest is derived from the text already in hand, never re-read.
+    assert service.storage.chapter_digest.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_reconcile_does_not_scan_for_prose_when_every_chapter_has_text():
+    """The whole-book "has prose" scan is lazy: healthy books never run it.
+
+    It reads chapter files, and computing it up front made *every* sync of
+    *every* book pay for a scan only an image-only chapter consults.
+    """
+    first = Chapter(
+        id="c1",
+        book_id="book-1",
+        chapter_number=1,
+        source_chapter_id="https://example.com/book/1/a.html",
+        title="第一章",
+        content_path="/real/000001.md",
+    )
+    second = Chapter(
+        id="c2",
+        book_id="book-1",
+        chapter_number=2,
+        source_chapter_id="https://example.com/book/1/b.html",
+        title="第二章",
+        content_path="/real/000002.md",
+    )
+    remote_chapters = [
+        RemoteChapter(
+            source_chapter_id=f"https://example.com/book/1/{letter}.html",
+            title=f"第{index}章",
+            url=f"https://example.com/book/1/{letter}.html",
+            chapter_number=index,
+        )
+        for index, letter in ((1, "a"), (2, "b"))
+    ]
+    bodies = {
+        "/real/000001.md": "#第一章\n\n这是一段足够长的真实正文内容，用来通过健康检查。",
+        "/real/000002.md": "#第二章\n\n这也是足够长的真实正文内容，同样通过健康检查。",
+    }
+
+    db = AsyncMock()
+    db.scalars = AsyncMock(
+        return_value=SimpleNamespace(all=lambda: [first, second])
+    )
+    db.flush = AsyncMock()
+    db.delete = AsyncMock()
+
+    service = SyncService(db)
+    service.storage = MagicMock()
+    service.storage.read_chapter = MagicMock(side_effect=lambda path: bodies[path])
+    prose_scan = MagicMock(wraps=service._chapter_body_has_prose)
+    service._chapter_body_has_prose = prose_scan
+
+    kept = await service._reconcile_chapter_ids("book-1", remote_chapters)
+
+    assert len(kept) == 2
+    assert prose_scan.call_count == 0
+    # One read per chapter: the health check hands its text to the digest check
+    # instead of letting it read the file again.
+    assert service.storage.read_chapter.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_reconcile_computes_the_prose_verdict_once_when_one_chapter_is_image_only():
+    """The "does this book have prose" scan is memoised.
+
+    It reads every chapter file, so a book with many gallery pages must pay for
+    the verdict once, not once per chapter.
+    """
+    prose = Chapter(
+        id="c1",
+        book_id="book-1",
+        chapter_number=1,
+        source_chapter_id="https://example.com/book/1/a.html",
+        title="第一章",
+        content_path="/real/000001.md",
+    )
+    gallery = Chapter(
+        id="c2",
+        book_id="book-1",
+        chapter_number=2,
+        source_chapter_id="https://example.com/book/1/b.html",
+        title="第二章",
+        content_path="/real/000002.md",
+    )
+    remote_chapters = [
+        RemoteChapter(
+            source_chapter_id="https://example.com/book/1/a.html",
+            title="第一章",
+            url="https://example.com/book/1/a.html",
+            chapter_number=1,
+        ),
+        RemoteChapter(
+            source_chapter_id="https://example.com/book/1/b.html",
+            title="第二章",
+            url="https://example.com/book/1/b.html",
+            chapter_number=2,
+        ),
+    ]
+    bodies = {
+        "/real/000001.md": "#第一章\n\n这是一段足够长的真实正文内容，用来通过健康检查。",
+        "/real/000002.md": "#第二章\n\n<img src=\"/api/chapters/c2/images/1.jpg\">",
+    }
+
+    db = AsyncMock()
+    db.scalars = AsyncMock(
+        return_value=SimpleNamespace(all=lambda: [prose, gallery])
+    )
+    db.flush = AsyncMock()
+    db.delete = AsyncMock()
+
+    service = SyncService(db)
+    service.storage = MagicMock()
+    service.storage.read_chapter = MagicMock(side_effect=lambda path: bodies[path])
+    prose_scan = MagicMock(wraps=service._chapter_body_has_prose)
+    service._chapter_body_has_prose = prose_scan
+
+    kept = await service._reconcile_chapter_ids("book-1", remote_chapters)
+
+    # An image-only page in a book whose other chapters hold prose is the old
+    # junk page: it is dropped for a refetch (codex-handoff 58) ...
+    assert kept == {"https://example.com/book/1/a.html"}
+    # ... and the whole-book verdict it needed was computed exactly once.
+    assert prose_scan.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_flush_chapter_writes_commits_before_indexing():
+    """Documents reach the engine only after the rows that describe them.
+
+    A search hit for a chapter the database does not have is a 404 in the
+    reader, so the batch commit has to happen first; a failure propagates and
+    the caller drops the documents.
+    """
+    order: list[str] = []
+    db = AsyncMock()
+
+    async def _commit() -> None:
+        order.append("commit")
+
+    db.commit = _commit
+    service = SyncService(db)
+
+    docs = [{"id": "c1"}, {"id": "c2"}]
+    with patch(
+        "app.services.sync.search_service.buffer_chapter",
+        side_effect=lambda doc: order.append(f"index:{doc['id']}"),
+    ), patch("app.services.sync.asyncio.to_thread", side_effect=_run_now):
+        await service._flush_chapter_writes(docs)
+
+    assert order == ["commit", "index:c1", "index:c2"]
+    assert docs == []
+
+
+@pytest.mark.asyncio
+async def test_flush_chapter_writes_survives_an_indexing_failure():
+    """A search-engine hiccup must not fail a book that is already saved.
+
+    The rows are committed and the chapter files are on disk, so the index can
+    catch up later; the older per-chapter ``buffer_chapter`` call landed in the
+    chapter-failure handler *after* its commit, which reported a saved chapter
+    as failed.
+    """
+    db = AsyncMock()
+    service = SyncService(db)
+    docs = [{"id": "c1"}, {"id": "c2"}]
+
+    with patch(
+        "app.services.sync.search_service.buffer_chapter",
+        side_effect=RuntimeError("meili down"),
+    ), patch("app.services.sync.asyncio.to_thread", side_effect=_run_now):
+        await service._flush_chapter_writes(docs)
+
+    assert db.commit.await_count == 1
+    assert docs == []
+
+
+@pytest.mark.asyncio
+async def test_flush_chapter_writes_propagates_a_failed_commit():
+    db = AsyncMock()
+    db.commit = AsyncMock(side_effect=SQLAlchemyError("boom"))
+    service = SyncService(db)
+    docs = [{"id": "c1"}]
+
+    with pytest.raises(SQLAlchemyError):
+        await service._flush_chapter_writes(docs)
+
+    # The caller clears these; what matters here is that nothing was indexed.
+    assert service.db.commit.await_count == 1
+
+
+async def _run_now(func, *args, **kwargs):
+    """``asyncio.to_thread`` stand-in that runs inline (tests only)."""
+    return func(*args, **kwargs)
 
 
 @pytest.mark.asyncio

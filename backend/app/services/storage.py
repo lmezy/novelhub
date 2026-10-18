@@ -7,6 +7,23 @@ import re
 from app.core.config import settings
 
 
+def chapter_markdown(chapter_title: str, content: str) -> str:
+    """The stored form of one chapter: a ``#`` title line, then the body."""
+    return f"#{chapter_title}\n\n{content.strip()}\n"
+
+
+def text_digest(text: str) -> str:
+    """sha256 of chapter markdown, decoded-text based (see ``chapter_digest``).
+
+    One helper for the three places that need the same number: ``write_chapter``
+    stores it on the row, ``chapter_digest`` re-derives it from a file, and
+    ``SyncService._chapter_file_is_ours`` re-derives it from text it has already
+    read -- which is what keeps a routine sync at one file read per chapter
+    instead of two.
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 # Filesystems cap a single path component at 255 bytes, which long
 # Japanese/Chinese titles blow past: syncing 绅士漫画 failed a whole book with
 # ``[Errno 36] File name too long`` for titles such as
@@ -223,9 +240,9 @@ class BookStorage:
         path = self.book_dir(author, title, ref)
         path.mkdir(parents=True, exist_ok=True)
         file_path = path / f"{number:06d}.md"
-        markdown = f"#{chapter_title}\n\n{content.strip()}\n"
+        markdown = chapter_markdown(chapter_title, content)
         file_path.write_text(markdown, encoding="utf-8")
-        content_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+        content_hash = text_digest(markdown)
         return str(file_path), content_hash
 
     def read_chapter(self, content_path: str) -> str:
@@ -244,9 +261,14 @@ class BookStorage:
         translates ``\\n`` to the platform's line separator (CRLF on Windows),
         so byte-level hashing would report every chapter of a Windows-hosted
         install as foreign.
+
+        A caller that already holds the text should hash it with
+        ``text_digest`` instead of asking for another read: a routine sync
+        verifies every chapter of a book, and reading each file twice was half
+        of that work (see ``SyncService._chapter_file_is_ours``).
         """
         try:
             markdown = Path(content_path).read_text(encoding="utf-8")
         except Exception:
             return None
-        return hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+        return text_digest(markdown)

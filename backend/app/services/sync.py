@@ -35,7 +35,7 @@ from app.models import (
     User,
 )
 from app.repositories.tag import TagRepository
-from app.services.storage import BookRef, BookStorage
+from app.services.storage import BookRef, BookStorage, text_digest
 from app.services.search import search_service
 from app.services.cookie_crypto import safe_decrypt_cookie
 from app.services.r18 import detect_r18
@@ -876,6 +876,20 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         book_row_verified = await self._ensure_book_row(book_id, book_values)
         consecutive_blocked = 0
         consecutive_transient = 0
+        # Chapter rows are committed in batches (``SYNC_CHAPTER_COMMIT_BATCH``):
+        # a commit is a WAL fsync, and one per chapter cost thousands of them per
+        # book on the 4-core NAS, competing with the crawler's own writes.  The
+        # search documents are buffered until the commit that makes their rows
+        # durable, so the index never carries a chapter the database lacks.
+        commit_batch = max(
+            1, int(getattr(settings, "SYNC_CHAPTER_COMMIT_BATCH", 25) or 25)
+        )
+        pending_chapter_writes = 0
+        pending_index_docs: list[dict] = []
+        # What the *database* holds, as opposed to ``book_kind`` which follows
+        # the chapter being indexed: a rolled-back batch must re-issue the comic
+        # classification instead of believing it was already written.
+        stored_kind = book_kind
         max_consecutive_transient = max(
             1,
             int(
@@ -985,10 +999,11 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                             )
                         book_row_verified = True
                     self.db.add(chapter)
+                    pending_chapter_writes += 1
                     # A chapter that is nothing but image markup is a gallery
                     # page: the book is a comic even when its source claims to
                     # be a text source.
-                    if book_kind != KIND_COMIC and is_comic_content(content):
+                    if stored_kind != KIND_COMIC and is_comic_content(content):
                         book_kind = KIND_COMIC
                         await self.db.execute(
                             update(Book)
@@ -996,10 +1011,7 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                             .values(kind=KIND_COMIC)
                         )
                     await self.db.flush()
-                    # Commit per chapter so a later failure cannot lose earlier work.
-                    await self.db.commit()
-
-                    await asyncio.to_thread(search_service.buffer_chapter, {
+                    pending_index_docs.append({
                         "id": chapter.id,
                         "book_id": book_id,
                         "title": chapter.title or "",
@@ -1017,6 +1029,10 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                         "is_public": book_is_public,
                         "kind": book_kind,
                     })
+                    if pending_chapter_writes >= commit_batch:
+                        await self._flush_chapter_writes(pending_index_docs)
+                        pending_chapter_writes = 0
+                        stored_kind = book_kind
 
                     consecutive_transient = 0
                     created += 1
@@ -1025,6 +1041,11 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                     # exhaustion included) is our own stack, not the site: it
                     # is recorded but counts toward nothing.
                     await self.db.rollback()
+                    # The rows added since the last commit went with the
+                    # rollback: keep the counters honest and never index them.
+                    created = max(0, created - pending_chapter_writes)
+                    pending_chapter_writes = 0
+                    pending_index_docs.clear()
                     book_row_verified = False
                     failed_chapters.append({
                         "chapter_number": remote_chapter.chapter_number,
@@ -1042,6 +1063,9 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                     continue
                 except Exception as exc:
                     await self.db.rollback()
+                    created = max(0, created - pending_chapter_writes)
+                    pending_chapter_writes = 0
+                    pending_index_docs.clear()
                     failed_chapters.append({
                         "chapter_number": remote_chapter.chapter_number,
                         "title": remote_chapter.title,
@@ -1059,6 +1083,17 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             for producer in producers:
                 producer.cancel()
             await asyncio.gather(*producers, return_exceptions=True)
+            if pending_chapter_writes or pending_index_docs:
+                # Whatever the loop left uncommitted (a short book, or a pause
+                # between batches) is written now, in the same commit-then-index
+                # order.
+                try:
+                    await self._flush_chapter_writes(pending_index_docs)
+                except SQLAlchemyError:
+                    await self.db.rollback()
+                    created = max(0, created - pending_chapter_writes)
+                    pending_index_docs.clear()
+                pending_chapter_writes = 0
             await asyncio.to_thread(search_service.flush_chapters)
 
         if source_owner_id is None:
@@ -1082,6 +1117,39 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             # the admin did not ask for, so it is reported, not silent.
             "repaired_chapters": replaced_foreign_chapters,
         }
+
+    async def _flush_chapter_writes(self, pending_index_docs: list[dict]) -> None:
+        """Commit the chapter rows written since the last batch, then index them.
+
+        Order matters: a search document must never describe a chapter the
+        database does not have, so the commit comes first.  Any error propagates
+        to the caller, which rolls back and drops ``pending_index_docs`` -- the
+        rows are gone, so their documents must not be indexed.
+
+        Committing per chapter (the older behaviour) was one WAL fsync per
+        chapter, thousands of them per book; batching keeps the same durability
+        guarantee at the batch boundary (a crash loses at most
+        ``SYNC_CHAPTER_COMMIT_BATCH - 1`` fetched chapters, whose files are
+        already on disk and whose rows the next sync simply refetches).
+        """
+        await self.db.commit()
+        docts = list(pending_index_docs)
+        pending_index_docs.clear()
+        for doc in docts:
+            try:
+                await asyncio.to_thread(search_service.buffer_chapter, doc)
+            except Exception as exc:
+                # The row is committed and the file is on disk; the search index
+                # is the only thing behind, and the next sync (or a rebuild) puts
+                # the document there.  Failing the whole book over it -- which is
+                # what a per-chapter ``buffer_chapter`` error used to do, by
+                # landing in the chapter-failure handler after the commit -- is
+                # strictly worse.
+                logger.warning(
+                    "Chapter {} saved but not queued for the index: {}",
+                    doc.get("id"),
+                    describe_error(exc),
+                )
 
     async def _get_or_create_author(self, name: str) -> Author:
         # Fallback for empty/missing author names from book sources
@@ -1259,13 +1327,20 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         }
         # A book is "prose" when at least one stored chapter holds real text:
         # that is what tells an ad/cover-only page from a real manga gallery.
-        # Reading the files once per chapter here is not extra work -- the
-        # per-chapter health check below reads them anyway.
-        book_has_prose = any(
-            self._chapter_body_has_prose(chapter)
-            for chapter in by_id.values()
-            if chapter.content_path
-        )
+        # The verdict costs a read of every chapter file, so it is computed on
+        # demand (only when a chapter actually looks image-only) and memoised --
+        # a comic used to pay for the whole scan on every sync, on top of the
+        # per-chapter health check.
+        prose_verdict: list[bool] = []
+
+        def book_has_prose() -> bool:
+            if not prose_verdict:
+                prose_verdict.append(any(
+                    self._chapter_body_has_prose(chapter)
+                    for chapter in by_id.values()
+                    if chapter.content_path
+                ))
+            return prose_verdict[0]
         stale_ids: list[str] = []
         for source_id, chapter in list(by_id.items()):
             if source_id in remote_ids:
@@ -1363,7 +1438,7 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         self,
         chapter: Chapter,
         *,
-        book_has_prose: bool = False,
+        book_has_prose: bool | Callable[[], bool] = False,
     ) -> str:
         """Why a stored chapter must be fetched again (``""`` when it is fine).
 
@@ -1375,7 +1450,9 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         text.  An image-only chapter is a legit manga page in a gallery book,
         but in a book whose other chapters are prose it is the page's ads or
         recommendation covers (御宅屋 stored "投推荐票 …" pages and cover grids
-        that way) and belongs in the same repair path.
+        that way) and belongs in the same repair path.  It may be a callable so
+        the (whole-book) verdict is only computed when a chapter actually looks
+        image-only -- see ``_resolve_book_has_prose``.
         """
         # A missing storage path means the historical chapter has no usable
         # body. Treat it as stale so the next sync can fetch it again.
@@ -1388,7 +1465,7 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             return "missing"
         if not isinstance(content, str):
             return "missing"
-        if not self._chapter_file_is_ours(chapter):
+        if not self._chapter_file_is_ours(chapter, content):
             # Another book overwrote this file (books used to share one
             # directory per author+title), so what is on disk is not this
             # chapter's text.  Refetch instead of serving the wrong book.
@@ -1420,21 +1497,42 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             # image references leaves no text.
             if not has_image_refs:
                 return "empty"
-            return "image-only" if book_has_prose else ""
+            if not self._resolve_book_has_prose(book_has_prose):
+                return ""
+            return "image-only"
         return ""
 
-    def _chapter_body_has_prose(self, chapter: Chapter) -> bool:
+    @staticmethod
+    def _resolve_book_has_prose(verdict: bool | Callable[[], bool]) -> bool:
+        """Resolve the "does this book hold any prose" verdict on demand.
+
+        ``_chapter_body_has_prose`` reads chapter files, and computing the
+        verdict up front meant a comic book paid for a scan of *every* chapter
+        file on every sync (the eager ``any()`` only short-circuits for prose
+        books).  Callers now pass a memoising callable, so the scan happens only
+        when a stored chapter actually looks image-only, and at most once per
+        book.
+        """
+        return bool(verdict() if callable(verdict) else verdict)
+
+    def _chapter_body_has_prose(
+        self,
+        chapter: Chapter,
+        content: str | None = None,
+    ) -> bool:
         """Whether a stored chapter holds readable text rather than only images.
 
         Same normalization as the health check: the ``#`` title line, markdown
-        image references and HTML wrappers are not prose.
+        image references and HTML wrappers are not prose.  Pass ``content`` when
+        the caller has already read the file.
         """
-        if not chapter.content_path:
-            return False
-        try:
-            content = self.storage.read_chapter(chapter.content_path)
-        except Exception:
-            return False
+        if content is None:
+            if not chapter.content_path:
+                return False
+            try:
+                content = self.storage.read_chapter(chapter.content_path)
+            except Exception:
+                return False
         if not isinstance(content, str):
             return False
         body = re.sub(r"^#.*(?:\r?\n|$)", "", content, flags=re.M)
@@ -1442,7 +1540,11 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         body = re.sub(r"<[^>]+>", " ", body)
         return len(re.sub(r"\s+", " ", body).strip()) >= 20
 
-    def _chapter_file_is_ours(self, chapter: Chapter) -> bool:
+    def _chapter_file_is_ours(
+        self,
+        chapter: Chapter,
+        content: str | None = None,
+    ) -> bool:
         """Whether the file at ``content_path`` is still this chapter's text.
 
         ``write_chapter`` returns the sha256 of the markdown it wrote and the
@@ -1450,10 +1552,16 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         exactly: a mismatch means some other book's sync replaced the file (the
         shared-directory era), never a heuristic guess.  Rows without a stored
         digest (imported data, older schemas) are trusted.
+
+        ``content`` is the text the caller already read; the digest is then
+        taken from it instead of reading the file a second time (a routine sync
+        verifies every chapter of every book it syncs).
         """
         expected = str(getattr(chapter, "hash", "") or "").strip()
         if not expected or not chapter.content_path:
             return True
+        if content is not None:
+            return text_digest(content) == expected
         digest = self.storage.chapter_digest(chapter.content_path)
         if digest is None:
             # Unreadable: let the caller's read attempt decide.

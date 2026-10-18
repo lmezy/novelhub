@@ -141,6 +141,9 @@
 - **点了「重建索引」看不到进度 / 跑没跑完不知道 / 能不能取消** →
   [codex-handoff.md](codex-handoff.md) 第 60 节（改成后台任务 + 进度条，可取消；
   `GET /api/search/index/rebuild/status`）
+- **同步很慢 / 想知道全站同步的本地开销花在哪** →
+  [codex-handoff.md](codex-handoff.md) 第 61 节（每章少读一次文件、整本正文扫描改惰性、
+  章节行批量提交 `SYNC_CHAPTER_COMMIT_BATCH`）
 
 ## 文档维护约定
 

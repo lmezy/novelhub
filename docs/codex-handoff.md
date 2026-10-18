@@ -2543,5 +2543,53 @@ docker logs -f novelhub-backup                 # 看 "[backup ...] database dump
 这次会看到进度条。进度条统计的是"已经提交给 Meilisearch 的文档量"，引擎消化完才真正可搜，
 所以重建期间搜索可能只覆盖部分章节（UI 里也写了这句）。
 
+---
+
+## 61. 同步（sync）热路径优化：每章少读一次、惰性整本扫描、批量提交（2026-10-18）
+
+线上是 46 436 本书 / 718 221 章，全站同步的**本地开销**（不算法），主要来自下面三处。
+三条都改完，`cd backend && python -m pytest -q` → **1094 passed**（新增 6 个测试）。
+
+1. **每个章节文件被读两次 → 一次**
+   `_stale_chapter_reason()` 先 `read_chapter()`，然后 `_chapter_file_is_ours()` 又
+   `chapter_digest()` **把同一个文件再读一遍**算 sha256。现在把已经读到的正文直接传进去
+   （`_chapter_file_is_ours(chapter, content=...)`，走新的 `storage.text_digest()`，
+   与 `write_chapter` 记在 `Chapter.hash` 上的算法完全一致）。全站同步因此少读 **71 万次**
+   文件 —— 部署机是机械盘池，这是实打实的 IO。
+2. **"这本书有没有正文"的整本扫描改成惰性 + 记忆化**
+   以前每次同步开头就 `any(_chapter_body_has_prose(ch) for ch in ...)`：`any()` 只对
+   **正文书**短路（第一个有正文就停），**漫画书要把整本读完**才知道"没有正文"。
+   现在 `book_has_prose` 可以是可调用对象（`_resolve_book_has_prose`），只在真的遇到
+   `image-only` 章节时才计算，且一本书最多算一次。正文书 → 0 次扫描。
+3. **章节行从"每章一次 commit"改成"每 `SYNC_CHAPTER_COMMIT_BATCH`（默认 25）章一次"**
+   commit 就是一次 WAL fsync，3 000 章的书以前要 3 000 次。现在：写满一批提交一次，
+   循环结束再补一次（`finally`）。**顺序仍保证**：先 `commit` 再 `buffer_chapter`，
+   所以索引里不会出现数据库没有的章节（`_flush_chapter_writes` 把待入队文档攒在
+   `pending_index_docs` 里，提交成功后才推给 Meilisearch —— 顺带把"每章一次
+   `to_thread`"也变成"每批一次"）。
+   失败语义：提交失败 → 原样抛给调用方回滚，并按 `pending_chapter_writes` 如实扣减
+   `created_chapters`（报告不虚报），这些章节的**文件已经在盘上**，下次同步重新抓行即可；
+   崩溃最多丢一批（默认 25 章）。
+   附带修掉一个旧毛病：`buffer_chapter` 以前在 `commit` **之后**抛错会落进章节失败分支，
+   把**已保存**的章节报成 failed；现在只记一条 warning，索引下次同步补上。
+4. 测试：`test_reconcile_does_not_scan_for_prose_when_every_chapter_has_text`、
+   `…_computes_the_prose_verdict_once_when_one_chapter_is_image_only`、
+   `test_reconcile_reads_each_chapter_file_once`、
+   `test_flush_chapter_writes_commits_before_indexing`、
+   `…_survives_an_indexing_failure`、`…_propagates_a_failed_commit`、
+   `test_sync_book_commits_chapter_rows_in_batches`；
+   原有的 `test_sync_book_continues_after_database_error` 用
+   `SYNC_CHAPTER_COMMIT_BATCH=1` 保留"单章失败不影响整本"的原语义。
+
+**还没做（评估过，等决定）**：
+- **章节内图片是串行下载的**（`_process_content_images` 一个个 `await fetcher`，
+  注释里写明是为了让进度条有东西动）。漫画单章几百张图时这是主要耗时，改成 3~4 并发
+  （保留 `image_progress_cb`）能把漫画章节提速数倍；代价是上游压力与进度语义变化。
+- **`checkpoint_cb` 每章一次 `db.refresh(task)`**（`crawl_runner._wait_if_paused`，
+  一次 SELECT + `db_lock`）：限流到 ~1 秒一次，暂停/取消最多晚 1 秒生效。
+- 每次同步仍会读该书写过的每一章做健康检查（§56/§58 的修复手段）。想彻底免掉需要
+  给 `chapters` 加一个"已验证"标记列 + 迁移；单章成本已经降到 1 次读，暂不做。
+
+
 
 
