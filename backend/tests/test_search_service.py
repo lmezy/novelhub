@@ -353,6 +353,86 @@ def test_chapter_buffer_flushes_in_batches():
     assert index.add_documents.call_count == 2
 
 
+@pytest.mark.asyncio
+async def test_rebuild_index_sends_books_in_one_batch_not_one_task_each():
+    """One ``add_documents`` task per book took the engine hours.
+
+    ``rebuild_index`` used to call ``index_book`` per row: 46 176 single-document
+    Meilisearch tasks for the live library, each its own LMDB write transaction.
+    Books now travel in batches, like chapters (codex-handoff 59).
+    """
+    from types import SimpleNamespace
+
+    service, client = _make_service()
+    index = client.index.return_value
+
+    books = [
+        SimpleNamespace(
+            id=f"b{i}",
+            title=f"书 {i}",
+            author_name="作者",
+            description="简介",
+            status="ongoing",
+            source_id="src",
+            author_id="auth",
+            is_r18=False,
+            owner_id=None,
+            is_public=True,
+            tag_names=[],
+            category_names=[],
+            kind="novel",
+        )
+        for i in range(5)
+    ]
+    chapter = SimpleNamespace(
+        id="c1",
+        book_id="b0",
+        title="第一章",
+        chapter_number=1,
+        content_path="/books/a/b/000001.md",
+    )
+
+    class FakeResult:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def unique(self):
+            return self
+
+        def all(self):
+            return self._rows
+
+    class FakeSession:
+        def __init__(self):
+            self._calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def scalars(self, _statement):
+            self._calls += 1
+            return FakeResult(books if self._calls == 1 else [chapter])
+
+        async def execute(self, _statement):
+            # The custom-tag join; no rows is fine here.
+            return FakeResult([])
+
+    storage = MagicMock()
+    storage.read_chapter.return_value = "#第一章\n\n正文"
+
+    with patch("app.core.database.SessionLocal", FakeSession), \
+         patch("app.services.storage.BookStorage", return_value=storage):
+        result = await service.rebuild_index()
+
+    assert result == {"books": 5, "chapters": 1}
+    first_batch = index.add_documents.call_args_list[0].args[0]
+    assert len(first_batch) == 5
+    assert all("kind" in doc for doc in first_batch)
+
+
 def test_search_books_applies_tag_filter():
     service, client = _make_service()
     index = client.index.return_value

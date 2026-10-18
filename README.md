@@ -333,6 +333,38 @@ docker compose up -d --build backend crawler scheduler frontend
 docker compose exec backend alembic upgrade head
 ```
 
+## 备份（`novelhub-backup`）
+
+备份分两块，代价差别很大：
+
+- **数据库**：`pg_dump` 每天一份，放在 `data/backup/daily/db_<时间>.dump`，几分钟。
+- **正文文件**（`storage/`，几百 GB）：**硬链接快照**，放在
+  `data/backup/storage/daily/<时间>/`。每次只是把上一份快照硬链接过来（瞬间、不占空间），
+  再复制「上次之后改动过的文件」、删掉已删除的文件 —— 每天只花改动的那点空间和时间，
+  但每份快照看起来都是一棵完整目录树。恢复就是直接把目录拷回去。
+
+以前是每天一次 `tar -I zstd` 全量打包：在 4 核 NAS 上要跑 **十几个小时**，把磁盘占满、
+搜索索引掉到每分钟几十条文档，还要占 7×250 GB 空间。现在的方案每天是**分钟级**、
+空间只有「一份 + 增量」。
+
+```bash
+# 只备份数据库（完全不要文件快照）
+BACKUP_STORAGE=0 docker compose up -d backup
+# 立即手动跑一次（不用等定时）
+docker compose exec backup sh /usr/local/bin/novelhub-backup.sh   # 或见 BACKUP_ONCE
+```
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `BACKUP_STORAGE` | `1` | `0` = 只备份数据库，跳过正文快照 |
+| `BACKUP_INTERVAL_SECONDS` | `86400` | 两轮之间的间隔 |
+| `BACKUP_DB_DAILY_KEEP` / `BACKUP_STORAGE_DAILY_KEEP` | `7` | 日备份保留数量 |
+| `BACKUP_STORAGE_WEEKLY_KEEP` | `4` | 每周快照保留数量 |
+| `BACKUP_WAIT_SECONDS` | `300` | 启动后等 Postgres 的时间（等不到就跳过这一轮的数据库备份，但不会写出空文件） |
+
+细节见 [scripts/backup.sh](scripts/backup.sh)。**第一份快照**是真正的全量拷贝（老 tar 无法
+当种子，硬链接不能跨文件系统），会跑一到两个小时，之后每天都是增量。
+
 ## Storage Layout
 
 ```text

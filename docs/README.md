@@ -135,6 +135,9 @@
   [codex-handoff.md](codex-handoff.md) 第 58 节 B
 - **点「切换书源」没反应 / 地址变了但页面还是原来那本书** →
   [codex-handoff.md](codex-handoff.md) 第 58 节 C（前端路由复用组件）
+- **重建索引半天没进展 / NAS 磁盘一直大量读写 / 数据库备份是 0 字节** →
+  [codex-handoff.md](codex-handoff.md) 第 59 节 + [../README.md](../README.md)「备份」
+  （每日全量 tar 换成硬链接增量快照；`BACKUP_STORAGE=0` 可只备份数据库）
 
 ## 文档维护约定
 

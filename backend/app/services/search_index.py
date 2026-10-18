@@ -313,9 +313,15 @@ class SearchIndexMixin:
         return result
 
     async def rebuild_index(self) -> dict:
-        """Rebuild both indexes from database and storage records."""
-        result = {"books": 0, "chapters": 0}
+        """Rebuild both indexes from database and storage records.
 
+        Books are submitted in batches, like chapters.  The old per-book
+        ``index_book`` loop enqueued **one Meilisearch task per book** -- 46 176
+        single-document tasks for the live library -- and each of those is its
+        own LMDB write transaction; with the daily backup reading the same disk
+        the engine needed hours to drain them (see codex-handoff 59).
+        """
+        result = {"books": 0, "chapters": 0}
         async def _rebuild():
             from app.core.database import SessionLocal
             from app.models import Book, BookCustomTag, Chapter, CustomTag
@@ -346,6 +352,7 @@ class SearchIndexMixin:
                 for book_id, name in custom_rows.all():
                     custom_tag_map.setdefault(str(book_id), []).append(name)
                 book_meta: dict[str, dict] = {}
+                book_batch: list[dict] = []
                 for book in books:
                     tags = list(
                         dict.fromkeys(
@@ -368,8 +375,14 @@ class SearchIndexMixin:
                         "kind": normalize_kind(book.kind),
                     }
                     book_meta[book.id] = doc
-                    self.index_book(doc)
-                result["books"] = len(books)
+                    book_batch.append(doc)
+                    if len(book_batch) >= self.BOOK_BUFFER_SIZE:
+                        self.client.index(self.INDEX_BOOKS).add_documents(book_batch)
+                        result["books"] += len(book_batch)
+                        book_batch = []
+                if book_batch:
+                    self.client.index(self.INDEX_BOOKS).add_documents(book_batch)
+                    result["books"] += len(book_batch)
 
                 chapters = (await db.scalars(select(Chapter))).unique().all()
                 batch: list[dict] = []
@@ -421,6 +434,10 @@ class SearchIndexMixin:
         await _rebuild()
         return result
 
+    # Chapters are submitted in this many documents per Meilisearch task (see
+    # ``CHAPTER_BUFFER_SIZE``); a book document is ~20x smaller, so one task can
+    # carry many more of them.
+    BOOK_BUFFER_SIZE = 500
     KIND_BACKFILL_BATCH = 1000
     # Ids one ``NOT EXISTS`` sweep collects per request, and the ceiling on one
     # sweep.  Meilisearch caps ``offset + limit`` at ``maxTotalHits``, so a sweep

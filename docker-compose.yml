@@ -181,25 +181,18 @@ services:
       PGPASSWORD: ${POSTGRES_PASSWORD}
       PGDATABASE: ${POSTGRES_DB}
       TZ: ${TZ}
+      # 1 = database dumps + hardlink snapshots of ./storage (minutes a day),
+      # 0 = database dumps only.  See scripts/backup.sh for the whole contract.
+      BACKUP_STORAGE: ${BACKUP_STORAGE:-1}
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+      BACKUP_DB_DAILY_KEEP: ${BACKUP_DB_DAILY_KEEP:-7}
+      BACKUP_STORAGE_DAILY_KEEP: ${BACKUP_STORAGE_DAILY_KEEP:-7}
+      BACKUP_STORAGE_WEEKLY_KEEP: ${BACKUP_STORAGE_WEEKLY_KEEP:-4}
     volumes:
       - ./data/backup:/backup
       - ./storage:/app/storage:ro
-    entrypoint: >
-      sh -c '
-      mkdir -p /backup/daily /backup/weekly;
-      while true; do
-        TS=$$(date +%Y%m%d_%H%M);
-        pg_dump -h postgres -U $${PGUSER} -d $${PGDATABASE} -Fc -f /backup/daily/db_$${TS}.dump;
-        tar -I zstd -cf /backup/daily/storage_$${TS}.tar.zst -C /app storage/ 2>/dev/null || true;
-        find /backup/daily -mtime +7 -delete;
-        if [ $$(date +%u) -eq 7 ]; then
-          cp /backup/daily/db_$${TS}.dump /backup/weekly/;
-          cp /backup/daily/storage_$${TS}.tar.zst /backup/weekly/ 2>/dev/null || true;
-          find /backup/weekly -mtime +60 -delete;
-        fi;
-        sleep 86400;
-      done
-      '
+      - ./scripts/backup.sh:/usr/local/bin/novelhub-backup.sh:ro
+    entrypoint: ["sh", "/usr/local/bin/novelhub-backup.sh"]
     deploy:
       resources:
         limits:

@@ -2389,3 +2389,93 @@ yswhub 第 1 章 → 正文 0 字节（原来会是那张搜索图标）。前�
    「只有导航/广告」，不会再存一张搜索图标；
 3. C 只需要重新部署前端（浏览器强刷一次）。
 
+---
+
+## 59. 「重建索引半天没好、磁盘一直大量读写」：每日全量 tar 备份 + 索引每本书一个任务（2026-10-18）
+
+**现象**：网页点了「重建索引」，半天过去还在大量磁盘读写，搜索也没变快。
+
+**线上实测（2026-10-18 12:20 前后）**：
+
+| 观测 | 值 |
+|---|---|
+| Meilisearch 排队任务 | **54 629**（books 46 447 + chapters 7 527） |
+| 上一个完成的章节批次 | **8 007 章耗时 5 小时 10 分**（10-17 23:14Z → 10-18 04:24Z） |
+| 正在跑的批次 | 652 个"单文档 books"任务，12:24 开始；抽两次 2 分钟窗口**完成 0 个** |
+| 重建请求本身 | nginx `POST /api/search/index/rebuild` → **HTTP 499**（01:47 客户端就断了） |
+| 备份容器 | 01:28 起 `tar -I zstd` 打包整个 storage，**11 小时**才写到 253 GiB / 上次全量 257 GiB，且最近一分钟只长 6 MB |
+| 数据库备份 | **0 字节**：`pg_dump: connection ... 127.0.0.1, port 15432 failed: Connection refused` |
+| 磁盘 | pool1 89% 满（剩 1.9 T），daily 7 份 × 250 GiB + weekly 60 天 |
+
+**根因（三个，都在备份/索引的形状上，不是站点或数据问题）**：
+
+1. **每天一次全量 `tar -I zstd` 打包 250 GiB**：在这个 4 核 NAS 上要跑 **15~19 小时**
+   （10-16 那次 20:07 → 次日 15:20），把磁盘占满 —— 同一时间 Meilisearch 索引一批 8 007 章
+   要 5 小时，就是因为抢不到 IO。而且 7 天 × 250 GiB 的压缩包把盘吃掉了 1.8 T。
+2. **备份容器一启动就先备份**：`while true; do ... sleep 86400` 的写法让**每次重启/redeploy
+   都立刻开始一轮全量**。这次是 01:27 重启 → 01:28 开始 tar，正好和索引重建撞在一起。
+3. **`pg_dump` 在 Postgres 就绪前执行**：备份容器和 postgres 同时启动，连接被拒后脚本
+   不检查、继续往下走，留下一个 **0 字节的 dump**（而且要到 24 小时后才会重试）——
+   也就是说当天实际只有 storage 备份、没有数据库备份。
+
+4. （索引侧）`rebuild_index` 用 `index_book()` 逐本提交：**每本书一个 Meilisearch 任务**，
+   46 176 个单文档任务，每个都是一次 LMDB 写事务；加上重建挂在 HTTP 请求里同步跑，
+   客户端 30 秒超时后 nginx 记 499、后端继续跑，用户既看不到进度也没法取消。
+
+**改动**：
+
+- **新增 `scripts/backup.sh`**（`docker-compose.yml` 的 backup 服务改为挂载并执行它）：
+  - 数据库：`pg_dump` 写到 `*.part`，**成功且非空**才改名成正式备份；写 `pg_isready` 等待
+    循环（`BACKUP_WAIT_SECONDS`，等不到就跳过这一轮并记日志，不会再留空文件）；
+  - 正文：**硬链接快照** `data/backup/storage/daily/<时间>/` —— 用 `cp -al` 从上一份快照
+    硬链接（瞬间、不占空间），只复制「上次之后改动过的文件」，再扫掉已删除的文件；
+    每份快照都像一棵完整目录树，恢复就是拷目录。**一份 + 增量**，每天分钟级；
+    `--remove-destination` 是必须的（普通 `cp` 会截断共享 inode，把上一份快照写坏）；
+    **绝不**硬链接 live 目录（crawler 会原地改写章节文件，共享 inode 会连快照一起改）；
+  - 重启不再立刻备份：`BACKUP_INTERVAL_SECONDS` 从 `last_cycle` 续算；
+  - `BACKUP_STORAGE=0` = 只备份数据库（完全不要正文快照）；
+  - 保留策略按数量（日 7 / 周 4），周快照也是硬链接，几乎不占空间。
+- `backend/app/services/search_index.py`：`rebuild_index` 的 books 也**批量提交**
+  （`BOOK_BUFFER_SIZE = 500`），46 176 个任务 → ~93 个。
+
+**验证**：脚本**在 NAS 上真实的 `postgres:17` 镜像里**跑过（`docker run --rm`，只挂 `/tmp`
+临时目录，跑完即删）：`sh -n` 通过；第一轮全量 → 第二轮只搬改动（1 改 1 增 1 删，内容正确、
+被删文件只在旧快照里、共享文件 inode/link 数正确、改动文件拿到新 inode）；`BACKUP_STORAGE=0`
+不建快照；重启后只等待不立刻备份。后端 `cd backend && python -m pytest -q` → **1078 passed**
+（新增 `test_rebuild_index_sends_books_in_one_batch_not_one_task_each`）。
+
+**线上怎么换**（NAS 的 compose 是改过的：host 网络 + `PGPORT=15432`，和仓库默认不同）：
+
+```yaml
+  backup:
+    image: postgres:17
+    container_name: novelhub-backup
+    restart: always
+    network_mode: host          # NAS 上原本就是这样
+    environment:
+      PGHOST: 127.0.0.1
+      PGPORT: 15432
+      PGUSER: novelhub
+      PGPASSWORD: <同 postgres>
+      PGDATABASE: novelhub
+      TZ: Asia/Shanghai
+      BACKUP_STORAGE: "0"        # 先用 0 让机器安静；夜里再改回 1 跑第一份全量
+    volumes:
+      - ./data/backup:/backup
+      - ./storage:/app/storage:ro
+      - ./scripts/backup.sh:/usr/local/bin/novelhub-backup.sh:ro
+    entrypoint: ["sh", "/usr/local/bin/novelhub-backup.sh"]
+```
+
+```bash
+docker compose up -d --force-recreate backup   # 只重建备份容器
+docker logs -f novelhub-backup                 # 看 "[backup ...] database dump ok"
+```
+
+**别忘了**：确认新的 `db_*.dump` 不是 0 字节之后，再把旧的 `data/backup/daily/storage_*.tar.zst`
+和 `weekly/` 里的 tar 删掉（约 1.8 T）；`BACKUP_STORAGE=1` 的**第一份快照是真全量拷贝**
+（老 tar 不能当种子，硬链接不跨文件系统），约 1~2 小时，放夜里跑，之后每天都是增量。
+另外队列里那 5.4 万个「重建任务」不会因为重启消失（Meilisearch 的队列落盘），
+要么等它排空，要么按 uid 分批 `POST /tasks/cancel` 取消 —— 备份不再抢 IO 后吞吐会快很多。
+
+
