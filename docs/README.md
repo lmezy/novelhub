@@ -122,6 +122,12 @@
 - **设置页「API 令牌」创建报 500 / 令牌填了没人认 / 自动同步到底几点跑** →
   [codex-handoff.md](codex-handoff.md) 第 47 节（令牌只接只读书库接口；定时同步的真实机制见
   [full-site-sync.md](full-site-sync.md) 「自动更新」）
+- **打开某本书正文内容不对（是推荐位/广告图，或像另一本书的正文）** →
+  [full-site-sync.md](full-site-sync.md) “打开某本书，正文内容不对” +
+  [codex-handoff.md](codex-handoff.md) 第 56 节（同名书共用一个目录；用书籍详情页
+  「重新抓取正文」重下一遍）
+- **设置 → AI 想存多个模型供应商 / 切了供应商还是老模型在回答** →
+  [ai-assistant.md](ai-assistant.md) §1.1 + [codex-handoff.md](codex-handoff.md) 第 56 节
 
 ## 文档维护约定
 

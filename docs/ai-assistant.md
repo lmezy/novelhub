@@ -7,6 +7,26 @@
 AI 配置存在数据库里（`app_settings`，键名 `ai_*`），改完立即生效，**不需要重建容器**。
 环境变量只在后台没有填写对应字段时才作为兜底。
 
+### 1.1 模型供应商（可以存多条）
+
+「模型供应商」一栏保存多套配置，点一下即切换 —— DeepSeek 主力、本地 Ollama、别家代理线路
+各存一条，不用每次重填 Key。列表里每条显示名称、提供方与模型，当前生效的那条标「使用中」，
+右边可以**复制**（改一份不影响原来的）或**删除**（保存后生效）。
+
+- 每一条 = 名称（备注用）+ 提供方 + 接口地址 + 模型 + API Key；点列表里的某一条，下面就是它的字段。
+- **API Key 逐条加密**（AES-GCM），接口只回掩码与「是否已存」；换条目时输入框会清空，
+  留空 = 不改这条的 Key，点「清除 Key」才是删掉它。
+- **升级后第一次进来**：列表里会显示当前那套配置（提示「还没保存成供应商列表」）。
+  点一次保存，它就变成第一个供应商，之后想加几条都可以。
+- 存储在 `app_settings.ai_providers`（JSON）+ `ai_active_profile`（生效的那条 id）。
+  **一旦存过列表，对话用的 provider / base_url / model / api_key 全部以列表为准**；
+  没有列表时仍然是 `ai_provider` / `ai_base_url` / `ai_model` / `ai_api_key` 四个键
+  （以及 `AI_*` 环境变量）说了算。
+- 浏览器里缓存着旧前端（还在提交单套字段的那个版本）也不会写坏配置：它提交的
+  provider / base_url / model / api_key 会落到**当前生效的那条**上。
+
+### 1.2 其它字段
+
 | 字段 | 说明 |
 |---|---|
 | 启用 AI 功能 | 总开关。OpenAI 兼容且填了 Key 时默认开启 |
@@ -14,14 +34,14 @@ AI 配置存在数据库里（`app_settings`，键名 `ai_*`），改完立即�
 | 模型 | 留空用提供方默认值（如 `deepseek-flash`、`qwen-plus`、`claude-3-5-haiku-latest`）；旁边的 **「拉取模型」** 会调 `{base}/models` 列出服务端真正提供的模型，点一下即填入 |
 | 接口地址 | 留空用提供方默认值。OpenAI 兼容端点写到 `/v1` 即可，会自动补 `/chat/completions`；Claude 会自动补 `/v1/messages` |
 | API Key | AES-GCM 加密入库，接口只回掩码；本地 Ollama 这类服务可以留空 |
-| Temperature / 最大输出 token / 超时 | 生成参数 |
-| 上下文上限（字符） | 每次问答拼给模型的原文上限 |
+| Temperature / 最大输出 token / 超时 / 上下文上限（字符） | 生成参数，对所有供应商生效 |
 | 使用代理 | 走代理发请求。勾选后留空表示**复用爬虫代理**（设置 → 代理里的地址） |
 | 向量提供方 / 向量模型 / 向量接口地址 / 向量 API Key | RAG 用的 embedding 服务，可以与对话模型不同 |
 | 问答时使用语义检索 / 检索片段数 | 是否用 RAG、检索几个片段 |
 
 **测试连接**会分别探测对话接口和向量接口，并显示：解析出的请求地址、是否走代理、耗时、
 返回的模型名。报错信息会直接说明原因（Key 无效 / 404 模型名或路径错 / 429 限流 / 超时与代理）。
+它测的是**已保存的生效供应商**，所以改完字段要先点「保存」。
 
 ### 常见提供方
 
@@ -143,7 +163,7 @@ curl -X POST "http://localhost:8088/api/ai/diagnose/<TASK_ID>/propose" \
 | POST | `/api/ai/timeline` | 时间线 |
 | POST | `/api/ai/transform` | 划词：解释 / 翻译 / 润色 / 续写 / 自定义 |
 | POST | `/api/ai/transform/stream` | 同上，流式（`start` / `delta` / `done` / `error`） |
-| GET/PUT | `/api/admin/ai` | 读取 / 保存 AI 配置（管理员，不回显 Key） |
+| GET/PUT | `/api/admin/ai` | 读取 / 保存 AI 配置（管理员，不回显 Key）。PUT 可以带 `profiles`（整份供应商列表）+ `active_profile_id`；**带了 `profiles` 就是整表替换**，某条的 `api_key` 传掩码或干脆不传 = 保留它已存的 Key，传空串 = 清掉 |
 | POST | `/api/admin/ai/test` | 连通性测试（管理员） |
 | POST | `/api/admin/ai/models` | 拉取服务端可用模型列表（管理员） |
 | GET | `/api/ai/diagnose/{task_id}` | 读取某次同步任务的 AI 诊断（管理员） |
@@ -172,3 +192,5 @@ curl -X POST "http://localhost:8088/api/ai/diagnose/<TASK_ID>/propose" \
 | 诊断报「AI 功能未启用」 | 先去 设置 → AI 配好并「测试连接」通过 |
 | AI 说「书源未配置 Cookie」，但设置 → 书源显示「已保存 Cookie」 | 旧版证据里没带 Cookie 状态，模型只能照着书源 JSON 的 `header` 猜（那里本来就不会有 cookie 字段）。现在证据会带 `## 登录状态（Cookie）`（只给 cookie **名字**与保存/过期时间，不给值），提示词也要求以它为准。**已存的那条诊断不会自愈**：在同步页对该任务点「重新分析」即可 |
 | AI 说「已保存 Cookie」，可我还是被站点拦 | 已保存 ≠ 仍有效：拦截页/403/要登录时按「Cookie 可能已过期」处理 —— 在浏览器里重新过验证，再导入一次 Cookie；不是改书源规则 |
+| 加了供应商、切过去却还是老模型在回答 | 列表改动要**点保存**才生效（`ai_active_profile` 是保存时才写的）；「测试连接」测的也是已保存的那条 |
+| 删掉所有供应商之后，AI 又变回以前那套配置 | 正常：没有列表时 `ai_provider` / `ai_api_key` 等单套键（或 `AI_*` 环境变量）就是唯一来源。想彻底换掉，就留一条供应商别删 |

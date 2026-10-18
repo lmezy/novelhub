@@ -31,72 +31,149 @@ const aiStore = useAdminAIStore()
         </button>
       </div>
 
-      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
-        <label class="block">
-          <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_provider') }}</span>
-          <select
-            v-model="aiStore.aiForm.provider"
-            @change="aiStore.applyProviderPreset(aiStore.aiForm.provider)"
-            class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
+      <!-- saved model providers -->
+      <div class="mb-4 p-3 rounded border border-border dark:border-gray-700">
+        <div class="flex items-center justify-between mb-2">
+          <span class="text-xs font-medium">{{ i18n.t('admin_ai_profiles_title') }}</span>
+          <button
+            type="button"
+            @click="aiStore.addAIProfile"
+            class="text-[11px] px-2 py-0.5 rounded border border-border dark:border-gray-700 hover:bg-accent/10"
+          >{{ i18n.t('admin_ai_profile_add') }}</button>
+        </div>
+        <p class="text-[11px] text-muted dark:text-gray-400 mb-2">
+          {{ aiStore.aiProfileSource === 'profiles'
+            ? i18n.t('admin_ai_profiles_hint')
+            : i18n.t('admin_ai_profiles_single_hint') }}
+        </p>
+
+        <div v-if="!aiStore.aiProfiles.length" class="text-[11px] text-muted dark:text-gray-400">
+          {{ i18n.t('admin_ai_profile_empty') }}
+        </div>
+        <div v-else class="space-y-1.5">
+          <div
+            v-for="profile in aiStore.aiProfiles"
+            :key="profile.id"
+            class="flex items-center gap-2 text-xs p-2 rounded border transition-colors cursor-pointer"
+            :class="profile.id === aiStore.aiActiveProfileId
+              ? 'border-accent bg-accent/5'
+              : 'border-border dark:border-gray-700 hover:border-accent/60'"
+            @click="aiStore.selectAIProfile(profile.id)"
           >
-            <option v-for="p in aiStore.aiConfig.providers" :key="p.value" :value="p.value">{{ p.label }}</option>
-          </select>
-        </label>
-        <label class="block">
-          <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_model') }}</span>
-          <div class="flex gap-2">
-            <input v-model="aiStore.aiForm.model" class="flex-1 min-w-0 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            <span class="flex-1 min-w-0 truncate">
+              {{ profile.name || profile.provider_label || profile.provider }}
+              <span class="text-muted dark:text-gray-400">
+                · {{ profile.provider_label || profile.provider }}
+                <template v-if="profile.model">· {{ profile.model }}</template>
+              </span>
+            </span>
+            <span
+              v-if="profile.id === aiStore.aiActiveProfileId"
+              class="text-[10px] px-1.5 py-0.5 rounded bg-accent/15 text-accent shrink-0"
+            >{{ i18n.t('admin_ai_profile_in_use') }}</span>
+            <span v-if="profile.api_key_set" class="text-[10px] text-green-600 dark:text-green-400 shrink-0">
+              {{ i18n.t('admin_ai_profile_key_saved') }}
+            </span>
             <button
               type="button"
-              @click="aiStore.loadAIModels"
-              :disabled="aiStore.aiModelsLoading"
-              class="px-2 py-2 rounded border border-border dark:border-gray-700 text-xs hover:bg-accent/10 disabled:opacity-50 shrink-0"
-            >{{ aiStore.aiModelsLoading ? i18n.t('admin_ai_models_fetching') : i18n.t('admin_ai_models_fetch') }}</button>
+              class="text-[11px] text-accent hover:opacity-70 shrink-0"
+              @click.stop="aiStore.duplicateAIProfile(profile.id)"
+            >{{ i18n.t('admin_ai_profile_duplicate') }}</button>
+            <button
+              type="button"
+              class="text-[11px] text-red-400 hover:text-red-600 shrink-0"
+              @click.stop="aiStore.removeAIProfile(profile.id)"
+            >{{ i18n.t('admin_ai_profile_delete') }}</button>
           </div>
-        </label>
-      </div>
-
-      <p v-if="aiStore.aiModelsError" class="text-xs text-amber-600 dark:text-amber-400 mb-2 break-words">{{ aiStore.aiModelsError }}</p>
-      <div v-if="aiStore.chatModelOptions.length" class="mb-3">
-        <span class="block text-[11px] text-muted dark:text-gray-400 mb-1">
-          {{ i18n.t('admin_ai_models_available', { n: aiStore.chatModelOptions.length }) }}
-        </span>
-        <div class="flex flex-wrap gap-1.5">
-          <button
-            v-for="model in aiStore.chatModelOptions"
-            :key="model"
-            type="button"
-            @click="aiStore.applyModel('model', model)"
-            class="text-[11px] px-2 py-0.5 rounded border transition-colors"
-            :class="aiStore.aiForm.model === model
-              ? 'border-accent text-accent bg-accent/10'
-              : 'border-border dark:border-gray-700 text-muted dark:text-gray-400 hover:text-accent'"
-          >{{ model }}</button>
         </div>
       </div>
 
-      <div class="mb-3">
-        <label class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_base_url') }}</label>
-        <input v-model="aiStore.aiForm.base_url" :placeholder="aiStore.aiConfig.effective_base_url" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-        <span class="block text-[11px] text-muted mt-1">{{ i18n.t('admin_ai_base_url_hint') }}</span>
-      </div>
+      <template v-if="aiStore.aiActiveProfile">
+        <div class="mb-3">
+          <label class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_profile_name') }}</label>
+          <input
+            v-model="aiStore.aiActiveProfile.name"
+            :placeholder="i18n.t('admin_ai_profile_placeholder')"
+            class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
+          />
+        </div>
 
-      <div class="mb-3">
-        <label class="block text-xs text-muted dark:text-gray-400 mb-1">
-          {{ i18n.t('admin_ai_api_key') }}
-          <span v-if="aiStore.aiConfig.api_key_hint" class="text-green-600 dark:text-green-400">
-            {{ i18n.t('admin_ai_key_saved', { hint: aiStore.aiConfig.api_key_hint }) }}
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+          <label class="block">
+            <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_provider') }}</span>
+            <select
+              v-model="aiStore.aiActiveProfile.provider"
+              @change="aiStore.applyProviderPreset(aiStore.aiActiveProfile.provider)"
+              class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
+            >
+              <option v-for="p in aiStore.aiConfig.providers" :key="p.value" :value="p.value">{{ p.label }}</option>
+            </select>
+          </label>
+          <label class="block">
+            <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_model') }}</span>
+            <div class="flex gap-2">
+              <input v-model="aiStore.aiActiveProfile.model" class="flex-1 min-w-0 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+              <button
+                type="button"
+                @click="aiStore.loadAIModels"
+                :disabled="aiStore.aiModelsLoading"
+                class="px-2 py-2 rounded border border-border dark:border-gray-700 text-xs hover:bg-accent/10 disabled:opacity-50 shrink-0"
+              >{{ aiStore.aiModelsLoading ? i18n.t('admin_ai_models_fetching') : i18n.t('admin_ai_models_fetch') }}</button>
+            </div>
+          </label>
+        </div>
+
+        <div v-if="aiStore.chatModelOptions.length" class="mb-3">
+          <span class="block text-[11px] text-muted dark:text-gray-400 mb-1">
+            {{ i18n.t('admin_ai_models_available', { n: aiStore.chatModelOptions.length }) }}
           </span>
-        </label>
-        <input
-          v-model="aiStore.aiApiKeyInput"
-          type="password"
-          autocomplete="new-password"
-          :placeholder="aiStore.aiConfig.api_key_set ? i18n.t('admin_ai_key_keep') : 'sk-...'"
-          class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
-        />
-        <span class="block text-[11px] text-muted mt-1">{{ i18n.t('admin_ai_key_hint') }}</span>
-      </div>
+          <div class="flex flex-wrap gap-1.5">
+            <button
+              v-for="model in aiStore.chatModelOptions"
+              :key="model"
+              type="button"
+              @click="aiStore.applyModel('model', model)"
+              class="text-[11px] px-2 py-0.5 rounded border transition-colors"
+              :class="aiStore.aiActiveProfile.model === model
+                ? 'border-accent text-accent bg-accent/10'
+                : 'border-border dark:border-gray-700 text-muted dark:text-gray-400 hover:text-accent'"
+            >{{ model }}</button>
+          </div>
+        </div>
+
+        <div class="mb-3">
+          <label class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_base_url') }}</label>
+          <input v-model="aiStore.aiActiveProfile.base_url" :placeholder="aiStore.aiActiveProfile.effective_base_url" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+          <span class="block text-[11px] text-muted mt-1">{{ i18n.t('admin_ai_base_url_hint') }}</span>
+        </div>
+
+        <div class="mb-3">
+          <label class="block text-xs text-muted dark:text-gray-400 mb-1">
+            {{ i18n.t('admin_ai_api_key') }}
+            <span v-if="aiStore.aiActiveProfile.api_key_set" class="text-green-600 dark:text-green-400">
+              {{ i18n.t('admin_ai_key_saved', { hint: aiStore.aiActiveProfile.api_key_hint }) }}
+            </span>
+          </label>
+          <div class="flex gap-2">
+            <input
+              v-model="aiStore.aiApiKeyInput"
+              type="password"
+              autocomplete="new-password"
+              :placeholder="aiStore.aiActiveProfile.api_key_set ? i18n.t('admin_ai_key_keep') : 'sk-...'"
+              class="flex-1 min-w-0 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800"
+            />
+            <button
+              v-if="aiStore.aiActiveProfile.api_key_set"
+              type="button"
+              @click="aiStore.clearAIProfileKey(aiStore.aiActiveProfile.id)"
+              class="px-2 py-2 rounded border border-border dark:border-gray-700 text-xs hover:bg-accent/10 shrink-0"
+            >{{ i18n.t('admin_ai_profile_clear_key') }}</button>
+          </div>
+          <span class="block text-[11px] text-muted mt-1">{{ i18n.t('admin_ai_key_hint') }}</span>
+        </div>
+      </template>
+
+      <p v-if="aiStore.aiModelsError" class="text-xs text-amber-600 dark:text-amber-400 mb-2 break-words">{{ aiStore.aiModelsError }}</p>
 
       <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3">
         <label class="block">

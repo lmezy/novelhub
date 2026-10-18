@@ -301,6 +301,19 @@ async def admin_update_proxy(
 # ---------------------------------------------------------------------------
 
 
+class AIProviderProfileUpdate(BaseModel):
+    """One saved model provider on the admin AI page."""
+
+    id: str | None = None
+    name: str | None = None
+    provider: str | None = None
+    base_url: str | None = None
+    model: str | None = None
+    #: ``********`` keeps the stored key of the same profile id, an empty
+    #: string clears it, anything else replaces it.
+    api_key: str | None = None
+
+
 class AIConfigUpdate(BaseModel):
     enabled: bool | None = None
     provider: str | None = None
@@ -323,6 +336,9 @@ class AIConfigUpdate(BaseModel):
     #: sends but this model does not declare is silently never persisted -- the
     #: toggle moved on screen and came back on after a reload.
     auto_diagnose: bool | None = None
+    #: Saved provider list (replaces the whole list) and which entry is in use.
+    profiles: list[AIProviderProfileUpdate] | None = None
+    active_profile_id: str | None = None
 
 
 def _config_payload(payload: BaseModel) -> dict:

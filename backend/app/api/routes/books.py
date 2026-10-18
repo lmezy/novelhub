@@ -965,9 +965,23 @@ async def download_epub(book_id: str, user: User = Depends(get_current_user), db
         headers={"Content-Disposition": f'attachment; filename="{safe_name}.epub"'},
     )
 @router.post("/{book_id}/sync", dependencies=[Depends(require_admin)])
-async def resync_book(book_id: str, db: AsyncSession = Depends(get_db)):
+async def resync_book(
+    book_id: str,
+    refetch_content: bool = False,
+    db: AsyncSession = Depends(get_db),
+):
+    """Re-sync one book.
+
+    ``refetch_content=true`` drops the stored chapters first, so the whole book
+    is downloaded again -- the repair for text that was saved wrong but looks
+    fine (content written by an older build, or by another book that shared the
+    same storage directory before the per-book directory fix).
+    """
     try:
-        return await SyncService(db).resync_book(book_id)
+        return await SyncService(db).resync_book(
+            book_id,
+            refetch_content=refetch_content,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

@@ -1515,6 +1515,61 @@ async def test_reconcile_chapter_ids_drops_anti_bot_junk_chapters():
 
 
 @pytest.mark.asyncio
+async def test_reconcile_chapter_ids_refetch_content_drops_healthy_chapters():
+    """An explicit repair re-downloads chapters that look perfectly healthy.
+
+    Stored text can be wrong in ways no check can see from the file alone --
+    written by an older build from a page that was not the chapter, say -- so
+    ``refetch_content`` has to drop every chapter of the remote TOC, not only
+    the ones that fail a health check.
+    """
+    healthy = Chapter(
+        id="c1",
+        book_id="book-1",
+        chapter_number=1,
+        source_chapter_id="https://example.com/book/1/a.html",
+        title="第一章",
+        content_path="/real/000001.md",
+    )
+    remote_chapters = [
+        RemoteChapter(
+            source_chapter_id="https://example.com/book/1/a.html",
+            title="第一章",
+            url="https://example.com/book/1/a.html",
+            chapter_number=1,
+        ),
+    ]
+
+    def _service() -> tuple[SyncService, AsyncMock]:
+        db = AsyncMock()
+        db.scalars = AsyncMock(
+            return_value=SimpleNamespace(all=lambda: [healthy])
+        )
+        db.flush = AsyncMock()
+        db.delete = AsyncMock()
+        service = SyncService(db)
+        service.storage = MagicMock()
+        service.storage.read_chapter.return_value = (
+            "#第一章\n\n这是一段足够长的真实正文内容，用于确认章节不会被误删。"
+        )
+        return service, db
+
+    service, db = _service()
+    kept = await service._reconcile_chapter_ids("book-1", remote_chapters)
+    assert kept == {"https://example.com/book/1/a.html"}
+    assert db.delete.await_count == 0
+
+    service, db = _service()
+    dropped = await service._reconcile_chapter_ids(
+        "book-1",
+        remote_chapters,
+        refetch_content=True,
+    )
+    assert dropped == set()
+    assert db.delete.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_reconcile_chapter_ids_detaches_references_before_deleting():
     """A stale chapter cannot be deleted while a reader points at it.
 

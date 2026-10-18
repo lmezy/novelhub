@@ -14,9 +14,11 @@ plaintext credential.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from typing import Any, Mapping
+from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -46,6 +48,12 @@ AI_EMBEDDING_BASE_URL_KEY = "ai_embedding_base_url"
 AI_EMBEDDING_API_KEY_KEY = "ai_embedding_api_key"
 AI_EMBEDDING_MODEL_KEY = "ai_embedding_model"
 AI_AUTO_DIAGNOSE_KEY = "ai_auto_diagnose"
+#: The saved provider list (JSON) and which entry is in use.  The single set of
+#: ``ai_provider`` / ``ai_base_url`` / ``ai_model`` / ``ai_api_key`` keys above
+#: stays authoritative only while no provider list is stored, so every existing
+#: install (and the environment-variable fallbacks) keeps working unchanged.
+AI_PROFILES_KEY = "ai_providers"
+AI_ACTIVE_PROFILE_KEY = "ai_active_profile"
 
 ALL_KEYS = (
     AI_ENABLED_KEY,
@@ -66,7 +74,17 @@ ALL_KEYS = (
     AI_EMBEDDING_API_KEY_KEY,
     AI_EMBEDDING_MODEL_KEY,
     AI_AUTO_DIAGNOSE_KEY,
+    AI_PROFILES_KEY,
+    AI_ACTIVE_PROFILE_KEY,
 )
+
+#: Upper bound for the saved provider list: a runaway client must not be able to
+#: grow one ``app_settings`` row forever.
+MAX_PROFILES = 20
+
+#: Keys that survive from a submitted provider entry into the stored JSON, so a
+#: client cannot smuggle arbitrary data into the row.
+PROFILE_FIELDS = ("id", "name", "provider", "base_url", "model", "api_key")
 
 #: ``AIConfig`` field name -> stored setting key.  Callers (the admin route, the
 #: UI) speak in field names, storage speaks in ``ai_*`` keys.
@@ -89,6 +107,8 @@ FIELD_TO_KEY = {
     "embedding_api_key": AI_EMBEDDING_API_KEY_KEY,
     "embedding_model": AI_EMBEDDING_MODEL_KEY,
     "auto_diagnose": AI_AUTO_DIAGNOSE_KEY,
+    "profiles": AI_PROFILES_KEY,
+    "active_profile_id": AI_ACTIVE_PROFILE_KEY,
 }
 
 # -- provider presets --------------------------------------------------------
@@ -286,6 +306,135 @@ def decrypt_secret(value: str) -> str:
 
 
 @dataclass(frozen=True)
+class AIProviderProfile:
+    """One saved model provider (vendor + endpoint + key + model).
+
+    The admin UI keeps a list of these so switching between vendors -- the
+    DeepSeek key, the local Ollama, a proxy endpoint -- does not mean retyping
+    the key and the model every time.  ``api_key`` is plaintext in memory and
+    encrypted at rest, exactly like the single-provider key it replaces; the API
+    only ever returns whether a key is set plus a masked hint.
+    """
+
+    id: str
+    name: str = ""
+    provider: str = DEFAULT_PROVIDER
+    base_url: str = ""
+    model: str = ""
+    api_key: str = ""
+
+    @property
+    def provider_label(self) -> str:
+        return str(_preset(self.provider).get("label") or self.provider)
+
+    @property
+    def label(self) -> str:
+        """What the UI lists: the admin's name, else the vendor's name."""
+        return self.name.strip() or self.provider_label
+
+    @property
+    def effective_base_url(self) -> str:
+        return (self.base_url or str(_preset(self.provider).get("base_url") or "")).rstrip("/")
+
+    @property
+    def effective_model(self) -> str:
+        return self.model or str(_preset(self.provider).get("model") or "")
+
+    @property
+    def needs_key(self) -> bool:
+        return bool(_preset(self.provider).get("needs_key", True))
+
+    @property
+    def configured(self) -> bool:
+        if not self.effective_base_url or not self.effective_model:
+            return False
+        return bool(self.api_key) or not self.needs_key
+
+    def public_dict(self, *, active: bool = False) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "label": self.label,
+            "provider": self.provider,
+            "provider_label": self.provider_label,
+            "base_url": self.base_url,
+            "effective_base_url": self.effective_base_url,
+            "model": self.model,
+            "effective_model": self.effective_model,
+            "api_key_set": bool(self.api_key),
+            "api_key_hint": _key_hint(self.api_key),
+            "configured": self.configured,
+            "active": active,
+        }
+
+
+def parse_profiles(raw: Any) -> list[AIProviderProfile]:
+    """Read the stored provider list, tolerant of anything unusable.
+
+    A row written by a future version, a truncated JSON blob or a hand-edited
+    value must not take the AI settings page down: entries that do not parse are
+    skipped, and duplicate ids keep the first occurrence.
+    """
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            raw = json.loads(text)
+        except (ValueError, TypeError):
+            logger.warning("Stored AI provider list is not valid JSON; ignoring it.")
+            return []
+    if not isinstance(raw, list):
+        return []
+
+    profiles: list[AIProviderProfile] = []
+    seen: set[str] = set()
+    for entry in raw[:MAX_PROFILES]:
+        if not isinstance(entry, dict):
+            continue
+        profile = profile_from_entry(entry)
+        if profile is None or profile.id in seen:
+            continue
+        seen.add(profile.id)
+        profiles.append(profile)
+    return profiles
+
+
+def profile_from_entry(entry: Mapping[str, Any]) -> AIProviderProfile | None:
+    """Build one profile from a stored/submitted entry, or ``None`` if unusable."""
+    profile_id = str(entry.get("id") or "").strip()
+    if not profile_id:
+        return None
+    api_key = str(entry.get("api_key") or "")
+    return AIProviderProfile(
+        id=profile_id,
+        name=str(entry.get("name") or "").strip(),
+        provider=normalize_provider(entry.get("provider")),
+        base_url=str(entry.get("base_url") or "").strip(),
+        model=str(entry.get("model") or "").strip(),
+        api_key=decrypt_secret(api_key) if api_key else "",
+    )
+
+
+def serialize_profiles(profiles: "list[AIProviderProfile]") -> str:
+    """JSON for storage: keys encrypted, nothing else added."""
+    return json.dumps(
+        [
+            {
+                "id": profile.id,
+                "name": profile.name,
+                "provider": profile.provider,
+                "base_url": profile.base_url,
+                "model": profile.model,
+                "api_key": encrypt_secret(profile.api_key),
+            }
+            for profile in profiles
+        ],
+        ensure_ascii=False,
+    )
+
+
+@dataclass(frozen=True)
 class AIConfig:
     """Resolved AI configuration (chat + embeddings)."""
 
@@ -310,8 +459,21 @@ class AIConfig:
     #: The answer is advice only -- nothing is ever applied without an admin
     #: approving the proposal it may produce.
     auto_diagnose: bool = True
+    #: Saved provider list and the entry in use.  Empty means "no list saved":
+    #: the single-provider fields above (and the environment) stay authoritative.
+    profiles: tuple[AIProviderProfile, ...] = ()
+    active_profile_id: str = ""
 
     # -- derived ------------------------------------------------------------
+
+    @property
+    def active_profile(self) -> AIProviderProfile | None:
+        if not self.profiles:
+            return None
+        for profile in self.profiles:
+            if profile.id == self.active_profile_id:
+                return profile
+        return self.profiles[0]
 
     @property
     def kind(self) -> str:
@@ -404,6 +566,15 @@ class AIConfig:
             "embedding_api_key_set": bool(self.embedding_api_key),
             "embeddings_supported": self.embeddings_supported,
             "auto_diagnose": self.auto_diagnose,
+            "profiles": [
+                profile.public_dict(active=profile.id == self.active_profile_id)
+                for profile in self.profiles
+            ],
+            "active_profile_id": self.active_profile_id,
+            #: "profiles" once a provider list is saved, otherwise the single
+            #: set of keys above is what the AI service actually uses.  The UI
+            #: says so instead of showing a list that has no effect.
+            "profile_source": "profiles" if self.profiles else "single",
             "providers": [
                 {
                     "value": name,
@@ -449,15 +620,35 @@ def resolve_ai_config(
         value = env.get(env_name, "")
         return str(value).strip() if value else default
 
-    provider = normalize_provider(pick(AI_PROVIDER_KEY, "AI_PROVIDER", DEFAULT_PROVIDER))
-    preset = _preset(provider)
+    # A saved provider list owns the vendor fields; the single-provider keys are
+    # the fallback (existing installs, environment defaults) and the target of
+    # an update that does not mention the list at all.
+    profiles = tuple(parse_profiles(stored.get(AI_PROFILES_KEY)))
+    requested_active = str(stored.get(AI_ACTIVE_PROFILE_KEY) or "").strip()
+    active = None
+    if profiles:
+        active = next(
+            (profile for profile in profiles if profile.id == requested_active),
+            profiles[0],
+        )
+    active_profile_id = active.id if active is not None else ""
 
-    api_key = pick(AI_API_KEY_KEY, "AI_API_KEY")
-    if api_key:
-        api_key = decrypt_secret(api_key)
+    if active is not None:
+        provider = normalize_provider(active.provider)
+        preset = _preset(provider)
+        api_key = active.api_key
+        base_url = active.base_url or str(preset.get("base_url") or "")
+        model = active.model or str(preset.get("model") or "")
+    else:
+        provider = normalize_provider(pick(AI_PROVIDER_KEY, "AI_PROVIDER", DEFAULT_PROVIDER))
+        preset = _preset(provider)
 
-    base_url = pick(AI_BASE_URL_KEY, "AI_BASE_URL", str(preset.get("base_url") or ""))
-    model = pick(AI_MODEL_KEY, "AI_MODEL", str(preset.get("model") or ""))
+        api_key = pick(AI_API_KEY_KEY, "AI_API_KEY")
+        if api_key:
+            api_key = decrypt_secret(api_key)
+
+        base_url = pick(AI_BASE_URL_KEY, "AI_BASE_URL", str(preset.get("base_url") or ""))
+        model = pick(AI_MODEL_KEY, "AI_MODEL", str(preset.get("model") or ""))
 
     embedding_provider_raw = pick(AI_EMBEDDING_PROVIDER_KEY, "AI_EMBEDDING_PROVIDER")
     embedding_provider = (
@@ -494,6 +685,8 @@ def resolve_ai_config(
         embedding_api_key=embedding_api_key,
         embedding_model=pick(AI_EMBEDDING_MODEL_KEY, "AI_EMBEDDING_MODEL"),
         auto_diagnose=_truthy(pick(AI_AUTO_DIAGNOSE_KEY, "AI_AUTO_DIAGNOSE"), True),
+        profiles=profiles,
+        active_profile_id=active_profile_id,
     )
 
 
@@ -528,9 +721,60 @@ async def set_ai_config(db: AsyncSession, values: Mapping[str, Any]) -> AIConfig
     Accepts either ``AIConfig`` field names (``api_key``) or storage keys
     (``ai_api_key``); ``None`` means "not sent" and an empty string clears the
     field so it falls back to the provider preset / environment default.
+
+    ``profiles`` (the saved provider list) and ``active_profile_id`` are the one
+    exception to the field-by-field rule: sending ``profiles`` replaces the
+    whole list, because a half-merged list would silently drop a vendor's key.
+
+    While a list exists, the vendor fields (``provider`` / ``base_url`` /
+    ``model`` / ``api_key``) update the **active profile** instead of the
+    single-provider keys.  A cached older frontend therefore keeps working --
+    it still edits the provider in use, it just does not know the other entries
+    exist.
     """
     existing = await db.scalars(select(AppSetting).where(AppSetting.key.in_(ALL_KEYS)))
     rows = {row.key: row for row in existing}
+    stored_profiles = parse_profiles(
+        rows[AI_PROFILES_KEY].value if AI_PROFILES_KEY in rows else ""
+    )
+    active_id = str(
+        rows[AI_ACTIVE_PROFILE_KEY].value if AI_ACTIVE_PROFILE_KEY in rows else ""
+    ).strip()
+
+    submitted_profiles = values.get("profiles")
+    if submitted_profiles is not None:
+        legacy_api_key = (
+            decrypt_secret(rows[AI_API_KEY_KEY].value)
+            if AI_API_KEY_KEY in rows
+            else ""
+        )
+        profiles = _merge_profiles(
+            stored_profiles,
+            submitted_profiles,
+            legacy_api_key=legacy_api_key,
+        )
+        requested_active = values.get("active_profile_id")
+        if requested_active is None:
+            requested_active = active_id
+        requested_active = str(requested_active or "").strip()
+        if profiles and requested_active not in {p.id for p in profiles}:
+            requested_active = profiles[0].id
+        values = {
+            **values,
+            "profiles": serialize_profiles(profiles),
+            "active_profile_id": requested_active if profiles else "",
+        }
+        # The list is the source of truth from here on, so the vendor fields in
+        # the same payload are already inside the merged list.
+        for field in ("provider", "base_url", "model", "api_key"):
+            values.pop(field, None)
+    elif stored_profiles:
+        if values.get("active_profile_id") is not None:
+            requested_active = str(values["active_profile_id"]).strip()
+            if requested_active not in {p.id for p in stored_profiles}:
+                requested_active = active_id
+            values = {**values, "active_profile_id": requested_active}
+        values = _merge_active_profile_values(values, stored_profiles, active_id)
 
     prepared: dict[str, str] = {}
     for field, value in values.items():
@@ -561,3 +805,101 @@ async def set_ai_config(db: AsyncSession, values: Mapping[str, Any]) -> AIConfig
     await db.commit()
 
     return await get_ai_config(db)
+
+
+def _merge_profiles(
+    stored: list[AIProviderProfile],
+    submitted: Any,
+    *,
+    legacy_api_key: str = "",
+) -> list[AIProviderProfile]:
+    """Apply a submitted provider list over the stored one.
+
+    ``api_key`` follows the same convention as the single-provider field: the
+    mask or an absent value keeps the stored key of the same provider id, an
+    empty string clears it, anything else is the new key.
+
+    ``legacy_api_key`` is the single-provider key this list replaces.  Saving
+    the first list is how an existing install turns its one configuration into
+    a provider entry -- without handing that key to the first entry, the key
+    would silently disappear the moment the admin pressed save.
+    """
+    if not isinstance(submitted, list):
+        return stored
+    by_id = {profile.id: profile for profile in stored}
+    merged: list[AIProviderProfile] = []
+    seen: set[str] = set()
+    for raw in submitted[:MAX_PROFILES]:
+        if not isinstance(raw, dict):
+            continue
+        entry = {key: raw[key] for key in PROFILE_FIELDS if key in raw}
+        profile_id = str(entry.get("id") or "").strip() or uuid4().hex
+        entry["id"] = profile_id
+        if profile_id in seen:
+            continue
+        seen.add(profile_id)
+        previous = by_id.get(profile_id)
+        api_key = entry.get("api_key")
+        if api_key is None or str(api_key) == MASKED_KEY:
+            if previous is not None:
+                entry["api_key"] = previous.api_key
+            elif not stored and not merged and legacy_api_key:
+                entry["api_key"] = legacy_api_key
+            else:
+                entry["api_key"] = ""
+        else:
+            entry["api_key"] = str(api_key)
+        profile = profile_from_entry(entry)
+        if profile is not None:
+            merged.append(profile)
+    return merged
+
+
+def _merge_active_profile_values(
+    values: Mapping[str, Any],
+    stored: list[AIProviderProfile],
+    active_id: str,
+) -> dict[str, Any]:
+    """Fold single-provider fields into the active provider entry.
+
+    This is the compatibility path for a client that does not send a provider
+    list (an older cached bundle, a script): without it, its edits would land in
+    ``ai_provider``/``ai_api_key`` and be ignored, because the list wins.
+    """
+    fields = ("provider", "base_url", "model", "api_key")
+    if not any(values.get(field) is not None for field in fields):
+        return dict(values)
+
+    profiles = list(stored)
+    index = next(
+        (i for i, profile in enumerate(profiles) if profile.id == active_id),
+        0,
+    )
+    current = profiles[index]
+    updated = {
+        "id": current.id,
+        "name": current.name,
+        "provider": current.provider,
+        "base_url": current.base_url,
+        "model": current.model,
+        "api_key": current.api_key,
+    }
+    for field in ("provider", "base_url", "model"):
+        value = values.get(field)
+        if value is not None:
+            updated[field] = str(value).strip()
+    api_key = values.get("api_key")
+    if api_key is not None and str(api_key) != MASKED_KEY:
+        updated["api_key"] = str(api_key)
+
+    profile = profile_from_entry(updated)
+    if profile is None:
+        return dict(values)
+    profiles[index] = profile
+
+    payload = dict(values)
+    for field in fields:
+        payload.pop(field, None)
+    payload["profiles"] = serialize_profiles(profiles)
+    payload["active_profile_id"] = profile.id
+    return payload

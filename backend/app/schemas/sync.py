@@ -11,6 +11,9 @@ class SyncResult(BaseModel):
     created_chapters: int
     skipped_chapters: int
     failed_chapters: list[dict] = []
+    #: Chapters whose stored text belonged to another book (books used to share
+    #: one storage directory per author+title) and were downloaded again.
+    repaired_chapters: int = 0
 
 
 class BookshelfSyncRequest(BaseModel):

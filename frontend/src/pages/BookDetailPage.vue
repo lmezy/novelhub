@@ -348,18 +348,52 @@ async function resyncBook() {
   syncing.value = true
   try {
     const result = await api.post<any>('/books/' + book.value.id + '/sync')
-    const failed = result.failed_chapters?.length || 0
-    const failedSuffix = failed ? i18n.t('book_failed_suffix', { n: failed }) : ''
-    alert(i18n.t('book_sync_result', {
-      created: result.created_chapters,
-      skipped: result.skipped_chapters,
-      failed: failedSuffix,
-    }))
-    chapters.value = await store.fetchChapters(book.value.id)
+    reportSyncResult(result)
   } catch (e) {
     alert(e instanceof Error ? e.message : i18n.t('book_sync_failed'))
   } finally {
     syncing.value = false
+  }
+}
+
+/**
+ * Download the whole book again, replacing the stored text.
+ *
+ * Incremental sync skips chapters that already exist, so text that was stored
+ * wrong (fetched from an ad/substitution page, or written by another book that
+ * shared the same storage folder) would never be repaired on its own.
+ */
+async function refetchBookContent() {
+  if (!book.value) return
+  if (!window.confirm(i18n.t('book_refetch_confirm'))) return
+  syncing.value = true
+  try {
+    const result = await api.post<any>(
+      '/books/' + book.value.id + '/sync?refetch_content=true',
+    )
+    reportSyncResult(result)
+  } catch (e) {
+    alert(e instanceof Error ? e.message : i18n.t('book_sync_failed'))
+  } finally {
+    syncing.value = false
+  }
+}
+
+function reportSyncResult(result: any) {
+  const failed = result.failed_chapters?.length || 0
+  const failedSuffix = failed ? i18n.t('book_failed_suffix', { n: failed }) : ''
+  const repaired = result.repaired_chapters || 0
+  // Text another book had overwritten is repaired silently otherwise.
+  const repairedSuffix = repaired
+    ? i18n.t('book_sync_repaired_suffix', { n: repaired })
+    : ''
+  alert(i18n.t('book_sync_result', {
+    created: result.created_chapters,
+    skipped: result.skipped_chapters,
+    failed: failedSuffix,
+  }) + repairedSuffix)
+  if (book.value) {
+    store.fetchChapters(book.value.id).then((rows) => (chapters.value = rows))
   }
 }
 
@@ -570,6 +604,13 @@ onMounted(async () => {
               :disabled="syncing"
               class="px-3 py-1 text-xs border border-border dark:border-gray-700 rounded hover:bg-accent/5 transition-colors disabled:opacity-50"
             >{{ syncing ? i18n.t('book_syncing') : i18n.t('book_resync') }}</button>
+            <button
+              v-if="auth.isAdmin && book.source_id"
+              @click="refetchBookContent"
+              :disabled="syncing"
+              :title="i18n.t('book_refetch_hint')"
+              class="px-3 py-1 text-xs border border-border dark:border-gray-700 rounded hover:bg-accent/5 transition-colors disabled:opacity-50"
+            >{{ i18n.t('book_refetch') }}</button>
           </div>
         </header>
 

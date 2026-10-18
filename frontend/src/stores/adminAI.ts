@@ -8,6 +8,39 @@ import { useI18nStore } from "./i18n"
 // ---------------------------------------------------------------------------
 const EMBEDDING_HINT_RE = /embed|bge|gte|m3|rerank/i
 
+// ---------------------------------------------------------------------------
+// Model providers
+//
+// The backend keeps a list of saved providers (endpoint + key + model) and one
+// of them is in use.  The form edits a working copy of that list, so switching
+// vendors is a click instead of retyping a key.  A key is never echoed back: an
+// entry only reports whether it has one, plus a masked hint.
+// ---------------------------------------------------------------------------
+export interface AIProviderDraft {
+  id: string
+  name: string
+  provider: string
+  base_url: string
+  model: string
+  provider_label?: string
+  effective_base_url?: string
+  effective_model?: string
+  api_key_set?: boolean
+  api_key_hint: string
+  configured?: boolean
+  //: Typed into the form but not saved yet; sent on save, then cleared.
+  api_key_input?: string
+  //: The admin asked to drop the stored key of this entry.
+  api_key_clear?: boolean
+  //: A local draft the server has not stored yet.
+  draft?: boolean
+}
+
+function newProfileId(): string {
+  const random = globalThis.crypto?.randomUUID?.()
+  return random ? `p_${random}` : `p_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
+}
+
 export const useAdminAIStore = defineStore("adminAI", () => {
   const i18n = useI18nStore()
 
@@ -24,6 +57,18 @@ export const useAdminAIStore = defineStore("adminAI", () => {
   const aiModels = ref<string[]>([])
   const aiModelsLoading = ref(false)
   const aiModelsError = ref("")
+  const aiProfiles = ref<AIProviderDraft[]>([])
+  const aiActiveProfileId = ref("")
+  //: "profiles" once the server has a saved list, "single" while only the
+  //: single-provider keys exist.
+  const aiProfileSource = ref("single")
+
+  const aiActiveProfile = computed(
+    () =>
+      aiProfiles.value.find((profile) => profile.id === aiActiveProfileId.value) ||
+      aiProfiles.value[0] ||
+      null,
+  )
 
   const chatModelOptions = computed(() =>
     aiModels.value.filter((m) => !EMBEDDING_HINT_RE.test(m)),
@@ -40,6 +85,24 @@ export const useAdminAIStore = defineStore("adminAI", () => {
   const aiIndexedBooks = ref<any[]>([])
   const aiIndexedLoading = ref(false)
 
+  function profileDraftFrom(value: any): AIProviderDraft {
+    return {
+      id: String(value?.id || newProfileId()),
+      name: String(value?.name || ""),
+      provider: String(value?.provider || "openai"),
+      base_url: String(value?.base_url || ""),
+      model: String(value?.model || ""),
+      provider_label: value?.provider_label,
+      effective_base_url: String(value?.effective_base_url || ""),
+      effective_model: String(value?.effective_model || ""),
+      api_key_set: !!value?.api_key_set,
+      api_key_hint: String(value?.api_key_hint || ""),
+      configured: value?.configured,
+      api_key_input: "",
+      api_key_clear: false,
+    }
+  }
+
   async function loadAIConfig() {
     aiLoading.value = true
     aiError.value = ""
@@ -48,9 +111,6 @@ export const useAdminAIStore = defineStore("adminAI", () => {
       aiConfig.value = res
       aiForm.value = {
         enabled: res.enabled,
-        provider: res.provider,
-        base_url: res.base_url || "",
-        model: res.model || "",
         temperature: res.temperature,
         max_tokens: res.max_tokens,
         timeout: res.timeout,
@@ -64,6 +124,33 @@ export const useAdminAIStore = defineStore("adminAI", () => {
         embedding_model: res.embedding_model || "",
         auto_diagnose: res.auto_diagnose !== false,
       }
+      aiProfileSource.value = res.profile_source === "profiles" ? "profiles" : "single"
+      const saved = Array.isArray(res.profiles) ? res.profiles : []
+      if (saved.length) {
+        aiProfiles.value = saved.map(profileDraftFrom)
+        aiActiveProfileId.value =
+          saved.find((profile: any) => profile.active || profile.id === res.active_profile_id)?.id ||
+          aiProfiles.value[0].id
+      } else {
+        // No list yet: show the current single configuration as one draft, so
+        // saving turns it into the first provider without retyping anything.
+        aiProfiles.value = [
+          {
+            id: newProfileId(),
+            name: "",
+            provider: res.provider || "openai",
+            base_url: res.base_url || "",
+            model: res.model || "",
+            provider_label: res.provider_label,
+            api_key_set: !!res.api_key_set,
+            api_key_hint: res.api_key_hint || "",
+            configured: res.configured,
+            api_key_input: "",
+            draft: true,
+          },
+        ]
+        aiActiveProfileId.value = aiProfiles.value[0].id
+      }
       aiApiKeyInput.value = ""
       aiEmbeddingKeyInput.value = ""
     } catch (e) {
@@ -73,12 +160,87 @@ export const useAdminAIStore = defineStore("adminAI", () => {
     }
   }
 
+  function addAIProfile() {
+    const draft = profileDraftFrom({
+      provider: aiActiveProfile.value?.provider || "openai",
+    })
+    draft.draft = true
+    aiProfiles.value = [...aiProfiles.value, draft]
+    aiActiveProfileId.value = draft.id
+    aiApiKeyInput.value = ""
+  }
+
+  function duplicateAIProfile(id: string) {
+    const source = aiProfiles.value.find((profile) => profile.id === id)
+    if (!source) return
+    const copy: AIProviderDraft = {
+      ...source,
+      id: newProfileId(),
+      name: source.name ? `${source.name} 副本` : "",
+      api_key_input: "",
+      api_key_clear: false,
+      draft: true,
+    }
+    aiProfiles.value = [...aiProfiles.value, copy]
+    aiActiveProfileId.value = copy.id
+    aiApiKeyInput.value = ""
+  }
+
+  function removeAIProfile(id: string) {
+    const index = aiProfiles.value.findIndex((profile) => profile.id === id)
+    if (index < 0) return
+    const draft = aiProfiles.value[index]
+    const label = draft.name || draft.provider_label || draft.provider
+    if (!window.confirm(i18n.t('admin_ai_profile_delete_confirm', { name: label }))) return
+    const next = aiProfiles.value.filter((profile) => profile.id !== id)
+    aiProfiles.value = next
+    if (aiActiveProfileId.value === id) {
+      aiActiveProfileId.value = next[0]?.id || ""
+      aiApiKeyInput.value = ""
+    }
+  }
+
+  function selectAIProfile(id: string) {
+    if (aiActiveProfileId.value === id) return
+    aiActiveProfileId.value = id
+    // A key typed for the previous entry must not follow us to this one.
+    aiApiKeyInput.value = ""
+  }
+
+  function clearAIProfileKey(id: string) {
+    const profile = aiProfiles.value.find((item) => item.id === id)
+    if (!profile) return
+    profile.api_key_input = ""
+    profile.api_key_clear = true
+    profile.api_key_set = false
+    profile.api_key_hint = ""
+    if (aiActiveProfileId.value === id) aiApiKeyInput.value = ""
+  }
+
   function applyProviderPreset(name: string) {
+    const profile = aiActiveProfile.value
     const preset = (aiConfig.value?.providers || []).find((p: any) => p.value === name)
-    if (!preset) return
-    aiForm.value.base_url = preset.base_url || ""
-    aiForm.value.model = preset.model || ""
-    aiForm.value.embedding_model = ""
+    if (!profile || !preset) return
+    profile.provider = name
+    profile.base_url = preset.base_url || ""
+    profile.model = preset.model || ""
+  }
+
+  function profilePayload() {
+    return aiProfiles.value.map((profile) => {
+      const entry: Record<string, any> = {
+        id: profile.id,
+        name: profile.name,
+        provider: profile.provider,
+        base_url: profile.base_url,
+        model: profile.model,
+      }
+      const typed = String(profile.api_key_input || "").trim()
+      if (typed) entry.api_key = typed
+      else if (profile.api_key_clear) entry.api_key = ""
+      // Otherwise the field is omitted and this entry's stored key stays.
+      return entry
+    })
   }
 
   async function saveAIConfig() {
@@ -87,10 +249,21 @@ export const useAdminAIStore = defineStore("adminAI", () => {
     aiSaved.value = false
     try {
       const body: any = { ...aiForm.value }
-      if (aiApiKeyInput.value) body.api_key = aiApiKeyInput.value
+      body.profiles = profilePayload()
+      body.active_profile_id = aiActiveProfileId.value || aiProfiles.value[0]?.id || ""
+      // Every provider key is in the list above; the single-provider field is
+      // only what a profile inherits when it has no key of its own.
       if (aiEmbeddingKeyInput.value) body.embedding_api_key = aiEmbeddingKeyInput.value
       const res = await api.put<any>("/admin/ai", body)
       aiConfig.value = { ...aiConfig.value, ...res }
+      aiProfileSource.value = res.profile_source === "profiles" ? "profiles" : "single"
+      const saved = Array.isArray(res.profiles) ? res.profiles : []
+      if (saved.length) {
+        aiProfiles.value = saved.map(profileDraftFrom)
+        aiActiveProfileId.value =
+          saved.find((profile: any) => profile.active || profile.id === res.active_profile_id)?.id ||
+          aiProfiles.value[0].id
+      }
       aiApiKeyInput.value = ""
       aiEmbeddingKeyInput.value = ""
       aiSaved.value = true
@@ -122,12 +295,14 @@ export const useAdminAIStore = defineStore("adminAI", () => {
     aiModelsLoading.value = true
     aiModelsError.value = ""
     try {
+      const profile = aiActiveProfile.value
       const body: any = {
-        provider: aiForm.value.provider,
-        base_url: aiForm.value.base_url,
+        provider: profile?.provider,
+        base_url: profile?.base_url,
       }
       // Use the key the admin just typed, otherwise the stored one.
-      if (aiApiKeyInput.value) body.api_key = aiApiKeyInput.value
+      const typed = String(aiApiKeyInput.value || "").trim()
+      if (typed) body.api_key = typed
       const res = await api.post<any>("/admin/ai/models", body)
       aiModels.value = res.models || []
       if (!res.ok) {
@@ -137,7 +312,7 @@ export const useAdminAIStore = defineStore("adminAI", () => {
       // Fill an empty field with a model the server just confirmed it accepts,
       // preferring a chat model for the chat field.
       const chat = res.models.find((m: string) => !EMBEDDING_HINT_RE.test(m))
-      if (!aiForm.value.model && chat) aiForm.value.model = chat
+      if (profile && !profile.model && chat) profile.model = chat
     } catch (e) {
       aiModelsError.value = e instanceof Error ? e.message : i18n.t('admin_ai_models_failed')
     } finally {
@@ -146,6 +321,11 @@ export const useAdminAIStore = defineStore("adminAI", () => {
   }
 
   function applyModel(target: "model" | "embedding_model", value: string) {
+    const profile = aiActiveProfile.value
+    if (target === "model" && profile) {
+      profile.model = value
+      return
+    }
     aiForm.value[target] = value
   }
 
@@ -202,6 +382,10 @@ export const useAdminAIStore = defineStore("adminAI", () => {
     aiModelsError,
     chatModelOptions,
     embeddingModelOptions,
+    aiProfiles,
+    aiActiveProfileId,
+    aiActiveProfile,
+    aiProfileSource,
     aiIndexBookId,
     aiIndexBusy,
     aiIndexError,
@@ -209,6 +393,11 @@ export const useAdminAIStore = defineStore("adminAI", () => {
     aiIndexedBooks,
     aiIndexedLoading,
     loadAIConfig,
+    addAIProfile,
+    duplicateAIProfile,
+    removeAIProfile,
+    selectAIProfile,
+    clearAIProfileKey,
     applyProviderPreset,
     saveAIConfig,
     testAIConfig,

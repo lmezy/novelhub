@@ -33,13 +33,44 @@ _config = ProxyConfig(
 
 
 def _config_path() -> Path:
+    """Where the proxy setting is persisted.
+
+    Inside ``STORAGE_PATH`` -- that directory is the one mount every NovelHub
+    container shares, while the parent (``/app``) is the image's own writable
+    layer.  A file there survived until the container was recreated and then
+    vanished silently, which on 2026-10-18 showed up as "alicesw cannot be
+    reached any more" (the crawler has no direct route to it, so without the
+    proxy every request failed) even though the admin page still had the
+    setting on screen before the restart.
+    """
+    from app.core.config import settings
+    return Path(settings.STORAGE_PATH) / "proxy_config.json"
+
+
+def _legacy_config_path() -> Path:
+    """The pre-2026-10-18 location, next to the image's ``/app`` directory.
+
+    Still read (never written) so an install that saved its proxy before the
+    move keeps working without the admin having to re-enter it.
+    """
     from app.core.config import settings
     return Path(settings.STORAGE_PATH).parent / "proxy_config.json"
 
 
 def _read_file_config() -> ProxyConfig | None:
+    for path in (_config_path(), _legacy_config_path()):
+        config = _read_config_file(path)
+        if config is not None:
+            return config
+    return None
+
+
+def _read_config_file(path: Path) -> ProxyConfig | None:
     try:
-        data = json.loads(_config_path().read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    try:
         return ProxyConfig(
             enabled=bool(data.get("enabled", False)),
             https_proxy=str(data.get("https_proxy", "") or ""),

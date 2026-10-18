@@ -16,7 +16,10 @@ PostgreSQL、Storage 抽象、Meilisearch、Celery 定时任务、插件框架�
 
 AI 消费端已补齐（配置在 `app_settings.ai_*`，服务在 `backend/app/services/ai_config.py`、
 `ai_client.py`、`ai.py`、`rag.py`，界面在 **设置 → AI** 与阅读器侧栏），
-使用与排错见 [ai-assistant.md](ai-assistant.md)。
+使用与排错见 [ai-assistant.md](ai-assistant.md)。**模型供应商可以存多条**：
+`app_settings.ai_providers`（JSON 列表，Key 逐条加密）+ `ai_active_profile`，生效的那条决定
+对话用的 provider / base_url / model / api_key；没有这个列表时，原来的单套 `ai_*` 键
+（以及 `AI_*` 环境变量）仍是唯一来源。
 
 ## 2. 架构与模块职责
 
@@ -65,8 +68,15 @@ Scheduler 容器：Celery Beat（定时同步、cookie 健康检查）
    作为可过滤属性，**搜索也按它分开**（`/search/advanced` 的 `kind` 参数）；老索引由 backend
    启动时的 `SearchService.sync_book_kinds()` 自动回填。
 - 正文以 Markdown 落 Storage：`storage/books/{author}/{title}/000001.md` + `metadata.json`。
+  **一本书 = 一个目录**：目录里已有 `metadata.json` 且属于别的书（认 `book_id`，老文件按
+  `source_id` + `source_book_id` 认）时，这本书写 `books/{author}/{title}~{book_id 前 8 位}/`，
+  这样"多书源带同一本书 / 同一书源两本同名同作者的书"不会再互相覆盖正文（见
+  [codex-handoff.md](codex-handoff.md) 第 55 节）。`Chapter.content_path` 存绝对路径，
+  历史文件照常可读，不需要迁移。
 - 更新必须是增量：拉目录 → 按章节 URL/Hash 比对 → 只下载新增 → 更新索引；
-  支持断点恢复与失败重试。
+  支持断点恢复与失败重试。**"已经存过"不等于"内容是对的**：正文由旧版本写坏、或被别的书
+  覆盖过的章节要靠 `_chapter_has_real_content` 判定为陈旧后重抓，或者用
+  `POST /api/books/{id}/sync?refetch_content=true`（书籍详情页「重新抓取正文」）整本重下。
 - 结构变更必须走 Alembic 迁移（backend 容器启动时自动 `alembic upgrade head`）。
   **不要**再引入 `Base.metadata.create_all` 之类的第二条建表路径。
 

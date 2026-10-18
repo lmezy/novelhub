@@ -1,5 +1,6 @@
 """API-level tests for the AI / RAG routes and the admin AI settings."""
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -344,6 +345,52 @@ async def test_admin_update_ai_validates_ranges():
     resp = await call("PUT", "/api/admin/ai", fake_db(), json={"temperature": 5})
 
     assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_admin_ai_route_saves_and_lists_saved_providers():
+    """The provider list has to survive the request model and stay masked.
+
+    ``AIConfigUpdate`` is the only gate between the UI payload and storage: a
+    field it does not declare is dropped without an error (see the
+    ``auto_diagnose`` regression above), so the list is pinned through the
+    route rather than only through the service.
+    """
+    db = fake_db()
+    payload = {
+        "profiles": [
+            {"id": "p1", "name": "DeepSeek 主力", "provider": "deepseek",
+             "model": "deepseek-flash", "api_key": "sk-deepseek"},
+            {"id": "p2", "name": "本地 Ollama", "provider": "ollama",
+             "base_url": "http://192.168.1.5:11434/v1", "model": "qwen2.5:7b",
+             "api_key": ""},
+        ],
+        "active_profile_id": "p2",
+    }
+
+    resp = await call("PUT", "/api/admin/ai", db, json=payload)
+
+    assert resp.status_code == 200
+    stored = {entry.args[0].key: entry.args[0].value for entry in db.add.call_args_list}
+    assert "sk-deepseek" not in stored["ai_providers"]
+    assert stored["ai_active_profile"] == "p2"
+    assert json.loads(stored["ai_providers"])[1]["base_url"] == "http://192.168.1.5:11434/v1"
+
+    # Reading it back lists both entries, marks the active one and never
+    # echoes a key.
+    rows = [
+        SimpleNamespace(key="ai_providers", value=stored["ai_providers"]),
+        SimpleNamespace(key="ai_active_profile", value=stored["ai_active_profile"]),
+    ]
+    resp = await call("GET", "/api/admin/ai", fake_db(rows=rows))
+
+    body = resp.json()
+    assert body["profile_source"] == "profiles"
+    assert [profile["id"] for profile in body["profiles"]] == ["p1", "p2"]
+    assert [profile["active"] for profile in body["profiles"]] == [False, True]
+    assert body["provider"] == "ollama"
+    assert body["effective_base_url"] == "http://192.168.1.5:11434/v1"
+    assert "sk-deepseek" not in resp.text
 
 
 @pytest.mark.asyncio

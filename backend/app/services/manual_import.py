@@ -8,7 +8,7 @@ from app.repositories.tag import TagRepository
 from app.services.book_enrichment import enrich_book_metadata
 from app.services.book_kind import normalize_kind
 from app.services.search import search_service
-from app.services.storage import BookStorage
+from app.services.storage import BookRef, BookStorage
 
 
 class ManualImportService:
@@ -92,10 +92,14 @@ class ManualImportService:
             book_tags.append(classification_tag)
         book_category_names = list(matched) if isinstance(matched, list) else []
 
+        # An imported book owns its directory too: importing a second file with
+        # the same author and title must not overwrite the first one's chapters.
+        import_ref = BookRef(book_id=book.id)
         self.storage.write_metadata(
             author_name,
             title,
             {
+                "book_id": book.id,
                 "source_id": None,
                 "source_book_id": None,
                 "title": title,
@@ -105,6 +109,7 @@ class ManualImportService:
                 "is_r18": is_r18,
                 "tags": tags,
             },
+            ref=import_ref,
         )
         search_service.index_book({
             "id": book.id,
@@ -132,6 +137,7 @@ class ManualImportService:
                 index,
                 chapter_title,
                 content,
+                ref=import_ref,
             )
             chapter_row = Chapter(
                 id=str(uuid4()),

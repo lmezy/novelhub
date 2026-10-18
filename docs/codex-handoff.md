@@ -2212,3 +2212,105 @@ WARNING Configured proxy http://127.0.0.1:27890 request failed for
 
 **验证**：`cd backend && python -m pytest -q` → **1039 passed**。
 
+---
+
+## 56. 「爱丽丝书屋的书正文内容是错的」：同名书共用一个目录 + AI 只存得下一套供应商（2026-10-18）
+
+**现象 A（正文不对）**：从书源抓回来的书打开就发现正文不对。线上实测三本：
+《丝袜高跟良家熟妇沉沦记》第 1-7 章正文是一张广告图 + 图说，
+《妈妈、岳母、媳妇我们过着神仙般的日子》全 8 章是 4 张别的书的封面图，
+《好色人妻》第 1 章正文的 H1 是「亚洲尺码和欧洲尺码专线的区别」。
+
+**根因（两个，都在代码里）**：
+
+1. **章节文件按「作者 / 书名 / 章节号」定位，不唯一**。`BookStorage.book_dir(author, title)` 只有
+   两级，而书名会撞车：线上《好色人妻》有 **4 本**（爱丽丝书屋 / BB成人小说 / 一夜春宵 / 要撸小说，
+   作者都是燃烧一切），四种书的 `chapters.content_path` 全都指向
+   `storage/books/燃烧一切/好色人妻/00000N.md`。谁的同步后跑谁覆盖谁 —— 用 DB 里的 `hash`
+   和磁盘上的 sha256 一比就能看到：000003-000013 是 BB 那本的，000001/000002 又是第三本的，
+   总之**没有一本的正文是自己的**。
+2. **"看起来健康"的坏正文永远不会被重抓**。`_chapter_has_real_content` 只判空、反爬页、
+   裸图片 URL；图片型的垃圾正文（推荐位/广告图）会被当成合法漫画章节留下，
+   而增量同步对已存在的章节直接跳过；`resync_book` 也是增量，没有"整本重下"的口子。
+   同理，被别的书覆盖过的文件，只要不是空，旧逻辑看不出来。
+
+（另外，症状的另一半来自旧版本解析：站点返回替代页时会把推荐位的封面图当正文存下来。
+现在的通用解析优先取正文容器，这一半在当前代码里已经不复现 —— 但它存下去的东西还在库里。）
+
+**改动**：
+
+- `backend/app/services/storage.py`：新增 `BookRef(book_id, source_id, source_book_id)`。
+  `book_dir()/write_chapter()/write_metadata()` 收 `ref`：目录空着、或已属于这本书（认
+  `metadata.json` 的 `book_id`，老文件按 `source_id`+`source_book_id` 认）就用原目录，
+  否则写 `books/<作者>/<书名>~<book_id 前 8 位>/`。**没撞车的书目录不变**，历史
+  `content_path` 是绝对路径，照常能读，不需要迁移。`write_metadata` 现在也写 `book_id`。
+- 新增 `BookStorage.chapter_digest()`：按**文本**（不是字节）重算 sha256 —— 与
+  `write_chapter` 当时算的一致，Windows 的 CRLF 也不会误判。
+- `backend/app/services/sync.py`：`_chapter_file_is_ours()` 用 `Chapter.hash` 比对磁盘内容，
+  对不上就是别的书覆盖过 → `_chapter_has_real_content` 返回 False → 重抓；
+  `sync_book(..., refetch_content=False)` / `resync_book(book_id, refetch_content=False)`
+  新增整本重下（`_reconcile_chapter_ids` 里把所有章节判为陈旧）。
+- `backend/app/api/routes/books.py`：`POST /api/books/{id}/sync?refetch_content=true`。
+  书籍详情页新增「重新抓取正文」，用于修已经存坏的正文。
+- `manual_import.py` 也带上了 ref（导入两本同名书同样会互相覆盖）。
+- 这种"被别的书覆盖"的章节是**静默重抓**的，所以同步结果多了一个 `repaired_chapters`
+  计数，书籍详情页同步后会提示「其中 N 章的正文原本属于同名的另一本书…」。
+
+**现象 B（AI 只能配一套供应商）**：设置 → AI 只有一份 provider / Key / 模型，换家就得重填。
+
+**改动**：`app_settings.ai_providers`（JSON 列表，Key 逐条 `enc:` 加密）+ `ai_active_profile`；
+`ai_config.py` 里 `AIProviderProfile` / `parse_profiles` / `_merge_profiles`，
+`resolve_ai_config` 有列表时以列表为准、没有时仍旧用 `ai_provider` 等单套键（环境变量兜底不变）；
+`PUT /api/admin/ai` 接受 `profiles`（整表替换）+ `active_profile_id`，**带了 profiles 时提交的
+单套字段会合并进生效的那条**（老前端缓存不至于写进被忽略的键）。前端 `adminAI.ts` 持有草稿列表，
+`AiPanel.vue` 加供应商列表（切换 / 复制 / 删除 / 清除 Key），i18n 中英各一套。
+
+**验证**：`cd backend && python -m pytest -q` → **1070 passed**（新增
+`test_storage_book_dirs.py`：真事故的四本《好色人妻》复现、覆盖检测、`refetch_content`、
+`repaired_chapters` 计数；`test_ai_provider_profiles.py`：多供应商读写、掩码保 Key、
+老前端字段合并、升级不丢 Key、Key 不回显；`test_ai_api.py` 走路由再钉一遍 profiles；
+`test_proxy_config_storage.py` 见第 57 节）。前端 `npm run typecheck && npm run build` 通过。
+
+**给线上用（重要）**：这个坑的规模比看到的几本大得多 —— 线上实测
+**1 435 个目录被 3 304 本书共用，涉及 270 208 章**（全库 46 436 本书 / 718 221 章）。
+部署后：
+
+- **已存坏的正文不会自动变好**：撞过车的章节只要 hash 对不上，下次同步（含定时同步）会
+  自动重抓，**量大且会持续一阵子**（每本书按 1.2s 的站点间隔慢慢补，别指望一次同步就完事）；
+- 只想先修手上要看的那几本：用书籍详情页的「重新抓取正文」（`refetch_content=true`），
+  其余交给同步自己慢慢修；
+- 这些书里"由旧版本写坏、但 hash 是对的"（广告/推荐位正文）**不会**被自动判出来，
+  只能靠「重新抓取正文」。遇到就点它。
+
+**在本机复现这类书源问题**：`HTTPS_PROXY=http://127.0.0.1:10808`（本机是 fake-ip DNS，
+插件直连不通；系统代理只对 httpx 的 trust_env 生效，JS 侧的 `java.ajax` 走 curl +
+`DSH_HTTP_PROXY`），并且要 `YUEDU_HTTP_CONNECT_TIMEOUT=30` —— alicesw 建连要 6~8 秒，
+默认 5 秒必然 ConnectTimeout，很容易被误判成"站点挂了"。yckceo.com 在系统代理白名单里，
+抓书源 JSON 反而要 `trust_env=False`。
+
+---
+
+## 57. 「代理配了、浏览器能翻墙，但同步却说访问不到站点」：代理配置写在容器层，重启就没了（2026-10-18）
+
+**现象**：排查第 56 节时实测线上 crawler 容器里 `curl https://www.alicesw.com/...` 直接
+`http=000`（连不上），而 `/app/proxy_config.json` 根本不存在 —— 用户明明在「设置 → 代理」里
+把 NovelHub 指向了 metacube 的代理端口。爱丽丝书屋这类站点在 NAS 上**没有直连路由**，
+代理没了就等于整个书源全失败。
+
+**根因**：`proxy_config._config_path()` 写的是 `Path(settings.STORAGE_PATH).parent /
+"proxy_config.json"`。`STORAGE_PATH` 是 `/app/storage`（**挂载卷**，backend/crawler 共用），
+而它的 parent `/app` 是**镜像自己的可写层**：容器一被重新创建（compose 重建、升级镜像、
+甚至某些重启方式），这个文件就没了，内存里的默认值又是从 `HTTPS_PROXY` 环境变量读的
+（线上没设），于是静默回到"直连"。
+
+**改动**：`backend/app/services/proxy_config.py`
+- `_config_path()` 改为 `Path(settings.STORAGE_PATH) / "proxy_config.json"`
+  （即 `/app/storage/proxy_config.json`，跟着挂载卷走）；
+- `_read_file_config()` 仍会读旧路径 `/app/proxy_config.json`（只读、不写），
+  老装机的设置不用重新填；新路径优先。
+
+**验证**：`backend/tests/test_proxy_config_storage.py`（保存后落在 storage 卷里、进程内清空后
+仍能从磁盘读回、旧路径仍可读）。
+
+**提醒**：部署后如果"设置 → 代理"里还是空的，先点一次保存让它落到新路径，之后重启就不会丢了。
+

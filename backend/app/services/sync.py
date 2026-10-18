@@ -35,7 +35,7 @@ from app.models import (
     User,
 )
 from app.repositories.tag import TagRepository
-from app.services.storage import BookStorage
+from app.services.storage import BookRef, BookStorage
 from app.services.search import search_service
 from app.services.cookie_crypto import safe_decrypt_cookie
 from app.services.r18 import detect_r18
@@ -514,6 +514,7 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         discovery_tags: list[str] | None = None,
         exclude_tags: list[str] | None = None,
         exclude_categories: list[str] | None = None,
+        refetch_content: bool = False,
     ) -> dict:
         source = await self.db.get(Source, source_id)
         if source is None or not source.enabled:
@@ -661,10 +662,19 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         # cannot leave chapters pointing at an uncommitted book row.
         await self.db.commit()
 
+        # One book = one storage directory.  Two books that share an author and
+        # a title (several sources can carry the same book) used to write the
+        # same ``000001.md``; the ref makes the second one use its own folder.
+        storage_ref = BookRef(
+            book_id=book.id,
+            source_id=source.id,
+            source_book_id=str(remote_book.source_book_id or ""),
+        )
         self.storage.write_metadata(
             author_name,
             book_title,
             {
+                "book_id": book.id,
                 "source_id": source.id,
                 "source_book_id": remote_book.source_book_id,
                 "title": book_title,
@@ -676,6 +686,7 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                 "cover": book.cover,
                 "cover_url": remote_cover_url,
             },
+            ref=storage_ref,
         )
 
         book_tags = await self._book_tag_names(book.id)
@@ -785,11 +796,22 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                     "content_pages_done": content_pages_done,
                 })
 
+        repair_stats: dict = {}
         existing_source_ids = await self._reconcile_chapter_ids(
             book_id,
             remote_book.chapters,
             gallery_size=len(getattr(plugin, "_chapter_image_manifest", []) or []),
+            refetch_content=refetch_content,
+            stats=repair_stats,
         )
+        replaced_foreign_chapters = int(repair_stats.get("foreign_chapters", 0))
+        if replaced_foreign_chapters:
+            logger.info(
+                "Book {} had {} chapter(s) whose stored text belonged to "
+                "another book (shared storage directory); refetching them",
+                book_id,
+                replaced_foreign_chapters,
+            )
 
         missing_chapters = [
             remote_chapter
@@ -945,6 +967,7 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                         remote_chapter.chapter_number,
                         remote_chapter.title,
                         content,
+                        ref=storage_ref,
                     )
                     chapter = Chapter(
                         id=chapter_db_id,
@@ -1053,6 +1076,10 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             "created_chapters": created,
             "skipped_chapters": skipped,
             "failed_chapters": failed_chapters,
+            # Text replaced because it belonged to another book that shared the
+            # same storage directory (see codex-handoff 56): a repair the admin
+            # did not ask for, so it is reported instead of staying invisible.
+            "repaired_chapters": replaced_foreign_chapters,
         }
 
     async def _get_or_create_author(self, name: str) -> Author:
@@ -1158,6 +1185,8 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         book_id: str,
         remote_chapters: list,
         gallery_size: int = 0,
+        refetch_content: bool = False,
+        stats: dict | None = None,
     ) -> set[str]:
         """Return existing source chapter ids, upgrading legacy numeric ids to URLs.
 
@@ -1172,6 +1201,16 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         stored image-only chapter that stops exactly there is the old
         12-image truncation (see ``_is_truncated_gallery``) and is dropped so
         the album can be fetched again.
+
+        ``refetch_content`` drops *every* stored chapter instead, which is what
+        an explicit "refetch this book's text" repair asks for: content that
+        was written by an older build (or by another book before the storage
+        fix) can look perfectly healthy to the checks above and would otherwise
+        never be fetched again.
+
+        ``stats`` collects what was repaired and why (``foreign_chapters``:
+        stored text that another book's sync had overwritten), so a caller can
+        report a repair the admin never asked for.
         """
         rows = await self.db.scalars(
             select(Chapter).where(Chapter.book_id == book_id)
@@ -1220,13 +1259,30 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         stale_ids: list[str] = []
         for source_id, chapter in list(by_id.items()):
             if source_id in remote_ids:
+                if refetch_content:
+                    # Explicit repair: the stored text is suspect however
+                    # healthy it looks, so drop the row and fetch it again.
+                    stale_ids.append(source_id)
+                    continue
                 # Rows created by older migrations/tests may not have a
                 # content path yet; keep those identities so URL migration
                 # and normal incremental sync can still reconcile them.
                 # A persisted path, on the other hand, means we can safely
                 # remove a known empty/anti-bot artifact.
-                if chapter.content_path and not self._chapter_has_real_content(chapter):
+                reason = (
+                    self._stale_chapter_reason(chapter)
+                    if chapter.content_path
+                    else ""
+                )
+                if reason:
                     stale_ids.append(source_id)
+                    if reason == "foreign" and stats is not None:
+                        # Text another book overwrote: counted separately
+                        # because it is repaired silently otherwise (the
+                        # shared-directory era, codex-handoff 56).
+                        stats["foreign_chapters"] = (
+                            stats.get("foreign_chapters", 0) + 1
+                        )
                 elif self._is_truncated_gallery(chapter, gallery_size):
                     stale_ids.append(source_id)
             elif self._looks_like_junk_chapter(chapter, remote_hosts):
@@ -1285,19 +1341,33 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
     )
 
     def _chapter_has_real_content(self, chapter: Chapter) -> bool:
-        """Return False for empty or anti-bot/captcha junk chapters so a
+        """Return False for empty, anti-bot or foreign junk chapters so a
         re-sync refetches them."""
+        return self._stale_chapter_reason(chapter) == ""
+
+    def _stale_chapter_reason(self, chapter: Chapter) -> str:
+        """Why a stored chapter must be fetched again (``""`` when it is fine).
+
+        The reason is a value, not just a boolean, so a caller can tell an
+        expected repair (a junk/anti-bot chapter) from the collateral one this
+        module owes the storage fix below -- and report the latter.
+        """
         # A missing storage path means the historical chapter has no usable
         # body. Treat it as stale so the next sync can fetch it again.
         if not chapter.content_path:
-            return False
+            return "missing"
         try:
             content = self.storage.read_chapter(chapter.content_path)
         except Exception:
             # A missing or unreadable storage object must be fetched again.
-            return False
+            return "missing"
         if not isinstance(content, str):
-            return False
+            return "missing"
+        if not self._chapter_file_is_ours(chapter):
+            # Another book overwrote this file (books used to share one
+            # directory per author+title), so what is on disk is not this
+            # chapter's text.  Refetch instead of serving the wrong book.
+            return "foreign"
         has_image_refs = bool(
             re.search(
                 r"!\[[^\]]*\]\([^)]*\)|<img\b[^>]*\bsrc=",
@@ -1314,17 +1384,35 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         if any(
             marker in lowered for marker in self.BLOCK_CONTENT_MARKERS
         ):
-            return False
+            return "blocked"
         # A chapter stored as one bare image URL is the old broken manga
         # fallback, not readable content.  Let a re-sync replace it with the
         # image-page chain (markdown/HTML image references).
         if body and re.fullmatch(r"(?:https?://\S+\s*)+", body):
-            return False
+            return "bare-url"
         if len(body) < 20:
             # Image-only manga chapters are valid even though stripping their
             # image references leaves no text.
-            return has_image_refs
-        return True
+            return "" if has_image_refs else "empty"
+        return ""
+
+    def _chapter_file_is_ours(self, chapter: Chapter) -> bool:
+        """Whether the file at ``content_path`` is still this chapter's text.
+
+        ``write_chapter`` returns the sha256 of the markdown it wrote and the
+        chapter row keeps it, so recomputing the digest answers the question
+        exactly: a mismatch means some other book's sync replaced the file (the
+        shared-directory era), never a heuristic guess.  Rows without a stored
+        digest (imported data, older schemas) are trusted.
+        """
+        expected = str(getattr(chapter, "hash", "") or "").strip()
+        if not expected or not chapter.content_path:
+            return True
+        digest = self.storage.chapter_digest(chapter.content_path)
+        if digest is None:
+            # Unreadable: let the caller's read attempt decide.
+            return True
+        return digest == expected
 
     def _is_truncated_gallery(self, chapter: Chapter, gallery_size: int) -> bool:
         """Whether a stored album chapter is the old "exactly N images" cut.
@@ -1475,8 +1563,14 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             bt = BookTag(book_id=book_id, tag_id=tag.id)
             self.db.add(bt)
         await self.db.flush()
-    async def resync_book(self, book_id: str) -> dict:
-        """Re-sync a book already in the library from its source."""
+    async def resync_book(self, book_id: str, refetch_content: bool = False) -> dict:
+        """Re-sync a book already in the library from its source.
+
+        ``refetch_content`` also drops every stored chapter, so the whole book
+        is downloaded again.  That is the repair for chapters whose stored text
+        is wrong but looks healthy -- content saved by an older build, or by
+        another book that shared its directory before the storage fix.
+        """
         book = await self.db.get(Book, book_id)
         if book is None:
             raise ValueError("Book not found")
@@ -1484,7 +1578,11 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             raise ValueError("Book has no source reference")
         source, plugin = await self._book_plugin(book)
         url = self._book_url(book, source, plugin)
-        return await self.sync_book(book.source_id, url)
+        return await self.sync_book(
+            book.source_id,
+            url,
+            refetch_content=refetch_content,
+        )
 
     async def resync_chapter(self, chapter_id: str) -> dict:
         """Re-fetch and overwrite a single chapter from its book source."""
@@ -1514,6 +1612,8 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         )
         book_id = book.id
         book_is_r18 = book.is_r18
+        book_source_id = str(book.source_id or "")
+        book_source_book_id = str(book.source_book_id or "")
         # ``tag_names`` / ``category_names`` / ``author_name`` are synchronous
         # ORM relationship reads that raise ``MissingGreenlet`` on an expired
         # instance -- the resync-chapter "greenlet_spawn has not been called"
@@ -1535,6 +1635,11 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             remote_chapter.chapter_number,
             remote_chapter.title,
             content,
+            ref=BookRef(
+                book_id=book_id,
+                source_id=book_source_id,
+                source_book_id=book_source_book_id,
+            ),
         )
 
         chapter.title = remote_chapter.title
