@@ -34,6 +34,13 @@ BACKUP_DB_WEEKLY_KEEP="${BACKUP_DB_WEEKLY_KEEP:-4}"
 BACKUP_STORAGE_DAILY_KEEP="${BACKUP_STORAGE_DAILY_KEEP:-7}"
 BACKUP_STORAGE_WEEKLY_KEEP="${BACKUP_STORAGE_WEEKLY_KEEP:-4}"
 BACKUP_WAIT_SECONDS="${BACKUP_WAIT_SECONDS:-300}"
+# Copies in flight while the snapshot is written.  The storage is hundreds of
+# thousands of *small* files on spinning disks: a single-threaded ``cp -a`` gave
+# the array no queue depth and managed ~1.2 MB/s on the live 250 GiB tree
+# (measured 2026-10-18, i.e. 2.4 days for the first snapshot).  Four parallel
+# copies are the difference between "overnight" and "next week"; raise it only
+# if the pool is idle.
+BACKUP_COPY_JOBS="${BACKUP_COPY_JOBS:-4}"
 
 PGHOST="${PGHOST:-postgres}"
 PGPORT="${PGPORT:-5432}"
@@ -102,7 +109,8 @@ sync_changed_files() {
     (
         cd "$BACKUP_SOURCE" || exit 0
         find . -type f -newer "$LAST_SNAPSHOT" -print0 2>/dev/null |
-            xargs -0 -r cp -p --parents --remove-destination -t "$dest" 2>/dev/null
+            xargs -0 -r -n 200 -P "$BACKUP_COPY_JOBS" \
+                cp -p --parents --remove-destination -t "$dest" 2>/dev/null
     )
 
     export DEST="$dest"
@@ -142,7 +150,16 @@ snapshot_storage() {
     fi
     if [ "$seeded" != "1" ]; then
         log "no usable previous snapshot, copying everything (the slow one, once)"
-        cp -a "$BACKUP_SOURCE/." "$dest/" 2>/dev/null || true
+        (
+            cd "$BACKUP_SOURCE" || exit 0
+            find . -type f -print0 2>/dev/null |
+                xargs -0 -r -n 200 -P "$BACKUP_COPY_JOBS" \
+                    cp -p --parents --remove-destination -t "$dest" 2>/dev/null
+        )
+        # ``find | xargs`` copies files only, so a directory holding no file is
+        # not recreated.  The live storage has none (every book directory holds
+        # its metadata.json and its chapters), so this is a non-issue there; a
+        # restore simply shows no empty directories.
     fi
 
     touch "$LAST_SNAPSHOT"
