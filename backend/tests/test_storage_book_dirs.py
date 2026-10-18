@@ -176,7 +176,7 @@ async def test_foreign_repair_is_counted_so_it_is_not_silent(tmp_path):
     kept = await service._reconcile_chapter_ids(BOOK_A, remote, stats=stats)
 
     assert kept == set()
-    assert stats["foreign_chapters"] == 1
+    assert stats["repaired_chapters"] == 1
     assert db.delete.await_count == 1
 
 

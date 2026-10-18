@@ -72,6 +72,48 @@ class UrlsMixin:
         if _HOST_ONLY_URL_PATTERN.match(pattern):
             return ""
         return pattern
+    @staticmethod
+    def _id_segments(url: str) -> set[str]:
+        """Digit runs in a URL's path that can identify one book.
+
+        ``/book/54294`` -> ``{"54294"}``, ``/read/65332.html`` -> ``{"65332"}``,
+        ``/bbs4/thread-1234567.html`` -> ``{"1234567"}`` (``4`` is dropped).
+        Short runs are ignored: a site that numbers its books from 1 would
+        otherwise "match" half of its own catalogue.
+        """
+        segments: set[str] = set()
+        for segment in urlparse(url).path.split("/"):
+            for found in re.findall(r"\d{3,}", segment.rsplit(".", 1)[0]):
+                segments.add(found)
+        return segments
+
+    def _toc_entry_matches_book_id(self, url: str, book_url: str) -> bool:
+        """Whether a *guessed* TOC link extends this book's URL or repeats its id.
+
+        The generic scanner runs only when the source's own ``ruleToc`` matched
+        nothing, so "it is a link on the book page" is the only evidence there
+        is -- and the recommendation/sidebar blocks on those pages are full of
+        *other* books' pages.  要撸小说's book page offered ``/books/<other-id>/``
+        links (242 stored as chapters across the library) and Icu's offered
+        other books' ``/xs_ls/<other-id>`` pages; every one of them was stored
+        with another novel's text as its "content".
+
+        A link matches when the book URL is a path prefix of it
+        (``/book/54294`` -> ``/book/54294/217367.html``) or when both share a
+        digit run (``/read/65332.html`` -> ``/read/65332/6972399.html``).
+        Sibling *shapes* deliberately do not match: 御宅屋 lists other books as
+        ``/read/65333.html`` next to this book's ``/read/65332.html``.
+        """
+        book_url = self._strip_url_options_suffix(book_url)
+        url = self._strip_url_options_suffix(url)
+        abs_url = self._make_absolute(url, book_url or self.base_url)
+        abs_book = self._make_absolute(book_url, self.base_url)
+        if abs_url.rstrip("/") == abs_book.rstrip("/"):
+            return False
+        if abs_url.startswith(abs_book.rstrip("/") + "/"):
+            return True
+        return bool(self._id_segments(abs_url) & self._id_segments(abs_book))
+
     def _is_book_url(self, url: str, require_pattern: bool = False) -> bool:
         """Check whether a URL points to a book detail page.
 

@@ -1663,6 +1663,87 @@ async def test_image_only_chapter_is_real_content_but_bare_url_is_not():
     assert service._chapter_has_real_content(chapter) is False
 
 
+def test_image_only_chapter_is_junk_only_in_a_book_that_has_prose():
+    """A gallery page is content in a comic, junk in a prose book.
+
+    御宅屋 chapters were stored as a single ad/cover image plus a caption while
+    every other chapter of those books was prose -- the page had answered
+    without its body.  The same shape is a normal manga chapter, so the verdict
+    depends on the book, not on the chapter alone.
+    """
+    service = SyncService(AsyncMock())
+    service.storage = MagicMock()
+    service.storage.read_chapter.return_value = (
+        "#（01）\n\n![](https://img.example/static/search.png)"
+    )
+    chapter = Chapter(
+        id="c1",
+        book_id="book-1",
+        chapter_number=1,
+        source_chapter_id="https://yswhub.cc/read/65332/6972399.html",
+        title="（01）",
+        content_path="/x/000001.md",
+    )
+
+    assert service._stale_chapter_reason(chapter) == ""
+    assert service._stale_chapter_reason(chapter, book_has_prose=True) == "image-only"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_repairs_image_only_chapters_of_a_prose_book():
+    prose = Chapter(
+        id="c1",
+        book_id="book-1",
+        chapter_number=1,
+        source_chapter_id="https://example.com/book/1/a.html",
+        title="第一章",
+        content_path="/prose/000001.md",
+    )
+    gallery = Chapter(
+        id="c2",
+        book_id="book-1",
+        chapter_number=2,
+        source_chapter_id="https://example.com/book/1/b.html",
+        title="第二章",
+        content_path="/junk/000002.md",
+    )
+    remote_chapters = [
+        RemoteChapter(
+            source_chapter_id="https://example.com/book/1/a.html",
+            title="第一章",
+            url="https://example.com/book/1/a.html",
+            chapter_number=1,
+        ),
+        RemoteChapter(
+            source_chapter_id="https://example.com/book/1/b.html",
+            title="第二章",
+            url="https://example.com/book/1/b.html",
+            chapter_number=2,
+        ),
+    ]
+
+    db = AsyncMock()
+    db.scalars = AsyncMock(
+        return_value=SimpleNamespace(all=lambda: [prose, gallery])
+    )
+    db.flush = AsyncMock()
+    db.delete = AsyncMock()
+
+    service = SyncService(db)
+    service.storage = MagicMock()
+    service.storage.read_chapter.side_effect = lambda path: {
+        "/prose/000001.md": "#第一章\n\n这是一段足够长的真实正文内容，用于确认章节不会被误删。",
+        "/junk/000002.md": "#第二章\n\n![](https://img.example/static/search.png)",
+    }.get(path, "")
+
+    stats: dict = {}
+    kept = await service._reconcile_chapter_ids("book-1", remote_chapters, stats=stats)
+
+    assert kept == {"https://example.com/book/1/a.html"}
+    assert stats["repaired_chapters"] == 1
+    assert db.delete.await_count == 1
+
+
 
 @pytest.mark.asyncio
 async def test_chapter_without_storage_path_is_not_healthy():

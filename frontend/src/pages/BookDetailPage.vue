@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue"
+import { computed, ref, watch } from "vue"
 import { useRoute, useRouter } from "vue-router"
 import { useBooksStore, type Book, type Chapter, type CustomTagOnBook, type ShelfGroup } from "../stores/books"
 import { useAuthStore } from "../stores/auth"
@@ -397,26 +397,56 @@ function reportSyncResult(result: any) {
   }
 }
 
-async function loadAlternates() {
+async function loadAlternates(bookId?: string) {
+  const id = bookId || (route.params.id as string)
   try {
-    const res = await api.get<any>("/books/" + route.params.id + "/sources")
+    const res = await api.get<any>("/books/" + id + "/sources")
     alternates.value = res.sources || []
   } catch { /* non-critical */ }
 }
 
+/**
+ * Switch to another copy of this book.
+ *
+ * The copy is another book row with its own detail page, so this navigates.
+ * ``/books/:id`` reuses this component for the new id, which is why the route
+ * watcher below -- not ``onMounted`` -- is what loads a book.
+ */
 function switchSource(id: string) {
+  if (!id || id === route.params.id) return
+  showSources.value = false
   router.push("/books/" + id)
 }
 
-onMounted(async () => {
-  // Render the book and its chapter list first: everything below is
-  // decoration that used to hold the whole page (and the reader link) behind
-  // the slowest request, including "read on another source", which scans the
-  // library for the same title.
+/**
+ * Load everything for one book row.
+ *
+ * Called for the first render *and* whenever the route id changes: clicking
+ * another source used to leave the page showing the previous book (the URL
+ * changed, the component was reused, and nothing re-read the id).
+ */
+async function loadBook(bookId: string) {
+  loading.value = true
+  error.value = ""
+  // Reset every per-book piece of state before the new data arrives, so a slow
+  // request cannot render the previous book's chapters, source list or
+  // bookmarks against the new id.
+  book.value = null
+  chapters.value = []
+  bookmarks.value = []
+  alternates.value = []
+  showSources.value = false
+  savedChapterId.value = null
+  favorite.value = false
+  customTags.value = []
+  tagDetail.value = null
+  selectedCategoryIds.value = []
+  bookGroupIds.value = []
+  editing.value = false
   try {
-    book.value = await store.fetchBook(route.params.id as string)
+    book.value = await store.fetchBook(bookId)
     favorite.value = book.value.is_favorite || false
-    chapters.value = await store.fetchChapters(route.params.id as string)
+    chapters.value = await store.fetchChapters(bookId)
   } catch (e) {
     error.value = e instanceof Error ? e.message : i18n.t('book_load_failed')
   } finally {
@@ -427,19 +457,30 @@ onMounted(async () => {
       // "继续阅读" points at the saved chapter, so it is the one piece of the
       // secondary data worth asking for first.
       if (auth.user) {
-        const p = await api.get<any>('/progress/' + route.params.id)
-        if (p) savedChapterId.value = p.chapter_id
+        const p = await api.get<any>('/progress/' + bookId)
+        if (p && route.params.id === bookId) savedChapterId.value = p.chapter_id
       }
+      // Everything below belongs to the book that is on screen now; drop the
+      // results of a request the user already navigated away from.
+      if (route.params.id !== bookId) return
       await loadCustomTags()
       await loadCategories()
       initCategorySelection()
       await loadShelfGroups()
       await loadBookGroups()
-      await loadAlternates()
+      await loadAlternates(bookId)
       await loadBookmarks()
     } catch { /* secondary data must never break the page */ }
   })()
-})
+}
+
+watch(
+  () => route.params.id,
+  (id) => {
+    if (id) void loadBook(String(id))
+  },
+  { immediate: true },
+)
 </script>
 
 <template>

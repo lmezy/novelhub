@@ -300,7 +300,11 @@ class YueduPlugin(UrlsMixin, ParsingMixin, ExploreMixin, BookMixin, ChapterMixin
     # Images that are clearly site chrome rather than chapter content.
     _NOISE_IMAGE_RE = re.compile(
         r"logo|avatar|icon|sprite|banner|advert|qrcode|blank|placeholder"
-        r"|loading|spacer|pixel|button",
+        r"|loading|spacer|pixel|button"
+        # Site UI assets: 御宅屋's chapter page without its body still carried
+        # ``/css/h_search.png`` (the reader's search icon), and that one image
+        # became the chapter's "content".
+        r"|search|menu|header|footer|/css/|btn_",
         re.IGNORECASE,
     )
     _IMAGE_FILE_RE = re.compile(

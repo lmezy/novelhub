@@ -5152,3 +5152,134 @@ def test_labelled_book_name_is_used_when_the_page_has_no_title():
     assert plugin._extract_labelled_title(
         BeautifulSoup("<html><body><p>别：x</p></body></html>", "lxml")
     ) == ""
+
+
+def test_generic_toc_ignores_other_books_pages():
+    """A guessed chapter list must not adopt other books' pages.
+
+    要撸小说's book page carries "热搜词" links (``/books/<other-id>/``, titles
+    like "致最终残留之物完整版哪里看"): the source's ``chapterList`` matched
+    nothing, the generic scanner took those links, and 242 such "chapters" were
+    stored across the library with other novels' text.
+    """
+    source = {
+        "bookSourceUrl": "https://www.yaoluku.com",
+        "bookUrlPattern": r"https://www\.yaoluku\.com/book/\d+",
+        "ruleToc": {"chapterList": "ul#ul_all_chapters > li", "chapterName": "a@text",
+                    "chapterUrl": "a@href"},
+    }
+    plugin = YueduPlugin(source)
+    html = """
+    <html><body>
+      <h1>致最终残留之物</h1>
+      <ul id="ul_all_chapters">
+        <li><a href="/book/54294/217367.html">第一章 起点</a></li>
+        <li><a href="/book/54294/217369.html">第二章 下落</a></li>
+      </ul>
+      <div class="hot">
+        <a href="/books/1969458166/">致最终残留之物完整版哪里看</a>
+        <a href="/books/1969458165/">致最终残留之物by葬之镜百度网盘</a>
+      </div>
+    </body></html>
+    """
+
+    parsed = plugin._parse_book_generic(html, "https://www.yaoluku.com/book/54294")
+
+    assert [c.url for c in parsed["chapters"]] == [
+        "https://www.yaoluku.com/book/54294/217367.html",
+        "https://www.yaoluku.com/book/54294/217369.html",
+    ]
+
+
+def test_generic_toc_reports_no_chapters_when_every_link_is_another_book():
+    """No chapters is the right answer when the page has nothing of this book.
+
+    The source declared where its chapters live and that rule stopped matching,
+    so a pile of "/books/<other-id>/" links is not evidence of a TOC.  The book
+    is then reported as unparsable instead of storing other novels' pages.
+    """
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://www.yaoluku.com",
+        "ruleToc": {"chapterList": "ul#ul_all_chapters > li",
+                    "chapterName": "a@text", "chapterUrl": "a@href"},
+    })
+    html = """
+    <html><body>
+      <a href="/books/1969458166/">致最终残留之物完整版哪里看</a>
+      <a href="/books/1865943302/">致最终残留之物海棠</a>
+      <a href="/books/1835349940/">致最终残留之物小说免费阅读</a>
+    </body></html>
+    """
+
+    parsed = plugin._parse_book_generic(html, "https://www.yaoluku.com/book/54294")
+
+    assert parsed["chapters"] == []
+
+
+def test_generic_toc_drops_other_books_of_the_same_shape():
+    """御宅屋 lists other books as ``/read/65333.html`` beside ``/read/65332.html``.
+
+    Same directory, same numeric shape -- only the link text tells them apart,
+    and those titles are other novels, not chapters.
+    """
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://yswhub.cc",
+        "ruleToc": {"chapterList": "ul#jsList1 li.two a", "chapterName": "@text",
+                    "chapterUrl": "@href"},
+    })
+    html = """
+    <html><body>
+      <div class="recent">
+        <a href="/read/65333.html">我不是神探之赵可乐的救赎</a>
+        <a href="/read/65334.html">段子楼</a>
+        <a href="/read/65335.html">女皇嗜血</a>
+      </div>
+    </body></html>
+    """
+
+    parsed = plugin._parse_book_generic(html, "https://yswhub.cc/read/65332.html")
+
+    assert parsed["chapters"] == []
+
+
+def test_generic_toc_keeps_chapter_titled_links_without_a_book_relation():
+    """A source with no ``chapterList`` keeps the looser rule.
+
+    Forum-style sources put every instalment on a URL that shares nothing with
+    the book URL, and the generic scan *is* their TOC parser; as long as the
+    link text reads like a chapter it stays.
+    """
+    plugin = YueduPlugin({"bookSourceUrl": "https://bbs.example.com"})
+    html = """
+    <html><body>
+      <a href="https://bbs.example.com/thread-9999999.html">第三章 夜行</a>
+      <a href="https://bbs.example.com/thread-8888888.html">第四章 归途</a>
+    </body></html>
+    """
+
+    parsed = plugin._parse_book_generic(html, "https://bbs.example.com/thread-1234567.html")
+
+    assert [c.title for c in parsed["chapters"]] == ["第三章 夜行", "第四章 归途"]
+
+
+def test_chapter_navigation_only_pages_are_not_content():
+    """御宅屋 stored the reader's own navigation as a chapter body.
+
+    The page answered without its text ("投推荐票 上一章 ← … 章节目录 → 下一章
+    加入书签"), and every one of those was saved as the chapter.
+    """
+    junk = (
+        "![搜索](https://yswhub.cc/static/search.png)\n\n"
+        "投推荐票 上一章 ← 122.114.227.213 章节目录 → 下一章 加入书签"
+    )
+    assert YueduPlugin._content_is_chapter_chrome(junk) is True
+
+    real = (
+        "#（01）\n\n"
+        "他推开门，走廊里只剩下脚步声。上一章留下的疑问，此刻终于有了答案。"
+    )
+    assert YueduPlugin._content_is_chapter_chrome(real) is False
+
+    # A long paragraph may legitimately mention the navigation words once.
+    long_text = "加入书签" + "正文内容。" * 60
+    assert YueduPlugin._content_is_chapter_chrome(long_text) is False

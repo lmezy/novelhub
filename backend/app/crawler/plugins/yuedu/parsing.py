@@ -10,12 +10,14 @@ title overflowing a filesystem component limit.
 """
 
 from app.crawler.base import RemoteChapter
+from app.crawler.plugins.yuedu.common import logger
 from app.crawler.plugins.yuedu.rule_engine import YueduRuleEngine
 from app.crawler.plugins.yuedu.selectors import GENERIC_BOOK_AUTHOR_SELECTORS
 from app.crawler.plugins.yuedu.selectors import GENERIC_BOOK_COVER_SELECTORS
 from app.crawler.plugins.yuedu.selectors import GENERIC_BOOK_DESC_SELECTORS
 from app.crawler.plugins.yuedu.selectors import GENERIC_BOOK_TITLE_SELECTORS
 from app.crawler.plugins.yuedu.selectors import GENERIC_CHAPTER_SELECTORS
+from app.crawler.plugins.yuedu.selectors import CHAPTER_TITLE_RE
 from app.crawler.plugins.yuedu.selectors import SERIES_INDEX_MAX_PARTS
 from app.crawler.plugins.yuedu.selectors import SERIES_INDEX_PART_TAIL_MAX
 from app.crawler.plugins.yuedu.selectors import SERIES_INDEX_PREFIX_MIN
@@ -220,6 +222,8 @@ class ParsingMixin:
                 if self._is_chapter_url(abs_url, url):
                     chapter_links.append(a)
 
+        chapter_links = self._filter_guessed_chapter_links(chapter_links, url)
+
         chapters: list[RemoteChapter] = []
         seen_urls: set[str] = set()
         chapter_number = 0
@@ -254,6 +258,60 @@ class ParsingMixin:
             "tags": self._clean_tags(tags, title, author),
             "chapters": chapters,
         }
+
+    def _filter_guessed_chapter_links(self, links: list[Tag], book_url: str) -> list[Tag]:
+        """Drop links a guessed chapter list must not have adopted.
+
+        Callers reach this scanner only after the source's own ``ruleToc``
+        produced nothing, so the links are guesses.  Two independent signals
+        decide whether a guess may stand:
+
+        * **relatedness** to the book URL (see ``_toc_entry_matches_book_id``):
+          a chapter URL normally extends the book URL (``/book/12`` ->
+          ``/book/12/34.html``) or repeats its id; anything else is another
+          book's page or an ad landing page.
+        * **the title reads like a chapter** ("第12章", "（03）", "12.").  Sites
+          fill book pages with "最近更新"/"热搜词" blocks whose link texts are
+          *book titles*; 要撸小说 offered "致最终残留之物完整版哪里看" and Icu
+          offered 137 other novels, all of which were stored as chapters with
+          another novel's text.
+
+        When the source *declared* a ``chapterList`` rule it also told us what
+        its chapters look like, and that rule has stopped matching -- so the
+        guess is held to the stricter standard (a related URL, or a chapter-like
+        title).  Sources without such a rule keep the looser behaviour: the
+        generic scan is their normal parser, and forum-style sources legitimately
+        put every instalment on an unrelated sibling URL.
+        """
+        declared_chapter_list = bool(
+            str((self.config.get("ruleToc") or {}).get("chapterList") or "").strip()
+        )
+        strong: list[Tag] = []
+        weak: list[Tag] = []
+        titled: list[Tag] = []
+        for link in links:
+            href = str(link.get("href") or "").strip()
+            if not href:
+                continue
+            abs_url = self._make_absolute(href, book_url)
+            title_ok = bool(CHAPTER_TITLE_RE.search(link.get_text(" ", strip=True)))
+            if self._toc_entry_matches_book_id(abs_url, book_url):
+                strong.append(link)
+            else:
+                if not declared_chapter_list:
+                    weak.append(link)
+                if title_ok:
+                    titled.append(link)
+        kept = strong or (titled if declared_chapter_list else weak or titled)
+        if len(kept) != len(links):
+            logger.debug(
+                "Guessed TOC for %s: kept %s of %s link(s)%s",
+                book_url,
+                len(kept),
+                len(links),
+                "" if declared_chapter_list else " (source declares no chapterList)",
+            )
+        return kept
     @classmethod
     def _inside_navigation(cls, element: Any) -> bool:
         """Whether an element sits inside the site chrome (menu/header/footer).

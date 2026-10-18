@@ -10,6 +10,7 @@ the chapter.
 from app.crawler.base import RemoteChapter
 from app.crawler.plugins.yuedu.common import logger
 from app.crawler.plugins.yuedu.rule_engine import YueduRuleEngine
+from app.crawler.plugins.yuedu.selectors import CHAPTER_CHROME_PHRASES
 from bs4 import BeautifulSoup
 from bs4 import Tag
 from collections.abc import Awaitable, Callable
@@ -222,6 +223,16 @@ class ChapterMixin:
                 "Chapter content looks like an anti-bot/captcha page "
                 f"(site asked for verification): {chapter.url}"
             )
+        if self._content_is_chapter_chrome(content):
+            # The page answered without its body and left the reader's own
+            # navigation behind ("投推荐票 上一章 → 章节目录 → 下一章 加入书签" on
+            # 御宅屋).  Failing is the honest outcome: the sync records a
+            # chapter-level failure and retries later, instead of storing a
+            # navigation line -- or an ad image next to it -- as the chapter.
+            raise RuntimeError(
+                "Chapter page returned only navigation/ads, not the chapter "
+                f"text: {chapter.url}"
+            )
         replace_rules = (self.config.get("ruleContent") or {}).get("replaceRegex", [])
         if replace_rules:
             content = chapter_engine._apply_replace_regex(content, replace_rules).strip()
@@ -230,6 +241,23 @@ class ChapterMixin:
                 f"Chapter returned empty content: {chapter.url}"
             )
         return content
+
+    @staticmethod
+    def _content_is_chapter_chrome(content: str) -> bool:
+        """Whether extracted "content" is only the reader's own navigation.
+
+        Deliberately narrow: a short block (no room for a real paragraph) that
+        carries at least two distinct chrome phrases.  A real chapter cannot say
+        "上一章" *and* "加入书签" *and* "目录" inside 120 characters while having
+        no prose at all.
+        """
+        text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", str(content or ""))
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text or len(text) > 120:
+            return False
+        hits = {phrase for phrase in CHAPTER_CHROME_PHRASES if phrase in text}
+        return len(hits) >= 2
     def _read_chapter_image_manifest(self) -> list[dict[str, str]]:
         """Read ``imgInfoList`` captured by a manga source's TOC script.
 

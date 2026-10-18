@@ -804,11 +804,11 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             refetch_content=refetch_content,
             stats=repair_stats,
         )
-        replaced_foreign_chapters = int(repair_stats.get("foreign_chapters", 0))
+        replaced_foreign_chapters = int(repair_stats.get("repaired_chapters", 0))
         if replaced_foreign_chapters:
             logger.info(
-                "Book {} had {} chapter(s) whose stored text belonged to "
-                "another book (shared storage directory); refetching them",
+                "Book {} had {} chapter(s) whose stored text was unusable "
+                "(another book's text, or a page with no body); refetching",
                 book_id,
                 replaced_foreign_chapters,
             )
@@ -1076,9 +1076,10 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             "created_chapters": created,
             "skipped_chapters": skipped,
             "failed_chapters": failed_chapters,
-            # Text replaced because it belonged to another book that shared the
-            # same storage directory (see codex-handoff 56): a repair the admin
-            # did not ask for, so it is reported instead of staying invisible.
+            # Text replaced because it was unusable -- it belonged to another
+            # book that shared the same storage directory, or the page came
+            # back with only images/ads (see codex-handoff 56/58).  A repair
+            # the admin did not ask for, so it is reported, not silent.
             "repaired_chapters": replaced_foreign_chapters,
         }
 
@@ -1256,6 +1257,15 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             for remote_chapter in remote_chapters
             if urlparse(remote_chapter.url).scheme in ("http", "https")
         }
+        # A book is "prose" when at least one stored chapter holds real text:
+        # that is what tells an ad/cover-only page from a real manga gallery.
+        # Reading the files once per chapter here is not extra work -- the
+        # per-chapter health check below reads them anyway.
+        book_has_prose = any(
+            self._chapter_body_has_prose(chapter)
+            for chapter in by_id.values()
+            if chapter.content_path
+        )
         stale_ids: list[str] = []
         for source_id, chapter in list(by_id.items()):
             if source_id in remote_ids:
@@ -1270,18 +1280,22 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                 # A persisted path, on the other hand, means we can safely
                 # remove a known empty/anti-bot artifact.
                 reason = (
-                    self._stale_chapter_reason(chapter)
+                    self._stale_chapter_reason(
+                        chapter,
+                        book_has_prose=book_has_prose,
+                    )
                     if chapter.content_path
                     else ""
                 )
                 if reason:
                     stale_ids.append(source_id)
-                    if reason == "foreign" and stats is not None:
-                        # Text another book overwrote: counted separately
-                        # because it is repaired silently otherwise (the
-                        # shared-directory era, codex-handoff 56).
-                        stats["foreign_chapters"] = (
-                            stats.get("foreign_chapters", 0) + 1
+                    if reason in ("foreign", "image-only") and stats is not None:
+                        # Repaired silently otherwise: text another book
+                        # overwrote (the shared-directory era, codex-handoff
+                        # 56) or a page whose body never arrived (image-only
+                        # ad/cover block).  A caller reports both.
+                        stats["repaired_chapters"] = (
+                            stats.get("repaired_chapters", 0) + 1
                         )
                 elif self._is_truncated_gallery(chapter, gallery_size):
                     stale_ids.append(source_id)
@@ -1345,12 +1359,23 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         re-sync refetches them."""
         return self._stale_chapter_reason(chapter) == ""
 
-    def _stale_chapter_reason(self, chapter: Chapter) -> str:
+    def _stale_chapter_reason(
+        self,
+        chapter: Chapter,
+        *,
+        book_has_prose: bool = False,
+    ) -> str:
         """Why a stored chapter must be fetched again (``""`` when it is fine).
 
         The reason is a value, not just a boolean, so a caller can tell an
         expected repair (a junk/anti-bot chapter) from the collateral one this
         module owes the storage fix below -- and report the latter.
+
+        ``book_has_prose`` says whether *any* chapter of this book holds real
+        text.  An image-only chapter is a legit manga page in a gallery book,
+        but in a book whose other chapters are prose it is the page's ads or
+        recommendation covers (御宅屋 stored "投推荐票 …" pages and cover grids
+        that way) and belongs in the same repair path.
         """
         # A missing storage path means the historical chapter has no usable
         # body. Treat it as stale so the next sync can fetch it again.
@@ -1393,8 +1418,29 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         if len(body) < 20:
             # Image-only manga chapters are valid even though stripping their
             # image references leaves no text.
-            return "" if has_image_refs else "empty"
+            if not has_image_refs:
+                return "empty"
+            return "image-only" if book_has_prose else ""
         return ""
+
+    def _chapter_body_has_prose(self, chapter: Chapter) -> bool:
+        """Whether a stored chapter holds readable text rather than only images.
+
+        Same normalization as the health check: the ``#`` title line, markdown
+        image references and HTML wrappers are not prose.
+        """
+        if not chapter.content_path:
+            return False
+        try:
+            content = self.storage.read_chapter(chapter.content_path)
+        except Exception:
+            return False
+        if not isinstance(content, str):
+            return False
+        body = re.sub(r"^#.*(?:\r?\n|$)", "", content, flags=re.M)
+        body = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", body)
+        body = re.sub(r"<[^>]+>", " ", body)
+        return len(re.sub(r"\s+", " ", body).strip()) >= 20
 
     def _chapter_file_is_ours(self, chapter: Chapter) -> bool:
         """Whether the file at ``content_path`` is still this chapter's text.

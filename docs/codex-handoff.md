@@ -2314,3 +2314,78 @@ WARNING Configured proxy http://127.0.0.1:27890 request failed for
 
 **提醒**：部署后如果"设置 → 代理"里还是空的，先点一次保存让它落到新路径，之后重启就不会丢了。
 
+---
+
+## 58. 更多「正文不对」的三种成因：猜出来的目录、只有导航/广告的正文、切换书源点了没反应（2026-10-18）
+
+第 56/57 节之后用户又报了 7 本书、3 类现象。逐本查线上库，是**三个独立成因**（不是同一个 bug），
+都已在本地区分修复：
+
+### A. 「章节名是一串搜索词 / 别的书名」：目录是猜出来的，猜到了推荐位（要撸小说、Icu）
+
+线上实测：**12 本书 / 379 章**是这种"把别的书当章节"的垃圾目录 —— 要撸小说的
+《致最终残留之物》《妈妈似乎被寄生了》《好色人妻》（11 本 / 242 章，URL 形如
+`/books/<别的书 id>/`，章节名是「致最终残留之物完整版哪里看」「…by葬之镜百度网盘」
+「妈妈是寄生兽漫画」，正文就是那张广告图）和 Icu 的《当我穿越变成宝可梦豪力后（宝可梦世界）》
+（137 章，URL 是 `https://…/xs_ls/<别的书 id>`，全是**其他书的详情页**，所以"每章内容都重复"
+且"章节名也不对"）。
+
+根因：这两个书源都声明了 `ruleToc.chapterList`（`ul#ul_all_chapters > li` / `id.myList@li@a`），
+但线上页面那一段匹配不到（要撸小说的书页对普通 HTTP 直接 403，Icu 的书页结构也变了），
+于是走到**通用链接扫描**；扫描唯一的标准是「像章节的 URL」，而书页上的「热搜词 / 最近更新」
+区块里全是**别的书**的链接 —— 正好都长得像章节（`/books/<id>/` 有两段路径；
+御宅屋那种 `/read/65333.html` 与本书 `/read/65332.html` 形状完全一样）。
+
+改动（都在插件里，没有为单个站点写死）：
+- `selectors.py` 新增 `CHAPTER_TITLE_RE`（第12章 / （03） / 12. / 楔子 / 番外 / Chapter 3 …）；
+- `urls.py` 新增 `_id_segments()` / `_toc_entry_matches_book_id()`：猜出来的链接必须**延伸本书
+  URL**（`/book/54294` → `/book/54294/217367.html`）或**复用本书的 id 数字**
+  （`/read/65332.html` → `/read/65332/6972399.html`）；光是"形状一样"不算；
+- `parsing.py::_parse_book_generic` → 新增 `_filter_guessed_chapter_links()`：
+  **书源声明了 `chapterList`**（说明它告诉过我们章节长什么样，只是规则失效了）时，只保留
+  "与本书有关的 URL" 或"标题像章节"的链接；一个都不剩就返回 0 章 —— 让同步明确报
+  「这本书解析不出目录」，而不是塞进一堆别的书。没声明 `chapterList` 的书源保持原样
+  （论坛类书源本来就把每层楼放在无关 URL 上，通用扫描就是它的正式解析器）。
+
+### B. 「正文是广告图 / 搜索图标 / 上一章下一章」：页面没带正文，旧逻辑把它当正文存了（御宅屋）
+
+御宅屋的《催眠系统》第 1 章、《绿情仙路》第 2 章正文是一张 `<img alt="搜索">`
+（`/css/h_search.png`，站点自己的搜索图标）；而 `#nr1` 在那种页面里只有
+「投推荐票 上一章 ← … 章节目录 → 下一章 加入书签」这一行导航。
+
+改动：
+- 插件 `chapter.py` 新增 `_content_is_chapter_chrome()`：抽出来的正文**短于 120 字且含两个以上**
+  导航短语（上一章/下一章/目录/加入书签/投推荐票…）→ 直接报错
+  「Chapter page returned only navigation/ads, not the chapter text」，
+  同步按章节失败处理并保留重试机会，不再把导航存成正文；
+- `_NOISE_IMAGE_RE` 补上 `search|menu|header|footer|/css/|btn_`（站点 UI 素材不算章节图片）；
+- `sync.py`：`_stale_chapter_reason(book_has_prose=…)` —— **纯图片章节在"有正文的书"里
+  判为陈旧（`image-only`）**，重新抓；整本都是图片的漫画书仍然保留（这是合法图集）。
+  命中 repair 的章节和"被别的书覆盖"一起计入 `repaired_chapters`，同步完会提示。
+
+### C. 「切换书源点了没反应」（网页）
+
+`BookDetailPage.vue` 只在 `onMounted` 里读 `route.params.id`，而"切换书源"是
+`router.push('/books/<另一个 id>')` —— 同一个路由 `/books/:id` 会**复用组件**，
+`onMounted` 不再执行，页面就停在原来那本书上（地址栏变了而已）。
+现在把加载逻辑提成 `loadBook(id)`，用 `watch(() => route.params.id, …, {immediate:true})`
+驱动，并在切换时清空上一本的章节/书源/书签等状态；点自己那一条不跳转。
+
+**验证**：`cd backend && python -m pytest -q` → **1077 passed**（新增
+`test_generic_toc_ignores_other_books_pages` / `…_reports_no_chapters_when_every_link_is_another_book` /
+`…_drops_other_books_of_the_same_shape` / `…_keeps_chapter_titled_links_without_a_book_relation` /
+`test_chapter_navigation_only_pages_are_not_content` /
+`…_image_only_chapter_is_junk_only_in_a_book_that_has_prose` /
+`…_reconcile_repairs_image_only_chapters_of_a_prose_book`）。
+另外用**线上真实页面**（local 代理抓的 yswhub / yaoluku HTML）跑过新守卫：
+yaoluku 的 `/books/<id>/` 列表页 → 0 章；yswhub 书页 → 0 章（原来会出 6 本别的书）；
+yswhub 第 1 章 → 正文 0 字节（原来会是那张搜索图标）。前端 `npm run typecheck && npm run build` 通过。
+
+**给线上用**：
+1. 部署后先修 A 类的 12 本：**书籍详情页「重新抓取正文」**（`refetch_content=true`）——
+   注意 Icu 的域名 `ztopaq7zrz.hq555.icu:1678` 从本机/NAS 都连不上（source 注释里也写了会换域名），
+   连不上时这本书会报"同步失败"，换域名更新书源后再重试；
+2. B 类的书（御宅屋等）在下次同步时会自动重抓那些纯图片章节，抓不到就明确报
+   「只有导航/广告」，不会再存一张搜索图标；
+3. C 只需要重新部署前端（浏览器强刷一次）。
+

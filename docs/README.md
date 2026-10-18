@@ -128,6 +128,13 @@
   「重新抓取正文」重下一遍）
 - **设置 → AI 想存多个模型供应商 / 切了供应商还是老模型在回答** →
   [ai-assistant.md](ai-assistant.md) §1.1 + [codex-handoff.md](codex-handoff.md) 第 56 节
+- **章节名是一串搜索词 / 别的书名，每章内容还都一样** →
+  [full-site-sync.md](full-site-sync.md) “章节名是一串搜索词或别的书名” +
+  [codex-handoff.md](codex-handoff.md) 第 58 节 A（猜目录猜到了书页上的推荐位）
+- **正文只有一张广告图/搜索图标，或一行「上一章 下一章 加入书签」** →
+  [codex-handoff.md](codex-handoff.md) 第 58 节 B
+- **点「切换书源」没反应 / 地址变了但页面还是原来那本书** →
+  [codex-handoff.md](codex-handoff.md) 第 58 节 C（前端路由复用组件）
 
 ## 文档维护约定
 

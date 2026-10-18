@@ -161,6 +161,43 @@ TOC_LINK_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A *guessed* chapter list has to look like chapters.  Sites put recommendation
+# blocks, "热搜词" links and ad pages on the same book page as the real TOC, and
+# those link texts are prose, not chapter titles: 要撸小说's book page offered
+# "致最终残留之物完整版哪里看" / "…by葬之镜百度网盘" links as "chapters"
+# (242 stored that way across the library), each one another book's page.
+# Titles that match this pattern are unambiguous chapters; see
+# ``_parse_book_generic``, which only demands the match when nothing else ties a
+# link to the book.
+CHAPTER_TITLE_RE = re.compile(
+    r"(?:第\s*[0-9０-９〇零一二三四五六七八九十百千两]+\s*[章节節回卷篇话話集])"
+    r"|(?:^|[\s\[（(【])\s*[0-9０-９]{1,4}\s*[)）\]】.、:：]"
+    r"|(?:^|[\s\[（(【])\s*[一二三四五六七八九十百千]{1,4}\s*[)）\]】、.]"
+    r"|楔子|序章|序言|前言|引子|后记|後記|尾声|尾聲|终章|終章|番外|大结局|大結局"
+    r"|chapter\s*[0-9]+|prologue|epilogue",
+    re.IGNORECASE,
+)
+
+# Reader chrome a chapter page shows when its body did not load.  A "chapter"
+# whose whole text is these phrases is the page's own navigation, not prose
+# (御宅屋 chapters were stored as a single "投推荐票 上一章 → 章节目录 → 下一章
+# 加入书签" line while the real body never arrived).
+CHAPTER_CHROME_PHRASES = (
+    "投推荐票",
+    "推荐票",
+    "加入书签",
+    "章节目录",
+    "返回目录",
+    "上一章",
+    "下一章",
+    "上一页",
+    "下一页",
+    "本站网址",
+    "请记住本站",
+    "手机用户请",
+    "章节列表",
+)
+
 CHAPTER_PATH_SEGMENTS = (
     "book",
     "read",
