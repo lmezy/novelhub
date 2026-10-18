@@ -145,7 +145,13 @@ class SearchService(SearchIndexMixin):
     # the part the clamp trims first, so it can be generous.
     SNIPPET_LEAD_CHARS = 12
     SNIPPET_TAIL_CHARS = 320
-    CONTENT_INDEX_LIMIT = 100_000
+    # Characters of chapter body kept in the index.  Measured on the live
+    # library: a 100 000-character chapter costs ~26 s of engine CPU per
+    # document (CJK text), and 11 627 stored chapters are that big -- at 100k
+    # a full rebuild is a multi-month job.  20 000 keeps body search useful
+    # (the candidate window re-scores far more than this per query) and makes
+    # a rebuild finish in hours; override with ``MEILI_CONTENT_INDEX_LIMIT``.
+    CONTENT_INDEX_LIMIT = 20_000
     DESCRIPTION_INDEX_LIMIT = 2000
 
     # ``content`` is deliberately absent from both lists: one chapter document

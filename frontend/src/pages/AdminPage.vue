@@ -434,6 +434,13 @@ async function revokeToken(id: string) {
 const indexStats = ref<any>(null)
 const indexRebuilding = ref(false)
 const indexError = ref("")
+//: Progress of the current/last search-index rebuild (see
+//: ``GET /search/index/rebuild/status``).  The rebuild runs in the backend in
+//: the background -- it reads every chapter file, so it is hours of work that
+//: used to sit inside the POST request with no feedback at all.
+const indexProgress = ref<any>(null)
+const indexCancelling = ref(false)
+let indexPollTimer: number | null = null
 
 async function loadIndexStats() {
   indexError.value = ""
@@ -445,18 +452,105 @@ async function loadIndexStats() {
   }
 }
 
+function stopIndexPolling() {
+  if (indexPollTimer !== null) {
+    window.clearInterval(indexPollTimer)
+    indexPollTimer = null
+  }
+}
+
+function ensureIndexPolling() {
+  if (indexPollTimer !== null) return
+  indexPollTimer = window.setInterval(() => void loadIndexProgress(), 2000)
+}
+
+async function loadIndexProgress(initial = false) {
+  try {
+    const progress = await api.get<any>("/search/index/rebuild/status")
+    indexProgress.value = progress
+    indexRebuilding.value = Boolean(progress?.running)
+    if (progress?.running) {
+      ensureIndexPolling()
+    } else {
+      stopIndexPolling()
+      // The stats card is what people look at after a rebuild: refresh it once
+      // the run finishes (but not on the first page load, loadIndexStats runs
+      // there anyway).
+      if (!initial) await loadIndexStats()
+    }
+  } catch {
+    /* progress display must never break the settings page */
+  }
+}
+
 async function rebuildIndex() {
-  indexRebuilding.value = true
   indexError.value = ""
   try {
-    await api.post("/search/index/rebuild")
-    await loadIndexStats()
+    const res = await api.post<any>("/search/index/rebuild")
+    indexProgress.value = res?.progress ?? null
+    indexRebuilding.value = Boolean(indexProgress.value?.running)
+    if (indexRebuilding.value) ensureIndexPolling()
+    else await loadIndexStats()
+  } catch (e) {
+    indexError.value = e instanceof Error ? e.message : i18n.t('admin_rebuild_failed')
+  }
+}
+
+async function cancelIndexRebuild() {
+  indexCancelling.value = true
+  try {
+    indexProgress.value = await api.post<any>("/search/index/rebuild/cancel")
   } catch (e) {
     indexError.value = e instanceof Error ? e.message : i18n.t('admin_rebuild_failed')
   } finally {
-    indexRebuilding.value = false
+    indexCancelling.value = false
   }
 }
+
+const indexPercent = computed(() => {
+  const p = indexProgress.value
+  if (!p) return 0
+  if (p.phase === "done") return 100
+  return Math.max(0, Math.min(100, Number(p.percent) || 0))
+})
+
+const indexElapsedSeconds = computed(() => {
+  const started = indexProgress.value?.started_at
+  if (!started) return 0
+  const start = new Date(started).getTime()
+  if (!Number.isFinite(start)) return 0
+  return Math.max(0, Math.round((Date.now() - start) / 1000))
+})
+
+function formatDuration(seconds: number): string {
+  if (!seconds || seconds < 0) return "0s"
+  const h = Math.floor(seconds / 3600)
+  const m = Math.floor((seconds % 3600) / 60)
+  const s = Math.round(seconds % 60)
+  if (h) return `${h}h ${m}m`
+  if (m) return `${m}m ${s}s`
+  return `${s}s`
+}
+
+const indexElapsed = computed(() => formatDuration(indexElapsedSeconds.value))
+
+const indexEta = computed(() => {
+  const percent = indexPercent.value
+  if (!indexProgress.value?.running || percent < 2) return ""
+  const remaining = (indexElapsedSeconds.value * (100 - percent)) / percent
+  return formatDuration(Math.round(remaining))
+})
+
+const indexPhaseLabel = computed(() => {
+  const phase = indexProgress.value?.phase
+  if (phase === "books") return i18n.t('admin_index_phase_books')
+  if (phase === "chapters") return i18n.t('admin_index_phase_chapters')
+  if (phase === "done") return i18n.t('admin_index_phase_done')
+  if (phase === "failed") return i18n.t('admin_index_phase_failed')
+  if (phase === "cancelled") return i18n.t('admin_index_phase_cancelled')
+  if (phase === "stale") return i18n.t('admin_index_phase_stale')
+  return i18n.t('admin_index_rebuilding')
+})
 
 // Novel/comic classification maintenance: the migration backfills existing
 // books, this re-runs the rules (optionally reading chapter bodies) so a new
@@ -525,6 +619,7 @@ onMounted(async () => {
   if (auth.isAdmin) {
     await loadStatus()
     await loadIndexStats()
+    await loadIndexProgress(true)
     await usersStore.loadUsers()
     await usersStore.loadRegistrationApproval()
     await approvalsStore.loadApprovals()
@@ -542,6 +637,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   // Polling lives in the global crawl store so the task survives route changes.
+  stopIndexPolling()
 })
 </script>
 
@@ -786,6 +882,35 @@ onUnmounted(() => {
                   : i18n.t('admin_index_last_update') + ': ' + (indexStats.chapters?.last_update ? new Date(indexStats.chapters.last_update).toLocaleString() : i18n.t('admin_index_unknown')) }}
               </p>
             </div>
+          </div>
+          <div v-if="indexProgress && indexProgress.phase && indexProgress.phase !== 'idle'" class="mb-4 p-3 rounded-lg border border-border dark:border-gray-700">
+            <div class="flex items-center justify-between text-xs mb-1">
+              <span class="font-medium">{{ indexPhaseLabel }}</span>
+              <span class="text-muted dark:text-gray-400">{{ indexPercent.toFixed(1) }}%</span>
+            </div>
+            <div class="h-2 rounded-full bg-gray-200 dark:bg-gray-700 overflow-hidden">
+              <div
+                class="h-full bg-accent transition-all duration-500"
+                :style="{ width: indexPercent + '%' }"
+              ></div>
+            </div>
+            <div class="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-1 text-[11px] text-muted dark:text-gray-400">
+              <span>{{ i18n.t('admin_index_progress_books', { done: indexProgress.books_done ?? 0, total: indexProgress.books_total ?? 0 }) }}</span>
+              <span>{{ i18n.t('admin_index_progress_chapters', { done: indexProgress.chapters_done ?? 0, total: indexProgress.chapters_total ?? 0 }) }}</span>
+              <span>{{ i18n.t('admin_index_progress_documents', { done: indexProgress.documents_done ?? 0, total: indexProgress.documents_total ?? 0 }) }}</span>
+              <span v-if="indexProgress.running">
+                {{ i18n.t('admin_index_progress_elapsed', { elapsed: indexElapsed }) }}<template v-if="indexEta"> · {{ i18n.t('admin_index_progress_eta', { eta: indexEta }) }}</template>
+              </span>
+            </div>
+            <p v-if="indexProgress.message" class="mt-2 text-xs">{{ indexProgress.message }}</p>
+            <p v-if="indexProgress.error" class="mt-1 text-xs text-red-600 break-words">{{ indexProgress.error }}</p>
+            <p class="mt-1 text-[11px] text-muted dark:text-gray-400">{{ i18n.t('admin_index_progress_note') }}</p>
+            <button
+              v-if="indexProgress.running"
+              @click="cancelIndexRebuild"
+              :disabled="indexCancelling || indexProgress.cancel_requested"
+              class="mt-2 px-3 py-1 text-xs border border-border dark:border-gray-700 rounded hover:bg-accent/5 disabled:opacity-50"
+            >{{ indexProgress.cancel_requested ? i18n.t('admin_index_cancelling') : i18n.t('admin_index_cancel') }}</button>
           </div>
           <button
             @click="rebuildIndex"

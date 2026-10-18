@@ -2478,4 +2478,70 @@ docker logs -f novelhub-backup                 # 看 "[backup ...] database dump
 另外队列里那 5.4 万个「重建任务」不会因为重启消失（Meilisearch 的队列落盘），
 要么等它排空，要么按 uid 分批 `POST /tasks/cancel` 取消 —— 备份不再抢 IO 后吞吐会快很多。
 
+---
+
+## 60. 「点重建索引后不知道进度」：重建改成后台任务 + 进度条（2026-10-18）
+
+**现象**：设置 → 搜索索引里点「重建索引」，页面只能干等；等不到结果（网关 30 秒超时、或关掉页面）
+就完全看不到"跑到哪了、还要多久、成没成"。线上点过一次之后，后台其实还在跑（499 了也照跑）。
+
+**根因（三个设计问题，都在"重建"这件事上）**：
+
+1. `rebuild_index()` 挂在 **HTTP 请求里同步跑**：它要读 46 436 本书 + 718 221 个章节文件、
+   往引擎推 ~76 万份文档，NAS 上是小时级；网关 30 秒就断开（nginx 记 `499`），后端继续跑，
+   于是"点了没反应、过很久也不知道好没好"。
+2. **没有进度状态**：只在最后返回 `{"books": n, "chapters": n}`，中途毫无信息。
+3. backend 线上是 **`--workers 2`**：请求会落到不同进程，**内存里的进度变量两边看不到**
+   （所以要落盘或落库）。
+
+**改动**：
+
+- `backend/app/services/search_index.py`
+  - 进度状态落盘到 `storage/.search-rebuild.json`：`phase`（starting/books/chapters/done/
+    failed/cancelled/stale）、书籍/章节/文档三条计数、`percent`、`message`、`error`、
+    `started_at`/`updated_at`/`finished_at`、`cancel_requested`，外加 **`heartbeat`** ——
+    心跳超过 180 秒说明进程死了（容器重启），`read_rebuild_progress()` 会翻成
+    `phase=stale`，UI 不会永远转圈。
+  - `rebuild_index(progress=…, should_stop=…)`：每写满一批就上报（`BOOK_BUFFER_SIZE` 500 本 /
+    `CHAPTER_BUFFER_SIZE` 100 章），每批开头检查一次取消标记（**不是**每章一次，718k 次文件读
+    太贵）；被取消时抛 `RebuildCancelled`。
+  - `start_rebuild()` / `cancel_rebuild()` / `_run_rebuild_background()` /
+    `rebuild_progress_callback()`（写盘节流 1 秒，`phase` 变化强制写）。已有一个在跑时
+    再点只会拿到同一个进度，**不会并发跑两份**（两份会把对方的索引删掉）。
+  - 先 `count(books)` / `count(chapters)` 拿到总数，进度条开局就有分母。
+- `backend/app/api/routes/search.py`：`POST /api/search/index/rebuild` 默认**后台启动**
+  （立刻返回 `{status, progress}`，`?wait=true` 保留旧的同步行为给脚本/冒烟测试）、
+  新增 `GET /api/search/index/rebuild/status`、`POST /api/search/index/rebuild/cancel`。
+- `frontend/src/pages/AdminPage.vue`：设置 →「搜索索引」加**进度条**（阶段、百分比、
+  书籍/章节/文档计数、已用时间、预计剩余）+「取消重建」按钮；2 秒轮询，**进页面就读一次
+  状态**（关掉页面再回来照样能看到），完成后自动刷新上面的书籍/章节统计。
+
+**验证**：`cd backend && python -m pytest -q` → **1087 passed**；新增
+`test_search_rebuild_api.py`（4 个：立刻返回/状态接口/`?wait=true`/取消透传）、
+`test_rebuild_progress_round_trips_and_detects_a_dead_rebuild`、
+`test_start_rebuild_refuses_a_second_concurrent_run`、
+`test_background_rebuild_publishes_done` / `…_publishes_failure`、
+`test_content_index_limit_defaults_to_20k_and_is_configurable`；前端
+`npm run typecheck && npm run build` 通过。
+
+**同一次里把「入库正文上限」从 10 万字降到 2 万字**（否则进度条只会停在个位数）：
+
+- 实测（线上，2026-10-18）：`data.ms/indexes` 只有 15 G、磁盘读 **0 MB/s**、CPU **100%** ——
+  重建不是 IO 瓶颈，是引擎在给 CJK 正文分词；**100 章一批要 43~90 分钟**，
+  上一批 `duration=PT2598`（43 分钟）。相当于 **~26 秒/章**。
+- 原因：库里 **11 627 个章节文件 ≥ 90 KB**（最大 **1.38 MB**，是个整本 TXT 被当成一章导入的），
+  旧上限 10 万字 → 单章文档 10 万字。7 182 批 × 43 分钟 ≈ 按"月/年"计。
+- 改动：`search.py::CONTENT_INDEX_LIMIT` 默认 **20 000**，新增
+  `SearchIndexMixin.content_index_limit()`（读 `MEILI_CONTENT_INDEX_LIMIT`，0/非法值用默认），
+  `rebuild_index` / `sync.py`（两处）/ `manual_import.py` 三处写索引统一走它。
+  **正文全文仍在 storage 里**，只是"索引副本"变短；正文搜索的候选窗口每查询重新打分，
+  前 2 万字已覆盖绝大多数命中。
+- 想恢复更深的正文搜索：`.env` 设 `MEILI_CONTENT_INDEX_LIMIT=100000` 再重建（会重新变慢）。
+
+**给线上用**：部署 backend + frontend 后，**当前正在跑的那次重建会随容器重启中断**
+（旧代码没有进度状态，也不会有记录），索引会停在已写入的样子 —— 重新点一次「重建索引」即可，
+这次会看到进度条。进度条统计的是"已经提交给 Meilisearch 的文档量"，引擎消化完才真正可搜，
+所以重建期间搜索可能只覆盖部分章节（UI 里也写了这句）。
+
+
 

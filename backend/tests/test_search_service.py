@@ -1,3 +1,5 @@
+import asyncio
+import json
 import time
 from unittest.mock import MagicMock, patch
 
@@ -359,7 +361,8 @@ async def test_rebuild_index_sends_books_in_one_batch_not_one_task_each():
 
     ``rebuild_index`` used to call ``index_book`` per row: 46 176 single-document
     Meilisearch tasks for the live library, each its own LMDB write transaction.
-    Books now travel in batches, like chapters (codex-handoff 59).
+    Books now travel in batches, like chapters (codex-handoff 59), and the run
+    publishes progress for the admin UI (codex-handoff 60).
     """
     from types import SimpleNamespace
 
@@ -384,14 +387,16 @@ async def test_rebuild_index_sends_books_in_one_batch_not_one_task_each():
         )
         for i in range(5)
     ]
-    chapter = SimpleNamespace(
-        id="c1",
-        book_id="b0",
-        title="第一章",
-        chapter_number=1,
-        content_path="/books/a/b/000001.md",
-    )
-
+    chapters = [
+        SimpleNamespace(
+            id=f"c{i}",
+            book_id="b0",
+            title=f"第{i + 1}章",
+            chapter_number=i + 1,
+            content_path=f"/books/a/b/00000{i + 1}.md",
+        )
+        for i in range(3)
+    ]
     class FakeResult:
         def __init__(self, rows):
             self._rows = rows
@@ -412,25 +417,190 @@ async def test_rebuild_index_sends_books_in_one_batch_not_one_task_each():
         async def __aexit__(self, *_exc):
             return False
 
+        async def scalar(self, _statement):
+            # ``count(books)`` then ``count(chapters)``.
+            self._counts = getattr(self, "_counts", 0) + 1
+            return len(books) if self._counts == 1 else len(chapters)
+
         async def scalars(self, _statement):
             self._calls += 1
-            return FakeResult(books if self._calls == 1 else [chapter])
+            return FakeResult(books if self._calls == 1 else chapters)
 
         async def execute(self, _statement):
             # The custom-tag join; no rows is fine here.
             return FakeResult([])
 
     storage = MagicMock()
-    storage.read_chapter.return_value = "#第一章\n\n正文"
+    # Longer than the cap on purpose: the rebuild must truncate what it hands
+    # to the engine (a 100k-character chapter costs ~26 s of engine CPU).
+    storage.read_chapter.return_value = "长" * 50_000
+
+    seen: list[dict] = []
 
     with patch("app.core.database.SessionLocal", FakeSession), \
          patch("app.services.storage.BookStorage", return_value=storage):
-        result = await service.rebuild_index()
+        result = await service.rebuild_index(progress=seen.append)
 
-    assert result == {"books": 5, "chapters": 1}
+    assert result == {"books": 5, "chapters": 3}
     first_batch = index.add_documents.call_args_list[0].args[0]
     assert len(first_batch) == 5
     assert all("kind" in doc for doc in first_batch)
+
+    phases = [entry.get("phase") for entry in seen if entry.get("phase")]
+    assert "books" in phases and "chapters" in phases
+    assert max(entry.get("documents_total", 0) for entry in seen) == 8
+    assert max(entry.get("documents_done", 0) for entry in seen) == 8
+    # Phase changes are published with ``force``: they must bypass the throttle
+    # so the UI switches from "书籍" to "章节" immediately.
+    assert any(entry.get("force") for entry in seen)
+
+    # Every chapter document handed to the engine is capped.
+    chapter_contents = [
+        doc["content"]
+        for call in index.add_documents.call_args_list
+        for doc in call.args[0]
+        if "content" in doc
+    ]
+    assert len(chapter_contents) == 3
+    assert all(len(text) <= service.content_index_limit() for text in chapter_contents)
+
+
+def test_content_index_limit_defaults_to_20k_and_is_configurable(monkeypatch):
+    """The indexed body cap is what makes a rebuild finish in hours.
+
+    Measured on the live library: a 100 000-character chapter (11 627 of them
+    exist, the largest is a whole TXT imported as one chapter) costs ~26 s of
+    Meilisearch CPU; at the old 100k cap a full rebuild was a multi-month job.
+    """
+    service, _client = _make_service()
+
+    monkeypatch.setattr(settings, "MEILI_CONTENT_INDEX_LIMIT", 20_000, raising=False)
+    assert service.content_index_limit() == 20_000
+
+    monkeypatch.setattr(settings, "MEILI_CONTENT_INDEX_LIMIT", 5_000, raising=False)
+    assert service.content_index_limit() == 5_000
+
+    # 0 / garbage means "use the shipped default", never "index nothing".
+    monkeypatch.setattr(settings, "MEILI_CONTENT_INDEX_LIMIT", 0, raising=False)
+    assert service.content_index_limit() == service.CONTENT_INDEX_LIMIT
+
+
+def test_rebuild_progress_round_trips_and_detects_a_dead_rebuild(tmp_path, monkeypatch):
+    """The progress the UI polls lives in a file, with a liveness heartbeat.
+
+    The endpoint answering the poll may be a different uvicorn worker, so the
+    state cannot be a module global; and a rebuild that died with its container
+    must not keep the console polling forever.
+    """
+    from app.services.search_index import (
+        read_rebuild_progress,
+        rebuild_state_path,
+        write_rebuild_progress,
+    )
+
+    monkeypatch.setattr(settings, "STORAGE_PATH", str(tmp_path))
+
+    assert read_rebuild_progress()["running"] is False
+
+    write_rebuild_progress({
+        "running": True,
+        "phase": "chapters",
+        "books_total": 10,
+        "books_done": 10,
+        "chapters_total": 90,
+        "chapters_done": 15,
+        "documents_total": 100,
+        "documents_done": 25,
+    })
+    progress = read_rebuild_progress()
+    assert progress["running"] is True
+    assert progress["phase"] == "chapters"
+    assert progress["percent"] == 25.0
+    assert progress["updated_at"]
+
+    # Heartbeat too old: the process is gone.
+    state = json.loads(rebuild_state_path().read_text(encoding="utf-8"))
+    state["heartbeat"] = time.time() - 1_000
+    rebuild_state_path().write_text(json.dumps(state), encoding="utf-8")
+    stale = read_rebuild_progress()
+    assert stale["running"] is False
+    assert stale["phase"] == "stale"
+    assert "重建" in stale["error"]
+
+
+@pytest.mark.asyncio
+async def test_start_rebuild_refuses_a_second_concurrent_run(tmp_path, monkeypatch):
+    from app.services.search_index import read_rebuild_progress
+
+    monkeypatch.setattr(settings, "STORAGE_PATH", str(tmp_path))
+    service, _client = _make_service()
+
+    started = {"count": 0}
+
+    async def fake_run():
+        started["count"] += 1
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(service, "_run_rebuild_background", fake_run)
+
+    first = service.start_rebuild()
+    second = service.start_rebuild()
+    await asyncio.sleep(0)               # let the scheduled task start
+
+    assert first["running"] is True
+    assert second["running"] is True
+    assert started["count"] == 1          # only one task was spawned
+    assert read_rebuild_progress()["phase"] == "starting"
+
+    cancelled = service.cancel_rebuild()
+    assert cancelled["cancel_requested"] is True
+    assert "取消" in cancelled["message"]
+
+
+@pytest.mark.asyncio
+async def test_background_rebuild_publishes_done(tmp_path, monkeypatch):
+    from app.services.search_index import read_rebuild_progress
+
+    monkeypatch.setattr(settings, "STORAGE_PATH", str(tmp_path))
+    service, _client = _make_service()
+
+    async def fake_rebuild(progress=None, should_stop=None):
+        if progress:
+            progress({"force": True, "phase": "chapters", "documents_total": 3})
+        return {"books": 1, "chapters": 2}
+
+    monkeypatch.setattr(service, "rebuild_index", fake_rebuild)
+    service.start_rebuild()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    done = read_rebuild_progress()
+    assert done["running"] is False
+    assert done["phase"] == "done"
+    assert done["percent"] == 100.0
+    assert done["result"] == {"books": 1, "chapters": 2}
+
+
+@pytest.mark.asyncio
+async def test_background_rebuild_publishes_failure(tmp_path, monkeypatch):
+    """A failure inside the task must reach the UI, not just the log."""
+    from app.services.search_index import read_rebuild_progress
+
+    monkeypatch.setattr(settings, "STORAGE_PATH", str(tmp_path))
+    service, _client = _make_service()
+
+    async def boom(progress=None, should_stop=None):
+        raise RuntimeError("meili down")
+
+    monkeypatch.setattr(service, "rebuild_index", boom)
+    service.start_rebuild()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    failed = read_rebuild_progress()
+    assert failed["running"] is False
+    assert failed["phase"] == "failed"
+    assert "meili down" in failed["error"]
 
 
 def test_search_books_applies_tag_filter():

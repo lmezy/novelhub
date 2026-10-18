@@ -155,7 +155,7 @@ class ManualImportService:
                 "book_id": book.id,
                 "title": chapter_title,
                 "chapter_number": index,
-                "content": content[: search_service.CONTENT_INDEX_LIMIT],
+                "content": content[: search_service.content_index_limit()],
                 "book_title": title,
                 "book_author": author_name,
                 "book_description": (book.description or "")[: search_service.DESCRIPTION_INDEX_LIMIT],

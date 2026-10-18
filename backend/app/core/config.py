@@ -92,6 +92,15 @@ class Settings(BaseSettings):
     # box needs.  Until this is enabled, a chapter-scoped title/author condition
     # keeps its windowed candidate path: correct, just bounded.
     MEILI_GRAM_BACKFILL_CHAPTERS:bool=False
+    # Characters of chapter body kept in one index document.  Meilisearch
+    # re-tokenises the whole document on every add, and CJK text is expensive:
+    # measured on the live library (2026-10-18) a 100 000-character chapter costs
+    # ~26 s of engine CPU, and 11 627 stored chapters are that big (the largest
+    # is a whole TXT imported as one chapter, 1.38 MB).  At 100k a full rebuild
+    # needed months; at 20k it is hours.  Body search still works -- the
+    # candidate window re-scores far more text than this per query -- and the
+    # full chapter is always in storage, this only limits the index copy.
+    MEILI_CONTENT_INDEX_LIMIT:int=20000
 
     SYNC_CHAPTER_CONCURRENCY:int=9
     SYNC_BOOK_CONCURRENCY:int=3

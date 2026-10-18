@@ -138,6 +138,9 @@
 - **重建索引半天没进展 / NAS 磁盘一直大量读写 / 数据库备份是 0 字节** →
   [codex-handoff.md](codex-handoff.md) 第 59 节 + [../README.md](../README.md)「备份」
   （每日全量 tar 换成硬链接增量快照；`BACKUP_STORAGE=0` 可只备份数据库）
+- **点了「重建索引」看不到进度 / 跑没跑完不知道 / 能不能取消** →
+  [codex-handoff.md](codex-handoff.md) 第 60 节（改成后台任务 + 进度条，可取消；
+  `GET /api/search/index/rebuild/status`）
 
 ## 文档维护约定
 

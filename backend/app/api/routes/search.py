@@ -12,6 +12,7 @@ from app.services.visibility import can_view_all_ages, can_view_r18
 from pydantic import BaseModel, Field
 
 from app.services.search import search_service
+from app.services.search_index import read_rebuild_progress
 
 
 class SearchResult(BaseModel):
@@ -250,13 +251,40 @@ async def index_stats(user: User = Depends(get_current_user)):
 
 
 @router.post("/index/rebuild")
-async def rebuild_index(user: User = Depends(get_current_user)):
-    """Rebuild search indexes from database."""
+async def rebuild_index(
+    wait: bool = False,
+    user: User = Depends(get_current_user),
+):
+    """Rebuild search indexes from database and storage records.
+
+    The rebuild reads every chapter file and pushes ~760 000 documents, which is
+    hours of work on a NAS.  It therefore runs **in the background** by default:
+    this returns immediately and the UI polls ``/index/rebuild/status``.  Send
+    ``?wait=true`` for the old blocking behaviour (scripts, smoke tests).
+    """
+    if not wait:
+        progress = search_service.start_rebuild()
+        status = "running" if progress.get("running") else "started"
+        return {"status": status, "progress": progress}
     try:
-        result = await search_service.rebuild_index()
+        result = await search_service.rebuild_index(
+            progress=search_service.rebuild_progress_callback(),
+        )
         return {"status": "ok", **result}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/index/rebuild/status")
+async def rebuild_status(user: User = Depends(get_current_user)):
+    """Progress of the current/last rebuild (bars, counters, ETA inputs)."""
+    return read_rebuild_progress()
+
+
+@router.post("/index/rebuild/cancel")
+async def rebuild_cancel(user: User = Depends(get_current_user)):
+    """Ask a running rebuild to stop after the batch it is writing."""
+    return search_service.cancel_rebuild()
 
 
 @router.post("/index/kinds")

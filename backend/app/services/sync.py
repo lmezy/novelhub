@@ -1005,7 +1005,7 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                         "title": chapter.title or "",
                         "chapter_number": chapter.chapter_number,
                         "content": self._strip_content_images(content)[
-                            : search_service.CONTENT_INDEX_LIMIT
+                            : search_service.content_index_limit()
                         ],
                         "book_title": book_title,
                         "book_author": book_author,
@@ -1704,7 +1704,7 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             "title": chapter.title or "",
             "chapter_number": chapter.chapter_number,
             "content": self._strip_content_images(content)[
-                : search_service.CONTENT_INDEX_LIMIT
+                : search_service.content_index_limit()
             ],
             "book_title": book_title,
             "book_author": book_author,

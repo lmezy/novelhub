@@ -5,11 +5,17 @@ creates/configures indexes, writes documents, or rebuilds/backfills them
 lives here as a mixin, so the 3000-line god file becomes two navigable ones.
 """
 
+import asyncio
+import json
+import os
 import time
+from pathlib import Path
+from typing import Any, Callable
 
 import meilisearch
 from loguru import logger
 
+from app.core.clock import naive_now
 from app.core.config import settings
 from app.services.book_kind import KIND_NOVEL, normalize_kind
 from app.services.search_ngrams import (
@@ -22,7 +28,114 @@ from app.services.search_ngrams import (
 )
 
 
+# -- rebuild progress --------------------------------------------------------
+#
+# A rebuild reads every book, every chapter file and pushes ~760 000 documents
+# into the engine; on a NAS that is hours of work, and doing it inside the HTTP
+# request left the admin staring at a spinner that a 30 s gateway timeout turns
+# into ``499`` while the work kept running (codex-handoff 59/60).
+#
+# The state therefore lives in a small JSON file inside the storage volume, not
+# in memory: the endpoint that answers the progress poll may be served by a
+# *different* uvicorn worker (the NAS runs ``--workers 2``), so a module global
+# would answer "not running" half the time.
+
+REBUILD_STATE_FILE = ".search-rebuild.json"
+#: A rebuild publishes at most this often (phase changes ignore the throttle).
+REBUILD_PROGRESS_THROTTLE_SECONDS = 1.0
+#: A "running" state whose heartbeat is older than this means the process died
+#: (container restart) -- the UI must stop polling instead of forever.
+REBUILD_STALE_SECONDS = 180
+
+
+class RebuildCancelled(RuntimeError):
+    """Raised inside a rebuild when the admin asked it to stop."""
+
+
+def rebuild_state_path() -> Path:
+    return Path(settings.STORAGE_PATH) / REBUILD_STATE_FILE
+
+
+def empty_rebuild_progress() -> dict[str, Any]:
+    return {
+        "running": False,
+        "phase": "idle",
+        "started_at": None,
+        "updated_at": None,
+        "finished_at": None,
+        "books_total": 0,
+        "books_done": 0,
+        "chapters_total": 0,
+        "chapters_done": 0,
+        "documents_done": 0,
+        "documents_total": 0,
+        "percent": 0.0,
+        "message": "",
+        "error": None,
+        "result": None,
+        "cancel_requested": False,
+    }
+
+
+def read_rebuild_progress() -> dict[str, Any]:
+    """The last published rebuild state (never raises)."""
+    progress = empty_rebuild_progress()
+    try:
+        raw = json.loads(rebuild_state_path().read_text(encoding="utf-8"))
+    except Exception:
+        return progress
+    if not isinstance(raw, dict):
+        return progress
+    for key in progress:
+        if key in raw:
+            progress[key] = raw[key]
+    if progress.get("running"):
+        heartbeat = 0.0
+        try:
+            heartbeat = float(raw.get("heartbeat") or 0)
+        except (TypeError, ValueError):
+            heartbeat = 0.0
+        if time.time() - heartbeat > REBUILD_STALE_SECONDS:
+            progress["running"] = False
+            progress["phase"] = "stale"
+            progress["error"] = (
+                "上一次重建没有正常结束（进程/容器重启过）。可以直接重新点「重建索引」。"
+            )
+    return progress
+
+
+def write_rebuild_progress(update: dict[str, Any]) -> dict[str, Any]:
+    """Merge ``update`` into the stored state and publish it atomically."""
+    current = read_rebuild_progress()
+    current.update({k: v for k, v in update.items() if k != "heartbeat"})
+    current["heartbeat"] = time.time()
+    current["updated_at"] = naive_now().isoformat(timespec="seconds")
+    total = int(current.get("documents_total") or 0)
+    done = int(current.get("documents_done") or 0)
+    current["percent"] = round(100.0 * done / total, 1) if total else 0.0
+
+    path = rebuild_state_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(current, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+    except Exception as exc:  # progress must never break the rebuild
+        logger.debug("Could not write rebuild progress: {}", exc)
+    return current
+
+
+#: Strong references to in-flight rebuild tasks: ``asyncio`` keeps only weak ones,
+#: and a garbage-collected task would abort a multi-hour rebuild silently.
+_REBUILD_TASKS: set[asyncio.Task] = set()
+
+
 class SearchIndexMixin:
+    """Index lifecycle, writes and maintenance for the search service."""
+
     def max_total_hits(self) -> int:
         """The engine's ``pagination.maxTotalHits`` for this deployment.
 
@@ -36,6 +149,23 @@ class SearchIndexMixin:
         except (TypeError, ValueError):
             configured = 0
         return configured if configured > 0 else self.MAX_TOTAL_HITS
+
+    def content_index_limit(self) -> int:
+        """Characters of chapter body kept in one index document.
+
+        Not a cosmetic knob: Meilisearch re-tokenises the whole document on
+        every write, and CJK text is expensive.  Measured on the live library,
+        a 100 000-character chapter costs ~26 s of engine CPU, and 11 627 stored
+        chapters are that big (the largest is a whole TXT imported as a single
+        chapter, 1.38 MB) -- at the old 100k cap a full rebuild was a
+        multi-month job.  The full text always stays in storage; this only
+        limits the index copy.
+        """
+        try:
+            configured = int(getattr(settings, "MEILI_CONTENT_INDEX_LIMIT", 0) or 0)
+        except (TypeError, ValueError):
+            configured = 0
+        return configured if configured > 0 else self.CONTENT_INDEX_LIMIT
 
     @classmethod
     def gram_fields(cls, name: str) -> tuple[str, ...]:
@@ -312,7 +442,11 @@ class SearchIndexMixin:
                 result[idx_name] = {"documents": 0, "is_indexing": False, "last_update": None}
         return result
 
-    async def rebuild_index(self) -> dict:
+    async def rebuild_index(
+        self,
+        progress: Callable[[dict[str, Any]], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> dict:
         """Rebuild both indexes from database and storage records.
 
         Books are submitted in batches, like chapters.  The old per-book
@@ -320,15 +454,32 @@ class SearchIndexMixin:
         single-document tasks for the live library -- and each of those is its
         own LMDB write transaction; with the daily backup reading the same disk
         the engine needed hours to drain them (see codex-handoff 59).
+
+        ``progress`` is called with partial counters while the rebuild runs (the
+        admin UI shows them as a progress bar), ``should_stop`` is polled between
+        batches so a running rebuild can be cancelled.
         """
         result = {"books": 0, "chapters": 0}
+
+        def publish(force: bool = False, **values: Any) -> None:
+            if progress is None:
+                return
+            progress({**values, "force": force})
+
+        def check_stop() -> None:
+            if should_stop is not None and should_stop():
+                raise RebuildCancelled("重建已取消")
+
         async def _rebuild():
             from app.core.database import SessionLocal
             from app.models import Book, BookCustomTag, Chapter, CustomTag
             from app.services.storage import BookStorage
-            from sqlalchemy import select
+            from sqlalchemy import func, select
 
             storage = BookStorage()
+            publish(force=True, phase="starting", message="正在删除旧索引…",
+                    documents_done=0, documents_total=0,
+                    started_at=naive_now().isoformat(timespec="seconds"))
             async with SessionLocal() as db:
                 for idx_name in [self.INDEX_BOOKS, self.INDEX_CHAPTERS]:
                     try:
@@ -343,6 +494,21 @@ class SearchIndexMixin:
                 self._ensure_index(self.INDEX_BOOKS)
                 self._ensure_index(self.INDEX_CHAPTERS)
 
+                # Totals first: the progress bar needs a denominator before the
+                # first batch, and counting is cheap compared to reading files.
+                books_total = int(await db.scalar(select(func.count(Book.id))) or 0)
+                chapters_total = int(
+                    await db.scalar(select(func.count(Chapter.id))) or 0
+                )
+                publish(
+                    force=True, phase="books",
+                    books_total=books_total, books_done=0,
+                    chapters_total=chapters_total, chapters_done=0,
+                    documents_total=books_total + chapters_total,
+                    documents_done=0,
+                    message=f"正在写入书籍 0 / {books_total}",
+                )
+
                 books = (await db.scalars(select(Book))).unique().all()
                 custom_rows = await db.execute(
                     select(BookCustomTag.book_id, CustomTag.name)
@@ -354,6 +520,7 @@ class SearchIndexMixin:
                 book_meta: dict[str, dict] = {}
                 book_batch: list[dict] = []
                 for book in books:
+                    check_stop()
                     tags = list(
                         dict.fromkeys(
                             [*book.tag_names, *custom_tag_map.get(book.id, [])]
@@ -380,13 +547,34 @@ class SearchIndexMixin:
                         self.client.index(self.INDEX_BOOKS).add_documents(book_batch)
                         result["books"] += len(book_batch)
                         book_batch = []
+                        publish(
+                            books_done=result["books"],
+                            documents_done=result["books"],
+                            message=f"正在写入书籍 {result['books']} / {books_total}",
+                        )
                 if book_batch:
                     self.client.index(self.INDEX_BOOKS).add_documents(book_batch)
                     result["books"] += len(book_batch)
+                    publish(
+                        force=True, books_done=result["books"],
+                        documents_done=result["books"],
+                        message=f"书籍完成（{result['books']}），开始写章节…",
+                    )
 
+                publish(
+                    force=True, phase="chapters",
+                    books_done=result["books"],
+                    documents_done=result["books"],
+                    message=f"正在写入章节 0 / {chapters_total}",
+                )
                 chapters = (await db.scalars(select(Chapter))).unique().all()
                 batch: list[dict] = []
                 for chapter in chapters:
+                    if len(batch) == 0:
+                        # Checked once per batch, not per document: reading the
+                        # cancel flag on every chapter would be 718 000 file
+                        # reads.
+                        check_stop()
                     meta = book_meta.get(chapter.book_id) or {}
                     content = ""
                     if chapter.content_path:
@@ -404,7 +592,7 @@ class SearchIndexMixin:
                         "book_description": (meta.get("description") or "")[
                             : self.DESCRIPTION_INDEX_LIMIT
                         ],
-                        "content": content[: self.CONTENT_INDEX_LIMIT],
+                        "content": content[: self.content_index_limit()],
                         "is_r18": bool(meta.get("is_r18", False)),
                         "owner_id": meta.get("owner_id"),
                         "is_public": bool(meta.get("is_public", False)),
@@ -421,9 +609,21 @@ class SearchIndexMixin:
                         self.client.index(self.INDEX_CHAPTERS).add_documents(batch)
                         result["chapters"] += len(batch)
                         batch = []
+                        publish(
+                            chapters_done=result["chapters"],
+                            documents_done=result["books"] + result["chapters"],
+                            message=(
+                                f"正在写入章节 {result['chapters']} / {chapters_total}"
+                            ),
+                        )
                 if batch:
                     self.client.index(self.INDEX_CHAPTERS).add_documents(batch)
                     result["chapters"] += len(batch)
+                    publish(
+                        force=True, chapters_done=result["chapters"],
+                        documents_done=result["books"] + result["chapters"],
+                        message="章节写入完成，正在收尾…",
+                    )
 
                 # The rebuild just wrote every document, gram fields included, so
                 # the metadata search may take the gram path immediately rather
@@ -433,6 +633,107 @@ class SearchIndexMixin:
 
         await _rebuild()
         return result
+
+    def rebuild_progress_callback(self) -> Callable[[dict[str, Any]], None]:
+        """A throttled writer for ``rebuild_index(progress=...)``."""
+        last_write = {"at": 0.0}
+
+        def publish(update: dict[str, Any]) -> None:
+            forced = bool(update.get("force"))
+            update = {k: v for k, v in update.items() if k != "force"}
+            now = time.time()
+            if not forced and now - last_write["at"] < REBUILD_PROGRESS_THROTTLE_SECONDS:
+                return
+            last_write["at"] = now
+            write_rebuild_progress(update)
+
+        return publish
+
+    def start_rebuild(self) -> dict[str, Any]:
+        """Kick off a background rebuild and return the initial progress.
+
+        Returns the progress of the *already running* rebuild when one is in
+        flight, so two clicks cannot run two rebuilds (they would delete each
+        other's index).
+        """
+        current = read_rebuild_progress()
+        if current.get("running"):
+            return current
+
+        write_rebuild_progress({
+            "running": True,
+            "phase": "starting",
+            "started_at": naive_now().isoformat(timespec="seconds"),
+            "finished_at": None,
+            "books_done": 0,
+            "chapters_done": 0,
+            "documents_done": 0,
+            "documents_total": 0,
+            "percent": 0.0,
+            "error": None,
+            "result": None,
+            "cancel_requested": False,
+            "message": "已开始，正在准备…",
+        })
+        task = asyncio.create_task(self._run_rebuild_background())
+        _REBUILD_TASKS.add(task)
+        task.add_done_callback(_REBUILD_TASKS.discard)
+        return read_rebuild_progress()
+
+    def cancel_rebuild(self) -> dict[str, Any]:
+        """Ask the running rebuild to stop at its next batch boundary."""
+        current = read_rebuild_progress()
+        if not current.get("running"):
+            return current
+        return write_rebuild_progress({
+            "cancel_requested": True,
+            "message": "已请求取消，等当前批次写完就停…",
+        })
+
+    async def _run_rebuild_background(self) -> None:
+        """Run a rebuild to completion, publishing progress and failures."""
+        publish = self.rebuild_progress_callback()
+        try:
+            result = await self.rebuild_index(
+                progress=publish,
+                should_stop=lambda: bool(read_rebuild_progress().get("cancel_requested")),
+            )
+        except RebuildCancelled:
+            logger.info("Search index rebuild cancelled by the admin")
+            write_rebuild_progress({
+                "running": False,
+                "phase": "cancelled",
+                "finished_at": naive_now().isoformat(timespec="seconds"),
+                "message": "重建已取消（已写入的部分保留）",
+            })
+            return
+        except Exception as exc:
+            # A background task that raises would only be logged as unhandled;
+            # the UI has to be able to say *why* it stopped.
+            logger.exception("Search index rebuild failed")
+            write_rebuild_progress({
+                "running": False,
+                "phase": "failed",
+                "finished_at": naive_now().isoformat(timespec="seconds"),
+                "error": str(exc) or type(exc).__name__,
+                "message": "重建失败",
+            })
+            return
+
+        write_rebuild_progress({
+            "running": False,
+            "phase": "done",
+            "finished_at": naive_now().isoformat(timespec="seconds"),
+            "books_done": result.get("books", 0),
+            "chapters_done": result.get("chapters", 0),
+            "documents_done": int(result.get("books", 0)) + int(result.get("chapters", 0)),
+            "percent": 100.0,
+            "result": result,
+            "message": (
+                f"完成：书籍 {result.get('books', 0)} 本、章节 "
+                f"{result.get('chapters', 0)} 章已提交，等待搜索服务消化"
+            ),
+        })
 
     # Chapters are submitted in this many documents per Meilisearch task (see
     # ``CHAPTER_BUFFER_SIZE``); a book document is ~20x smaller, so one task can
@@ -782,8 +1083,8 @@ class SearchIndexMixin:
 
         **Chapters are not backfilled by default.**  Meilisearch re-tokenises the
         whole document on every update, and a chapter document carries up to
-        ``CONTENT_INDEX_LIMIT`` (100 000) characters of body -- so gramming 732k
-        chapters is a near-full re-index of a 94 GB store, measured on production
+        ``content_index_limit()`` characters of body (20 000 by default) -- so
+        gramming 732k chapters is a near-full re-index of a 94 GB store, measured on production
         as a single batch still running after 19 minutes with 11 of the 12 GB
         container's memory in use.  Books carry no body, so their backfill is
         cheap and is what the search box mostly needs.  Set
