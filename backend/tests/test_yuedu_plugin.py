@@ -5283,3 +5283,33 @@ def test_chapter_navigation_only_pages_are_not_content():
     # A long paragraph may legitimately mention the navigation words once.
     long_text = "加入书签" + "正文内容。" * 60
     assert YueduPlugin._content_is_chapter_chrome(long_text) is False
+
+def test_describe_book_page_says_which_knob_to_turn():
+    """The same "chapters=0" error hid four different causes on 要撸小说.
+
+    A 403 JS-redirect stub, a page whose TOC container was empty, a page whose
+    container had disappeared and a captcha page all surfaced identically; the
+    verdict is what tells the operator to change the proxy node or the rule.
+    """
+    from app.crawler.plugins.yuedu.book import describe_book_page, toc_container_hint
+
+    stub = '<html><script>window.location.href="/book/1"</script></html>'
+    assert "跳转/挑战页" in describe_book_page(stub, "ul#ul_all_chapters > li")
+
+    captcha = "<html>" + "x" * 3000 + " Just a moment... </html>"
+    assert "人机验证" in describe_book_page(captcha, "ul#ul_all_chapters > li")
+
+    missing = "<html>" + "x" * 3000 + "</html>"
+    verdict = describe_book_page(missing, "ul#ul_all_chapters > li")
+    assert 'id="ul_all_chapters"' in verdict and "没有目录容器" in verdict
+
+    empty = '<html>' + "x" * 3000 + ' id="ul_all_chapters" ' + "y" * 100 + "</html>"
+    verdict = describe_book_page(empty, "ul#ul_all_chapters > li")
+    assert "是空的" in verdict and "限流" in verdict
+
+    # No usable selector hint -> a generic verdict, never a crash.
+    assert "没有解析出任何章节链接" in describe_book_page(missing, "")
+
+    assert toc_container_hint("ul#ul_all_chapters > li") == 'id="ul_all_chapters"'
+    assert toc_container_hint("div.chapter-list a") == 'class="chapter-list"'
+    assert toc_container_hint("ul > li") == ""

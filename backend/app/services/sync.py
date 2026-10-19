@@ -202,6 +202,29 @@ def _last_explore_diagnosis(plugin) -> str:
     return f" 最近一次分类页：{url} → {summary}"
 
 
+def _last_book_diagnosis(plugin) -> str:
+    """Append what the site answered to a "no usable chapters" book error.
+
+    Mirrors ``_last_explore_diagnosis``: the yuedu plugin records one line for
+    every book page whose table of contents parsed to zero chapters, and that
+    line is the difference between "换代理节点" and "书源规则过期了" -- the
+    live 要撸小说 failure looked identical for both (codex-handoff 62).
+    """
+    diagnosis = getattr(plugin, "_book_page_diagnosis", None)
+    if not diagnosis:
+        return ""
+    try:
+        url, summary = diagnosis
+    except (TypeError, ValueError):
+        return ""
+    summary = " ".join(str(summary or "").split())
+    if not summary:
+        return ""
+    if len(summary) > 200:
+        summary = summary[:200] + "…"
+    return f" 书页诊断：{url} → {summary}"
+
+
 async def load_source_cookie(source_id: str) -> str | None:
     """Read a source's stored Cookie on its own short-lived session.
 
@@ -577,6 +600,7 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             raise ValueError(
                 f"Book page returned no usable metadata/chapters: {url} "
                 f"(title={remote_book.title!r}, chapters={len(remote_book.chapters)})"
+                + _last_book_diagnosis(plugin)
             )
 
         async def _checkpoint() -> None:

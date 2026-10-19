@@ -160,6 +160,10 @@ class YueduPlugin(UrlsMixin, ParsingMixin, ExploreMixin, BookMixin, ChapterMixin
         # parsed to zero books, so the "returned no books" warning can say
         # what the site actually answered instead of only the URL.
         self._explore_page_diagnostics: dict[str, str] = {}
+        # ``(toc_url, verdict)`` for the last book page that parsed to zero
+        # chapters, so the sync error can say *why* (anti-bot shell page vs. an
+        # empty TOC container vs. an outdated rule).
+        self._book_page_diagnosis: tuple[str, str] | None = None
         # ``{kind_url: page-1 URL}`` memo so a ``<js>`` rule is not evaluated
         # twice per page.
         self._explore_kind_bases: dict[str, str] = {}

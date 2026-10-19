@@ -24,7 +24,65 @@ import random
 import re
 
 
+def describe_book_page(html: str, toc_selector: str = "") -> str:
+    """One line about a book page whose table of contents parsed to nothing.
+
+    Written after the 要撸小说 case (2026-10-19): the same URL answered a 403
+    JS-redirect stub, a full page whose ``ul#ul_all_chapters`` was empty, and a
+    60-second timeout, all within minutes, depending on which exit IP the proxy
+    handed out -- and every one of them surfaced as the same "no usable
+    metadata/chapters" error.  The verdict says which knob to turn.
+    """
+    text = str(html or "")
+    lowered = text.lower()
+    if len(text) < 2048 or "window.location.href" in lowered:
+        return (
+            f"站点只返回了 {len(text)} 字节的跳转/挑战页，不是目录页；"
+            "换一个代理节点或更新书源 Cookie 后重试"
+        )
+    for marker in ("just a moment", "cf-chl", "cf_chl", "captcha", "人机验证", "安全验证"):
+        if marker in lowered:
+            return "站点返回了人机验证页面；换代理节点或更新书源 Cookie 后重试"
+    container = toc_container_hint(toc_selector)
+    if container and container not in text:
+        return f"页面已加载，但里面没有目录容器 {container}（书源规则可能已过期）"
+    if container:
+        return (
+            f"页面已加载，目录容器 {container} 是空的"
+            "（站点可能对该出口 IP 限流，换节点或更新 Cookie 后重试）"
+        )
+    return "页面已加载，但没有解析出任何章节链接（书源规则可能已过期）"
+
+
+def toc_container_hint(selector: str) -> str:
+    """``ul#ul_all_chapters > li`` -> ``id="ul_all_chapters"`` (best effort)."""
+    text = str(selector or "")
+    match = re.search(r"#([A-Za-z0-9_-]+)", text)
+    if match:
+        return f'id="{match.group(1)}"'
+    match = re.search(r"\.([A-Za-z0-9_-]+)", text)
+    if match:
+        return f'class="{match.group(1)}"'
+    return ""
+
+
 class BookMixin:
+    def _record_book_page_diagnosis(self, toc_html: str, toc_url: str) -> None:
+        """Remember why a book page produced no chapters.
+
+        Mirrors ``_explore_page_diagnostics``: the sync layer appends this to the
+        "no usable metadata/chapters" error, which is otherwise the same sentence
+        for an anti-bot shell page, a page whose TOC container disappeared and a
+        page whose container is simply empty (see ``describe_book_page``).
+        """
+        rule_toc = getattr(self, "config", None)
+        selector = ""
+        if isinstance(rule_toc, dict):
+            toc_rule = rule_toc.get("ruleToc")
+            if isinstance(toc_rule, dict):
+                selector = str(toc_rule.get("chapterList") or "")
+        self._book_page_diagnosis = (toc_url, describe_book_page(toc_html, selector))
+
     """Methods extracted from ``YueduPlugin``."""
 
     def build_book_url(self, book_id: str) -> str:
@@ -373,6 +431,7 @@ class BookMixin:
                 # really other books and failed one by one with "Chapter
                 # returned empty content".  Skip the book with a clear reason
                 # instead of inventing a table of contents.
+                self._record_book_page_diagnosis(toc_html, toc_url)
                 raise EmptyTocError(
                     "书源目录规则已失效：书源声明的目录页没有解析出任何章节"
                     f"（{toc_url}）。该书在源站可能没有章节，或站点已把目录改成"
@@ -389,6 +448,10 @@ class BookMixin:
                 chapter_number=1,
             )]
         chapters = self._dedupe_chapters(chapters, identity_url)
+        if not chapters:
+            # The page loaded but gave us nothing to read: remember what the
+            # site actually answered so the sync error can say why.
+            self._record_book_page_diagnosis(toc_html, toc_url)
         chapters = self._attach_next_urls(chapters)
 
         cover_url = self._pick_cover_url(info.get("coverUrl"), identity_url)

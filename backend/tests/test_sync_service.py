@@ -394,6 +394,29 @@ async def test_content_images_are_fetched_in_parallel(monkeypatch):
     assert all(total == 8 for _, total in progress)
 
 
+def test_last_book_diagnosis_appends_the_page_verdict():
+    """A book that yields no chapters must say what the site answered."""
+    from app.services.sync import _last_book_diagnosis
+
+    plugin = SimpleNamespace(
+        _book_page_diagnosis=(
+            "https://www.yaoluku.com/book/54294",
+            "页面已加载，目录容器 id=\"ul_all_chapters\" 是空的（站点可能对该出口 IP 限流）",
+        )
+    )
+    hint = _last_book_diagnosis(plugin)
+
+    assert "书页诊断" in hint
+    assert "ul_all_chapters" in hint
+    assert "限流" in hint
+
+    # Nothing recorded, or a malformed record: no suffix, never an exception.
+    assert _last_book_diagnosis(SimpleNamespace()) == ""
+    assert _last_book_diagnosis(SimpleNamespace(_book_page_diagnosis=None)) == ""
+    assert _last_book_diagnosis(SimpleNamespace(_book_page_diagnosis="oops")) == ""
+    assert _last_book_diagnosis(SimpleNamespace(_book_page_diagnosis=("u", ""))) == ""
+
+
 def test_empty_catalog_error_reports_what_the_site_answered():
     """A Cloudflare 520 must not look like a book source whose rules broke."""
     from app.services.sync import _last_explore_diagnosis
