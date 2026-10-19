@@ -101,6 +101,12 @@ class Settings(BaseSettings):
     # candidate window re-scores far more text than this per query -- and the
     # full chapter is always in storage, this only limits the index copy.
     MEILI_CONTENT_INDEX_LIMIT:int=20000
+    # How many tasks the engine may still have queued before an index rebuild
+    # waits for it.  Meilisearch merges consecutive tasks into one batch and a
+    # batch is one transaction: on 2026-10-19 the live engine merged 3 787
+    # chapter tasks (~380 000 documents) and could not finish it in 15 hours
+    # (60-76 MB/s of index reads, nothing committed).  0 keeps the code default.
+    MEILI_BACKLOG_LIMIT:int=0
 
     SYNC_CHAPTER_CONCURRENCY:int=9
     # Chapter rows are committed in batches of this size instead of one commit

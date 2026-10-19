@@ -442,6 +442,57 @@ class SearchIndexMixin:
                 result[idx_name] = {"documents": 0, "is_indexing": False, "last_update": None}
         return result
 
+    def engine_backlog(self) -> int | None:
+        """How many tasks the engine still has queued, or ``None`` if unknown.
+
+        Meilisearch coalesces consecutive small tasks into **one batch**, and a
+        batch is a single transaction: on 2026-10-19 the live engine ended up
+        with 3 787 chapter tasks (~380 000 documents) in one batch and spent 15
+        hours reading the index at 60-76 MB/s with a 12 GB container, without
+        committing a single document (books index fine, chapters frozen at
+        339 600).  A writer that waits for the engine to catch up never builds
+        that batch.
+        """
+        try:
+            tasks = self.client.get_tasks({"statuses": "enqueued,processing", "limit": 1})
+        except Exception as exc:  # a probe must never break indexing
+            logger.debug("Could not read the engine backlog: {}", exc)
+            return None
+        if not isinstance(tasks, dict):
+            return None
+        total = tasks.get("total")
+        return int(total) if isinstance(total, int) else None
+
+    async def wait_for_engine(self) -> None:
+        """Block while the engine's queue is longer than ``INDEX_BACKLOG_LIMIT``.
+
+        Bounded: if the engine is hopelessly behind (or its task endpoint is
+        unavailable) the rebuild continues anyway after
+        ``INDEX_BACKLOG_MAX_WAIT_SECONDS`` -- a stuck index is bad, but an
+        unbounded wait that never writes anything is worse.
+        """
+        limit = max(1, int(getattr(settings, "MEILI_BACKLOG_LIMIT", 0) or 0) or self.INDEX_BACKLOG_LIMIT)
+        deadline = time.monotonic() + self.INDEX_BACKLOG_MAX_WAIT_SECONDS
+        warned = False
+        while True:
+            backlog = await asyncio.to_thread(self.engine_backlog)
+            if backlog is None or backlog <= limit:
+                return
+            if time.monotonic() >= deadline:
+                if not warned:
+                    logger.warning(
+                        "Engine backlog is still {} (limit {}); continuing after {}s",
+                        backlog, limit, self.INDEX_BACKLOG_MAX_WAIT_SECONDS,
+                    )
+                return
+            if not warned:
+                logger.info(
+                    "Engine backlog {} > {}; waiting for it to catch up",
+                    backlog, limit,
+                )
+                warned = True
+            await asyncio.sleep(self.INDEX_BACKLOG_POLL_SECONDS)
+
     async def rebuild_index(
         self,
         progress: Callable[[dict[str, Any]], None] | None = None,
@@ -547,6 +598,7 @@ class SearchIndexMixin:
                         self.client.index(self.INDEX_BOOKS).add_documents(book_batch)
                         result["books"] += len(book_batch)
                         book_batch = []
+                        await self.wait_for_engine()
                         publish(
                             books_done=result["books"],
                             documents_done=result["books"],
@@ -609,6 +661,7 @@ class SearchIndexMixin:
                         self.client.index(self.INDEX_CHAPTERS).add_documents(batch)
                         result["chapters"] += len(batch)
                         batch = []
+                        await self.wait_for_engine()
                         publish(
                             chapters_done=result["chapters"],
                             documents_done=result["books"] + result["chapters"],
@@ -739,6 +792,15 @@ class SearchIndexMixin:
     # ``CHAPTER_BUFFER_SIZE``); a book document is ~20x smaller, so one task can
     # carry many more of them.
     BOOK_BUFFER_SIZE = 500
+    #: Tasks the engine may still have queued before a rebuild waits for it.
+    #: Keep it far below what one batch can hold: Meilisearch merges consecutive
+    #: tasks, and a merged batch of thousands of chapter documents is a single
+    #: transaction that the live 12 GB container could not finish (2026-10-19).
+    INDEX_BACKLOG_LIMIT = 200
+    INDEX_BACKLOG_POLL_SECONDS = 2.0
+    #: Never wait longer than this for the engine, so a wedged engine cannot hang
+    #: a rebuild forever.
+    INDEX_BACKLOG_MAX_WAIT_SECONDS = 300.0
     KIND_BACKFILL_BATCH = 1000
     # Ids one ``NOT EXISTS`` sweep collects per request, and the ceiling on one
     # sweep.  Meilisearch caps ``offset + limit`` at ``maxTotalHits``, so a sweep

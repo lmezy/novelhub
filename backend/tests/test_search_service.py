@@ -465,6 +465,69 @@ async def test_rebuild_index_sends_books_in_one_batch_not_one_task_each():
     assert all(len(text) <= service.content_index_limit() for text in chapter_contents)
 
 
+def test_engine_backlog_parses_the_engine_answer(monkeypatch):
+    """A probe that must never break indexing when the engine misbehaves."""
+    service, client = _make_service()
+
+    client.get_tasks.return_value = {"total": 42, "results": []}
+    assert service.engine_backlog() == 42
+
+    client.get_tasks.return_value = {"results": []}      # no total field
+    assert service.engine_backlog() is None
+
+    client.get_tasks.side_effect = RuntimeError("engine down")
+    assert service.engine_backlog() is None
+
+
+@pytest.mark.asyncio
+async def test_wait_for_engine_only_waits_while_the_queue_is_long(monkeypatch):
+    """The rebuild must not fill the engine's queue faster than it drains it.
+
+    Meilisearch coalesces consecutive tasks into one batch, and a batch of
+    thousands of chapter documents is a single transaction the live 12 GB
+    container could not finish (2026-10-19: 3 787 tasks, 15 hours, no commit).
+    """
+    service, _client = _make_service()
+    monkeypatch.setattr(service, "INDEX_BACKLOG_LIMIT", 5)
+    monkeypatch.setattr(service, "INDEX_BACKLOG_POLL_SECONDS", 0)
+    monkeypatch.setattr(service, "INDEX_BACKLOG_MAX_WAIT_SECONDS", 60.0)
+
+    # Above the limit twice (waits), then drained (returns).
+    backlogs = iter([50, 50, 4])
+    monkeypatch.setattr(service, "engine_backlog", lambda: next(backlogs, 4))
+    slept: list[float] = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr("app.services.search_index.asyncio.sleep", fake_sleep)
+
+    await service.wait_for_engine()
+
+    # Waited exactly for the two samples above the limit.
+    assert len(slept) == 2
+    assert all(seconds == 0 for seconds in slept)
+
+    # An unknown backlog (endpoint down) must not block the rebuild.
+    monkeypatch.setattr(service, "engine_backlog", lambda: None)
+    await service.wait_for_engine()
+
+
+@pytest.mark.asyncio
+async def test_wait_for_engine_gives_up_after_the_maximum(monkeypatch):
+    service, _client = _make_service()
+    monkeypatch.setattr(service, "INDEX_BACKLOG_LIMIT", 1)
+    monkeypatch.setattr(service, "INDEX_BACKLOG_POLL_SECONDS", 0)
+    monkeypatch.setattr(service, "INDEX_BACKLOG_MAX_WAIT_SECONDS", 0.0)
+    monkeypatch.setattr(service, "engine_backlog", lambda: 999)
+    async def fake_sleep(seconds):
+        return None
+
+    monkeypatch.setattr("app.services.search_index.asyncio.sleep", fake_sleep)
+
+    await service.wait_for_engine()      # returns instead of hanging forever
+
+
 def test_content_index_limit_defaults_to_20k_and_is_configurable(monkeypatch):
     """The indexed body cap is what makes a rebuild finish in hours.
 
