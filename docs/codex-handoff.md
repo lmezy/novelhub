@@ -2590,6 +2590,48 @@ docker logs -f novelhub-backup                 # 看 "[backup ...] database dump
 - 每次同步仍会读该书写过的每一章做健康检查（§56/§58 的修复手段）。想彻底免掉需要
   给 `chapters` 加一个"已验证"标记列 + 迁移；单章成本已经降到 1 次读，暂不做。
 
+上面那两条（图片并发、checkpoint 限流）**已在 `b8caf76` 里做完**：
+`SYNC_IMAGE_CONCURRENCY`（默认 3，`_process_content_images` 用信号量并发抓图，进度回调每张仍触发一次、
+替换正文仍按顺序）与 `CheckpointThrottle`（`_CHECKPOINT_REFRESH_SECONDS = 1.0`，
+`crawl_runner._wait_if_paused` 不再每章 `db.refresh`）。
+
+---
+
+## 62. 「0 章」到底是谁的错：同步错误现在带上书页诊断（2026-10-19）
+
+**背景**：要撸小说《致最终残留之物》同步失败，报错永远是同一句
+`Book page returned no usable metadata/chapters: … (title=…, chapters=0)`，
+但实测同一个 URL 在几分钟内会给出**四种完全不同的响应**（取决于代理节点给出的出口 IP）：
+
+| 实测 | 现象 | 该做的事 |
+|---|---|---|
+| `curl` 走代理 | **403** + `<script>window.location.href="/book/54294"</script>`（120 字节跳转桩） | 换代理节点 / 更新 Cookie |
+| Playwright 带 Cookie | 页面 295 KB 正常加载，但 `ul#ul_all_chapters` **是空的** | 站点对该 IP 限流 |
+| Playwright | 拿不到 `ul_all_chapters`（容器整个不存在） | 规则可能过期 |
+| Playwright | 60 秒超时 | 换节点 |
+
+**改动**：
+
+- `crawler/plugins/yuedu/book.py` 新增 `describe_book_page(html, toc_selector)` 与
+  `toc_container_hint(selector)`：把上面四种情况分成不同的可读判词（跳转/挑战页、
+  人机验证页、目录容器不见了、容器是空的、解析不出章节链接）。`BookMixin`
+  在「TOC 解析成 0 章」的两条退出路径上调用 `_record_book_page_diagnosis()`
+  记下 `(toc_url, 判词)`（与 `_explore_page_diagnostics` 同款）。
+- `services/sync.py` 新增 `_last_book_diagnosis(plugin)`，把那句话追加到
+  `Book page returned no usable metadata/chapters` 的报错里（最长 200 字）。
+- 测试：`test_describe_book_page_says_which_knob_to_turn`（四种判词 + 无 selector 不炸）、
+  `test_last_book_diagnosis_appends_the_page_verdict`（含畸形记录不抛异常）。
+  提交 `d27a59e`，全套 `pytest -q` → **1098 passed**。
+
+**顺带记一笔线上事实**：要撸小说网源的 `ruleSearch.bookUrl`/探索规则本身就是
+`div.img_span a@href@js:result + ',{"webView":true}'`，插件看到这个后缀会自动走
+Playwright（`transport._get` → `_get_with_web_js`，`fallback_http=False`）。
+但**老书的 `books.source_book_id` 里没有这个后缀**，所以它们一直走普通 HTTP →
+403。2026-10-19 已给该源 887 本的 `source_book_id` 补上 `,{"webView":true}`
+（注意：SQL 必须走 `psql -f -` 的 stdin，用 `-c "…"` 会让两层 shell 把 JSON 的引号吃掉，
+变成 `{webView:true}` 反而 404）。
+
+
 
 
 
