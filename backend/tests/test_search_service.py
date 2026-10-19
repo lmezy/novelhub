@@ -472,6 +472,16 @@ def test_engine_backlog_parses_the_engine_answer(monkeypatch):
     client.get_tasks.return_value = {"total": 42, "results": []}
     assert service.engine_backlog() == 42
 
+    # The real client hands back a ``TaskResults`` model, not a dict: reading it
+    # with ``.get`` is what made the rebuild's throttle silently do nothing.
+    from types import SimpleNamespace
+
+    client.get_tasks.return_value = SimpleNamespace(total=42)
+    assert service.engine_backlog() == 42
+
+    client.get_tasks.return_value = SimpleNamespace(total=None)
+    assert service.engine_backlog() is None
+
     client.get_tasks.return_value = {"results": []}      # no total field
     assert service.engine_backlog() is None
 

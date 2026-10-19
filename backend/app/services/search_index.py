@@ -458,10 +458,15 @@ class SearchIndexMixin:
         except Exception as exc:  # a probe must never break indexing
             logger.debug("Could not read the engine backlog: {}", exc)
             return None
-        if not isinstance(tasks, dict):
+        # The client returns a ``TaskResults`` object (which ``.get`` does not
+        # exist on -- that bug made this probe return ``None`` and the rebuild
+        # never waited, 2026-10-19), while older/newer clients may hand back the
+        # raw mapping.  Accept both.
+        total = tasks.get("total") if isinstance(tasks, dict) else getattr(tasks, "total", None)
+        try:
+            return int(total) if total is not None else None
+        except (TypeError, ValueError):
             return None
-        total = tasks.get("total")
-        return int(total) if isinstance(total, int) else None
 
     async def wait_for_engine(self) -> None:
         """Block while the engine's queue is longer than ``INDEX_BACKLOG_LIMIT``.
