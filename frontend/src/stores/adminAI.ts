@@ -52,7 +52,6 @@ export const useAdminAIStore = defineStore("adminAI", () => {
   const aiSaved = ref(false)
   const aiTesting = ref(false)
   const aiTestResult = ref<any>(null)
-  const aiApiKeyInput = ref("")
   const aiEmbeddingKeyInput = ref("")
   const aiModels = ref<string[]>([])
   const aiModelsLoading = ref(false)
@@ -163,7 +162,6 @@ export const useAdminAIStore = defineStore("adminAI", () => {
         ]
         aiActiveProfileId.value = aiProfiles.value[0].id
       }
-      aiApiKeyInput.value = ""
       aiEmbeddingKeyInput.value = ""
     } catch (e) {
       aiError.value = e instanceof Error ? e.message : i18n.t('admin_failed')
@@ -179,7 +177,6 @@ export const useAdminAIStore = defineStore("adminAI", () => {
     draft.draft = true
     aiProfiles.value = [...aiProfiles.value, draft]
     aiActiveProfileId.value = draft.id
-    aiApiKeyInput.value = ""
   }
 
   function duplicateAIProfile(id: string) {
@@ -195,7 +192,6 @@ export const useAdminAIStore = defineStore("adminAI", () => {
     }
     aiProfiles.value = [...aiProfiles.value, copy]
     aiActiveProfileId.value = copy.id
-    aiApiKeyInput.value = ""
   }
 
   function removeAIProfile(id: string) {
@@ -208,7 +204,6 @@ export const useAdminAIStore = defineStore("adminAI", () => {
     aiProfiles.value = next
     if (aiActiveProfileId.value === id) {
       aiActiveProfileId.value = next[0]?.id || ""
-      aiApiKeyInput.value = ""
     }
   }
 
@@ -216,7 +211,6 @@ export const useAdminAIStore = defineStore("adminAI", () => {
     if (aiActiveProfileId.value === id) return
     aiActiveProfileId.value = id
     // A key typed for the previous entry must not follow us to this one.
-    aiApiKeyInput.value = ""
   }
 
   function clearAIProfileKey(id: string) {
@@ -226,7 +220,6 @@ export const useAdminAIStore = defineStore("adminAI", () => {
     profile.api_key_clear = true
     profile.api_key_set = false
     profile.api_key_hint = ""
-    if (aiActiveProfileId.value === id) aiApiKeyInput.value = ""
   }
 
   function applyProviderPreset(name: string) {
@@ -279,7 +272,6 @@ export const useAdminAIStore = defineStore("adminAI", () => {
           saved.find((profile: any) => profile.active || profile.id === res.active_profile_id)?.id ||
           aiProfiles.value[0].id
       }
-      aiApiKeyInput.value = ""
       aiEmbeddingKeyInput.value = ""
       aiSaved.value = true
       window.setTimeout(() => (aiSaved.value = false), 2000)
@@ -316,7 +308,7 @@ export const useAdminAIStore = defineStore("adminAI", () => {
         base_url: profile?.base_url,
       }
       // Use the key the admin just typed, otherwise the stored one.
-      const typed = String(aiApiKeyInput.value || "").trim()
+      const typed = String(profile?.api_key_input || "").trim()
       if (typed) body.api_key = typed
       const res = await api.post<any>("/admin/ai/models", body)
       aiModels.value = res.models || []
@@ -390,7 +382,6 @@ export const useAdminAIStore = defineStore("adminAI", () => {
     aiSaved,
     aiTesting,
     aiTestResult,
-    aiApiKeyInput,
     aiEmbeddingKeyInput,
     aiModels,
     aiModelsLoading,

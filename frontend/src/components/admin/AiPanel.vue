@@ -156,7 +156,7 @@ const aiStore = useAdminAIStore()
           </label>
           <div class="flex gap-2">
             <input
-              v-model="aiStore.aiApiKeyInput"
+              v-model="aiStore.aiActiveProfile.api_key_input"
               type="password"
               autocomplete="new-password"
               :placeholder="aiStore.aiActiveProfile.api_key_set ? i18n.t('admin_ai_key_keep') : 'sk-...'"
