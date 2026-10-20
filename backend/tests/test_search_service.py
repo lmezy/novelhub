@@ -505,6 +505,11 @@ async def test_wait_for_engine_only_waits_while_the_queue_is_long(monkeypatch):
     # Above the limit twice (waits), then drained (returns).
     backlogs = iter([50, 50, 4])
     monkeypatch.setattr(service, "engine_backlog", lambda: next(backlogs, 4))
+    heartbeats: list[dict] = []
+    monkeypatch.setattr(
+        "app.services.search_index.write_rebuild_progress",
+        lambda update: heartbeats.append(update),
+    )
     slept: list[float] = []
 
     async def fake_sleep(seconds):
@@ -514,9 +519,12 @@ async def test_wait_for_engine_only_waits_while_the_queue_is_long(monkeypatch):
 
     await service.wait_for_engine()
 
-    # Waited exactly for the two samples above the limit.
+    # Waited exactly for the two samples above the limit, and kept the progress
+    # heartbeat warm so the wait cannot look like a dead rebuild.
     assert len(slept) == 2
     assert all(seconds == 0 for seconds in slept)
+    assert len(heartbeats) == 2
+    assert "等待搜索引擎消化" in heartbeats[0]["message"]
 
     # An unknown backlog (endpoint down) must not block the rebuild.
     monkeypatch.setattr(service, "engine_backlog", lambda: None)

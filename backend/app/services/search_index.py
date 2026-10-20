@@ -45,7 +45,11 @@ REBUILD_STATE_FILE = ".search-rebuild.json"
 REBUILD_PROGRESS_THROTTLE_SECONDS = 1.0
 #: A "running" state whose heartbeat is older than this means the process died
 #: (container restart) -- the UI must stop polling instead of forever.
-REBUILD_STALE_SECONDS = 180
+# Must stay well above ``INDEX_BACKLOG_MAX_WAIT_SECONDS``: the rebuild publishes
+# progress and then waits for the engine, and a window shorter than that wait
+# turns a healthy rebuild into a "stale" one (2026-10-20: 300 s of waiting vs a
+# 180 s window killed a live rebuild through its own monitor).
+REBUILD_STALE_SECONDS = 900
 
 
 class RebuildCancelled(RuntimeError):
@@ -551,6 +555,14 @@ class SearchIndexMixin:
                     backlog, limit,
                 )
                 warned = True
+            # Keep the progress heartbeat warm: this wait lasts minutes, and a
+            # heartbeat older than REBUILD_STALE_SECONDS makes everyone watching
+            # (the admin UI, an operator's monitor) declare the rebuild dead --
+            # which is exactly how a live rebuild got killed on 2026-10-20: the
+            # monitor saw ``stale`` and exited, taking the rebuild with it.
+            write_rebuild_progress({
+                "message": f"等待搜索引擎消化（队列 {backlog} 条）…",
+            })
             await asyncio.sleep(self.INDEX_BACKLOG_POLL_SECONDS)
 
     async def rebuild_index(
