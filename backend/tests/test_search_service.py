@@ -538,6 +538,58 @@ async def test_wait_for_engine_gives_up_after_the_maximum(monkeypatch):
     await service.wait_for_engine()      # returns instead of hanging forever
 
 
+def test_ensure_index_repairs_a_missing_primary_key():
+    """An index without a primary key rejects every chapter batch.
+
+    A chapter carries ``id`` and ``book_id``, so the engine's inference refuses
+    it; after a wipe (or the delete/create race) the index exists but has no key
+    and the whole rebuild indexes nothing (live incident 2026-10-20).
+    """
+    from types import SimpleNamespace
+
+    service, client = _make_service()
+    client.get_index.return_value = SimpleNamespace(primary_key=None)
+
+    service._ensure_index("chapters")
+
+    client.update_index.assert_called_once_with("chapters", {"primaryKey": "id"})
+    # An index that already has its key is left alone.
+    client.reset_mock()
+    service._ensured.clear()
+    client.get_index.return_value = SimpleNamespace(primary_key="id")
+    service._ensure_index("chapters")
+    client.update_index.assert_not_called()
+
+
+def test_primary_key_of_accepts_model_and_mapping():
+    from types import SimpleNamespace
+
+    service, _client = _make_service()
+
+    assert service._primary_key_of(SimpleNamespace(primary_key="id")) == "id"
+    assert service._primary_key_of({"primaryKey": "id"}) == "id"
+    assert service._primary_key_of(SimpleNamespace(primary_key=None)) is None
+    assert service._primary_key_of({}) is None
+
+
+def test_wait_for_task_waits_for_the_deletion_to_land():
+    """``delete_index`` is asynchronous; not waiting lost the primary key."""
+    from types import SimpleNamespace
+
+    service, client = _make_service()
+    task = SimpleNamespace(task_uid=7322)
+
+    service.wait_for_task(task)
+
+    client.wait_for_task.assert_called_once()
+    assert client.wait_for_task.call_args.args[0] == 7322
+
+    # A client without ``wait_for_task`` (or a malformed task) must not raise.
+    client.wait_for_task = None
+    service.wait_for_task(task)
+    service.wait_for_task(SimpleNamespace())
+
+
 def test_content_index_limit_defaults_to_20k_and_is_configurable(monkeypatch):
     """The indexed body cap is what makes a rebuild finish in hours.
 

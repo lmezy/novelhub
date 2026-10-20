@@ -192,13 +192,68 @@ class SearchIndexMixin:
         """Every filterable attribute of one index, base fields plus grams."""
         return [*cls.FILTERABLE_ATTRIBUTES, *cls.gram_fields(name)]
 
+    @staticmethod
+    def _primary_key_of(index: Any) -> str | None:
+        """The index's primary key, whichever shape the client returned."""
+        value = (
+            index.get("primaryKey") if isinstance(index, dict)
+            else getattr(index, "primary_key", None)
+        )
+        return str(value) if value else None
+
+    def wait_for_task(self, task: Any, timeout_seconds: float = 30.0) -> None:
+        """Wait for one of the engine's tasks -- they are all asynchronous.
+
+        ``delete_index`` only *enqueues* the deletion.  Without waiting, a
+        rebuild's ``_ensure_index`` still saw the old index and skipped the
+        create; the deletion then landed, the first document batch auto-created
+        the index **without a primary key**, and every following batch failed
+        with ``primary_key_multiple_candidates_found`` -- the whole rebuild
+        produced an empty index (2026-10-20).  Never raises: a slow engine must
+        not break the caller.
+        """
+        if isinstance(task, dict):
+            uid = task.get("taskUid") or task.get("uid")
+        else:
+            uid = getattr(task, "task_uid", None) or getattr(task, "uid", None)
+        if uid is None:
+            return
+        waiter = getattr(self.client, "wait_for_task", None)
+        if waiter is None:
+            return
+        try:
+            waiter(
+                uid,
+                timeout_in_ms=int(max(1.0, timeout_seconds) * 1000),
+                interval_in_ms=200,
+            )
+        except Exception as exc:
+            logger.debug("Task {} did not confirm: {}", uid, exc)
+
     def _ensure_index(self, name: str, primary_key: str = "id") -> None:
         if name in self._ensured:
             return
         try:
-            self.client.get_index(name)
+            existing = self.client.get_index(name)
         except meilisearch.errors.MeilisearchApiError:
             self.client.create_index(name, {"primaryKey": primary_key})
+        else:
+            # An index that exists *without* a primary key cannot take our
+            # documents: a chapter carries ``id`` **and** ``book_id``, so the
+            # engine's inference refuses the batch.  An empty index accepts the
+            # key, so repair it here (after a wipe, or after losing the
+            # delete/create race described in ``wait_for_task``).
+            if not self._primary_key_of(existing):
+                try:
+                    self.client.update_index(name, {"primaryKey": primary_key})
+                    logger.warning(
+                        "Index {} had no primary key; set it to {!r}",
+                        name, primary_key,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "Could not set the primary key of {}: {}", name, exc
+                    )
         index = self.client.index(name)
         index.update_filterable_attributes(self.filterable_attributes(name))
         if name == self.INDEX_BOOKS:
@@ -539,7 +594,12 @@ class SearchIndexMixin:
             async with SessionLocal() as db:
                 for idx_name in [self.INDEX_BOOKS, self.INDEX_CHAPTERS]:
                     try:
-                        self.client.delete_index(idx_name)
+                        # The deletion is asynchronous: wait for it, otherwise
+                        # ``_ensure_index`` below still sees the old index and
+                        # the re-created one would have no primary key.
+                        await asyncio.to_thread(
+                            self.wait_for_task, self.client.delete_index(idx_name)
+                        )
                     except Exception:
                         pass
                 self._ensured.clear()
