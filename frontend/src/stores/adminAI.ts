@@ -103,27 +103,39 @@ export const useAdminAIStore = defineStore("adminAI", () => {
     }
   }
 
+  /** The admin form for one `/admin/ai` response.
+   *
+   * One mapping for both the initial load and every save response: the tuning
+   * boxes (temperature / max_tokens / timeout / context_chars) used to be read
+   * only on load, so a field the API dropped looked saved until the next reload
+   * (reported 2026-10-20).  Rebuilding the form from the response makes the
+   * screen show exactly what the server stored.
+   */
+  function formFromConfig(res: any) {
+    return {
+      enabled: res.enabled,
+      temperature: res.temperature,
+      max_tokens: res.max_tokens,
+      timeout: res.timeout,
+      use_proxy: res.use_proxy,
+      proxy_url: res.proxy_url || "",
+      context_chars: res.context_chars,
+      rag_enabled: res.rag_enabled,
+      rag_top_k: res.rag_top_k,
+      embedding_provider: res.embedding_provider || "",
+      embedding_base_url: res.embedding_base_url || "",
+      embedding_model: res.embedding_model || "",
+      auto_diagnose: res.auto_diagnose !== false,
+    }
+  }
+
   async function loadAIConfig() {
     aiLoading.value = true
     aiError.value = ""
     try {
       const res = await api.get<any>("/admin/ai")
       aiConfig.value = res
-      aiForm.value = {
-        enabled: res.enabled,
-        temperature: res.temperature,
-        max_tokens: res.max_tokens,
-        timeout: res.timeout,
-        use_proxy: res.use_proxy,
-        proxy_url: res.proxy_url || "",
-        context_chars: res.context_chars,
-        rag_enabled: res.rag_enabled,
-        rag_top_k: res.rag_top_k,
-        embedding_provider: res.embedding_provider || "",
-        embedding_base_url: res.embedding_base_url || "",
-        embedding_model: res.embedding_model || "",
-        auto_diagnose: res.auto_diagnose !== false,
-      }
+      aiForm.value = formFromConfig(res)
       aiProfileSource.value = res.profile_source === "profiles" ? "profiles" : "single"
       const saved = Array.isArray(res.profiles) ? res.profiles : []
       if (saved.length) {
@@ -256,6 +268,9 @@ export const useAdminAIStore = defineStore("adminAI", () => {
       if (aiEmbeddingKeyInput.value) body.embedding_api_key = aiEmbeddingKeyInput.value
       const res = await api.put<any>("/admin/ai", body)
       aiConfig.value = { ...aiConfig.value, ...res }
+      // Show what the server actually stored, not what was typed: a dropped
+      // field reverts here instead of looking saved until the next page load.
+      aiForm.value = formFromConfig({ ...aiForm.value, ...res })
       aiProfileSource.value = res.profile_source === "profiles" ? "profiles" : "single"
       const saved = Array.isArray(res.profiles) ? res.profiles : []
       if (saved.length) {

@@ -23,6 +23,10 @@ from app.services.ai_config import (
     get_ai_config,
     parse_profiles,
     resolve_ai_config,
+    AI_CONTEXT_CHARS_KEY,
+    AI_MAX_TOKENS_KEY,
+    AI_TEMPERATURE_KEY,
+    AI_TIMEOUT_KEY,
     set_ai_config,
 )
 from app.models.app_setting import AppSetting
@@ -167,6 +171,35 @@ async def test_set_ai_config_stores_keys_encrypted_and_switches_the_active_entry
     assert switched.provider == "deepseek"
     assert switched.api_key == "sk-deepseek"
     assert switched.effective_model == "deepseek-flash"
+
+
+@pytest.mark.asyncio
+async def test_numeric_tuning_fields_survive_a_save_next_to_the_provider_list():
+    """Temperature / max_tokens / timeout / context_chars must really persist.
+
+    The admin UI sends the four tuning boxes in the same PUT as the provider
+    list; a save that only kept the vendor fields left them looking unsaved and
+    reverted on reload (reported 2026-10-20).  Pinned here so the settings path
+    cannot regress silently again.
+    """
+    db = FakeDB()
+    cfg = await set_ai_config(db, {
+        "temperature": 1.3,
+        "max_tokens": 4096,
+        "timeout": 120,
+        "context_chars": 30000,
+        "profiles": [profile_entry()],
+        "active_profile_id": "p1",
+    })
+
+    assert db.value_of(AI_TEMPERATURE_KEY) == "1.3"
+    assert db.value_of(AI_MAX_TOKENS_KEY) == "4096"
+    assert db.value_of(AI_TIMEOUT_KEY) == "120"
+    assert db.value_of(AI_CONTEXT_CHARS_KEY) == "30000"
+    assert cfg.temperature == 1.3
+    assert cfg.max_tokens == 4096
+    assert cfg.timeout == 120.0
+    assert cfg.context_chars == 30000
 
 
 @pytest.mark.asyncio
