@@ -238,23 +238,54 @@ function safeImageUrl(url: string): string | null {
   return null
 }
 
-const chapterBodyHtml = computed(() => {
-  if (!chapter.value) return ""
-  // Escape FIRST: chapter content is crawled from third-party sites, and
-  // without this a source can inject markup (XSS) into the reader.
-  let html = escapeHtml(chapter.value.content)
-    .replace(
-      /!\[([^\]]*)\]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)/g,
-      (_match, alt: string, url: string) => {
-        const safe = safeImageUrl(url)
-        return safe ? `<img src="${safe}" alt="${alt}" loading="lazy">` : ""
-      },
-    )
+function decodeEntities(text: string): string {
+  return text
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+}
+
+/**
+ * Chapter content -> reader HTML.
+ *
+ * Content is escaped first (it is crawled from third-party sites, so raw markup
+ * would be an XSS hole), then Markdown images are turned back into `<img>`.
+ *
+ * The crawler stores manga pages as plain HTML `<img>` tags, and a "全话阅读"
+ * chapter is nothing *but* those tags -- so escaping them rendered every comic
+ * chapter as literal text with no pictures at all.  Those tags are therefore
+ * lifted out before escaping and re-inserted as sanitized `<img>` elements
+ * afterwards; every other tag stays escaped text.
+ */
+function renderChapterHtml(content: string): string {
+  const images: string[] = []
+  let text = String(content || "").replace(/<img\b[^>]*>/gi, (tag: string) => {
+    const src = /src\s*=\s*["']([^"']+)["']/i.exec(tag)?.[1] ?? ""
+    const alt = /alt\s*=\s*["']([^"']*)["']/i.exec(tag)?.[1] ?? ""
+    const safe = safeImageUrl(decodeEntities(src))
+    if (!safe) return ""
+    images.push(`<img src="${safe}" alt="${escapeHtml(decodeEntities(alt))}" loading="lazy">`)
+    return `\u0000img${images.length - 1}\u0000`
+  })
+  let html = escapeHtml(text).replace(
+    /!\[([^\]]*)\]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)/g,
+    (_match, alt: string, url: string) => {
+      const safe = safeImageUrl(url)
+      return safe ? `<img src="${safe}" alt="${alt}" loading="lazy">` : ""
+    },
+  )
+  html = html.replace(/\u0000img(\d+)\u0000/g, (_match, index: string) => images[Number(index)] ?? "")
   html = html
     .replace(/\n\n/g, "</p><p>")
     .replace(/\n/g, "<br>")
   return "<p>" + html + "</p>"
-})
+}
+
+const chapterBodyHtml = computed(() =>
+  chapter.value ? renderChapterHtml(chapter.value.content) : "",
+)
 
 const pageProgress = computed(() => {
   if (pageCount.value <= 1) return 100
