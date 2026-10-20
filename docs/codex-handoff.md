@@ -2630,8 +2630,44 @@ Playwright（`transport._get` → `_get_with_web_js`，`fallback_http=False`）�
 403。2026-10-19 已给该源 887 本的 `source_book_id` 补上 `,{"webView":true}`
 （注意：SQL 必须走 `psql -f -` 的 stdin，用 `-c "…"` 会让两层 shell 把 JSON 的引号吃掉，
 变成 `{webView:true}` 反而 404）。
+---
 
+## 63. 书库首页 1.8 秒 → 0.4 秒：`/books/home` 的 44 条查询和缺掉的分类索引（2026-10-20）
 
+**现象**：「书库」页面打开慢。
 
+**测量**（线上 backend 容器里直接调路由函数，管理员身份）：
 
+| 端点 | 实测 |
+|---|---|
+| `/books/home` | **1 761.7 ms**，22 个分类 → **44 条 SQL**（每类一条 `count(*)` + 一条 `LIMIT`） |
+| `/books/browse` | 47.9 ms（正常） |
 
+**两个原因**：
+
+1. `get_books_home` 在 `for category in categories:` 里各跑两条查询 —— 22 类 = 44 条，
+   每条都 join `book_categories`（6.2 万行）。
+2. **`book_categories` 只有复合主键 `(book_id, category_id)`，按 category 查没有索引**
+   → 每条分类查询都退化成顺序扫描。`books(updated_at)` / `books(kind)` 本来就有索引，
+   所以 `/books/browse` 不受影响。
+
+**改动**：
+
+- `app/api/routes/books.py::get_books_home`：计数改成**一条 `GROUP BY category_id`**；
+  每类前 6 本改成**一条窗口函数查询**
+  （`row_number() OVER (PARTITION BY category_id ORDER BY updated_at DESC)` 再筛 `position <= N`），
+  最后一次性 `selectinload` 取回 106 本书再按分类分组。**44 条 → 3 条**。
+- `app/models/book_category.py` + 迁移 `0037_book_category_index`：
+  `CREATE INDEX IF NOT EXISTS ix_book_categories_category_id ON book_categories (category_id, book_id)`
+  （线上已手建同名索引，迁移用 `IF NOT EXISTS` 保证幂等）。
+
+**实测对比（线上库：22 类 / 46 436 本 / 62 668 条关联）**：
+
+| 方案 | 耗时 |
+|---|---|
+| 旧：44 条查询 | 1 761.7 ms |
+| 新：分组计数 99 ms + 窗口取前 N 185 ms + 载入书 90 ms | **≈ 380~420 ms** |
+| 对照：`LATERAL` 每类 `LIMIT 6`（补索引后） | 573 ms（更差，未采用） |
+
+**验证**：`pytest -q` → **1104 passed**（`tests/test_migrations.py` 的 head 断言同步更新）；
+`/books/browse` 的 SQL 未动。
