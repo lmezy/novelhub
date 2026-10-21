@@ -374,7 +374,7 @@ async def test_rebuild_index_sends_books_in_one_batch_not_one_task_each():
             id=f"b{i}",
             title=f"书 {i}",
             author_name="作者",
-            description="简介",
+            description="简介" * 2000,
             status="ongoing",
             source_id="src",
             author_id="auth",
@@ -462,6 +462,18 @@ async def test_rebuild_index_sends_books_in_one_batch_not_one_task_each():
         if "content" in doc
     ]
     assert len(chapter_contents) == 3
+
+    # The book description is copied into every chapter document, so it is
+    # capped hard: 2 000 characters x 718 221 chapters was what pushed the live
+    # index to 63 GB and made every merge slow (2026-10-21).
+    chapter_descriptions = [
+        doc["book_description"]
+        for call in index.add_documents.call_args_list
+        for doc in call.args[0]
+        if "book_description" in doc
+    ]
+    assert chapter_descriptions
+    assert max(len(text) for text in chapter_descriptions) <= service.CHAPTER_BOOK_DESCRIPTION_LIMIT
     assert all(len(text) <= service.content_index_limit() for text in chapter_contents)
 
 

@@ -719,7 +719,7 @@ class SearchIndexMixin:
                         "book_title": meta.get("title", ""),
                         "book_author": meta.get("author", ""),
                         "book_description": (meta.get("description") or "")[
-                            : self.DESCRIPTION_INDEX_LIMIT
+                            : self.CHAPTER_BOOK_DESCRIPTION_LIMIT
                         ],
                         "content": content[: self.content_index_limit()],
                         "is_r18": bool(meta.get("is_r18", False)),
@@ -865,6 +865,12 @@ class SearchIndexMixin:
             ),
         })
 
+    #: Characters of the *book* description copied into every chapter document.
+    #: The book's own index holds the full text; duplicating 2 000 characters
+    #: across 718 221 chapter documents cost more index than the chapter bodies
+    #: themselves (the live index reached 63 GB) and made every merge slow.  300
+    #: keeps "search by summary" working while shrinking each document.
+    CHAPTER_BOOK_DESCRIPTION_LIMIT = 300
     # Chapters are submitted in this many documents per Meilisearch task (see
     # ``CHAPTER_BUFFER_SIZE``); a book document is ~20x smaller, so one task can
     # carry many more of them.
