@@ -1608,6 +1608,28 @@ onUnmounted(() => {
   will-change: transform;
 }
 
+/* Multicol pagination: an unbreakable box taller than the column overflows on
+   top of the NEXT page, so the reader saw "the last line of page N printed over
+   the first line of page N+1" (reported 2026-10-21 on a chapter with images).
+   Comic pages are 2-3x the viewport, and markdown links can hold a very long
+   word, so cap both here instead of trusting the source markup. */
+.page-columns :deep(img) {
+  display: block;
+  max-width: 100%;
+  max-height: calc(100vh - 190px);
+  object-fit: contain;
+  margin: 0.5rem auto;
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+.page-columns :deep(p),
+.page-columns :deep(blockquote),
+.page-columns :deep(li) {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 .page-mode-cover .page-columns {
   transition: transform 0.22s cubic-bezier(0.2, 0.7, 0.25, 1);
   filter: drop-shadow(-12px 0 10px rgba(0, 0, 0, 0.08));
