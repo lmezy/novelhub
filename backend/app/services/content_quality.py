@@ -55,13 +55,23 @@ def cover_wall_matches(
     known = {normalize_title(title) for title in other_titles if title}
     own = normalize_title(book_title)
     matched: list[str] = []
+    seen: set[str] = set()
     for tag in images:
         found = ALT_RE.search(tag)
         if not found:
             continue
-        alt = normalize_title(found.group(1))
-        if not alt or alt == own or alt not in known:
+        raw = found.group(1).strip()
+        alt = normalize_title(raw)
+        if not alt or alt == own or alt in seen:
             continue
-        if alt not in [normalize_title(item) for item in matched]:
-            matched.append(found.group(1).strip())
+        # Exact match, or the alt carries the title plus decorations
+        # ("【完】世上只有妈妈好 1-7"), which the sources do a lot.
+        hit = alt if alt in known else next(
+            (title for title in known if len(title) >= 4 and title in alt),
+            "",
+        )
+        if not hit:
+            continue
+        seen.add(alt)
+        matched.append(raw)
     return matched if len(matched) >= MIN_MATCHED_TITLES else []
