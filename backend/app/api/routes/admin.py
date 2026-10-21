@@ -348,10 +348,17 @@ class AIConfigUpdate(BaseModel):
         """An empty number box means "not sent", not a validation failure.
 
         The admin form is saved as one payload: a single blank box (or a value
-        the browser turns into "") used to fail the whole PUT with a 422, which
-        looked like "the other numbers do not save".
+        the browser turns into "", "NaN", "1,5" ...) used to fail the whole PUT
+        with a 422, which looked like "the other numbers do not save".
         """
-        if isinstance(value, str) and not value.strip():
+        if value is None or isinstance(value, bool):
+            return None if value is None else value
+        if isinstance(value, str):
+            text = value.strip().replace(",", ".")
+            if not text or text.lower() in {"nan", "null", "undefined"}:
+                return None
+            return text
+        if isinstance(value, float) and value != value:  # NaN
             return None
         return value
     active_profile_id: str | None = None

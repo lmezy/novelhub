@@ -17,7 +17,12 @@ from app.services.security import hash_password
 from app.api.router import router as api_router
 from app.core.config import settings
 from app.core.logging import setup_logging
-from app.core.error_handlers import generic_exception_handler, value_error_handler
+from app.core.error_handlers import (
+    generic_exception_handler,
+    request_validation_handler,
+    value_error_handler,
+)
+
 
 setup_logging()
 
@@ -31,6 +36,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from fastapi.exceptions import RequestValidationError
+
+app.add_exception_handler(RequestValidationError, request_validation_handler)
 app.add_exception_handler(Exception, generic_exception_handler)
 app.add_exception_handler(ValueError, value_error_handler)
 app.add_exception_handler(

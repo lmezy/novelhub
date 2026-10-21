@@ -253,7 +253,16 @@ export const useAdminAIStore = defineStore("adminAI", () => {
     aiError.value = ""
     aiSaved.value = false
     try {
-      const body: any = { ...aiForm.value }
+      // Never send a half-filled box: "" / NaN / undefined for a numeric field
+      // made the whole PUT fail with a 422 (the other numbers then looked
+      // unsaveable too).  Omitted keys mean "leave as is".
+      const body: Record<string, any> = {}
+      for (const [key, value] of Object.entries(aiForm.value as Record<string, any>)) {
+        if (value === undefined || value === null) continue
+        if (typeof value === "string" && !value.trim()) continue
+        if (typeof value === "number" && !Number.isFinite(value)) continue
+        body[key] = value
+      }
       body.profiles = profilePayload()
       body.active_profile_id = aiActiveProfileId.value || aiProfiles.value[0]?.id || ""
       // Every provider key is in the list above; the single-provider field is
