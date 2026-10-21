@@ -261,7 +261,12 @@ function decodeEntities(text: string): string {
  */
 function renderChapterHtml(content: string): string {
   const images: string[] = []
-  let text = String(content || "").replace(/<img\b[^>]*>/gi, (tag: string) => {
+  let text = String(content || "")
+    // Some sources store the chapter markup already escaped ("&lt;img ...&gt;"),
+    // and the reader then showed the tag itself as text.  Decode just those
+    // image tags first; everything else stays escaped.
+    .replace(/&lt;img\b[\s\S]*?&gt;/gi, (escaped: string) => decodeEntities(escaped))
+    .replace(/<img\b[^>]*>/gi, (tag: string) => {
     const src = /src\s*=\s*["']([^"']+)["']/i.exec(tag)?.[1] ?? ""
     const alt = /alt\s*=\s*["']([^"']*)["']/i.exec(tag)?.[1] ?? ""
     const safe = safeImageUrl(decodeEntities(src))

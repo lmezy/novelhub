@@ -463,6 +463,13 @@ async def test_rebuild_index_sends_books_in_one_batch_not_one_task_each():
     ]
     assert len(chapter_contents) == 3
 
+    # Every write names the primary key explicitly.  A chapter document carries
+    # both ``id`` and ``book_id``, so the engine refuses to infer one, and a
+    # freshly created index has no key yet: the 2026-10-21 rebuild "submitted"
+    # 248 700 chapters that the engine rejected in 2 ms each.
+    for call in index.add_documents.call_args_list:
+        assert call.kwargs.get("primary_key") == "id"
+
     # A chapter document carries no book description: copying 2 000 characters
     # into each of 718 221 chapters is what pushed the live index to 63 GB and
     # made every merge slow (2026-10-21).  The books index keeps the full text,

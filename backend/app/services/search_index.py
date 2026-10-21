@@ -298,7 +298,7 @@ class SearchIndexMixin:
         # here, in the one funnel every write path goes through, so a book cannot
         # be indexed without them (``sync_book_grams`` backfills older ones).
         doc.update(book_gram_fields(doc))
-        self.client.index(self.INDEX_BOOKS).add_documents([doc])
+        self.client.index(self.INDEX_BOOKS).add_documents([doc], primary_key="id")
         logger.debug("Indexed book {}", doc.get("id"))
 
     def index_chapter(self, chapter: dict) -> None:
@@ -306,7 +306,7 @@ class SearchIndexMixin:
         doc = dict(chapter)
         self._normalize_visibility(doc)
         doc.update(chapter_gram_fields(doc))
-        self.client.index(self.INDEX_CHAPTERS).add_documents([doc])
+        self.client.index(self.INDEX_CHAPTERS).add_documents([doc], primary_key="id")
         logger.debug("Indexed chapter {}", doc.get("id"))
 
     def update_book_tags(self, book_id: str, tags: list[str]) -> None:
@@ -349,7 +349,7 @@ class SearchIndexMixin:
         docs = self._chapter_buffer
         self._chapter_buffer = []
         try:
-            self.client.index(self.INDEX_CHAPTERS).add_documents(docs)
+            self.client.index(self.INDEX_CHAPTERS).add_documents(docs, primary_key="id")
             logger.debug("Indexed {} chapters", len(docs))
         except Exception as exc:
             logger.warning("Failed to index {} chapters: {}", len(docs), exc)
@@ -685,7 +685,7 @@ class SearchIndexMixin:
                     book_meta[book.id] = doc
                     book_batch.append(doc)
                     if len(book_batch) >= self.BOOK_BUFFER_SIZE:
-                        self.client.index(self.INDEX_BOOKS).add_documents(book_batch)
+                        self.client.index(self.INDEX_BOOKS).add_documents(book_batch, primary_key="id")
                         result["books"] += len(book_batch)
                         book_batch = []
                         await self.wait_for_engine()
@@ -695,7 +695,7 @@ class SearchIndexMixin:
                             message=f"正在写入书籍 {result['books']} / {books_total}",
                         )
                 if book_batch:
-                    self.client.index(self.INDEX_BOOKS).add_documents(book_batch)
+                    self.client.index(self.INDEX_BOOKS).add_documents(book_batch, primary_key="id")
                     result["books"] += len(book_batch)
                     publish(
                         force=True, books_done=result["books"],
@@ -745,7 +745,7 @@ class SearchIndexMixin:
                         }),
                     })
                     if len(batch) >= self.CHAPTER_BUFFER_SIZE:
-                        self.client.index(self.INDEX_CHAPTERS).add_documents(batch)
+                        self.client.index(self.INDEX_CHAPTERS).add_documents(batch, primary_key="id")
                         result["chapters"] += len(batch)
                         batch = []
                         await self.wait_for_engine()
@@ -757,7 +757,7 @@ class SearchIndexMixin:
                             ),
                         )
                 if batch:
-                    self.client.index(self.INDEX_CHAPTERS).add_documents(batch)
+                    self.client.index(self.INDEX_CHAPTERS).add_documents(batch, primary_key="id")
                     result["chapters"] += len(batch)
                     publish(
                         force=True, chapters_done=result["chapters"],
