@@ -1069,9 +1069,6 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                         ],
                         "book_title": book_title,
                         "book_author": book_author,
-                        "book_description": (book_description or "")[
-                            : search_service.CHAPTER_BOOK_DESCRIPTION_LIMIT
-                        ],
                         "tags": index_tags,
                         "category_names": book_category_names,
                         "is_r18": book_is_r18,
@@ -1866,9 +1863,6 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             ],
             "book_title": book_title,
             "book_author": book_author,
-            "book_description": (book_description or "")[
-                : search_service.CHAPTER_BOOK_DESCRIPTION_LIMIT
-            ],
             "tags": index_tags,
             "category_names": book_category_names,
             "is_r18": book_is_r18,

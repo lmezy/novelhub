@@ -107,6 +107,10 @@ class Settings(BaseSettings):
     # chapter tasks (~380 000 documents) and could not finish it in 15 hours
     # (60-76 MB/s of index reads, nothing committed).  0 keeps the code default.
     MEILI_BACKLOG_LIMIT:int=0
+    # How often an index rebuild re-checks the engine's queue while it waits,
+    # and how long it may wait before continuing anyway (0 keeps the defaults).
+    MEILI_BACKLOG_POLL_SECONDS:float=2.0
+    MEILI_BACKLOG_MAX_WAIT_SECONDS:float=300.0
 
     SYNC_CHAPTER_CONCURRENCY:int=9
     # Chapter rows are committed in batches of this size instead of one commit

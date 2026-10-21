@@ -88,6 +88,16 @@ services:
       - .env
     environment:
       MEILI_KEY: ${MEILI_MASTER_KEY}
+      # Search-index and sync tuning.  Every one is optional; the deployment
+      # file is the one place to adjust them (see .env.example for meaning).
+      MEILI_CONTENT_INDEX_LIMIT: ${MEILI_CONTENT_INDEX_LIMIT:-20000}
+      MEILI_MAX_TOTAL_HITS: ${MEILI_MAX_TOTAL_HITS:-200000}
+      MEILI_BACKLOG_LIMIT: ${MEILI_BACKLOG_LIMIT:-200}
+      MEILI_BACKLOG_POLL_SECONDS: ${MEILI_BACKLOG_POLL_SECONDS:-2}
+      MEILI_BACKLOG_MAX_WAIT_SECONDS: ${MEILI_BACKLOG_MAX_WAIT_SECONDS:-300}
+      SYNC_CHAPTER_CONCURRENCY: ${SYNC_CHAPTER_CONCURRENCY:-9}
+      SYNC_IMAGE_CONCURRENCY: ${SYNC_IMAGE_CONCURRENCY:-3}
+      SYNC_CHAPTER_COMMIT_BATCH: ${SYNC_CHAPTER_COMMIT_BATCH:-25}
 
     depends_on:
       postgres:
@@ -124,6 +134,16 @@ services:
       - .env
     environment:
       MEILI_KEY: ${MEILI_MASTER_KEY}
+      # Search-index and sync tuning.  Every one is optional; the deployment
+      # file is the one place to adjust them (see .env.example for meaning).
+      MEILI_CONTENT_INDEX_LIMIT: ${MEILI_CONTENT_INDEX_LIMIT:-20000}
+      MEILI_MAX_TOTAL_HITS: ${MEILI_MAX_TOTAL_HITS:-200000}
+      MEILI_BACKLOG_LIMIT: ${MEILI_BACKLOG_LIMIT:-200}
+      MEILI_BACKLOG_POLL_SECONDS: ${MEILI_BACKLOG_POLL_SECONDS:-2}
+      MEILI_BACKLOG_MAX_WAIT_SECONDS: ${MEILI_BACKLOG_MAX_WAIT_SECONDS:-300}
+      SYNC_CHAPTER_CONCURRENCY: ${SYNC_CHAPTER_CONCURRENCY:-9}
+      SYNC_IMAGE_CONCURRENCY: ${SYNC_IMAGE_CONCURRENCY:-3}
+      SYNC_CHAPTER_COMMIT_BATCH: ${SYNC_CHAPTER_COMMIT_BATCH:-25}
     depends_on:
       postgres:
         condition: service_healthy
@@ -146,6 +166,16 @@ services:
       - .env
     environment:
       MEILI_KEY: ${MEILI_MASTER_KEY}
+      # Search-index and sync tuning.  Every one is optional; the deployment
+      # file is the one place to adjust them (see .env.example for meaning).
+      MEILI_CONTENT_INDEX_LIMIT: ${MEILI_CONTENT_INDEX_LIMIT:-20000}
+      MEILI_MAX_TOTAL_HITS: ${MEILI_MAX_TOTAL_HITS:-200000}
+      MEILI_BACKLOG_LIMIT: ${MEILI_BACKLOG_LIMIT:-200}
+      MEILI_BACKLOG_POLL_SECONDS: ${MEILI_BACKLOG_POLL_SECONDS:-2}
+      MEILI_BACKLOG_MAX_WAIT_SECONDS: ${MEILI_BACKLOG_MAX_WAIT_SECONDS:-300}
+      SYNC_CHAPTER_CONCURRENCY: ${SYNC_CHAPTER_CONCURRENCY:-9}
+      SYNC_IMAGE_CONCURRENCY: ${SYNC_IMAGE_CONCURRENCY:-3}
+      SYNC_CHAPTER_COMMIT_BATCH: ${SYNC_CHAPTER_COMMIT_BATCH:-25}
 
   frontend:
     build:

@@ -536,7 +536,20 @@ class SearchIndexMixin:
         unbounded wait that never writes anything is worse.
         """
         limit = max(1, int(getattr(settings, "MEILI_BACKLOG_LIMIT", 0) or 0) or self.INDEX_BACKLOG_LIMIT)
-        deadline = time.monotonic() + self.INDEX_BACKLOG_MAX_WAIT_SECONDS
+        # ``getattr`` with a default, not ``or``: 0 is a meaningful value here
+        # ("poll flat out" / "never wait"), and ``x or default`` would silently
+        # replace it with the class default.
+        poll = float(
+            getattr(settings, "MEILI_BACKLOG_POLL_SECONDS", self.INDEX_BACKLOG_POLL_SECONDS)
+        )
+        max_wait = float(
+            getattr(
+                settings,
+                "MEILI_BACKLOG_MAX_WAIT_SECONDS",
+                self.INDEX_BACKLOG_MAX_WAIT_SECONDS,
+            )
+        )
+        deadline = time.monotonic() + max_wait
         warned = False
         while True:
             backlog = await asyncio.to_thread(self.engine_backlog)
@@ -546,7 +559,7 @@ class SearchIndexMixin:
                 if not warned:
                     logger.warning(
                         "Engine backlog is still {} (limit {}); continuing after {}s",
-                        backlog, limit, self.INDEX_BACKLOG_MAX_WAIT_SECONDS,
+                        backlog, limit, max_wait,
                     )
                 return
             if not warned:
@@ -563,7 +576,7 @@ class SearchIndexMixin:
             write_rebuild_progress({
                 "message": f"等待搜索引擎消化（队列 {backlog} 条）…",
             })
-            await asyncio.sleep(self.INDEX_BACKLOG_POLL_SECONDS)
+            await asyncio.sleep(poll)
 
     async def rebuild_index(
         self,
@@ -718,9 +731,6 @@ class SearchIndexMixin:
                         "chapter_number": chapter.chapter_number or 0,
                         "book_title": meta.get("title", ""),
                         "book_author": meta.get("author", ""),
-                        "book_description": (meta.get("description") or "")[
-                            : self.CHAPTER_BOOK_DESCRIPTION_LIMIT
-                        ],
                         "content": content[: self.content_index_limit()],
                         "is_r18": bool(meta.get("is_r18", False)),
                         "owner_id": meta.get("owner_id"),
@@ -865,12 +875,6 @@ class SearchIndexMixin:
             ),
         })
 
-    #: Characters of the *book* description copied into every chapter document.
-    #: The book's own index holds the full text; duplicating 2 000 characters
-    #: across 718 221 chapter documents cost more index than the chapter bodies
-    #: themselves (the live index reached 63 GB) and made every merge slow.  300
-    #: keeps "search by summary" working while shrinking each document.
-    CHAPTER_BOOK_DESCRIPTION_LIMIT = 300
     # Chapters are submitted in this many documents per Meilisearch task (see
     # ``CHAPTER_BUFFER_SIZE``); a book document is ~20x smaller, so one task can
     # carry many more of them.

@@ -463,17 +463,15 @@ async def test_rebuild_index_sends_books_in_one_batch_not_one_task_each():
     ]
     assert len(chapter_contents) == 3
 
-    # The book description is copied into every chapter document, so it is
-    # capped hard: 2 000 characters x 718 221 chapters was what pushed the live
-    # index to 63 GB and made every merge slow (2026-10-21).
-    chapter_descriptions = [
-        doc["book_description"]
+    # A chapter document carries no book description: copying 2 000 characters
+    # into each of 718 221 chapters is what pushed the live index to 63 GB and
+    # made every merge slow (2026-10-21).  The books index keeps the full text,
+    # and that is where "search by summary" belongs.
+    assert all(
+        "book_description" not in doc
         for call in index.add_documents.call_args_list
         for doc in call.args[0]
-        if "book_description" in doc
-    ]
-    assert chapter_descriptions
-    assert max(len(text) for text in chapter_descriptions) <= service.CHAPTER_BOOK_DESCRIPTION_LIMIT
+    )
     assert all(len(text) <= service.content_index_limit() for text in chapter_contents)
 
 
@@ -510,9 +508,10 @@ async def test_wait_for_engine_only_waits_while_the_queue_is_long(monkeypatch):
     container could not finish (2026-10-19: 3 787 tasks, 15 hours, no commit).
     """
     service, _client = _make_service()
-    monkeypatch.setattr(service, "INDEX_BACKLOG_LIMIT", 5)
-    monkeypatch.setattr(service, "INDEX_BACKLOG_POLL_SECONDS", 0)
-    monkeypatch.setattr(service, "INDEX_BACKLOG_MAX_WAIT_SECONDS", 60.0)
+    # The waits are configuration now (docker-compose knobs), so patch settings.
+    monkeypatch.setattr(settings, "MEILI_BACKLOG_LIMIT", 5)
+    monkeypatch.setattr(settings, "MEILI_BACKLOG_POLL_SECONDS", 0.0)
+    monkeypatch.setattr(settings, "MEILI_BACKLOG_MAX_WAIT_SECONDS", 60.0)
 
     # Above the limit twice (waits), then drained (returns).
     backlogs = iter([50, 50, 4])
@@ -546,9 +545,9 @@ async def test_wait_for_engine_only_waits_while_the_queue_is_long(monkeypatch):
 @pytest.mark.asyncio
 async def test_wait_for_engine_gives_up_after_the_maximum(monkeypatch):
     service, _client = _make_service()
-    monkeypatch.setattr(service, "INDEX_BACKLOG_LIMIT", 1)
-    monkeypatch.setattr(service, "INDEX_BACKLOG_POLL_SECONDS", 0)
-    monkeypatch.setattr(service, "INDEX_BACKLOG_MAX_WAIT_SECONDS", 0.0)
+    monkeypatch.setattr(settings, "MEILI_BACKLOG_LIMIT", 1)
+    monkeypatch.setattr(settings, "MEILI_BACKLOG_POLL_SECONDS", 0.0)
+    monkeypatch.setattr(settings, "MEILI_BACKLOG_MAX_WAIT_SECONDS", 0.0)
     monkeypatch.setattr(service, "engine_backlog", lambda: 999)
     async def fake_sleep(seconds):
         return None
