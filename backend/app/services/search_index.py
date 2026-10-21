@@ -650,7 +650,10 @@ class SearchIndexMixin:
                     message=f"正在写入书籍 0 / {books_total}",
                 )
 
-                books = (await db.scalars(select(Book))).unique().all()
+                # Quarantined books are not searchable and their chapters are skipped.
+                books = (
+                    await db.scalars(select(Book).where(Book.hidden == False))  # noqa: E712
+                ).unique().all()
                 custom_rows = await db.execute(
                     select(BookCustomTag.book_id, CustomTag.name)
                     .join(CustomTag, BookCustomTag.custom_tag_id == CustomTag.id)

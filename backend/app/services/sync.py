@@ -35,6 +35,7 @@ from app.models import (
     User,
 )
 from app.repositories.tag import TagRepository
+from app.services.content_quality import cover_wall_matches
 from app.services.storage import BookRef, BookStorage, text_digest
 from app.services.search import search_service
 from app.services.cookie_crypto import safe_decrypt_cookie
@@ -256,6 +257,9 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
     def __init__(self, db: AsyncSession, storage: BookStorage | None = None):
         self.db = db
         self.storage = storage or BookStorage()
+        #: Every book title in the library, loaded once per sync run; the
+        #: cover-wall detector compares image alt texts against it.
+        self._other_book_titles: set[str] | None = None
 
     def _source_plugin(self, source: Source):
         """Build the plugin for a source, carrying its request interval.
@@ -1022,6 +1026,23 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                         ) from error
                     continue
 
+                # Some sources put the site's "related works" grid inside the
+                # chapter container: the body is then nothing but other books'
+                # covers.  Writing it would make a junk book that looks read-
+                # able; skip the chapter instead and say so.
+                wall_hits = cover_wall_matches(
+                    content, await self._library_titles(), book_title
+                )
+                if wall_hits:
+                    logger.warning(
+                        "第 {} 章《{}》的正文实际是其他书的封面（命中书名：{}），已跳过写入",
+                        remote_chapter.chapter_number,
+                        remote_chapter.title,
+                        "、".join(wall_hits[:3]),
+                    )
+                    await _report_progress(remote_chapter)
+                    continue
+
                 try:
                     content_path, content_hash = self.storage.write_chapter(
                         author_name,
@@ -1164,6 +1185,13 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             # the admin did not ask for, so it is reported, not silent.
             "repaired_chapters": replaced_foreign_chapters,
         }
+
+    async def _library_titles(self) -> set[str]:
+        """Every book title in the library (loaded once per sync run)."""
+        if self._other_book_titles is None:
+            rows = await self.db.scalars(select(Book.title))
+            self._other_book_titles = {str(title) for title in rows.all() if title}
+        return self._other_book_titles
 
     async def _flush_chapter_writes(self, pending_index_docs: list[dict]) -> None:
         """Commit the chapter rows written since the last batch, then index them.

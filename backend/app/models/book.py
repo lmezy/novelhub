@@ -22,6 +22,9 @@ class Book(Base):
     title = Column(String(255), nullable=False)
     is_r18 = Column(Boolean, default=False, nullable=False)
     is_public = Column(Boolean, default=False, nullable=False)
+    #: Hidden from every listing and from the search index, without deleting the
+    #: rows or the chapter files -- reversible quarantine for junk records.
+    hidden = Column(Boolean, default=False, nullable=False, server_default="0")
     all_ages_confirmed = Column(Boolean, default=False, nullable=False)
     # ``novel`` or ``comic``.  Comics are read as image galleries, novels as
     # text, so the library keeps them on separate pages.  The value is derived

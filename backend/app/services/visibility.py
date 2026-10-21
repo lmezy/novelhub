@@ -67,6 +67,9 @@ def visible_tags(user: User, tag_names: list[str]) -> list[str]:
 
 def apply_book_visibility(query, user: User, book=Book):
     """Restrict a book query to the rows ``user`` is allowed to see."""
+    # Quarantined rows are invisible to everyone, admins included: they exist
+    # only so the cleanup can be undone.
+    query = query.where(book.hidden == False)  # noqa: E712
     if user.role not in ("admin", "super_admin"):
         query = query.where(or_(
             book.owner_id.is_(None),
