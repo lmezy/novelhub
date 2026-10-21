@@ -1459,6 +1459,12 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         await self.db.execute(
             delete(Bookmark).where(Bookmark.chapter_id == chapter_id)
         )
+        # Saved AI analyses that quoted this chapter stay attached to the book
+        # but are flagged: the text they were based on is about to be replaced,
+        # so the model must re-check them against the new version.
+        from app.services.ai_insights import mark_chapter_insights_stale
+
+        await mark_chapter_insights_stale(self.db, chapter_id)
 
     # Content markers that indicate an anti-bot / captcha page was saved
     # instead of real chapter text.  Chapters matching these are dropped on

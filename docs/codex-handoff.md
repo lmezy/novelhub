@@ -2671,3 +2671,37 @@ Playwright（`transport._get` → `_get_with_web_js`，`fallback_http=False`）�
 
 **验证**：`pytest -q` → **1104 passed**（`tests/test_migrations.py` 的 head 断言同步更新）；
 `/books/browse` 的 SQL 未动。
+---
+
+## 64. 阅读时问 AI：结果存档并在同类提问里复用（2026-10-21）
+
+**需求**：阅读时用 AI 提问/分析，结果要存下来；下次对**同一本书**问类似的问题时，把上次的结论带进提示里一起分析。
+
+**范围决定**（用户确认）：① 只复用**同一本书**的历史分析；② 命中时**照常调用模型**，只是把旧答案作为参考资料塞进提示（不做"直接返回缓存"）；③ **所有读者共享**。
+
+**实现**：
+
+- 新表 `ai_book_insights`（迁移 `0038_ai_insights`）：`book_id` / `chapter_id`(SET NULL) /
+  `user_id`(SET NULL) / `question` / `answer` / `answered_by` / `hit_count` / `stale` /
+  时间戳；索引 `(book_id, updated_at)`、`chapter_id`。
+- `app/services/ai_insights.py`：
+  - `similarity()` = **问题文本的字符二元组 Jaccard**（中文没有空格，这是最便宜且确定的相似度；
+    「主角是谁」对「这本书的主角是谁」≈0.43，无关问题 <0.15）。以后要换成向量相似度只需改这一个函数。
+  - `related_insights()`：同一本书里取相似度 ≥ `RELATED_QUESTION(0.3)` 的前 3 条，并给命中项 `hit_count += 1`。
+  - `prior_block()`：把命中的「问 / 答（截 600 字，标 `stale`）」拼成提示段，并要求模型
+    「与旧结论一致就复用、不一致或原文更新则以原文为准并指出差异」。
+  - `remember_insight()`：保存问答；同一本书里相似度 ≥ `SAME_QUESTION(0.8)` 视为同一问题 →
+    **更新**该条（不新增），每本书最多 200 条、超出按「最少使用 + 最旧」清理。
+- `app/api/routes/ai.py`：`/ai/chat` 与 `/ai/chat/stream` 先把提示拼上
+  `prior_block(related_insights(...))`（作为**用户消息的一部分**，不污染读者的对话历史），
+  回答后再 `remember_insight()`（流式答复在流结束后落库）；
+  新增 `GET /ai/insights/{book_id}`（列表）与 `DELETE /ai/insights/item/{id}`
+  （作者或管理员可删）。
+- 重新抓取正文时（`sync._release_chapter_references`）把引用该章的旧分析标 `stale`，
+  下次命中时提示模型"原文已更新，请核对"。
+- 开关：`AI_INSIGHT_REUSE`（默认 true，`docker-compose.yml` / `.env` 都能改）——
+  关掉即恢复"每次都从零回答"，也不再写表。
+
+**验证**：`pytest -q` → **1111 passed**（新增 `tests/test_ai_insights.py` 6 个：
+相似度分档、提示拼装/截断/stale、只取本书相关、重复问题合并、异常不抛、
+`/ai/chat` 确实把旧分析塞进 message 并把新答案落库）。

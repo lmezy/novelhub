@@ -101,6 +101,11 @@ class Settings(BaseSettings):
     # candidate window re-scores far more text than this per query -- and the
     # full chapter is always in storage, this only limits the index copy.
     MEILI_CONTENT_INDEX_LIMIT:int=20000
+    # Reuse saved AI analyses: when a reader asks something similar about the
+    # same book again, the earlier question/answer is fed back into the prompt.
+    # Set to false to keep every request stateless (and stop writing to
+    # ai_book_insights).
+    AI_INSIGHT_REUSE:bool=True
     # How many tasks the engine may still have queued before an index rebuild
     # waits for it.  Meilisearch merges consecutive tasks into one batch and a
     # batch is one transaction: on 2026-10-19 the live engine merged 3 787

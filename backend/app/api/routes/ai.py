@@ -15,14 +15,23 @@ from __future__ import annotations
 import json
 from typing import Any, AsyncIterator
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from loguru import logger
+
+from app.core.config import settings
 from app.core.database import get_db
 from app.models import Book, User
 from app.services.ai import AIService
+from app.services.ai_insights import (
+    list_insights,
+    prior_block,
+    related_insights,
+    remember_insight,
+)
 from app.services.ai_client import AIError, diagnose
 from app.services.ai_config import get_ai_config
 from app.services.auth import get_current_user, require_admin
@@ -174,15 +183,52 @@ async def ai_status(user: User = Depends(get_current_user),
     return {key: status.get(key) for key in AIStatusResponse.model_fields}
 
 
+async def _prompt_message(db: AsyncSession, payload: "ChatRequest") -> str:
+    """The user message, prefixed with earlier analyses of the same book.
+
+    The saved question/answer pairs are handed to the model as part of the
+    question (not as extra chat turns, so they never appear in the reader's own
+    transcript) and only for the same book.
+    """
+    if not bool(getattr(settings, "AI_INSIGHT_REUSE", True)):
+        return payload.message
+    try:
+        rows = await related_insights(db, payload.book_id, payload.message)
+    except Exception as exc:  # noqa: BLE001 - reuse is best-effort
+        logger.debug("Could not load saved AI analyses: {}", exc)
+        return payload.message
+    block = prior_block(rows)
+    if not block:
+        return payload.message
+    return f"{block}\n\n===== 读者当前的提问 =====\n{payload.message}"
+
+
+async def _keep_answer(db: AsyncSession, payload: "ChatRequest", user: User, answer: str, *,
+                       model: str = "") -> None:
+    """Remember this question/answer for the next reader of the same book."""
+    if not answer:
+        return
+    await remember_insight(
+        db,
+        book_id=payload.book_id,
+        question=payload.message,
+        answer=answer,
+        chapter_number=payload.chapter_number,
+        user=user,
+        answered_by=model,
+    )
+
+
 @router.post("/chat", response_model=ChatResponse)
 async def ai_chat(payload: ChatRequest, user: User = Depends(get_current_user),
                   db: AsyncSession = Depends(get_db)):
     """Ask a question about a book with context-aware AI."""
     await _require_visible_book(db, user, payload.book_id)
+    message = await _prompt_message(db, payload)
     try:
-        return await AIService(db).chat(
+        response = await AIService(db).chat(
             book_id=payload.book_id,
-            message=payload.message,
+            message=message,
             chapter_number=payload.chapter_number,
             context_chapters=payload.context_chapters,
             history=[m.model_dump() for m in payload.history],
@@ -190,6 +236,9 @@ async def ai_chat(payload: ChatRequest, user: User = Depends(get_current_user),
         )
     except Exception as exc:
         raise _http_error(exc) from exc
+    await _keep_answer(db, payload, user, str(response.get("answer") or ""),
+                       model=str(response.get("model") or ""))
+    return response
 
 
 async def _sse(events: AsyncIterator[dict[str, Any]]) -> AsyncIterator[str]:
@@ -204,16 +253,30 @@ async def ai_chat_stream(payload: ChatRequest, user: User = Depends(get_current_
     """Streamed answer (SSE). Errors arrive as an ``error`` event."""
     await _require_visible_book(db, user, payload.book_id)
     service = AIService(db)
-    events = service.stream_chat(
-        book_id=payload.book_id,
-        message=payload.message,
-        chapter_number=payload.chapter_number,
-        context_chapters=payload.context_chapters,
-        history=[m.model_dump() for m in payload.history],
-        mode=payload.mode,
-    )
+    message = await _prompt_message(db, payload)
+    replay = {"text": [], "model": ""}
+
+    async def _stream_and_remember() -> AsyncIterator[dict[str, Any]]:
+        async for event in service.stream_chat(
+            book_id=payload.book_id,
+            message=message,
+            chapter_number=payload.chapter_number,
+            context_chapters=payload.context_chapters,
+            history=[m.model_dump() for m in payload.history],
+            mode=payload.mode,
+        ):
+            kind = event.get("type")
+            if kind == "delta":
+                replay["text"].append(str(event.get("text") or ""))
+            elif kind == "done":
+                replay["model"] = str(event.get("model") or "")
+            yield event
+        await _keep_answer(
+            db, payload, user, "".join(replay["text"]), model=replay["model"],
+        )
+
     return StreamingResponse(
-        _sse(events),
+        _sse(_stream_and_remember()),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -345,6 +408,48 @@ async def get_task_diagnosis(task_id: str,
     if stored is None:
         raise HTTPException(status_code=404, detail="这个任务还没有 AI 诊断结果")
     return stored
+
+
+@router.get("/insights/{book_id}")
+async def ai_book_insights(book_id: str, limit: int = Query(50, ge=1, le=200),
+                           user: User = Depends(get_current_user),
+                           db: AsyncSession = Depends(get_db)):
+    """Saved analyses of one book (shared by every reader of that book)."""
+    await _require_visible_book(db, user, book_id)
+    rows = await list_insights(db, book_id, limit=limit)
+    return {
+        "items": [
+            {
+                "id": row.id,
+                "question": row.question,
+                "answer": row.answer,
+                "chapter_id": row.chapter_id,
+                "stale": bool(row.stale),
+                "hit_count": int(row.hit_count or 0),
+                "answered_by": row.answered_by or "",
+                "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+            }
+            for row in rows
+        ],
+        "total": len(rows),
+    }
+
+
+@router.delete("/insights/item/{insight_id}")
+async def ai_delete_insight(insight_id: str,
+                            user: User = Depends(get_current_user),
+                            db: AsyncSession = Depends(get_db)):
+    """Remove one saved analysis (its author or an admin)."""
+    from app.models import AIBookInsight
+
+    row = await db.get(AIBookInsight, insight_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="分析不存在")
+    if user.role not in ("admin", "super_admin") and row.user_id not in (None, user.id):
+        raise HTTPException(status_code=403, detail="只有创建者或管理员可以删除")
+    await db.delete(row)
+    await db.commit()
+    return {"status": "ok"}
 
 
 @router.post("/diagnose/{task_id}")

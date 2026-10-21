@@ -78,3 +78,4 @@ from .book_favorite import BookFavorite  # noqa: F401
 from .custom_tag import CustomTag, BookCustomTag  # noqa: F401
 from .bookshelf_group import BookshelfGroup, BookFavoriteGroup  # noqa: F401
 from .sync_diagnosis import SyncDiagnosis  # noqa: F401
+from .ai_insight import AIBookInsight  # noqa: F401
