@@ -2,7 +2,7 @@ from dataclasses import replace
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -338,6 +338,22 @@ class AIConfigUpdate(BaseModel):
     auto_diagnose: bool | None = None
     #: Saved provider list (replaces the whole list) and which entry is in use.
     profiles: list[AIProviderProfileUpdate] | None = None
+
+    @field_validator(
+        "temperature", "max_tokens", "timeout", "context_chars", "rag_top_k",
+        mode="before",
+    )
+    @classmethod
+    def _blank_number_is_absent(cls, value):
+        """An empty number box means "not sent", not a validation failure.
+
+        The admin form is saved as one payload: a single blank box (or a value
+        the browser turns into "") used to fail the whole PUT with a 422, which
+        looked like "the other numbers do not save".
+        """
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
     active_profile_id: str | None = None
 
 

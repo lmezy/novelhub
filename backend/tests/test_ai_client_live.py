@@ -182,7 +182,11 @@ async def test_stream_is_delivered_incrementally(llm_server):
 
 @pytest.mark.asyncio
 async def test_embeddings_over_a_real_socket(llm_server):
-    vectors = await LLMClient(config_for(llm_server)).embed(["a", "b"], retries=0)
+    # A custom endpoint that inherits the chat URL no longer counts as
+    # embeddings-capable, so the test names the endpoint explicitly.
+    vectors = await LLMClient(
+        config_for(llm_server, embedding_base_url=llm_server)
+    ).embed(["a", "b"], retries=0)
 
     assert vectors == [[0.0, 0.5], [1.0, 0.5]]
     assert RECEIVED[0]["path"] == "/v1/embeddings"

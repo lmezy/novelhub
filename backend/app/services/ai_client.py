@@ -690,7 +690,13 @@ async def diagnose(cfg: AIConfig, *, test_embeddings: bool = True) -> dict[str, 
         if not cfg.embeddings_supported:
             results["embeddings"] = {
                 "ok": False,
-                "error": "当前配置没有可用的 Embedding 服务/模型（RAG 语义检索会不可用）。",
+                "supported": False,
+                "error": (
+                    "当前配置没有可用的向量接口（/embeddings），RAG 语义检索会不可用。"
+                    "对话供应商（例如自定义/Command Code）通常不提供向量接口：请单独配置 "
+                    "embedding_provider（openai / qwen / zhipu / siliconflow，或本地 Ollama）"
+                    "与对应的向量模型。"
+                ),
             }
         else:
             try:

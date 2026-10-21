@@ -519,11 +519,24 @@ class AIConfig:
 
     @property
     def embeddings_supported(self) -> bool:
-        return bool(
-            self.effective_embedding_base_url
-            and self.effective_embedding_model
-            and self.effective_embedding_provider in EMBEDDING_CAPABLE
-        )
+        """Whether an embeddings request has somewhere sensible to go.
+
+        Inheriting the *chat* endpoint only works for vendors that really serve
+        ``/embeddings`` on the same base URL.  A "custom" chat endpoint used to
+        inherit it and answer a bare 404 ("is not a registered API route"), so
+        the inherited case now requires the vendor to document an embeddings
+        API (``EMBEDDING_PRESETS``).  An explicitly configured embedding base
+        URL, or a different embedding provider, always counts.
+        """
+        if not self.effective_embedding_base_url or not self.effective_embedding_model:
+            return False
+        if self.embedding_base_url:
+            return True
+        if self.effective_embedding_provider != self.provider:
+            return self.effective_embedding_provider in EMBEDDING_CAPABLE
+        if self.effective_embedding_provider not in EMBEDDING_CAPABLE:
+            return False
+        return bool(_embedding_preset(self.effective_embedding_provider).get("model"))
 
     @property
     def configured(self) -> bool:
