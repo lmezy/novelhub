@@ -234,6 +234,29 @@ class SearchIndexMixin:
         except Exception as exc:
             logger.debug("Task {} did not confirm: {}", uid, exc)
 
+    def _add_documents(self, name: str, docs: list[dict], *, primary_key: str = "id"):
+        """Write one batch, repairing a lost primary key once.
+
+        A queued ``settingsUpdate`` can re-create an index that a rebuild just
+        deleted, and a freshly created index has no primary key -- every batch
+        then fails with ``index_primary_key_multiple_candidates_found`` (a
+        chapter document carries both ``id`` and ``book_id``).  That failure is
+        self-healing here instead of silently indexing nothing.
+        """
+        index = self.client.index(name)
+        try:
+            return index.add_documents(docs, primary_key=primary_key)
+        except meilisearch.errors.MeilisearchApiError as exc:
+            if "index_primary_key" not in str(exc):
+                raise
+            logger.warning(
+                "Index {} lost its primary key ({}); repairing and retrying",
+                name, exc,
+            )
+            self.client.update_index(name, {"primaryKey": primary_key})
+            time.sleep(1.5)
+            return self.client.index(name).add_documents(docs, primary_key=primary_key)
+
     def _ensure_index(self, name: str, primary_key: str = "id") -> None:
         if name in self._ensured:
             return
@@ -260,6 +283,18 @@ class SearchIndexMixin:
                     )
         index = self.client.index(name)
         index.update_filterable_attributes(self.filterable_attributes(name))
+        # A settings task re-creates a just-deleted index *without* a primary
+        # key, so verify again after it (see _add_documents for the same trap).
+        try:
+            current = self.client.get_index(name)
+            if not self._primary_key_of(current):
+                self.client.update_index(name, {"primaryKey": primary_key})
+                logger.warning(
+                    "Index {} lost its primary key after the settings update; "
+                    "set it back to {!r}", name, primary_key,
+                )
+        except Exception as exc:  # noqa: BLE001 - best effort
+            logger.debug("Could not verify the primary key of {}: {}", name, exc)
         if name == self.INDEX_BOOKS:
             index.update_searchable_attributes(self.SEARCHABLE_BOOKS)
         else:
@@ -298,7 +333,7 @@ class SearchIndexMixin:
         # here, in the one funnel every write path goes through, so a book cannot
         # be indexed without them (``sync_book_grams`` backfills older ones).
         doc.update(book_gram_fields(doc))
-        self.client.index(self.INDEX_BOOKS).add_documents([doc], primary_key="id")
+        self._add_documents(self.INDEX_BOOKS, [doc])
         logger.debug("Indexed book {}", doc.get("id"))
 
     def index_chapter(self, chapter: dict) -> None:
@@ -306,7 +341,7 @@ class SearchIndexMixin:
         doc = dict(chapter)
         self._normalize_visibility(doc)
         doc.update(chapter_gram_fields(doc))
-        self.client.index(self.INDEX_CHAPTERS).add_documents([doc], primary_key="id")
+        self._add_documents(self.INDEX_CHAPTERS, [doc])
         logger.debug("Indexed chapter {}", doc.get("id"))
 
     def update_book_tags(self, book_id: str, tags: list[str]) -> None:
@@ -349,7 +384,7 @@ class SearchIndexMixin:
         docs = self._chapter_buffer
         self._chapter_buffer = []
         try:
-            self.client.index(self.INDEX_CHAPTERS).add_documents(docs, primary_key="id")
+            self._add_documents(self.INDEX_CHAPTERS, docs)
             logger.debug("Indexed {} chapters", len(docs))
         except Exception as exc:
             logger.warning("Failed to index {} chapters: {}", len(docs), exc)
@@ -688,7 +723,7 @@ class SearchIndexMixin:
                     book_meta[book.id] = doc
                     book_batch.append(doc)
                     if len(book_batch) >= self.BOOK_BUFFER_SIZE:
-                        self.client.index(self.INDEX_BOOKS).add_documents(book_batch, primary_key="id")
+                        self._add_documents(self.INDEX_BOOKS, book_batch)
                         result["books"] += len(book_batch)
                         book_batch = []
                         await self.wait_for_engine()
@@ -698,7 +733,7 @@ class SearchIndexMixin:
                             message=f"正在写入书籍 {result['books']} / {books_total}",
                         )
                 if book_batch:
-                    self.client.index(self.INDEX_BOOKS).add_documents(book_batch, primary_key="id")
+                    self._add_documents(self.INDEX_BOOKS, book_batch)
                     result["books"] += len(book_batch)
                     publish(
                         force=True, books_done=result["books"],
@@ -748,7 +783,7 @@ class SearchIndexMixin:
                         }),
                     })
                     if len(batch) >= self.CHAPTER_BUFFER_SIZE:
-                        self.client.index(self.INDEX_CHAPTERS).add_documents(batch, primary_key="id")
+                        self._add_documents(self.INDEX_CHAPTERS, batch)
                         result["chapters"] += len(batch)
                         batch = []
                         await self.wait_for_engine()
@@ -760,7 +795,7 @@ class SearchIndexMixin:
                             ),
                         )
                 if batch:
-                    self.client.index(self.INDEX_CHAPTERS).add_documents(batch, primary_key="id")
+                    self._add_documents(self.INDEX_CHAPTERS, batch)
                     result["chapters"] += len(batch)
                     publish(
                         force=True, chapters_done=result["chapters"],
