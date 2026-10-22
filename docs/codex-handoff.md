@@ -2778,3 +2778,23 @@ Playwright（`transport._get` → `_get_with_web_js`，`fallback_http=False`）�
 **部署建议**（NAS 上，需重建镜像后）：重建索引前先重启后端（或直接
 `MEILI_GRAM_BACKFILL_CHAPTERS: false`）——重建本身会写 gram 字段，章回填只在
 "不重建、只想给旧索引补字段"时才需要。已污染的索引要重新重建一次才干净。
+
+---
+
+## 67. 「取消重建」点了要等 3 分钟才生效（2026-10-22）
+
+**现象**：后台点「取消」后按钮一直停在「正在取消」。实测 14:48:54 发起的取消，
+14:52:05 才真正停下（3 分 11 秒），而且这段期间进度消息一直是
+「等待搜索引擎消化（队列 207 条）…」，看起来像没点上去。
+
+**根因**：`rebuild_index` 只在批次边界调 `check_stop()`（第 100 章写完、下一批开始
+之前），而每批写完一定会进 `wait_for_engine()`：引擎队列顶在 200 条上限时它要等满
+`MEILI_BACKLOG_MAX_WAIT_SECONDS`（默认 300 s），**等待循环不读取消标志**；更糟的是它
+每 2 秒用「等待搜索引擎消化…」覆盖 `cancel_rebuild()` 写下的「已请求取消…」消息。
+
+**实现**：`wait_for_engine(should_stop=None)` 每轮（2 s）轮询取消标志，命中立即抛
+`RebuildCancelled`；`rebuild_index` 书/章两处调用都把 `should_stop` 传进去。取消现在
+在 2 秒内生效。
+
+**验证**：新增 `test_wait_for_engine_stops_as_soon_as_the_rebuild_is_cancelled`；
+`pytest -q` → **1129 passed**。

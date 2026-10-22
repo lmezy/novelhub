@@ -577,13 +577,19 @@ class SearchIndexMixin:
         except (TypeError, ValueError):
             return None
 
-    async def wait_for_engine(self) -> None:
+    async def wait_for_engine(self, should_stop: Callable[[], bool] | None = None) -> None:
         """Block while the engine's queue is longer than ``INDEX_BACKLOG_LIMIT``.
 
         Bounded: if the engine is hopelessly behind (or its task endpoint is
         unavailable) the rebuild continues anyway after
         ``INDEX_BACKLOG_MAX_WAIT_SECONDS`` -- a stuck index is bad, but an
         unbounded wait that never writes anything is worse.
+
+        ``should_stop`` is polled on every round.  It used to be checked only at
+        batch boundaries, so a cancel issued while the writer was parked here
+        waited out the whole five-minute window (measured 3 min 11 s on the live
+        NAS, 2026-10-22) and the wait kept publishing "waiting for the engine"
+        over the "cancelling" message -- the admin saw a stuck "正在取消".
         """
         limit = max(1, int(getattr(settings, "MEILI_BACKLOG_LIMIT", 0) or 0) or self.INDEX_BACKLOG_LIMIT)
         # ``getattr`` with a default, not ``or``: 0 is a meaningful value here
@@ -602,6 +608,8 @@ class SearchIndexMixin:
         deadline = time.monotonic() + max_wait
         warned = False
         while True:
+            if should_stop is not None and should_stop():
+                raise RebuildCancelled("重建已取消")
             backlog = await asyncio.to_thread(self.engine_backlog)
             if backlog is None or backlog <= limit:
                 return
@@ -741,7 +749,7 @@ class SearchIndexMixin:
                         self._add_documents(self.INDEX_BOOKS, book_batch)
                         result["books"] += len(book_batch)
                         book_batch = []
-                        await self.wait_for_engine()
+                        await self.wait_for_engine(should_stop)
                         publish(
                             books_done=result["books"],
                             documents_done=result["books"],
@@ -801,7 +809,7 @@ class SearchIndexMixin:
                         self._add_documents(self.INDEX_CHAPTERS, batch)
                         result["chapters"] += len(batch)
                         batch = []
-                        await self.wait_for_engine()
+                        await self.wait_for_engine(should_stop)
                         publish(
                             chapters_done=result["chapters"],
                             documents_done=result["books"] + result["chapters"],

@@ -565,6 +565,44 @@ async def test_wait_for_engine_gives_up_after_the_maximum(monkeypatch):
     await service.wait_for_engine()      # returns instead of hanging forever
 
 
+@pytest.mark.asyncio
+async def test_wait_for_engine_stops_as_soon_as_the_rebuild_is_cancelled(monkeypatch):
+    """Cancelling must not wait out the backlog window.
+
+    Measured on the live NAS (2026-10-22): the admin clicked cancel while the
+    writer was parked in this wait; the stop took 3 min 11 s because the flag
+    was only read at the next batch boundary, and the UI sat on "正在取消".
+    """
+    from app.services.search_index import RebuildCancelled
+
+    service, _client = _make_service()
+    monkeypatch.setattr(settings, "MEILI_BACKLOG_LIMIT", 5)
+    monkeypatch.setattr(settings, "MEILI_BACKLOG_POLL_SECONDS", 0.0)
+    monkeypatch.setattr(settings, "MEILI_BACKLOG_MAX_WAIT_SECONDS", 300.0)
+    monkeypatch.setattr(service, "engine_backlog", lambda: 50)
+    monkeypatch.setattr(
+        "app.services.search_index.write_rebuild_progress", lambda update: None
+    )
+
+    async def fake_sleep(seconds):
+        return None
+
+    monkeypatch.setattr("app.services.search_index.asyncio.sleep", fake_sleep)
+
+    polls = {"n": 0}
+
+    def should_stop() -> bool:
+        polls["n"] += 1
+        return polls["n"] > 1
+
+    with pytest.raises(RebuildCancelled):
+        await service.wait_for_engine(should_stop)
+
+    # One round to see the long queue, the next one to see the cancel -- the
+    # 300 s deadline never comes into play.
+    assert polls["n"] == 2
+
+
 def test_ensure_index_repairs_a_missing_primary_key():
     """An index without a primary key rejects every chapter batch.
 
