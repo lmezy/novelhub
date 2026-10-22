@@ -553,16 +553,70 @@ const indexPhaseLabel = computed(() => {
 })
 
 // Novel/comic classification maintenance: the migration backfills existing
-// books, this re-runs the rules (optionally reading chapter bodies) so a new
-// image source does not need a manual DB fix.
+// books, this re-runs the rules (reading several chapter bodies per book) so a
+// new image source does not need a manual DB fix -- and, since the rules now let
+// chapter content outrank a wrong label, so the novels a stray 漫画 tag or a
+// placeholder first chapter locked as comics can be put back.
+//
+// It reads chapters, so on a large library it is minutes of work: it runs in
+// the backend in the background and this polls
+// ``GET /books/reclassify/status`` (see ``loadKindProgress``).
 const kindScanContent = ref(true)
 const kindForce = ref(false)
 const kindReclassifying = ref(false)
+const kindCancelling = ref(false)
+const kindProgress = ref<any>(null)
 const kindResult = ref("")
 const kindError = ref("")
+let kindPollTimer: number | null = null
+
+function stopKindPolling() {
+  if (kindPollTimer !== null) {
+    window.clearInterval(kindPollTimer)
+    kindPollTimer = null
+  }
+}
+
+function ensureKindPolling() {
+  if (kindPollTimer !== null) return
+  kindPollTimer = window.setInterval(() => void loadKindProgress(), 1500)
+}
+
+async function loadKindProgress(initial = false) {
+  try {
+    const progress = await api.get<any>("/books/reclassify/status")
+    kindProgress.value = progress
+    kindReclassifying.value = Boolean(progress?.running)
+    if (progress?.running) {
+      ensureKindPolling()
+    } else {
+      stopKindPolling()
+      // A finished run carries its own summary; show it instead of the
+      // placeholder text so the numbers survive a page reload.
+      if (!initial && progress?.phase === "done" && progress?.result) {
+        setKindResult(progress.result)
+      }
+    }
+  } catch {
+    /* progress display must never break the settings page */
+  }
+}
+
+function setKindResult(res: any) {
+  kindResult.value = i18n.t("admin_kind_done", {
+    books: res.books ?? 0,
+    comics: res.comics ?? 0,
+    novels: res.novels ?? 0,
+    updated: res.updated ?? 0,
+  })
+  // The endpoint also refreshes the search index for the books that changed;
+  // surface a failure there instead of reporting a clean success.
+  if (res.index?.error) {
+    kindError.value = i18n.t("admin_kind_index_failed", { error: res.index.error })
+  }
+}
 
 async function reclassifyKinds() {
-  kindReclassifying.value = true
   kindError.value = ""
   kindResult.value = ""
   try {
@@ -570,23 +624,44 @@ async function reclassifyKinds() {
       "/books/reclassify?scan_content=" + (kindScanContent.value ? "true" : "false")
         + "&force=" + (kindForce.value ? "true" : "false"),
     )
-    kindResult.value = i18n.t("admin_kind_done", {
-      books: res.books ?? 0,
-      comics: res.comics ?? 0,
-      novels: res.novels ?? 0,
-      updated: res.updated ?? 0,
-    })
-    // The endpoint also refreshes the search index for the books that changed;
-    // surface a failure there instead of reporting a clean success.
-    if (res.index?.error) {
-      kindError.value = i18n.t("admin_kind_index_failed", { error: res.index.error })
-    }
+    kindProgress.value = res?.progress ?? res
+    kindReclassifying.value = Boolean(kindProgress.value?.running)
+    if (kindReclassifying.value) ensureKindPolling()
+    else setKindResult(res)
+  } catch (e) {
+    kindError.value = e instanceof Error ? e.message : i18n.t('admin_kind_failed')
+  }
+}
+
+async function cancelKindReclassify() {
+  kindCancelling.value = true
+  try {
+    kindProgress.value = await api.post<any>("/books/reclassify/cancel")
   } catch (e) {
     kindError.value = e instanceof Error ? e.message : i18n.t('admin_kind_failed')
   } finally {
-    kindReclassifying.value = false
+    kindCancelling.value = false
   }
 }
+
+const kindPercent = computed(() => {
+  const p = kindProgress.value
+  if (!p) return 0
+  if (p.phase === "done") return 100
+  return Math.max(0, Math.min(100, Number(p.percent) || 0))
+})
+
+const kindPhaseLabel = computed(() => {
+  const phase = kindProgress.value?.phase
+  // The backend's own message ("已开始…", "完成：共 N 本…") is the most
+  // accurate thing to show while a run is in flight.
+  if (kindProgress.value?.message) return kindProgress.value.message
+  if (phase === "done") return i18n.t('admin_kind_phase_done')
+  if (phase === "failed") return i18n.t('admin_kind_phase_failed')
+  if (phase === "cancelled") return i18n.t('admin_kind_phase_cancelled')
+  if (phase === "stale") return i18n.t('admin_kind_phase_stale')
+  return i18n.t('admin_kind_phase_scanning')
+})
 
 const healthStatus = ref<any>(null)
 
@@ -620,6 +695,7 @@ onMounted(async () => {
     await loadStatus()
     await loadIndexStats()
     await loadIndexProgress(true)
+    await loadKindProgress(true)
     await usersStore.loadUsers()
     await usersStore.loadRegistrationApproval()
     await approvalsStore.loadApprovals()
@@ -638,6 +714,7 @@ onMounted(async () => {
 onUnmounted(() => {
   // Polling lives in the global crawl store so the task survives route changes.
   stopIndexPolling()
+  stopKindPolling()
 })
 </script>
 
@@ -924,6 +1001,36 @@ onUnmounted(() => {
           <p class="text-xs text-muted dark:text-gray-400 mb-4">{{ i18n.t('admin_kind_hint') }}</p>
           <p v-if="kindError" class="text-sm text-red-600 mb-3">{{ kindError }}</p>
           <p v-if="kindResult" class="text-sm text-green-700 mb-3">{{ kindResult }}</p>
+
+          <!-- It reads several chapters per book, so it runs in the backend in
+               the background; these bars are the only way to tell "still going"
+               from "stuck". -->
+          <div v-if="kindReclassifying || kindProgress?.phase === 'done' || kindProgress?.phase === 'failed' || kindProgress?.phase === 'cancelled' || kindProgress?.phase === 'stale'" class="mb-4">
+            <div class="flex items-center justify-between text-xs text-muted dark:text-gray-400 mb-1">
+              <span>{{ kindPhaseLabel }}</span>
+              <span>{{ kindPercent }}%</span>
+            </div>
+            <div class="w-full h-2 rounded bg-border dark:bg-gray-700 overflow-hidden">
+              <div
+                class="h-full rounded transition-all duration-300"
+                :class="kindProgress?.phase === 'failed' || kindProgress?.phase === 'stale' ? 'bg-red-500' : kindProgress?.phase === 'done' ? 'bg-green-600' : 'bg-accent'"
+                :style="{ width: kindPercent + '%' }"
+              />
+            </div>
+            <div class="flex flex-wrap gap-x-4 gap-y-1 mt-2 text-xs text-muted dark:text-gray-400">
+              <span v-if="kindProgress?.books_total">
+                {{ i18n.t('admin_kind_progress_books') }}: {{ kindProgress.books_done }} / {{ kindProgress.books_total }}
+              </span>
+              <span v-if="kindProgress?.scanned">
+                {{ i18n.t('admin_kind_scanned') }}: {{ kindProgress.scanned }}
+              </span>
+              <span v-if="kindProgress?.updated">
+                {{ i18n.t('admin_kind_updated') }}: {{ kindProgress.updated }}
+              </span>
+            </div>
+            <p v-if="kindProgress?.error" class="text-xs text-red-600 mt-2">{{ kindProgress.error }}</p>
+          </div>
+
           <label class="flex items-center gap-2 mb-4 text-xs text-muted dark:text-gray-400 cursor-pointer">
             <input v-model="kindScanContent" type="checkbox" class="rounded" />
             <span>{{ i18n.t('admin_kind_scan') }}</span>
@@ -932,11 +1039,19 @@ onUnmounted(() => {
             <input v-model="kindForce" type="checkbox" class="rounded" />
             <span>{{ i18n.t('admin_kind_force') }}</span>
           </label>
-          <button
-            @click="reclassifyKinds"
-            :disabled="kindReclassifying"
-            class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50"
-          >{{ kindReclassifying ? i18n.t('admin_kind_running') : i18n.t('admin_kind_run') }}</button>
+          <div class="flex gap-3">
+            <button
+              @click="reclassifyKinds"
+              :disabled="kindReclassifying"
+              class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50"
+            >{{ kindReclassifying ? i18n.t('admin_kind_running') : i18n.t('admin_kind_run') }}</button>
+            <button
+              v-if="kindReclassifying"
+              @click="cancelKindReclassify"
+              :disabled="kindCancelling"
+              class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm font-medium hover:bg-surface dark:bg-gray-900 disabled:opacity-50"
+            >{{ kindCancelling ? i18n.t('admin_kind_cancelling') : i18n.t('admin_kind_cancel') }}</button>
+          </div>
         </div>
       </section>
 

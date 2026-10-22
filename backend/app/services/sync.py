@@ -45,9 +45,12 @@ from app.services.book_title import normalized_title_sql
 from app.services.source_interval import apply_source_interval, source_sync_interval
 from app.services.book_kind import (
     KIND_COMIC,
+    chapter_comic_vote,
+    is_ambiguous_chapter,
     is_comic_content,
     normalize_kind,
     resolve_kind,
+    should_promote_to_comic,
 )
 
 
@@ -942,6 +945,11 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         # the chapter being indexed: a rolled-back batch must re-issue the comic
         # classification instead of believing it was already written.
         stored_kind = book_kind
+        # One vote per chapter written so far.  A single image-only chapter
+        # does not make the book a comic: novels routinely ship a cover or a
+        # placeholder as chapter 1, and a sync can only ever upgrade, so that
+        # mistake used to be permanent.
+        kind_votes: list[bool] = []
         max_consecutive_transient = max(
             1,
             int(
@@ -1071,8 +1079,15 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                     pending_chapter_writes += 1
                     # A chapter that is nothing but image markup is a gallery
                     # page: the book is a comic even when its source claims to
-                    # be a text source.
-                    if stored_kind != KIND_COMIC and is_comic_content(content):
+                    # be a text source -- but only once *several* chapters say
+                    # so, because a lone placeholder image is not a gallery.
+                    if stored_kind != KIND_COMIC:
+                        # ``None`` means "one lone image, could be either a
+                        # novel's placeholder or a one-page album": not a vote.
+                        vote = chapter_comic_vote(content)
+                        if vote is not None:
+                            kind_votes.append(vote)
+                    if stored_kind != KIND_COMIC and should_promote_to_comic(kind_votes):
                         book_kind = KIND_COMIC
                         await self.db.execute(
                             update(Book)
@@ -1882,7 +1897,16 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         chapter.source_chapter_id = remote_chapter.source_chapter_id
         chapter.content_path = content_path
         chapter.hash = content_hash
-        if normalize_kind(book_kind_value) != KIND_COMIC and is_comic_content(content):
+        # Re-syncing a single chapter: one chapter is all we can see, so only a
+        # page that is unmistakably a gallery promotes the book.  A cover or a
+        # placeholder image (one image, no words) is what novels use as their
+        # first chapter, and promoting on it used to lock the whole book as a
+        # comic for good.
+        if (
+            normalize_kind(book_kind_value) != KIND_COMIC
+            and is_comic_content(content)
+            and not is_ambiguous_chapter(content)
+        ):
             book.kind = KIND_COMIC
             book_kind_value = KIND_COMIC
         await self.db.commit()

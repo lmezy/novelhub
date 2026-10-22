@@ -144,6 +144,11 @@
 - **同步很慢 / 想知道全站同步的本地开销花在哪** →
   [codex-handoff.md](codex-handoff.md) 第 61 节（每章少读一次文件、整本正文扫描改惰性、
   章节行批量提交 `SYNC_CHAPTER_COMMIT_BATCH`）
+- **小说被存成了漫画 / 点「重新识别」没反应 / 被「漫画」标签或首页占位图锁死** →
+  [codex-handoff.md](codex-handoff.md) 第 68 节（改成多章投票 + 正文证据压过标签）
+- **想看「重新识别」跑到哪了 / 能不能取消** →
+  [codex-handoff.md](codex-handoff.md) 第 68 节（后台任务 + 进度条；
+  `GET /api/books/reclassify/status`）
 
 ## 文档维护约定
 

@@ -2798,3 +2798,59 @@ Playwright（`transport._get` → `_get_with_web_js`，`fallback_http=False`）�
 
 **验证**：新增 `test_wait_for_engine_stops_as_soon_as_the_rebuild_is_cancelled`；
 `pytest -q` → **1129 passed**。
+---
+
+## 68. 「重新识别」改不动被锁成漫画的小说（2026-10-22）
+
+**现象**：书库里一批小说被存成了漫画，管理页点「重新识别」（勾选严格重算也一样）
+完全不动。用户报了两类：约 45 本被一个「漫画」标签锁死，约 20 本是「第一章是占位图」
+锁死。
+
+**根因**：`book_kind.resolve_kind()` 是一条短路链，**标签一命中就直接返回 comic**，
+而且同步侧只能升不能降，所以：
+
+1. **标签锁死**：书自带 `漫画` tag（源站给的），`auto_categorize` 又据此打上 `漫画`
+   分类。真实数据里 43 本就是这样，正文全是文字，但标签一票否决。
+   顺带一个更隐蔽的来源：`classify_category_names()` 给标题/简介匹配也加分，《在漫畫店
+   被輪姦》《假戏真做的淫妻写真》这种**标题里带"漫畫/写真"的小说**会被自动分到
+   `漫画`/`写真` 分类，`Book.kind` 再跟着分类走。
+2. **占位图锁死**：`reclassify_books()` 只读**第一章**。《好色人妻》《禁锢的爱情》等
+   第一章是站点的一张占位/搜索图标图（1 张图、零文字），`is_comic_content()` 判成画廊，
+   整本书就此升成漫画且再也降不回来。同步侧同理，见下。
+
+**改动**：
+
+- `services/book_kind.py` 重写判定为**证据 + 多章投票**：
+  - 抽 `KIND_SCAN_CHAPTERS`(6) 章（首章必抽，其余均摊全本）逐章投票，
+    `content_verdict()` 按**过半数**决出 comic/novel；决定性明确时提前停读。
+  - **正文证据压过标签**，且是双向的：正文说是小说，就能把 `漫画` 标签锁死的书改回来。
+    这是"重新识别点不动"的直接修复。
+  - 抽不到任何可决章节时返回 `None`，回退到标签/书源/原值——**没同步章节的漫画不会被
+    因为"没东西可读"而改成小说**（库里有 218 本这种）。
+  - 新增 `is_ambiguous_chapter()`：**1 张图 + 零文字 + 无「全话阅读」标题 = 弃权**，
+    不投任何一方。小说的占位图因此不再投 comic，而单页画册也不会被误投 novel。
+- **「全话阅读」是关键判别式**，别删：Legado 把图片源整本合并成一章并用这个标题。
+  库里 **1819 本漫画只有一章、且很多只同步到 1 页**，第一次试算就是用"1 张图=占位图"
+  把 1586 本真漫画误判成小说（试算 `would change: 1625`，其中 1586 本 `ch=1`）。
+- `services/sync.py`：单章即升 comic 改成 `should_promote_to_comic()`（≥2 章投画廊且
+  过半数），重抓单章那条路径加 `not is_ambiguous_chapter()`。同步只能升不能降，所以
+  宁可晚一章也不要错升。
+- `services/auto_categorize.py`：`漫画`/`写真`/`图集` 这三个**决定 kind 的分类**
+  （`KIND_BEARING_CATEGORIES`）现在必须有 tag 命中，标题/简介加分不再单独成立。
+- **重新识别改成后台任务 + 进度**：新增 `services/reclassify_progress.py`（进度落盘，
+  因为 NAS 是 `--workers 2`，内存全局会有一半概率答"没在跑"）；
+  `POST /books/reclassify` 默认 `wait=false` 立刻返回，`GET /books/reclassify/status`
+  轮询，`POST /books/reclassify/cancel` 取消。前端 AdminPage 加进度条、计数、
+  后端消息与完成结果，并复用 `formatDuration` 那套展示。
+
+**验证**：`backend/tests/test_book_kind.py` 补到 24 条（占位图弃权、全话阅读单页画册、
+标签被正文推翻、无章节不改判、同步单章不升级）；`pytest -q` → **1143 passed**
+（改动前 1141）。远端库做过只读试算（只读，未写库）。
+
+**仍然有效的提醒**：判 kind 时"1 张图"永远不能单独下结论——它同时是小说占位图和
+单页画册的形状；要区分只能靠「全话阅读」标题，或者干脆弃权让别的章节说话。
+
+**追加优化（同日）**：`scan_book_votes` 的 `storage.read_chapter` 是阻塞文件 I/O，
+原来直接内联在 async 循环里，会把跑后台任务的 uvicorn worker 整个冻住（NAS
+`--workers 2`，等于一半 API 含进度轮询全停）。现改走 `asyncio.to_thread`；返回值
+同时改为 `(votes, chapters_read)`，弃权章也计入读取数，进度数字反映真实 I/O。

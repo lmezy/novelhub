@@ -49,6 +49,14 @@ R18_CATEGORY_NAMES = {
 
 PRIMARY_CATEGORY_NAMES = set(DEFAULT_CATEGORY_RULES) - R18_CATEGORY_NAMES - {"其他"}
 
+#: Categories that decide whether a book is a novel or a comic.  They must be
+#: earned by a real tag: ``classify_category_names`` also scores title and
+#: description matches, and a novel whose *title* merely mentions 漫画
+#: (《在漫畫店被輪姦》) or 写真 (《假戏真做的淫妻写真》) used to be filed as a
+#: comic -- and ``Book.kind`` follows that label, so the mistake propagated all
+#: the way to the reader.
+KIND_BEARING_CATEGORIES = {"漫画", "写真", "图集"}
+
 
 def classify_category_names(
     tags: list[str],
@@ -61,6 +69,11 @@ def classify_category_names(
 
     Source tags are stronger evidence than prose. This avoids assigning many
     unrelated genres because a common word happens to occur in a synopsis.
+
+    漫画 / 写真 / 图集 are stricter still: they need a matching *tag*.  The
+    title and description bonuses below are what filed prose novels under 漫画
+    because their title mentioned a manga shop, and ``Book.kind`` then followed
+    that category.
     """
     tag_values = [str(tag or "").strip().lower() for tag in tags if str(tag or "").strip()]
     title_text = str(title or "").lower()
@@ -71,17 +84,23 @@ def classify_category_names(
         if category == "其他" or (category in R18_CATEGORY_NAMES and not is_r18):
             continue
         score = 10 if category.lower() in tag_values else 0
+        tag_hits = 0
         for keyword in keywords:
             needle = keyword.lower()
             for tag in tag_values:
                 if tag == needle:
                     score += 8
+                    tag_hits += 1
                 elif needle in tag:
                     score += 4
+                    tag_hits += 1
             if needle and needle in title_text:
                 score += 2
             if needle and needle in description_text:
                 score += 1
+        if category in KIND_BEARING_CATEGORIES and not tag_hits:
+            # Title/description alone would be a guess about the *medium*.
+            continue
         if score:
             scores[category] = score
 

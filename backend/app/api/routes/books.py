@@ -13,11 +13,8 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.models import Book, BookCategory, BookFavorite, BookFavoriteGroup, BookTag, Category, Chapter, Source, Tag, User
 from app.services.book_enrichment import analyze_book_text
-from app.services.book_kind import (
-    KINDS,
-    normalize_kind,
-    reclassify_books as reclassify_book_kinds,
-)
+from app.services.book_kind import KINDS, normalize_kind
+from app.services import reclassify_progress
 from app.services.auth import get_current_user, get_current_user_or_token, require_admin
 from app.services.book_cleanup import delete_books
 from app.services.book_title import normalize_title, normalized_title_sql
@@ -348,33 +345,45 @@ async def reclassify_book_kinds_endpoint(
     source_id: str | None = Query(None, description="Only re-check one source"),
     force: bool = Query(
         False,
-        description="Re-derive from scratch instead of only promoting to comic",
+        description="Also clear the kind of books that have nothing stored",
     ),
+    wait: bool = Query(False, description="Run inline instead of in the background"),
     db: AsyncSession = Depends(get_db),
 ):
     """Recompute novel/comic for the whole library (or one source).
 
     The migration backfills the obvious cases; this endpoint is the escape
-    hatch for galleries whose source does not declare an image type and for
-    re-checking a source after its rules changed.  The books whose kind moved
-    are pushed into the search index as well, otherwise a re-classified comic
-    would keep showing up in novel search results.
+    hatch for galleries whose source does not declare an image type, for
+    re-checking a source after its rules changed, and for the novels that a
+    stray 漫画 tag or a placeholder first chapter locked as comics.
+
+    It reads several chapters per book, so on a large library it is minutes of
+    work: it therefore runs **in the background** and the UI polls
+    ``GET /books/reclassify/status``.  Pass ``?wait=true`` for the old blocking
+    behaviour (scripts, smoke tests).
     """
-    result = await reclassify_book_kinds(
+    if not wait:
+        return reclassify_progress.start(
+            scan_content=scan_content, source_id=source_id, force=force
+        )
+    return await reclassify_progress.run_reclassify(
         db,
         scan_content=scan_content,
         source_id=source_id,
         force=force,
     )
-    changed = result.pop("changed_book_ids", [])
-    try:
-        # Only the books whose kind actually moved need touching in the index.
-        result["index"] = await search_service.sync_book_kinds(book_ids=changed)
-    except Exception as exc:
-        # The DB side already succeeded; report the index problem instead of
-        # failing the whole request.
-        result["index"] = {"error": str(exc)}
-    return result
+
+
+@router.get("/reclassify/status", dependencies=[Depends(require_admin)])
+async def reclassify_status():
+    """Progress of the current/last re-classification (bars, counters)."""
+    return reclassify_progress.read_progress()
+
+
+@router.post("/reclassify/cancel", dependencies=[Depends(require_admin)])
+async def reclassify_cancel():
+    """Ask a running re-classification to stop after the chunk it is on."""
+    return reclassify_progress.cancel()
 
 
 @router.post("/batch-delete", dependencies=[Depends(require_admin)])
