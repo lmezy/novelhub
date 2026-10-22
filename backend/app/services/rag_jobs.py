@@ -157,9 +157,8 @@ def _lock_owner_alive(path: Path) -> bool:
     return True
 
 
-def _acquire_lock() -> bool:
-    """Take the single-runner lock, or report that another worker owns it."""
-    path = _lock_path()
+def acquire_file_lock(path: Path) -> bool:
+    """Take a single-runner lock file, or report that another process owns it."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
     except Exception:
@@ -189,11 +188,19 @@ def _acquire_lock() -> bool:
     return False
 
 
-def _release_lock() -> None:
+def release_file_lock(path: Path) -> None:
     try:
-        _lock_path().unlink()
+        path.unlink()
     except OSError:
         pass
+
+
+def _acquire_lock() -> bool:
+    return acquire_file_lock(_lock_path())
+
+
+def _release_lock() -> None:
+    release_file_lock(_lock_path())
 
 
 # -- queue -------------------------------------------------------------------

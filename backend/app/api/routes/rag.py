@@ -12,8 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.models import Book, ChapterEmbedding, User
-from app.services import rag_jobs
-from app.services.ai_client import AIError
+from app.services import book_profiles, library_jobs, rag_jobs
+from app.services.ai_client import AIError, LLMClient
 from app.services.ai_config import get_ai_config
 from app.services.auth import get_current_user, require_admin
 from app.services.book_kind import KIND_COMIC
@@ -181,6 +181,8 @@ async def auto_index_book(book_id: str, user: User = Depends(get_current_user),
 @router.post("/batch", dependencies=[Depends(require_admin)])
 async def start_batch(payload: RAGBatchRequest, db: AsyncSession = Depends(get_db)):
     """Queue up to ``MAX_BATCH_BOOKS`` books for background indexing."""
+    if library_jobs.read_state().get("running"):
+        raise HTTPException(status_code=409, detail="书库画像正在构建，等它结束再建索引")
     titles: dict[str, str] = {}
     if payload.scope == "book_ids":
         requested = list(dict.fromkeys(str(i) for i in payload.book_ids if i))[: payload.limit]
@@ -263,3 +265,115 @@ async def jobs_status(db: AsyncSession = Depends(get_db)):
 async def cancel_jobs():
     """Stop after the book currently being indexed."""
     return rag_jobs.cancel()
+
+
+# ---------------------------------------------------------------------------
+# Cross-book discovery ("找相似的书"): one profile per book, pgvector HNSW.
+#
+# This is deliberately separate from the per-book chapter index: discovery only
+# needs four vectors per book (a whole-library chapter index is 70-100 GB), and
+# it is built once for the library instead of on demand per book.
+# ---------------------------------------------------------------------------
+
+
+class LibraryBuildRequest(BaseModel):
+    limit: int = Field(
+        default=library_jobs.DEFAULT_BOOKS_PER_RUN, ge=1,
+        le=library_jobs.MAX_BOOKS_PER_RUN,
+    )
+    force: bool = Field(default=False, description="Rebuild books that already have a profile")
+
+
+class LibrarySearchRequest(BaseModel):
+    query: str = Field(default="", description="Scene/plot description, or empty with book_id")
+    book_id: str | None = Field(default=None, description="Find books similar to this one")
+    top_k: int = Field(default=10, ge=1, le=30)
+
+
+@router.post("/library/build", dependencies=[Depends(require_admin)])
+async def build_library_profiles(payload: LibraryBuildRequest):
+    """Queue a whole-library profile build (bounded by ``limit`` books)."""
+    try:
+        return library_jobs.start(limit=payload.limit, force=payload.force)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/library/status", dependencies=[Depends(require_admin)])
+async def library_status(db: AsyncSession = Depends(get_db)):
+    state = library_jobs.status()
+    state["stats"] = await book_profiles.stats(db)
+    return state
+
+
+@router.post("/library/cancel", dependencies=[Depends(require_admin)])
+async def library_cancel():
+    return library_jobs.cancel()
+
+
+@router.post("/library/search")
+async def library_search(payload: LibrarySearchRequest,
+                         user: User = Depends(get_current_user),
+                         db: AsyncSession = Depends(get_db)):
+    """Find books whose story resembles a scene, or that book."""
+    query = str(payload.query or "").strip()
+    if not query and not payload.book_id:
+        raise HTTPException(status_code=400, detail="请提供一段情节描述，或指定一本书")
+
+    cfg = await get_ai_config(db)
+    if not cfg.embeddings_supported:
+        raise HTTPException(
+            status_code=503,
+            detail="跨书检索需要向量服务：请在「设置 → AI → 语义检索」配置 Embedding",
+        )
+
+    vector: list[float] | None = None
+    if query:
+        try:
+            vectors = await LLMClient(cfg).embed([query], batch_size=1)
+        except AIError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        vector = vectors[0] if vectors else None
+    elif payload.book_id:
+        vector = await book_profiles.book_vector(db, payload.book_id)
+        if vector is None:
+            raise HTTPException(
+                status_code=404,
+                detail="这本书还没有书库画像；请先在设置里构建书库画像（或换一段文字描述）",
+            )
+
+    if not vector:
+        return {"items": [], "query": query}
+
+    rows = await book_profiles.similar_books(
+        db, vector, limit=payload.top_k * 6, exclude_book_id=payload.book_id,
+    )
+    best: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        best.setdefault(row["book_id"], row)
+    if not best:
+        return {"items": [], "query": query}
+
+    books = list(
+        (await db.scalars(select(Book).where(Book.id.in_(list(best))))).all()
+    )
+    by_id = {book.id: book for book in books}
+    items = []
+    for book_id, row in best.items():
+        book = by_id.get(book_id)
+        # Same rule as every other listing: private, R18 and quarantined books
+        # must not leak through discovery.
+        if book is None or not ensure_book_visible(user, book):
+            continue
+        items.append({
+            "book_id": book_id,
+            "title": book.title,
+            "author": getattr(book, "author_name", "") or "",
+            "cover": book.display_cover or book.cover,
+            "is_r18": bool(book.is_r18),
+            "similarity": row["similarity"],
+            "excerpt": row["excerpt"],
+        })
+        if len(items) >= payload.top_k:
+            break
+    return {"items": items, "query": query, "model": cfg.effective_embedding_model}

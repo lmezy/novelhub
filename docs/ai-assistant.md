@@ -113,6 +113,37 @@ curl "http://localhost:8088/api/rag/index?limit=50" -H "Authorization: Bearer $T
 手机端容易中途断开——要稳就用后台批量或「打开即建」。片段总数上限 2000（`max_chunks` 可调），
 超出会截断并在结果里标注。
 
+### 3.1 跨书找相似（书库画像）
+
+想「看到一段情节，找其他类似的书」时用这个，它和上面的**按书 RAG 是两套索引**：
+
+- 每本书生成 **4 条画像向量**（均匀抽 4 个章节各截 900 字，前面加书名/作者/标签/简介），
+  整库约 18.5 万条、1.3 GB；不需要把 71 万章全部向量化（那是 70~100 GB）。
+- 管理员在 **设置 → AI → RAG 索引管理 → 书库画像** 里构建：每次最多 2000 本（建议 500~1000），
+  后台跑、可取消，页面 4 秒刷新进度与已建总量。
+- 读者在导航 **「找相似」** 页粘贴一段情节 → 语义检索；书籍详情页也有「找相似」。
+- 要求向量模型输出 **1024 维**（bge-m3 / text-embedding-v3 / embedding-3），
+  数据库要跑 **pgvector** 镜像（`pgvector/pgvector:pg17`），迁移 0040 会建
+  `book_profiles` 表与 HNSW 索引。
+
+```bash
+TOKEN=<管理员 JWT>
+# 构建（每次最多 2000 本）
+curl -X POST "http://localhost:8088/api/rag/library/build" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"limit":500,"force":false}'
+# 进度 / 取消
+curl "http://localhost:8088/api/rag/library/status" -H "Authorization: Bearer $TOKEN"
+curl -X POST "http://localhost:8088/api/rag/library/cancel" -H "Authorization: Bearer $TOKEN"
+# 检索（普通用户）：文字，或按一本书找相似
+curl -X POST "http://localhost:8088/api/rag/library/search" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"query":"主角被关在箱子里挑拨两派","top_k":12}'
+curl -X POST "http://localhost:8088/api/rag/library/search" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"book_id":"<BOOK_ID>","top_k":12}'
+```
+
+检索结果会按「书内最像的那一段」排序，并返回命中的原文片段；不可见、R18 受限和已隔离的书
+不会出现在结果里。
+
 ## 4. 同步报错诊断
 
 失败的时候不用自己啃日志：**同步页 → 选中那个失败的任务 → 「AI 分析这次报错」**。

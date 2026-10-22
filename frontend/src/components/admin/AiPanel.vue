@@ -62,11 +62,56 @@ const indexedStats = computed(() => {
   }
 })
 
+// -- whole-library profiles (cross-book discovery) --------------------------
+const library = computed(() => aiStore.libraryStatus)
+const libraryRunning = computed(() => !!library.value?.running)
+const libraryCancelling = computed(() => !!library.value?.cancel_requested)
+const libraryTotal = computed(() => Number(library.value?.total || 0))
+const libraryDone = computed(
+  () =>
+    Number(library.value?.done || 0) +
+    Number(library.value?.skipped || 0) +
+    Number(library.value?.failed || 0),
+)
+const libraryPercent = computed(() => {
+  if (!libraryTotal.value) return libraryRunning.value ? 5 : 0
+  return Math.max(0, Math.min(100, Math.round((libraryDone.value / libraryTotal.value) * 100)))
+})
+const libraryPhaseLabel = computed(() => {
+  const phase = String(library.value?.phase || "idle")
+  if (phase === "done") return i18n.t("admin_ai_library_done")
+  if (phase === "cancelled") return i18n.t("admin_ai_library_cancelled")
+  if (phase === "failed") return i18n.t("admin_ai_library_failed_state")
+  if (libraryRunning.value) return i18n.t("admin_ai_library_running")
+  return i18n.t("admin_ai_library_idle")
+})
+const libraryCurrent = computed(() => String(library.value?.current?.title || ""))
+const libraryStats = computed(() => {
+  const stats = library.value?.stats || {}
+  return {
+    books: Number(stats.books || 0),
+    vectors: Number(stats.vectors || 0),
+    mb: Math.round(Number(stats.db_bytes || 0) / (1024 * 1024)),
+  }
+})
+// One embedding request carries four books (4 segments each = 16 texts).
+const libraryRequests = computed(() => {
+  const books = Math.max(1, Number(aiStore.libraryLimit) || 2000)
+  return Math.ceil(books / 4)
+})
+const libraryMb = computed(() => {
+  const books = Math.max(1, Number(aiStore.libraryLimit) || 2000)
+  // 4 segments × (4 KB vector + ~3 KB excerpt)
+  return Math.max(1, Math.round((books * 4 * 7 * 1024) / (1024 * 1024)))
+})
+
 let pollTimer: number | undefined
 onMounted(() => {
   void aiStore.loadRagJobStatus()
+  void aiStore.loadLibraryStatus()
   pollTimer = window.setInterval(() => {
     void aiStore.loadRagJobStatus()
+    void aiStore.loadLibraryStatus()
   }, POLL_MS)
 })
 onUnmounted(() => {
@@ -497,6 +542,50 @@ onUnmounted(() => {
             books: indexedStats.books, chunks: indexedStats.chunks, size: indexedStats.mb,
           }) }}
         </p>
+      </div>
+    </div>
+
+    <div class="mt-4 pt-4 border-t border-border dark:border-gray-700">
+      <h3 class="text-xs font-medium mb-1">{{ i18n.t('admin_ai_library_title') }}</h3>
+      <p class="text-[11px] text-muted dark:text-gray-400 mb-3">{{ i18n.t('admin_ai_library_hint') }}</p>
+
+      <div class="max-w-[12rem] mb-3">
+        <label class="text-[11px] text-muted">
+          {{ i18n.t('admin_ai_library_limit') }}
+          <input v-model.number="aiStore.libraryLimit" type="number" min="1" max="50000" :disabled="libraryRunning" class="mt-1 w-full px-2 py-1 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 disabled:opacity-60" />
+        </label>
+      </div>
+
+      <p class="text-[11px] text-amber-600 dark:text-amber-400 mb-3 break-words">
+        {{ i18n.t('admin_ai_library_warn', { size: libraryMb, calls: libraryRequests }) }}
+      </p>
+
+      <div class="flex flex-wrap gap-2 mb-3">
+        <button @click="aiStore.startLibraryBuild" :disabled="aiStore.libraryBusy || libraryRunning" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">
+          {{ aiStore.libraryBusy ? i18n.t('admin_ai_library_starting') : i18n.t('admin_ai_library_start') }}
+        </button>
+        <button v-if="libraryRunning" @click="aiStore.cancelLibraryBuild" :disabled="libraryCancelling" class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm text-ink hover:bg-accent/5 disabled:opacity-50">
+          {{ libraryCancelling ? i18n.t('admin_ai_library_cancelling') : i18n.t('admin_ai_library_cancel') }}
+        </button>
+      </div>
+
+      <p v-if="aiStore.libraryError" class="text-xs text-red-500 mb-2 break-words">{{ aiStore.libraryError }}</p>
+
+      <div v-if="library" class="mb-1 p-2 rounded border border-border dark:border-gray-700">
+        <div class="flex items-center justify-between text-[11px] text-muted dark:text-gray-400 mb-1">
+          <span>{{ libraryPhaseLabel }}</span>
+          <span>{{ libraryDone }} / {{ libraryTotal }}</span>
+        </div>
+        <div class="h-1.5 rounded bg-gray-200 dark:bg-gray-700 overflow-hidden mb-1">
+          <div class="h-full bg-accent transition-all" :style="{ width: libraryPercent + '%' }"></div>
+        </div>
+        <p v-if="libraryCurrent" class="text-[11px] text-muted truncate">{{ i18n.t('admin_ai_library_current', { title: libraryCurrent }) }}</p>
+        <p class="text-[11px] text-muted dark:text-gray-400">
+          {{ i18n.t('admin_ai_library_stats', {
+            books: libraryStats.books, vectors: libraryStats.vectors, size: libraryStats.mb,
+          }) }}
+        </p>
+        <p v-if="library.error" class="text-[11px] text-red-500 break-words">{{ library.error }}</p>
       </div>
     </div>
 

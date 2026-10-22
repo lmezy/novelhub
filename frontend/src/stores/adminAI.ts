@@ -94,6 +94,13 @@ export const useAdminAIStore = defineStore("adminAI", () => {
   const ragBatchError = ref("")
   const ragBatchResult = ref<any>(null)
 
+  // Whole-library book profiles (cross-book discovery).  Same shape: one
+  // background runner, the panel only polls and shows the cost estimate.
+  const libraryStatus = ref<any>(null)
+  const libraryError = ref("")
+  const libraryBusy = ref(false)
+  const libraryLimit = ref(2000)
+
   function profileDraftFrom(value: any): AIProviderDraft {
     return {
       id: String(value?.id || newProfileId()),
@@ -436,6 +443,40 @@ export const useAdminAIStore = defineStore("adminAI", () => {
     }
   }
 
+  async function loadLibraryStatus() {
+    try {
+      libraryStatus.value = await api.get<any>("/rag/library/status")
+      libraryError.value = ""
+    } catch (e) {
+      libraryError.value = e instanceof Error ? e.message : i18n.t('admin_ai_library_status_failed')
+    }
+  }
+
+  async function startLibraryBuild() {
+    libraryBusy.value = true
+    libraryError.value = ""
+    try {
+      const limit = Math.max(1, Math.min(50000, Number(libraryLimit.value) || 2000))
+      libraryLimit.value = limit
+      await api.post("/rag/library/build", { limit, force: false })
+      await loadLibraryStatus()
+    } catch (e) {
+      libraryError.value = e instanceof Error ? e.message : i18n.t('admin_ai_library_failed')
+    } finally {
+      libraryBusy.value = false
+    }
+  }
+
+  async function cancelLibraryBuild() {
+    libraryError.value = ""
+    try {
+      await api.post("/rag/library/cancel")
+      await loadLibraryStatus()
+    } catch (e) {
+      libraryError.value = e instanceof Error ? e.message : i18n.t('admin_ai_library_failed')
+    }
+  }
+
   return {
     aiConfig,
     aiForm,
@@ -485,5 +526,12 @@ export const useAdminAIStore = defineStore("adminAI", () => {
     loadRagJobStatus,
     startRagBatch,
     cancelRagBatch,
+    libraryStatus,
+    libraryError,
+    libraryBusy,
+    libraryLimit,
+    loadLibraryStatus,
+    startLibraryBuild,
+    cancelLibraryBuild,
   }
 })

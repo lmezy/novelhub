@@ -9,7 +9,11 @@ x-logging: &default-logging
 services:
 
   postgres:
-    image: postgres:17
+    # pgvector image = postgres 17 + the ``vector`` extension.  Same major
+    # version and data directory as ``postgres:17``, so an existing deployment
+    # only needs this image swap (then ``alembic upgrade`` creates the
+    # extension and the book_profiles table).
+    image: pgvector/pgvector:pg17
     container_name: novelhub-postgres
     restart: always
     logging: *default-logging

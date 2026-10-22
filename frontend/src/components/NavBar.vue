@@ -44,6 +44,7 @@ function closeMenu() {
         <router-link to="/" class="text-sm text-muted hover:text-ink no-underline transition-colors">{{ i18n.t('nav_shelf') }}</router-link>
         <router-link to="/books" class="text-sm text-muted hover:text-ink no-underline transition-colors">{{ i18n.t('nav_library') }}</router-link>
         <template v-if="auth.user">
+          <router-link to="/discover" class="text-sm text-muted hover:text-ink no-underline transition-colors">{{ i18n.t('nav_discover') }}</router-link>
           <router-link to="/sync" class="text-sm text-muted hover:text-ink no-underline transition-colors">{{ i18n.t('nav_sync') }}</router-link>
           <router-link to="/settings" class="text-sm text-muted hover:text-ink no-underline transition-colors">{{ i18n.t('nav_admin') }}</router-link>
           <button @click="logout" class="text-sm text-muted hover:text-ink transition-colors">{{ i18n.t('nav_logout') }}</button>
@@ -65,6 +66,7 @@ function closeMenu() {
       <router-link to="/" @click="closeMenu" class="block text-sm text-muted hover:text-ink no-underline py-1">{{ i18n.t('nav_shelf') }}</router-link>
       <router-link to="/books" @click="closeMenu" class="block text-sm text-muted hover:text-ink no-underline py-1">{{ i18n.t('nav_library') }}</router-link>
       <template v-if="auth.user">
+        <router-link to="/discover" @click="closeMenu" class="block text-sm text-muted hover:text-ink no-underline py-1">{{ i18n.t('nav_discover') }}</router-link>
         <router-link to="/sync" @click="closeMenu" class="block text-sm text-muted hover:text-ink no-underline py-1">{{ i18n.t('nav_sync') }}</router-link>
         <router-link to="/settings" @click="closeMenu" class="block text-sm text-muted hover:text-ink no-underline py-1">{{ i18n.t('nav_admin') }}</router-link>
         <button @click="logout" class="block text-sm text-muted hover:text-ink py-1 w-full text-left">{{ i18n.t('nav_logout') }}</button>

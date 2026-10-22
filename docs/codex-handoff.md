@@ -2892,3 +2892,45 @@ embedding 请求约 **22~30 万次**（每次 16 条）。所以全库不是配�
 **验证**：`backend/tests/test_rag_jobs.py` 14 条（队列去重、批量硬上限、chunks 上限、
 自动索引的 6 种拒绝理由、每日上限、重复入队、runner 正常收尾/连续失败停止/取消）；
 `pytest -q` → **1158 passed**；前端 `vue-tsc --noEmit` 与 `vite build` 均通过。
+
+---
+
+## 70. 跨书找相似：书库画像（pgvector）+「找相似」页（2026-10-22）
+
+**需求**：看到一段有意思的情节，想找**其他书**里类似的故事。这不是"某本书内的问答"，
+所以不能复用章级 RAG。
+
+**量级决策**：全库章级向量 = 71.6 万章 → 350~500 万片段、70~100 GB、22~30 万次请求，
+为"找相似"付这个代价不值。改成**每本书 4 条画像向量**：均匀抽 4 章各截 900 字
+（短书把全文切 4 段），前面拼书名/作者/标签/简介。46 412 本 → **18.5 万向量**、
+约 **1.3 GB**、约 **1.16 万次请求**（4 本 / 请求，每本 4 段 = 16 条）→ 1~2 小时。
+
+**实现**：
+
+- 迁移 `0040_book_profiles`：`CREATE EXTENSION vector` + `book_profiles(book_id, segment,
+  excerpt, embedding vector(1024), model)` + HNSW（cosine）。维度固定 1024：pgvector 索引
+  要求固定维度，而推荐的中文向量模型（bge-m3 / text-embedding-v3 / embedding-3）都是 1024。
+  **数据库镜像要换 `pgvector/pgvector:pg17`**（与 postgres:17 同大版本，数据目录兼容）。
+- `services/book_profiles.py`：画像文本构造（`segment_texts` / `metadata_line` / 抽样）、
+  `insert_profiles`（原生 SQL `CAST(:embedding AS vector)`，不需要 pgvector 的 Python 驱动）、
+  `similar_books`（一次 `ORDER BY embedding <=> $1 LIMIT n`，返回带 `excerpt`）、
+  `book_vector`（一本书用自己的 4 段取平均当查询向量）、`stats`。
+- `services/library_jobs.py`：整库构建的后台任务，状态落盘 `.library-jobs.json`、锁文件
+  `.library-jobs.lock`（复用 `rag_jobs.acquire_file_lock`，pid 存活判断解决重启残留）。
+  每批 4 本一次 embedding + 一次 commit；批次间可取消；连续 3 批失败就停；
+  与 `rag_jobs` 互斥（两边 `start` 会互相拒绝，避免同时打 embedding 和磁盘）。
+  单次上限 50 000 本（防手滑），默认 2000。
+- API：`POST /rag/library/build`、`GET /rag/library/status`、`POST /rag/library/cancel`
+  （管理员），`POST /rag/library/search`（普通用户，`query` 或 `book_id`）。
+  检索按"书内最像的一段"聚合，结果经过 `ensure_book_visible`（私有/R18/已隔离的书不外泄）。
+- 前端：导航新增**「找相似」**页（粘贴情节 → 结果卡片显示相似度 + 命中片段）；
+  书籍详情页加「找相似」；AI 设置页「RAG 索引管理」加**书库画像**构建区
+  （本数、估算 MB/请求、进度条、取消），与 RAG 队列一起 4 秒轮询。
+
+**部署顺序**（重要）：先换 postgres 镜像并重建（`docker compose up -d postgres`），
+再起 backend（`alembic upgrade head` 才会执行 `CREATE EXTENSION`）；反过来 backend 启动会失败。
+换镜像前先确认有一次可用的数据库备份。
+
+**验证**：`backend/tests/test_book_profiles.py` 9 条（抽样、短书切段、读不到正文、向量字面量、
+构建任务的上限/取消/与 RAG 队列互斥）；`pytest -q` → **1168 passed**；
+前端 `vue-tsc --noEmit` 与 `vite build` 通过。

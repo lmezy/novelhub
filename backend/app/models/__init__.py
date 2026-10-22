@@ -70,6 +70,7 @@ __all__=[
 ]
 
 from .chapter_embedding import ChapterEmbedding  # noqa: F401
+from .book_profile import BookProfile  # noqa: F401
 from .source_credential import SourceCredential  # noqa: F401
 from .api_token import ApiToken  # noqa: F401
 from .category import Category  # noqa: F401

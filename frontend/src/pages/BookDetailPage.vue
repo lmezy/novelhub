@@ -625,6 +625,10 @@ watch(
               @click="toggleFavorite"
               class="px-3 py-1 text-xs border border-border dark:border-gray-700 rounded hover:bg-accent/5 transition-colors"
             >{{ favorite ? i18n.t('book_favorite_added') : i18n.t('book_favorite') }}</button>
+            <router-link
+              :to="'/discover?book_id=' + book.id"
+              class="px-3 py-1 text-xs border border-border dark:border-gray-700 rounded hover:bg-accent/5 transition-colors no-underline"
+            >{{ i18n.t('book_find_similar') }}</router-link>
             <button
               @click="editing = !editing"
               class="px-3 py-1 text-xs border border-accent/50 text-accent rounded hover:bg-accent/5 transition-colors"
