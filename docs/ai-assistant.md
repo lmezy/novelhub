@@ -70,14 +70,35 @@ AI 配置存在数据库里（`app_settings`，键名 `ai_*`），改完立即�
 
 ## 3. RAG 索引
 
-**设置 → AI → RAG 索引管理**：输入书籍 ID → 建立索引；下方列出已建索引的书（片段数 / 章节数）
-并可删除。已经建过且章节数没变的书会直接跳过，要强制重建加 `force=true`。
+**建索引有三种方式**（都只对**小说**有意义，漫画不需要向量）：
+
+| 方式 | 入口 | 特点 |
+|---|---|---|
+| 按需逐本 | 设置 → AI → RAG 索引管理 → 输入书籍 ID → 建立索引 | 同步执行，适合"就这一本"；同章节数已建过的书直接跳过，`force=true` 才重建 |
+| 打开即建 | 设置 → AI → 语义检索 → 「打开书籍时自动建索引」+ 保存 | 读者打开一本书就排队后台建；**每天最多 20 本**、队列最多 20 本、每本最多 300 片段、已建/漫画/无章节跳过 |
+| 后台批量 | 设置 → AI → RAG 索引管理 → 「后台批量建索引」 | 只挑**还没有向量**的小说按最近更新排序；一次最多 **200 本**、每本最多 **2000 片段**；页面关掉也会继续跑，可随时取消 |
+
+**为什么要限制**：每本书的每个片段都是一次向量调用 + 一条 JSONB 记录（1 024 维约 20 KB）。
+你的 4.6 万本书全建一遍约 350~500 万片段 ≈ 70~100 GB、20~30 万次请求——不要一次跑全库，
+按需分批（界面上会按当前设置估算"约多少 MB、多少次请求"再让你点）。
+
+后台任务的状态写在 `storage/.rag-jobs.json`，页面轮询 `GET /api/rag/jobs/status` 显示进度；
+取消只会在**当前这本书写完后**生效（一本几百章的书可能要一两分钟）。
 
 ```bash
 TOKEN=<你的 JWT>
-# 建索引（管理员）
+# 按需建索引（管理员）
 curl -X POST "http://localhost:8088/api/rag/index/<BOOK_ID>?force=true" \
   -H "Authorization: Bearer $TOKEN"
+# 后台批量（管理员，最多 200 本）
+curl -X POST "http://localhost:8088/api/rag/batch" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"limit":20,"max_chunks":400,"scope":"unindexed"}'
+# 批量进度 / 取消（管理员）
+curl "http://localhost:8088/api/rag/jobs/status" -H "Authorization: Bearer $TOKEN"
+curl -X POST "http://localhost:8088/api/rag/jobs/cancel" -H "Authorization: Bearer $TOKEN"
+# 读者打开书籍时触发"打开即建"（任意可见该书的用户，返回排没排上及原因）
+curl -X POST "http://localhost:8088/api/rag/auto/<BOOK_ID>" -H "Authorization: Bearer $TOKEN"
 # 状态（普通用户，需可见该书）
 curl "http://localhost:8088/api/rag/status/<BOOK_ID>" -H "Authorization: Bearer $TOKEN"
 # 语义检索
@@ -88,8 +109,9 @@ curl -X POST "http://localhost:8088/api/rag/search" -H "Authorization: Bearer $T
 curl "http://localhost:8088/api/rag/index?limit=50" -H "Authorization: Bearer $TOKEN"
 ```
 
-建索引是同步请求，会反复调用向量接口：一本几百章的书可能要一两分钟
-（网关已配 3600s 超时）。片段总数上限 2000（`max_chunks` 可调），超出会截断并在结果里标注。
+单本同步建索引会反复调用向量接口：一本几百章的书可能要一两分钟（网关已配 3600s 超时），
+手机端容易中途断开——要稳就用后台批量或「打开即建」。片段总数上限 2000（`max_chunks` 可调），
+超出会截断并在结果里标注。
 
 ## 4. 同步报错诊断
 

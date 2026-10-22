@@ -12,6 +12,7 @@ similarity search uses numpy when it is available.
 
 from __future__ import annotations
 
+import asyncio
 import math
 from typing import Any, Sequence
 from uuid import uuid4
@@ -192,6 +193,9 @@ class RAGService:
             batch_metas = []
 
         for chapter in chapters:
+            # Reading a chapter file is synchronous; yielding keeps the uvicorn
+            # worker answering requests while a 1 000-chapter book is indexed.
+            await asyncio.sleep(0)
             if total_chunks >= limit_chunks:
                 skipped += 1
                 continue

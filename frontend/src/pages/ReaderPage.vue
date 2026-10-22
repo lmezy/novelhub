@@ -1000,6 +1000,17 @@ watch(
   },
 )
 
+// "打开即建": ask the backend to queue this book for background RAG indexing.
+// The server owns every guard (setting off, comic, already indexed, daily cap),
+// and the reader must never wait for this -- so the answer is ignored and a
+// failure is silent.
+async function requestAutoRagIndex(id: string | null | undefined) {
+  if (!id) return
+  try {
+    await api.post(`/rag/auto/${encodeURIComponent(id)}`)
+  } catch { /* best effort; chat still works in window mode */ }
+}
+
 watch(
   () => route.params.bookId,
   async (newId) => {
@@ -1010,6 +1021,7 @@ watch(
     // Same reasoning as onMounted: do not block the chapter on these.
     void loadAlternates()
     void loadBookmarks()
+    void requestAutoRagIndex(newId as string)
     if (isMobileLayout.value) nextTick(refreshMobileLayout)
   },
 )
@@ -1031,6 +1043,7 @@ onMounted(async () => {
   // by as long as /books/{id}/sources took.
   void loadAlternates()
   void loadBookmarks()
+  void requestAutoRagIndex(bookId.value)
   await loadChapter(chapterId.value)
   window.addEventListener("pagehide", flushPageProgressKeepalive)
 })

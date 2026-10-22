@@ -43,6 +43,9 @@ AI_PROXY_URL_KEY = "ai_proxy_url"
 AI_CONTEXT_CHARS_KEY = "ai_context_chars"
 AI_RAG_ENABLED_KEY = "ai_rag_enabled"
 AI_RAG_TOP_K_KEY = "ai_rag_top_k"
+#: When a reader opens a book, queue it for background RAG indexing.  Off by
+#: default: every indexed book costs embedding tokens and Postgres space.
+AI_RAG_AUTO_INDEX_KEY = "ai_rag_auto_index"
 AI_EMBEDDING_PROVIDER_KEY = "ai_embedding_provider"
 AI_EMBEDDING_BASE_URL_KEY = "ai_embedding_base_url"
 AI_EMBEDDING_API_KEY_KEY = "ai_embedding_api_key"
@@ -69,6 +72,7 @@ ALL_KEYS = (
     AI_CONTEXT_CHARS_KEY,
     AI_RAG_ENABLED_KEY,
     AI_RAG_TOP_K_KEY,
+    AI_RAG_AUTO_INDEX_KEY,
     AI_EMBEDDING_PROVIDER_KEY,
     AI_EMBEDDING_BASE_URL_KEY,
     AI_EMBEDDING_API_KEY_KEY,
@@ -102,6 +106,7 @@ FIELD_TO_KEY = {
     "context_chars": AI_CONTEXT_CHARS_KEY,
     "rag_enabled": AI_RAG_ENABLED_KEY,
     "rag_top_k": AI_RAG_TOP_K_KEY,
+    "rag_auto_index": AI_RAG_AUTO_INDEX_KEY,
     "embedding_provider": AI_EMBEDDING_PROVIDER_KEY,
     "embedding_base_url": AI_EMBEDDING_BASE_URL_KEY,
     "embedding_api_key": AI_EMBEDDING_API_KEY_KEY,
@@ -451,6 +456,9 @@ class AIConfig:
     context_chars: int = 24000
     rag_enabled: bool = True
     rag_top_k: int = 6
+    #: Queue a book for background indexing when a reader opens it.  Off by
+    #: default: it spends embedding tokens and Postgres space without asking.
+    rag_auto_index: bool = False
     embedding_provider: str = ""
     embedding_base_url: str = ""
     embedding_api_key: str = ""
@@ -571,6 +579,7 @@ class AIConfig:
             "context_chars": self.context_chars,
             "rag_enabled": self.rag_enabled,
             "rag_top_k": self.rag_top_k,
+            "rag_auto_index": self.rag_auto_index,
             "embedding_provider": self.embedding_provider,
             "embedding_base_url": self.embedding_base_url,
             "embedding_model": self.embedding_model,
@@ -693,6 +702,7 @@ def resolve_ai_config(
         context_chars=_as_int(pick(AI_CONTEXT_CHARS_KEY, "AI_CONTEXT_CHARS", "24000"), 24000),
         rag_enabled=_truthy(pick(AI_RAG_ENABLED_KEY, "AI_RAG_ENABLED"), True),
         rag_top_k=_as_int(pick(AI_RAG_TOP_K_KEY, "AI_RAG_TOP_K", "6"), 6),
+        rag_auto_index=_truthy(pick(AI_RAG_AUTO_INDEX_KEY, "AI_RAG_AUTO_INDEX")),
         embedding_provider=embedding_provider,
         embedding_base_url=pick(AI_EMBEDDING_BASE_URL_KEY, "AI_EMBEDDING_BASE_URL"),
         embedding_api_key=embedding_api_key,

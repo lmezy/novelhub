@@ -2854,3 +2854,41 @@ Playwright（`transport._get` → `_get_with_web_js`，`fallback_http=False`）�
 原来直接内联在 async 循环里，会把跑后台任务的 uvicorn worker 整个冻住（NAS
 `--workers 2`，等于一半 API 含进度轮询全停）。现改走 `asyncio.to_thread`；返回值
 同时改为 `(votes, chapters_read)`，弃权章也计入读取数，进度数字反映真实 I/O。
+
+---
+
+## 69. RAG 索引改成三条路：按需、打开即建、后台批量（2026-10-22）
+
+**需求**：配好向量模型后要能"对书库的书籍进行处理"，但不能一键跑全库。三种方式都要有，
+并且要有硬上限、进度和成本提示。
+
+**为什么必须限量**（同一天实测的库量）：46 412 本 × 15.4 章 ≈ 71.6 万章，每章约 5~7 个
+片段 → **350~500 万片段**；每个片段一条 JSONB 向量（1 024 维 ≈ 20 KB）→ **70~100 GB**，
+embedding 请求约 **22~30 万次**（每次 16 条）。所以全库不是配置问题，是不该做的事。
+
+**实现**：
+
+- `services/rag_jobs.py`（新）：一个后台队列 + 单 worker。
+  - 状态落盘 `storage/.rag-jobs.json`（NAS 是 `--workers 2`，内存全局会有一半概率答"没在跑"），
+    进度端点轮询它；`.rag-jobs.lock` + 过期时间保证只有一个 worker 真的在跑。
+  - 上限：批量 `MAX_BATCH_BOOKS=200`、每本 `MAX_CHUNKS_PER_BOOK=2000`；
+    自动队列 `MAX_AUTO_QUEUE=20`、每天 `AUTO_DAILY_LIMIT=20` 本、每本 300 片段；
+    连续失败 `MAX_CONSECUTIVE_FAILURES=3` 次就停（限流/坏 Key 不会自愈）。
+  - 跳过硬约束：漫画、已建过向量、没有可读章节、设置未开启、队列已满、当天额度用完。
+  - 取消在**当前这本书写完之后**生效（单本中途不中断，避免写半本）。
+- `services/rag.py`：章节循环里加 `await asyncio.sleep(0)`，一本上千章的书不再把整个
+  uvicorn worker 冻住（后台任务和 API 共用一个事件循环）。
+- API：`POST /rag/auto/{book_id}`（读者打开书籍时触发，任意可见该书的用户）、
+  `POST /rag/batch`（管理员，`scope=unindexed|book_ids`）、`GET /rag/jobs/status`、
+  `POST /rag/jobs/cancel`。批量只挑**还没有向量**的小说，按 `updated_at` 倒序。
+- 配置：新增 `ai_rag_auto_index`（默认 **false**，`ai_config` 的字段/键/解析/`public_dict`
+  全套 + `AIConfigUpdate` + `.env.example` 的 `AI_RAG_AUTO_INDEX`）。
+- 前端：AI 设置页「语义检索」加自动建索引开关（保存后生效）；「RAG 索引管理」加批量表单
+  （本数 ≤200、每本片段 ≤2000）、按当前设置估算 **约 X MB / Y 次请求** 的警告、
+  进度条（完成/跳过/失败/片段、当前书名）、取消按钮，4 秒轮询一次。
+  `ReaderPage` 在打开/切换书籍时 fire-and-forget 调 `/rag/auto/{id}`，失败静默
+  （问答仍走章节窗口模式）。
+
+**验证**：`backend/tests/test_rag_jobs.py` 14 条（队列去重、批量硬上限、chunks 上限、
+自动索引的 6 种拒绝理由、每日上限、重复入队、runner 正常收尾/连续失败停止/取消）；
+`pytest -q` → **1158 passed**；前端 `vue-tsc --noEmit` 与 `vite build` 均通过。

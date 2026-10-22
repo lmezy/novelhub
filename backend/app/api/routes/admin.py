@@ -328,6 +328,8 @@ class AIConfigUpdate(BaseModel):
     context_chars: int | None = None
     rag_enabled: bool | None = None
     rag_top_k: int | None = None
+    #: Queue a book for background RAG indexing when a reader opens it.
+    rag_auto_index: bool | None = None
     embedding_provider: str | None = None
     embedding_base_url: str | None = None
     embedding_api_key: str | None = None

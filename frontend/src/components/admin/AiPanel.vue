@@ -1,9 +1,77 @@
 <script setup lang="ts">
+import { computed, onMounted, onUnmounted } from "vue"
 import { useI18nStore } from "../../stores/i18n"
 import { useAdminAIStore } from "../../stores/adminAI"
 
 const i18n = useI18nStore()
 const aiStore = useAdminAIStore()
+
+// -- background RAG indexing (batch + "打开即建") --------------------------
+//
+// One server-side runner drains the queue, so the panel only polls.  The
+// numbers below are what the admin needs before spending embedding quota:
+// how many books this run will touch, roughly how much Postgres space that is,
+// and how many embedding calls it costs (16 chunks per call).
+const POLL_MS = 4000
+
+const job = computed(() => aiStore.ragJobStatus)
+const jobRunning = computed(() => !!job.value?.running)
+const jobCancelling = computed(() => !!job.value?.cancel_requested)
+const jobTotal = computed(() => Number(job.value?.total || 0))
+const jobProcessed = computed(
+  () =>
+    Number(job.value?.done || 0) +
+    Number(job.value?.skipped || 0) +
+    Number(job.value?.failed || 0),
+)
+const jobPercent = computed(() => {
+  if (!jobTotal.value) return jobRunning.value ? 5 : 0
+  return Math.max(0, Math.min(100, Math.round((jobProcessed.value / jobTotal.value) * 100)))
+})
+const jobPhaseLabel = computed(() => {
+  const phase = String(job.value?.phase || "idle")
+  if (phase === "done") return i18n.t("admin_ai_rag_job_done")
+  if (phase === "cancelled") return i18n.t("admin_ai_rag_job_cancelled")
+  if (phase === "failed") return i18n.t("admin_ai_rag_job_failed")
+  if (jobRunning.value) return i18n.t("admin_ai_rag_job_running")
+  return i18n.t("admin_ai_rag_job_idle")
+})
+const jobCurrent = computed(() => String(job.value?.current?.title || ""))
+const jobLastError = computed(() => {
+  const errors = Array.isArray(job.value?.recent_errors) ? job.value.recent_errors : []
+  if (!errors.length) return ""
+  return String(errors[errors.length - 1]?.error || "")
+})
+const estimateMb = computed(() => {
+  const books = Math.max(1, Number(aiStore.ragBatchLimit) || 20)
+  const chunks = Math.max(1, Number(aiStore.ragBatchChunks) || 400)
+  const perChunk = Number(job.value?.limits?.chunk_bytes_estimate) || 20480
+  return Math.max(1, Math.round((books * chunks * perChunk) / (1024 * 1024)))
+})
+const estimateCalls = computed(() => {
+  const books = Math.max(1, Number(aiStore.ragBatchLimit) || 20)
+  const chunks = Math.max(1, Number(aiStore.ragBatchChunks) || 400)
+  return Math.ceil((books * chunks) / 16)
+})
+const indexedStats = computed(() => {
+  const stats = job.value?.stats || {}
+  return {
+    books: Number(stats.indexed_books || 0),
+    chunks: Number(stats.chunks || 0),
+    mb: Math.round(Number(stats.db_bytes || 0) / (1024 * 1024)),
+  }
+})
+
+let pollTimer: number | undefined
+onMounted(() => {
+  void aiStore.loadRagJobStatus()
+  pollTimer = window.setInterval(() => {
+    void aiStore.loadRagJobStatus()
+  }, POLL_MS)
+})
+onUnmounted(() => {
+  if (pollTimer) window.clearInterval(pollTimer)
+})
 </script>
 
 <template>
@@ -323,6 +391,16 @@ const aiStore = useAdminAIStore()
     </div>
 
     <div class="flex items-center justify-between mb-3 p-3 rounded border border-border dark:border-gray-700">
+      <div class="pr-3">
+        <span class="text-sm block">{{ i18n.t('admin_ai_rag_auto_index') }}</span>
+        <span class="text-[11px] text-muted dark:text-gray-400">{{ i18n.t('admin_ai_rag_auto_hint') }}</span>
+      </div>
+      <button @click="aiStore.aiForm.rag_auto_index = !aiStore.aiForm.rag_auto_index" :class="aiStore.aiForm.rag_auto_index ? 'bg-green-500' : 'bg-gray-300 dark:bg-gray-600'" class="relative w-11 h-6 rounded-full transition-colors duration-200 shrink-0">
+        <span :class="aiStore.aiForm.rag_auto_index ? 'translate-x-5' : 'translate-x-0.5'" class="absolute top-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform duration-200"></span>
+      </button>
+    </div>
+
+    <div class="flex items-center justify-between mb-3 p-3 rounded border border-border dark:border-gray-700">
       <div>
         <span class="text-sm block">{{ i18n.t('admin_ai_auto_diagnose') }}</span>
         <span class="text-[11px] text-muted dark:text-gray-400">{{ i18n.t('admin_ai_auto_diagnose_hint') }}</span>
@@ -356,6 +434,71 @@ const aiStore = useAdminAIStore()
       }) }}
       <span v-if="aiStore.aiIndexResult.skipped">{{ i18n.t('admin_ai_index_skipped') }}</span>
     </p>
+
+    <div class="mt-4 pt-4 border-t border-border dark:border-gray-700">
+      <h3 class="text-xs font-medium mb-1">{{ i18n.t('admin_ai_rag_batch_title') }}</h3>
+      <p class="text-[11px] text-muted dark:text-gray-400 mb-3">{{ i18n.t('admin_ai_rag_batch_hint') }}</p>
+
+      <div class="grid grid-cols-2 gap-2 max-w-sm mb-3">
+        <label class="text-[11px] text-muted">
+          {{ i18n.t('admin_ai_rag_batch_limit') }}
+          <input v-model.number="aiStore.ragBatchLimit" type="number" min="1" max="200" :disabled="jobRunning" class="mt-1 w-full px-2 py-1 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 disabled:opacity-60" />
+        </label>
+        <label class="text-[11px] text-muted">
+          {{ i18n.t('admin_ai_rag_batch_chunks') }}
+          <input v-model.number="aiStore.ragBatchChunks" type="number" min="1" max="2000" :disabled="jobRunning" class="mt-1 w-full px-2 py-1 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 disabled:opacity-60" />
+        </label>
+      </div>
+
+      <p class="text-[11px] text-amber-600 dark:text-amber-400 mb-3 break-words">
+        {{ i18n.t('admin_ai_rag_batch_warn', { size: estimateMb, calls: estimateCalls }) }}
+      </p>
+
+      <div class="flex flex-wrap gap-2 mb-3">
+        <button @click="aiStore.startRagBatch" :disabled="aiStore.ragBatchBusy || jobRunning" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">
+          {{ aiStore.ragBatchBusy ? i18n.t('admin_ai_rag_batch_starting') : i18n.t('admin_ai_rag_batch_start') }}
+        </button>
+        <button v-if="jobRunning" @click="aiStore.cancelRagBatch" :disabled="jobCancelling" class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm text-ink hover:bg-accent/5 disabled:opacity-50">
+          {{ jobCancelling ? i18n.t('admin_ai_rag_batch_cancelling') : i18n.t('admin_ai_rag_batch_cancel') }}
+        </button>
+      </div>
+
+      <p v-if="aiStore.ragBatchError" class="text-xs text-red-500 mb-2 break-words">{{ aiStore.ragBatchError }}</p>
+      <p v-if="aiStore.ragBatchResult" class="text-xs text-muted dark:text-gray-400 mb-2 break-words">
+        <template v-if="aiStore.ragBatchResult.queued">
+          {{ i18n.t('admin_ai_rag_batch_queued', {
+            queued: aiStore.ragBatchResult.queued,
+            candidates: aiStore.ragBatchResult.candidates ?? aiStore.ragBatchResult.queued,
+          }) }}
+        </template>
+        <template v-else>{{ aiStore.ragBatchResult.message || i18n.t('admin_ai_rag_batch_none') }}</template>
+      </p>
+      <p v-if="aiStore.ragJobError" class="text-xs text-red-500 mb-2 break-words">{{ aiStore.ragJobError }}</p>
+
+      <div v-if="job" class="mb-3 p-2 rounded border border-border dark:border-gray-700">
+        <div class="flex items-center justify-between text-[11px] text-muted dark:text-gray-400 mb-1">
+          <span>{{ jobPhaseLabel }}</span>
+          <span>{{ jobProcessed }} / {{ jobTotal }}</span>
+        </div>
+        <div class="h-1.5 rounded bg-gray-200 dark:bg-gray-700 overflow-hidden mb-1">
+          <div class="h-full bg-accent transition-all" :style="{ width: jobPercent + '%' }"></div>
+        </div>
+        <p v-if="jobCurrent" class="text-[11px] text-muted truncate">{{ i18n.t('admin_ai_rag_job_current', { title: jobCurrent }) }}</p>
+        <p class="text-[11px] text-muted dark:text-gray-400">
+          {{ i18n.t('admin_ai_rag_job_stats', {
+            done: job.done || 0, skipped: job.skipped || 0,
+            failed: job.failed || 0, chunks: job.chunks || 0,
+          }) }}
+        </p>
+        <p v-if="jobLastError" class="text-[11px] text-red-500 break-words">{{ jobLastError }}</p>
+        <p v-if="job.error" class="text-[11px] text-red-500 break-words">{{ job.error }}</p>
+        <p class="text-[11px] text-muted dark:text-gray-400 mt-1">
+          {{ i18n.t('admin_ai_rag_indexed_stats', {
+            books: indexedStats.books, chunks: indexedStats.chunks, size: indexedStats.mb,
+          }) }}
+        </p>
+      </div>
+    </div>
 
     <div class="flex items-center justify-between mb-2">
       <span class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_ai_index_list') }}</span>

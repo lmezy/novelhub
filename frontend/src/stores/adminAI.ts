@@ -84,6 +84,16 @@ export const useAdminAIStore = defineStore("adminAI", () => {
   const aiIndexedBooks = ref<any[]>([])
   const aiIndexedLoading = ref(false)
 
+  // Background RAG queue: the reader's "打开即建" progress and the capped
+  // admin batch run.  Both are one server-side runner, so the UI only polls.
+  const ragJobStatus = ref<any>(null)
+  const ragJobError = ref("")
+  const ragBatchLimit = ref(20)
+  const ragBatchChunks = ref(400)
+  const ragBatchBusy = ref(false)
+  const ragBatchError = ref("")
+  const ragBatchResult = ref<any>(null)
+
   function profileDraftFrom(value: any): AIProviderDraft {
     return {
       id: String(value?.id || newProfileId()),
@@ -121,6 +131,7 @@ export const useAdminAIStore = defineStore("adminAI", () => {
       context_chars: res.context_chars,
       rag_enabled: res.rag_enabled,
       rag_top_k: res.rag_top_k,
+      rag_auto_index: res.rag_auto_index === true,
       embedding_provider: res.embedding_provider || "",
       embedding_base_url: res.embedding_base_url || "",
       embedding_model: res.embedding_model || "",
@@ -382,6 +393,49 @@ export const useAdminAIStore = defineStore("adminAI", () => {
     }
   }
 
+  async function loadRagJobStatus() {
+    try {
+      ragJobStatus.value = await api.get<any>("/rag/jobs/status")
+      ragJobError.value = ""
+    } catch (e) {
+      ragJobError.value = e instanceof Error ? e.message : i18n.t('admin_ai_rag_jobs_failed')
+    }
+  }
+
+  async function startRagBatch() {
+    ragBatchBusy.value = true
+    ragBatchError.value = ""
+    ragBatchResult.value = null
+    try {
+      // The server enforces the same ceilings; clamping here keeps the box from
+      // showing a value that was silently reduced.
+      const limit = Math.max(1, Math.min(200, Number(ragBatchLimit.value) || 20))
+      const maxChunks = Math.max(1, Math.min(2000, Number(ragBatchChunks.value) || 400))
+      ragBatchLimit.value = limit
+      ragBatchChunks.value = maxChunks
+      ragBatchResult.value = await api.post<any>("/rag/batch", {
+        limit,
+        max_chunks: maxChunks,
+        scope: "unindexed",
+      })
+      await loadRagJobStatus()
+    } catch (e) {
+      ragBatchError.value = e instanceof Error ? e.message : i18n.t('admin_ai_rag_batch_failed')
+    } finally {
+      ragBatchBusy.value = false
+    }
+  }
+
+  async function cancelRagBatch() {
+    ragBatchError.value = ""
+    try {
+      await api.post("/rag/jobs/cancel")
+      await loadRagJobStatus()
+    } catch (e) {
+      ragBatchError.value = e instanceof Error ? e.message : i18n.t('admin_ai_rag_batch_failed')
+    }
+  }
+
   return {
     aiConfig,
     aiForm,
@@ -421,5 +475,15 @@ export const useAdminAIStore = defineStore("adminAI", () => {
     loadIndexedBooks,
     indexBookForRAG,
     deleteRAGIndex,
+    ragJobStatus,
+    ragJobError,
+    ragBatchLimit,
+    ragBatchChunks,
+    ragBatchBusy,
+    ragBatchError,
+    ragBatchResult,
+    loadRagJobStatus,
+    startRagBatch,
+    cancelRagBatch,
   }
 })
