@@ -114,9 +114,15 @@ class FakeLLM:
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.calls: list[list[dict]] = []
+        #: ``max_tokens`` / ``timeout`` of every ``chat`` call, in order.
+        self.budgets: list[int | None] = []
+        self.timeouts: list[float | None] = []
 
-    async def chat(self, messages, max_tokens=None, temperature=None, retries=None):
+    async def chat(self, messages, max_tokens=None, temperature=None, retries=None,
+                   timeout=None):
         self.calls.append(list(messages))
+        self.budgets.append(max_tokens)
+        self.timeouts.append(timeout)
         return LLMResult(
             self.text,
             model="fake-model",
@@ -523,6 +529,85 @@ async def test_stream_parses_openai_sse_deltas(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_stream_drops_reasoning_deltas(monkeypatch):
+    """A thinking model streams its deliberation before the answer.
+
+    ``delta.reasoning_content`` arrives without a ``content`` key; treating it
+    as answer text showed the reader (and stored) the model's English planning
+    (2026-10-22).
+    """
+    patch_http(monkeypatch, FakeHTTP(FakeResponse(lines=[
+        'data: {"choices":[{"delta":{"role":"assistant"}}]}',
+        'data: {"choices":[{"delta":{"reasoning_content":"We need answer "}}]}',
+        'data: {"choices":[{"delta":{"reasoning_content":"in Chinese."}}]}',
+        'data: {"choices":[{"delta":{"content":"主角是"}}]}',
+        'data: {"choices":[{"delta":{"content":"林知夏。"}}]}',
+        "data: [DONE]",
+    ])))
+    cfg = configured_config()
+
+    parts = [chunk async for chunk in LLMClient(cfg).stream([{"role": "user", "content": "hi"}])]
+
+    assert parts == ["主角是", "林知夏。"]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_only_completion_is_an_actionable_error(monkeypatch):
+    """Empty ``content`` + thinking is not an answer.
+
+    The old client returned the chain of thought as the reply: JSON analyses
+    then "parsed" into one nameless row and summaries were English monologues.
+    """
+    patch_http(monkeypatch, FakeHTTP(FakeResponse(payload={
+        "choices": [{
+            "message": {"content": "", "reasoning_content": "We need answer only JSON."},
+            "finish_reason": "length",
+        }],
+        "usage": {"prompt_tokens": 50, "completion_tokens": 3000,
+                  "completion_tokens_details": {"reasoning_tokens": 3000}},
+    })))
+    cfg = configured_config()
+
+    with pytest.raises(AIError) as excinfo:
+        await LLMClient(cfg).chat([{"role": "user", "content": "hi"}], retries=0)
+
+    message = str(excinfo.value)
+    assert "思考" in message
+    assert "最大输出 token" in message
+
+
+@pytest.mark.asyncio
+async def test_reasoning_never_replaces_a_real_answer(monkeypatch):
+    resp = FakeResponse(payload={
+        "choices": [{
+            "message": {"content": "正文回答", "reasoning_content": "We need answer."},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 20,
+                  "completion_tokens_details": {"reasoning_tokens": 12}},
+    })
+    patch_http(monkeypatch, FakeHTTP(resp))
+
+    result = await LLMClient(configured_config()).chat(
+        [{"role": "user", "content": "hi"}], retries=0
+    )
+
+    assert result.text == "正文回答"
+
+
+def test_analysis_budget_leaves_room_for_thinking():
+    from app.services.ai import AIService
+
+    small = configured_config(max_tokens=900)
+    big = configured_config(max_tokens=50000)
+
+    assert AIService._analysis_budget(small) == 4096
+    assert AIService._analysis_budget(big) == 50000
+    assert AIService._analysis_timeout(configured_config(timeout=90)) == 300.0
+    assert AIService._analysis_timeout(configured_config(timeout=600)) == 600.0
+
+
+@pytest.mark.asyncio
 async def test_stream_parses_anthropic_events(monkeypatch):
     patch_http(monkeypatch, FakeHTTP(FakeResponse(lines=[
         "event: content_block_delta",
@@ -766,6 +851,9 @@ async def test_summarize_maps_in_batches_then_reduces():
     assert result["total_chapters"] == 8
     assert result["sampled"] is False
     assert result["chapter_start"] == 1 and result["chapter_end"] == 8
+    # A reasoning model needs room for its thinking before the bullets appear.
+    assert all((budget or 0) >= 4096 for budget in fake.budgets)
+    assert all((timeout or 0) >= 300 for timeout in fake.timeouts)
 
 
 @pytest.mark.asyncio

@@ -2705,3 +2705,76 @@ Playwright（`transport._get` → `_get_with_web_js`，`fallback_http=False`）�
 **验证**：`pytest -q` → **1111 passed**（新增 `tests/test_ai_insights.py` 6 个：
 相似度分档、提示拼装/截断/stale、只取本书相关、重复问题合并、异常不抛、
 `/ai/chat` 确实把旧分析塞进 message 并把新答案落库）。
+
+---
+
+## 65. 问答里混进「思考过程」、摘要/人物/时间线全失败：推理模型的 reasoning 被当正文（2026-10-22）
+
+**现象**（用户报）：手机阅读时 AI 侧栏的**摘要 / 人物 / 时间线**都报失败；问答的回复里
+夹着一段英文「参数」一样的自我分析（`We need answer Chinese, same language. User asks 大致内容…`）。
+
+**证据**（线上 NAS，供应商 `custom` = commandcode，模型 `minimax/minimax-m3.1-flash:free`）：
+
+- `ai_book_insights` 里 5 条存档的答案，正文前全是一段英文推理，之后才是中文回答。
+- 直接打供应商：非流式响应 `choices[0].message` 同时有 `content` 和 `reasoning_content`；
+  `usage.completion_tokens_details.reasoning_tokens` 有值。流式响应里**思考块只有
+  `delta.reasoning_content`、没有 `content` 键**。
+- `ai_client` 的两处 fallback 把思考当答案：`_parse_completion()` 在
+  `content` 为空时取 `reasoning_content`；`_delta_text()` 在 `delta.content` 为 `None`
+  时取 `delta.reasoning_content`。于是流式问答把思考当成正文推给前端（并落库成"历史分析"），
+  非流式在预算被思考吃光后把思考当成"答案"返回。
+- 三条分析调用把 `max_tokens` 写死成 900 / 2200 / 3000。思考模型先思考再回答，
+  实测 8 章（2.5 万字）的「人物」请求思考就要 3 000+ token：`finish_reason=length`、
+  `content=""`、`reasoning_content` 一大段 → `parse_json_list` 把思考当成散文回退成
+  「一条没有名字的人物」，摘要则直接抛「AI 返回了空摘要」→ 前端显示失败。
+- 修复后实测：同一模型、同一本书，`max_tokens` 给够后人物识别 15 s 正常返回 JSON；
+  6 章摘要 84 s 返回中文要点；流式只输出 `2`（不再带 `We need…`）。
+
+**实现**：
+
+- `app/services/ai_client.py`
+  - 新增 `_content_text()`：只认 `content`（字符串或分段数组），**永不**回退到
+    `reasoning_content` / `reasoning`。
+  - `_parse_completion()`：`content` 为空且响应里带思考时抛 `AIError`，文案直接给处置
+    （调大「最大输出 token」到 4096 以上，或换非思考模型），不再把思考当答案；
+    `_delta_text()` 只取 `delta.content`，思考块返回空串。
+  - `chat()` 新增 `timeout` 参数（分析类请求要读几十章，交互式 90 s 不够）。
+  - 连通性测试的 `max_tokens` 16 → 256：思考模型的 16 token 全用在思考上，
+    以前会显示"连不上"。
+- `app/services/ai.py`：分析类调用不再写死小预算——`_analysis_budget(cfg)` =
+  `max(4096, 配置的 max_tokens)`，`_analysis_timeout(cfg)` = `max(配置 timeout, 300s)`；
+  摘要的 map/reduce、人物、时间线四处都走它。
+
+**验证**：`pytest -q` → **1128 passed**（新增 4 个：流式丢弃思考块、只返回思考时报可处置错误、
+正文不被思考覆盖、分析预算/超时下限）；线上用同一供应商跑通人物与摘要。
+
+**注意**：`ai_book_insights` 里修复前写下的那几条答案仍带着英文思考，会被 `prior_block()`
+当成"旧结论"再喂给模型；要清掉请手工删除（`DELETE /api/ai/insights/item/{id}`）。
+
+---
+
+## 66. 重建索引时，启动的 gram 回填在同一个索引里抢写（2026-10-22）
+
+**现象**：重建索引进度条正常在涨，但 meilisearch 里 `chapters` 的文档数比重建"已提交"的多
+（12:02 时 453 199 vs 387 600），其中约 9.6 万条只有 `title` / `book_title` / gram 字段、
+**没有 `content` / `book_id`**；引擎队列长期顶在 200 条上限，每批 1 万文档要 45~60 分钟。
+
+**根因**：NAS 的 `docker-compose.yaml` 打开了 `MEILI_GRAM_BACKFILL_CHAPTERS: true`，
+后端启动时 `sync_book_grams()` 会对**全部 71.6 万章**做 gram 回填（`update_documents`，
+每批 1 000 条）。用户在同一分钟点了「重建索引」：重建删除并新建索引后，回填仍在按
+`Chapter.id` 顺序往里写，而这些章节重建还没写到 → 于是出现"重建没提交过、但索引里已有"的
+半成品文档；回填的写任务还和重建抢同一个引擎队列。索引删除任务本身是成功的
+（meili 任务 16730/16702 在 22:19–22:20 完成），文档不是上一轮残留。
+
+**实现**：`app/services/search_index.py`
+
+- 新增 `rebuild_in_progress()`（读 `.search-rebuild.json` 的 `running`）。
+- `sync_book_grams()`：启动时若重建在跑 → 直接 `skipped/rebuild` 返回，一条都不写；
+  已经在走的话，在每个批次之间检查一次，重建一起来就停（`interrupted`），
+  并跳过收尾的孤儿清理/完整性探测（重建会自己写 gram 字段并标记 ready）。
+
+**验证**：`pytest -q` → 1128 passed（新增 2 个：重建期间回填不动、已开跑的回填在一批内让位）。
+
+**部署建议**（NAS 上，需重建镜像后）：重建索引前先重启后端（或直接
+`MEILI_GRAM_BACKFILL_CHAPTERS: false`）——重建本身会写 gram 字段，章回填只在
+"不重建、只想给旧索引补字段"时才需要。已污染的索引要重新重建一次才干净。

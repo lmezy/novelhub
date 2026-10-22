@@ -2223,6 +2223,59 @@ async def test_gram_backfill_statements_are_executable():
 
 
 @pytest.mark.asyncio
+async def test_gram_backfill_stands_down_while_a_rebuild_runs(monkeypatch):
+    """A rebuild writes the gram fields itself; the backfill must not race it.
+
+    On the live NAS the startup backfill ran through the new index while the
+    admin's rebuild was writing it, which produced ~65 000 content-less chapter
+    documents the rebuild had not submitted yet (2026-10-22).
+    """
+    from app.services import search_index
+
+    service, client = _make_service()
+    client.index.return_value.search.return_value = {"hits": [{"id": "x"}]}
+    monkeypatch.setattr(
+        search_index, "read_rebuild_progress", lambda: {"running": True}
+    )
+
+    result = await service.sync_book_grams()
+
+    assert result["skipped"] is True
+    assert result["rebuild"] is True
+    assert client.index.return_value.update_documents.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_gram_backfill_stops_between_batches_when_a_rebuild_starts(monkeypatch):
+    """A backfill that was already walking must yield within one batch."""
+    from app.core import database as database_module
+    from app.services import search_index
+
+    captured: list = []
+    service, client = _make_service()
+    client.index.return_value.search.return_value = {"hits": [{"id": "x"}]}
+
+    calls = {"n": 0}
+
+    def state():
+        calls["n"] += 1
+        return {"running": calls["n"] > 1}
+
+    monkeypatch.setattr(search_index, "read_rebuild_progress", state)
+
+    with patch.object(
+        database_module, "SessionLocal",
+        lambda: _FakeSession(captured, [("b1", "书名", "作者")]),
+    ):
+        result = await service.sync_book_grams()
+
+    assert result["interrupted"] is True
+    assert result["books"] == 0
+    # No ``update_documents`` batch may land after the rebuild took over.
+    assert client.index.return_value.update_documents.call_count == 0
+
+
+@pytest.mark.asyncio
 async def test_gram_backfill_skips_when_another_worker_holds_the_lock():
     """The second uvicorn worker must not re-tokenise the index a second time."""
     from app.core import database as database_module

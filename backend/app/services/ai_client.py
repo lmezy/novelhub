@@ -256,6 +256,60 @@ def build_payload(cfg: AIConfig, messages: Sequence[dict[str, str]], *,
     return _endpoint(cfg.effective_base_url, "openai"), payload
 
 
+def _content_text(value: Any) -> str:
+    """Assistant *answer* text from a ``content`` field.
+
+    ``content`` is a string for every OpenAI-compatible provider, but newer
+    multimodal responses send a list of parts.  Only ``content`` counts: the
+    ``reasoning_content`` / ``reasoning`` fields carry a reasoning model's
+    hidden chain of thought, which is not an answer (see
+    ``_reasoning_only_error``).
+    """
+    if isinstance(value, list):
+        return "".join(
+            str(part.get("text") or "")
+            for part in value
+            if isinstance(part, dict)
+        )
+    return str(value or "")
+
+
+def _reasoning_tokens(usage: Any) -> int:
+    """How many completion tokens a reasoning model spent thinking."""
+    details = usage.get("completion_tokens_details") if isinstance(usage, dict) else None
+    if not isinstance(details, dict):
+        return 0
+    try:
+        return int(details.get("reasoning_tokens") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _reasoning_only_error(cfg: AIConfig, *, reasoning_tokens: int,
+                          finish_reason: str) -> AIError:
+    """The reply was thinking only -- an empty answer, and a fixable one.
+
+    A reasoning model ("thinking" model) spends the completion budget before it
+    starts writing, so a ``max_tokens`` sized for the answer alone comes back
+    with ``content: ""``, ``finish_reason: "length"`` and the thinking in
+    ``reasoning_content``.  The old client returned that thinking as the
+    answer: character/timeline JSON parsing then "succeeded" with one nameless
+    row, and summaries came back as an English monologue (2026-10-22).
+    """
+    spent = f"（思考用了 {reasoning_tokens} tokens）" if reasoning_tokens else ""
+    if finish_reason == "length":
+        return AIError(
+            "AI 只输出了思考过程，没有产出正文：模型的思考占满了「最大输出 token」"
+            f"{spent}，回答被截断。请在「设置 → AI → 最大输出 token」里调大数值"
+            "（建议 4096 以上），或换一个不强制思考的模型。",
+            provider=cfg.provider,
+        )
+    return AIError(
+        f"AI 只返回了思考过程，没有正文内容{spent}。请重试，或换一个模型。",
+        provider=cfg.provider,
+    )
+
+
 def _error_hint(status: int, body: str, cfg: AIConfig) -> str:
     snippet = (body or "").strip().replace("\n", " ")[:300]
     where = cfg.effective_base_url or "AI 服务"
@@ -335,7 +389,14 @@ class LLMClient:
     async def chat(self, messages: Sequence[dict[str, str]], *,
                    max_tokens: int | None = None,
                    temperature: float | None = None,
-                   retries: int = DEFAULT_MAX_RETRIES) -> LLMResult:
+                   retries: int = DEFAULT_MAX_RETRIES,
+                   timeout: float | None = None) -> LLMResult:
+        """One completion.
+
+        ``timeout`` overrides the configured request timeout for callers that
+        legitimately take minutes (a reasoning model reading forty chapters):
+        the panel's per-request value is sized for an interactive chat turn.
+        """
         url, payload = build_payload(
             self.cfg, messages, max_tokens=max_tokens, temperature=temperature
         )
@@ -344,7 +405,7 @@ class LLMClient:
 
         for attempt in range(retries + 1):
             try:
-                async with self._client() as client:
+                async with self._client(timeout=timeout) as client:
                     response = await client.post(url, headers=headers, json=payload)
                     if response.status_code >= 400:
                         if response.status_code in (429,) or response.status_code >= 500:
@@ -401,24 +462,27 @@ class LLMClient:
         choices = data.get("choices") or [{}]
         choice = choices[0] if choices else {}
         message = choice.get("message") or {}
-        text = message.get("content")
-        if text is None:
-            # Some providers return ``reasoning_content`` only, or a list of
-            # content parts (newer OpenAI multimodal responses).
-            text = message.get("reasoning_content") or ""
-        if isinstance(text, list):
-            text = "".join(
-                str(part.get("text") or "")
-                for part in text
-                if isinstance(part, dict)
-            )
         usage = data.get("usage") or {}
+        finish_reason = str(choice.get("finish_reason") or "")
+        text = _content_text(message.get("content")).strip()
+        if not text:
+            # Never fall back to ``reasoning_content``: thinking is not the
+            # answer, and handing it to the caller turned JSON analyses into a
+            # single nameless row and summaries into English deliberation.
+            reasoning_tokens = _reasoning_tokens(usage)
+            if reasoning_tokens or message.get("reasoning_content") or \
+                    message.get("reasoning"):
+                raise _reasoning_only_error(
+                    self.cfg,
+                    reasoning_tokens=reasoning_tokens,
+                    finish_reason=finish_reason,
+                )
         return LLMResult(
-            str(text or "").strip(),
+            text,
             model=str(data.get("model") or payload.get("model") or ""),
             prompt_tokens=int(usage.get("prompt_tokens") or 0),
             completion_tokens=int(usage.get("completion_tokens") or 0),
-            finish_reason=str(choice.get("finish_reason") or ""),
+            finish_reason=finish_reason,
         )
 
     async def stream(self, messages: Sequence[dict[str, str]], *,
@@ -489,6 +553,15 @@ class LLMClient:
                 yield text
 
     def _delta_text(self, payload: dict[str, Any]) -> str:
+        """One streamed answer chunk.
+
+        Reasoning models stream their thinking as ``delta.reasoning_content``
+        (or ``delta.reasoning``) *without* a ``content`` key.  The old fallback
+        turned those chunks into the visible answer, so the reader saw the
+        model's English deliberation prepended to every reply -- and the same
+        text was persisted as the saved analysis (2026-10-22).  Only
+        ``content`` is the answer; thinking deltas yield nothing.
+        """
         if self.cfg.kind == "anthropic":
             if payload.get("type") == "content_block_delta":
                 delta = payload.get("delta") or {}
@@ -499,16 +572,7 @@ class LLMClient:
         if not choices:
             return ""
         delta = choices[0].get("delta") or {}
-        content = delta.get("content")
-        if content is None:
-            content = delta.get("reasoning_content")
-        if isinstance(content, list):
-            return "".join(
-                str(part.get("text") or "")
-                for part in content
-                if isinstance(part, dict)
-            )
-        return str(content or "")
+        return _content_text(delta.get("content"))
 
     # -- embeddings ---------------------------------------------------------
 
@@ -621,7 +685,10 @@ class LLMClient:
                 {"role": "system", "content": "You are a connectivity probe. Reply with OK only."},
                 {"role": "user", "content": "ping"},
             ],
-            max_tokens=16,
+            # 16 tokens was not enough for a reasoning model's thinking, which
+            # then answered with an empty ``content`` and looked like a broken
+            # connection; 256 leaves room for a short deliberation.
+            max_tokens=256,
             temperature=0.0,
             retries=0,
         )

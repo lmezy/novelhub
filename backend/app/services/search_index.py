@@ -137,6 +137,21 @@ def write_rebuild_progress(update: dict[str, Any]) -> dict[str, Any]:
 _REBUILD_TASKS: set[asyncio.Task] = set()
 
 
+def rebuild_in_progress() -> bool:
+    """Whether a rebuild currently owns both indexes.
+
+    The startup gram backfill writes documents too.  When it starts before the
+    admin clicks "重建索引" they fight over the same index: the rebuild deletes
+    it, the backfill keeps ``update_documents``-ing the chapters it walks, and
+    the result is an index with documents the rebuild has not written yet --
+    content-less ones, because the backfill only knows the gram fields.  On the
+    live NAS this showed up as 453 199 chapter documents against 387 600
+    submitted by the rebuild, ~96 000 of them without ``content``/``book_id``
+    (2026-10-22).
+    """
+    return bool(read_rebuild_progress().get("running"))
+
+
 class SearchIndexMixin:
     """Index lifecycle, writes and maintenance for the search service."""
 
@@ -1315,6 +1330,16 @@ class SearchIndexMixin:
         }
         if result["skipped"]:
             return result
+        if rebuild_in_progress():
+            # The rebuild writes every document *and* its gram fields.  Writing
+            # into the index it is rebuilding only pollutes it and competes for
+            # the engine queue (see ``rebuild_in_progress``).
+            logger.info(
+                "A search-index rebuild is running; the gram backfill stands down"
+            )
+            result["skipped"] = True
+            result["rebuild"] = True
+            return result
 
         from sqlalchemy import select, text
 
@@ -1351,6 +1376,10 @@ class SearchIndexMixin:
             if need_books:
                 last_id = ""
                 while True:
+                    if rebuild_in_progress():
+                        logger.info("Gram backfill stopped: a rebuild took over")
+                        result["interrupted"] = True
+                        break
                     rows = (
                         await db.execute(
                             # ``Book.author_name`` is a Python property over the
@@ -1382,6 +1411,10 @@ class SearchIndexMixin:
             if need_chapters:
                 last_id = ""
                 while True:
+                    if rebuild_in_progress():
+                        logger.info("Gram backfill stopped: a rebuild took over")
+                        result["interrupted"] = True
+                        break
                     rows = (
                         await db.execute(
                             # ``outerjoin``, not ``join``: a chapter whose book row
@@ -1414,6 +1447,13 @@ class SearchIndexMixin:
                         docs.append({**doc, **chapter_gram_fields(doc)})
                     chapters_index.update_documents(docs)
                     result["chapters"] += len(docs)
+
+        if result.get("interrupted"):
+            # Do not judge -- or delete documents from -- an index the rebuild is
+            # rewriting: the completeness probe would revoke "ready", and
+            # ``purge_orphan_documents`` could remove a document the rebuild is
+            # about to write.  The rebuild marks the gram path ready itself.
+            return result
 
         # Verify rather than assume.  Only an index that now reports nothing
         # missing may take the gram path: a backfill interrupted halfway would

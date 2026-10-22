@@ -48,6 +48,18 @@ ANALYSIS_MAX_CHAPTERS = 40
 #: How many trailing chat turns are replayed to the model.
 MAX_HISTORY_MESSAGES = 10
 MAX_HISTORY_CHARS = 2000
+#: Floor for one structured-analysis completion (summary / characters /
+#: timeline).  Reasoning models spend part of the completion budget on their
+#: hidden thinking before they emit an answer: the 900 / 3000-token caps these
+#: calls used to pass came back with ``finish_reason: "length"``, an empty
+#: ``content`` and nothing but the chain of thought, so summaries reported an
+#: empty result and characters/timeline showed one nameless row (2026-10-22).
+#: The configured "最大输出 token" is the real budget; this floor only keeps a
+#: small configured value from starving the answer.
+ANALYSIS_MIN_TOKENS = 4096
+#: Structured analysis reads dozens of chapters and thinks about them, so it
+#: needs a longer per-request timeout than the interactive chat default.
+ANALYSIS_TIMEOUT_SECONDS = 300.0
 
 IMAGE_MARKDOWN_RE = re.compile(r"!\[[^\]]*\]\([^)\s]+(?:\s+[\"'][^\"']*[\"'])?\)")
 
@@ -201,6 +213,27 @@ class AIService:
     @staticmethod
     def _not_configured_reason(cfg: AIConfig) -> str:
         return not_configured_reason(cfg)
+
+    @staticmethod
+    def _analysis_budget(cfg: AIConfig, *, floor: int = ANALYSIS_MIN_TOKENS) -> int:
+        """Completion budget for one analysis call.
+
+        Never below ``floor``: a reasoning model needs room for its thinking
+        *and* the answer, and "900 tokens" only ever bought the thinking.
+        """
+        try:
+            configured = int(getattr(cfg, "max_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            configured = 0
+        return max(floor, configured)
+
+    @staticmethod
+    def _analysis_timeout(cfg: AIConfig) -> float:
+        try:
+            configured = float(getattr(cfg, "timeout", 0) or 0)
+        except (TypeError, ValueError):
+            configured = 0.0
+        return max(configured, ANALYSIS_TIMEOUT_SECONDS)
 
     async def status(self) -> dict[str, Any]:
         """Configuration + index summary for the front-end."""
@@ -552,7 +585,8 @@ class AIService:
             result = await client.chat(
                 [{"role": "system", "content": SYSTEM_SUMMARY_BATCH},
                  {"role": "user", "content": user}],
-                max_tokens=900,
+                max_tokens=self._analysis_budget(cfg),
+                timeout=self._analysis_timeout(cfg),
             )
             prompt_tokens += result.prompt_tokens
             completion_tokens += result.completion_tokens
@@ -575,7 +609,8 @@ class AIService:
             result = await client.chat(
                 [{"role": "system", "content": SYSTEM_SUMMARY_FINAL},
                  {"role": "user", "content": user}],
-                max_tokens=2200,
+                max_tokens=self._analysis_budget(cfg),
+                timeout=self._analysis_timeout(cfg),
             )
             prompt_tokens += result.prompt_tokens
             completion_tokens += result.completion_tokens
@@ -617,7 +652,8 @@ class AIService:
         result = await client.chat(
             [{"role": "system", "content": SYSTEM_CHARACTERS},
              {"role": "user", "content": user}],
-            max_tokens=3000,
+            max_tokens=self._analysis_budget(cfg),
+            timeout=self._analysis_timeout(cfg),
         )
         characters, parsed = parse_json_list(result.text)
         return {
@@ -651,7 +687,8 @@ class AIService:
         result = await client.chat(
             [{"role": "system", "content": SYSTEM_TIMELINE},
              {"role": "user", "content": user}],
-            max_tokens=3000,
+            max_tokens=self._analysis_budget(cfg),
+            timeout=self._analysis_timeout(cfg),
         )
         events, parsed = parse_json_list(result.text)
         return {
