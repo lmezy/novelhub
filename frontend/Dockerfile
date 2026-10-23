@@ -15,7 +15,9 @@ RUN npm run build
 
 
 # ---- Run stage: serve the static bundle with nginx ----
-FROM nginx:alpine
+# Pinned: this image only serves files, so an unattended major upgrade buys
+# nothing and can change default behaviour.
+FROM nginx:1.27-alpine
 
 # Listen port is templated into nginx.conf at container start (the nginx
 # entrypoint runs envsubst on /etc/nginx/templates/*.template). Default keeps

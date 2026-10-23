@@ -2934,3 +2934,28 @@ embedding 请求约 **22~30 万次**（每次 16 条）。所以全库不是配�
 **验证**：`backend/tests/test_book_profiles.py` 9 条（抽样、短书切段、读不到正文、向量字面量、
 构建任务的上限/取消/与 RAG 队列互斥）；`pytest -q` → **1168 passed**；
 前端 `vue-tsc --noEmit` 与 `vite build` 通过。
+
+---
+
+## 71. 部署卫生：镜像 tag 钉死 + 参考源码不进构建上下文（2026-10-23）
+
+**缘起**：核对"仓库里有没有 PHP/Go/Java"时发现两件事。
+
+1. **`yuedu/` 一直躺在 crawler/scheduler 的构建上下文里**。它是 Legado 安卓客户端的
+   参考源码（1816 个文件、21 MB、844 个 kt + 88 个 java + 7 个 jar），没有任何 Dockerfile
+   COPY 它，所以从没进过镜像；但每次 `docker build`（context = 仓库根目录）都要把它传给
+   daemon。`.dockerignore` 补上 `yuedu`（顺带 `dumps` / `logs` / `.workbuddy` / `.pytest_cache`）。
+2. **浮动 tag**：仓库写 `nginx:latest`、`redis:7-alpine`、`meilisearch:v1.10`，而 NAS 上实际跑
+   的是 `nginx:latest`（镜像停在 **2019 年的 1.17.4**）、`redis:7-alpine`、`meilisearch:v1.12`。
+   浮动 tag 的含义是"第一次 pull 时的样子"，不是"最新"，`docker compose pull` 随时可能变成
+   一次没人计划的升级。现在钉成：`nginx:1.27-alpine`（compose + 前端 Dockerfile 的运行阶段）、
+   `redis:7.4-alpine`、`getmeili/meilisearch:v1.12`；`postgres:17` 保持大版本写法（备份容器
+   的 `pg_dump` 也用它，必须与服务端同大版本）。
+
+**注意**：NAS 上下次部署会真的把 nginx 从 1.17.4 拉到 1.27（配置用的是常规 `map` /
+`proxy_pass` / SSE 头，兼容；如果不想顺带升级，把 compose 里那一行改回 `nginx:latest` 即可，
+但那就还是浮动 tag）。
+
+**技术栈结论（写下来免得再查）**：线上只有 Python 3.13（backend/crawler/scheduler）、
+Node（前端构建 + 执行书源 JS 规则的运行时）、nginx、PostgreSQL(+pgvector)、Redis、Meilisearch。
+**没有 PHP、没有 Go、没有 JVM**；Java/Kotlin 仅存在于 `yuedu/` 参考源码里，不参与构建和运行。

@@ -14,6 +14,14 @@ frontend
 nginx
 docs
 storage
+# Reference-only source: ``yuedu/`` is the Legado Android client we borrowed
+# rules from (1816 files, 21 MB).  No Dockerfile copies it, so it must not ride
+# along in the build context either.
+yuedu
+dumps
+logs
+.workbuddy
+.pytest_cache
 .codex
 .agents
 .commandcode

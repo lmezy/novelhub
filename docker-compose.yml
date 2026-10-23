@@ -51,7 +51,9 @@ services:
       -c effective_io_concurrency=200
 
   redis:
-    image: redis:7-alpine
+    # Pinned instead of ``7-alpine``: a floating tag turns ``docker compose
+    # pull`` into an unplanned Redis upgrade.
+    image: redis:7.4-alpine
     container_name: novelhub-redis
     restart: always
     logging: *default-logging
@@ -71,7 +73,10 @@ services:
       retries: 5
 
   meilisearch:
-    image: getmeili/meilisearch:v1.10
+    # Must stay in step with what the deployment actually runs (the NAS has
+    # been on 1.12 since the index work); a mismatched tag here is how "it
+    # works locally" drifts from production.
+    image: getmeili/meilisearch:v1.12
     container_name: novelhub-search
     restart: always
     logging: *default-logging
@@ -192,7 +197,9 @@ services:
       - "${FRONTEND_PORT:-5173}:5173"
 
   nginx:
-    image: nginx:latest
+    # ``nginx:latest`` on the NAS was still running a 2019 image (1.17.4): a
+    # floating tag does not mean "current", it means "whatever was pulled once".
+    image: nginx:1.27-alpine
     container_name: novelhub-nginx
     restart: always
     logging: *default-logging
