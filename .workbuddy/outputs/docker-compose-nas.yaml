@@ -7,6 +7,8 @@
 #   3. backend/crawler/scheduler 显式注入 REDIS_PASSWORD
 #   4. frontend 改为生产构建镜像（删除 npm run dev 覆盖命令）
 #   5. 所有服务增加容器日志轮转（10MB x 3，防止撑满磁盘）
+# 2026-10-25：postgres 换 pgvector/pgvector:pg17（书库画像需要 vector 扩展，
+#             迁移 0040 会 CREATE EXTENSION）；章级 gram 回填关闭；redis/nginx 钉版本。
 # ============================================================
 
 x-logging: &default-logging
@@ -18,7 +20,7 @@ x-logging: &default-logging
 services:
 
   postgres:
-    image: postgres:17
+    image: pgvector/pgvector:pg17
     container_name: novelhub-postgres
     restart: always
     network_mode: host
@@ -58,7 +60,7 @@ services:
       -c jit=off
 
   redis:
-    image: redis:7-alpine
+    image: redis:7.4-alpine
     container_name: novelhub-redis
     restart: always
     network_mode: host
@@ -100,7 +102,7 @@ services:
       resources:
         limits:
           cpus: "2.0"
-          memory: 12G
+          memory: 20G
 
   backend:
     image: lonezy/novelhub-backend
@@ -117,7 +119,7 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       MEILI_KEY: ${MEILI_MASTER_KEY}
       MEILI_HOST: http://127.0.0.1:${MEILI_PORT:-17700}
-      MEILI_GRAM_BACKFILL_CHAPTERS: true
+      MEILI_GRAM_BACKFILL_CHAPTERS: false
     command:
       [
         "sh",
@@ -222,7 +224,7 @@ services:
           memory: 512M
 
   nginx:
-    image: nginx:latest
+    image: nginx:1.27-alpine
     container_name: novelhub-nginx
     restart: always
     network_mode: host
@@ -251,25 +253,17 @@ services:
       PGPASSWORD: ${POSTGRES_PASSWORD}
       PGDATABASE: ${POSTGRES_DB}
       TZ: ${TZ}
+      BACKUP_STORAGE: ${BACKUP_STORAGE:-0}          # 先 0：只备份数据库
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+      BACKUP_DB_DAILY_KEEP: ${BACKUP_DB_DAILY_KEEP:-7}
+      BACKUP_STORAGE_DAILY_KEEP: ${BACKUP_STORAGE_DAILY_KEEP:-7}
+      BACKUP_STORAGE_WEEKLY_KEEP: ${BACKUP_STORAGE_WEEKLY_KEEP:-4}
+      BACKUP_WAIT_SECONDS: ${BACKUP_WAIT_SECONDS:-300}
     volumes:
       - ./data/backup:/backup
       - ./storage:/app/storage:ro
-    entrypoint: >
-      sh -c '
-      mkdir -p /backup/daily /backup/weekly;
-      while true; do
-        TS=$$(date +%Y%m%d_%H%M);
-        pg_dump -h 127.0.0.1 -p ${POSTGRES_PORT:-15432} -U $${PGUSER} -d $${PGDATABASE} -Fc -f /backup/daily/db_$${TS}.dump;
-        tar -I zstd -cf /backup/daily/storage_$${TS}.tar.zst -C /app storage/ 2>/dev/null || true;
-        find /backup/daily -mtime +7 -delete;
-        if [ $$(date +%u) -eq 7 ]; then
-          cp /backup/daily/db_$${TS}.dump /backup/weekly/;
-          cp /backup/daily/storage_$${TS}.tar.zst /backup/weekly/ 2>/dev/null || true;
-          find /backup/weekly -mtime +60 -delete;
-        fi;
-        sleep 86400;
-      done
-      '
+      - ./scripts/backup.sh:/usr/local/bin/novelhub-backup.sh:ro
+    entrypoint: ["sh", "/usr/local/bin/novelhub-backup.sh"]
     deploy:
       resources:
         limits:
