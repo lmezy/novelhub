@@ -2723,3 +2723,115 @@ def test_chapter_metadata_and_search_gets_the_gram_narrowing_too():
             assert scan["limit"] == SearchService.METADATA_SCAN_CHUNK
 
 
+
+
+# ---- book-level 正文 AND + the raised conjunction window (2026-10-25) ----
+
+
+def test_conjunction_window_reaches_the_engine_ceiling():
+    """A phrase AND may rank up to ``maxTotalHits``, not the old 10 000."""
+    service, _, _ = _service_with_indexes()
+
+    assert service.conjunction_window() == service.max_total_hits()
+    assert service.conjunction_window() >= SearchService.CONJUNCTION_CANDIDATE_LIMIT
+
+
+def test_conjunction_rank_pages_instead_of_one_huge_response():
+    """200k ids in one response is tens of MB; the walk must be chunked."""
+    service, _, chapters_index = _service_with_indexes()
+    service.METADATA_SCAN_CHUNK = 2
+    calls = []
+
+    def _search(query, options):
+        calls.append(dict(options))
+        offset, size = options["offset"], options["limit"]
+        ids = [f"c{number}" for number in range(offset, min(offset + size, 5))]
+        return {"hits": [{"id": doc_id} for doc_id in ids], "estimatedTotalHits": 5}
+
+    chapters_index.search.side_effect = _search
+
+    ranked, total = service._conjunction_rank(
+        SearchService.INDEX_CHAPTERS, "content", _conjunction_condition(), None, 10_000,
+    )
+
+    assert len(ranked) == 5
+    assert total == 5
+    assert [call["offset"] for call in calls] == [0, 2, 4]
+    assert all(call["limit"] == 2 for call in calls)
+
+
+def _book_route(chapters):
+    """Engine answers: one hit list per condition, carrying ``book_id``."""
+
+    def _search(query, options):
+        if "乳环" in query:
+            return {"hits": chapters["乳环"], "estimatedTotalHits": len(chapters["乳环"])}
+        return {"hits": chapters["师妹"], "estimatedTotalHits": len(chapters["师妹"])}
+
+    return _search
+
+
+def test_book_level_and_matches_chapters_from_the_same_book():
+    """正文 乳环 AND 师妹 at book level: b2 qualifies through chapters c2 and c3.
+
+    The chapter-level conjunction needs both terms in one chapter; this mode
+    intersects per-condition book sets, and the page shows the chapter of the
+    rarer condition (「师妹」 here).
+    """
+    service, _, chapters_index = _service_with_indexes()
+    chapters_index.search.side_effect = _book_route({
+        "乳环": [{"id": "c1", "book_id": "b1"}, {"id": "c2", "book_id": "b2"}],
+        "师妹": [{"id": "c3", "book_id": "b2"}],
+    })
+    service._serialize_scored_hit = (
+        lambda hit, score, fields, scope, values=None: {"id": hit.get("id")}
+    )
+    service._hydrate_around = (
+        lambda index, ids, query, attr: {doc_id: {"id": doc_id} for doc_id in ids}
+    )
+
+    result = service._content_book_and(
+        [{"field": "content", "mode": "exact", "value": "乳环"},
+         {"field": "content", "mode": "exact", "value": "师妹"}],
+        filters=None, offset=0, limit=10,
+    )
+
+    assert result["total"] == 1
+    assert [hit["id"] for hit in result["hits"]] == ["c3"]
+
+
+def test_advanced_search_book_aggregate_uses_the_book_path():
+    service, _, chapters_index = _service_with_indexes()
+    chapters_index.search.side_effect = _book_route({
+        "乳环": [{"id": "c1", "book_id": "b1"}, {"id": "c2", "book_id": "b2"}],
+        "师妹": [{"id": "c3", "book_id": "b2"}],
+    })
+    service._serialize_scored_hit = (
+        lambda hit, score, fields, scope, values=None: {"id": hit.get("id")}
+    )
+    service._hydrate_around = (
+        lambda index, ids, query, attr: {doc_id: {"id": doc_id} for doc_id in ids}
+    )
+
+    result = service.advanced_search(
+        [{"field": "content", "mode": "exact", "value": "乳环"},
+         {"field": "content", "mode": "exact", "value": "师妹"}],
+        match="and", aggregate="book", scope="all", limit=10,
+    )
+
+    assert result["total"] == 1
+    assert [hit["id"] for hit in result["hits"]] == ["c3"]
+
+
+def test_book_aggregate_is_ignored_without_two_content_conditions():
+    """Nothing else may be silently rerouted: a tag+正文 AND stays chapter-level."""
+    service, _, chapters_index = _service_with_indexes()
+    chapters_index.search.side_effect = _book_route({"乳环": [], "师妹": []})
+
+    result = service._content_book_and(
+        [{"field": "content", "mode": "exact", "value": "乳环"},
+         {"field": "title", "mode": "exact", "value": "师妹"}],
+        filters=None, offset=0, limit=10,
+    )
+
+    assert result is None

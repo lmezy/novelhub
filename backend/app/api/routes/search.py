@@ -39,6 +39,11 @@ class SearchCondition(BaseModel):
 class AdvancedSearchRequest(BaseModel):
     conditions: list[SearchCondition] = Field(default_factory=list)
     match: Literal["and", "or"] = "and"
+    #: ``book`` aggregates 正文 ANDs per book: a book qualifies when each
+    #: condition appears somewhere in it, even in different chapters (the
+    #: chapter-level default needs them in the same chapter).  Only meaningful
+    #: for two or more 正文 conditions joined with AND.
+    aggregate: Literal["chapter", "book"] = "chapter"
     scope: Literal["all", "books", "chapters"] = "all"
     tag: str | None = None
     source_id: str | None = None
@@ -221,6 +226,7 @@ async def advanced_search(
         search_service.advanced_search,
         [condition.model_dump() for condition in payload.conditions],
         match=payload.match,
+        aggregate=payload.aggregate,
         scope=payload.scope,
         tag=payload.tag,
         source_id=payload.source_id,

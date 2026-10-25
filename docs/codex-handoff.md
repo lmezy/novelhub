@@ -2959,3 +2959,42 @@ embedding 请求约 **22~30 万次**（每次 16 条）。所以全库不是配�
 **技术栈结论（写下来免得再查）**：线上只有 Python 3.13（backend/crawler/scheduler）、
 Node（前端构建 + 执行书源 JS 规则的运行时）、nginx、PostgreSQL(+pgvector)、Redis、Meilisearch。
 **没有 PHP、没有 Go、没有 JVM**；Java/Kotlin 仅存在于 `yuedu/` 参考源码里，不参与构建和运行。
+
+---
+
+## 72. 多条件「精准」正文搜索：75 条不是被截断；新增书级聚合 + 提高窗口（2026-10-25）
+
+**现象**：用户用多条件精准搜索「正文 乳环」AND「正文 师妹」，只有 75 条，怀疑只搜了前一万章。
+
+**实测（线上 716 373 章索引）**：调用后端服务原样跑查询，返回 75、耗时 17~39 s；
+引擎短语查询 `"乳环" "师妹"` 只有 **78** 章命中（乳环 2 211 章、师妹 12 023 章），
+逐条核对正文后 75 —— **这就是全库真实结果，不是被截断**。
+同一查询换成模糊模式（词元 AND）是 **6 312** 章、3.7 s；模糊+精准混用则掉进逐条扫描，要 123 s。
+
+**为什么 75 是真的**：「精准」在正文条件上被构造成带引号的**短语查询**（`_conjunction_query`），
+要求两个字连续出现；「模糊」只要求每个字符在本章出现。
+
+**改动 1（用户选项 3）——精准 AND 的候选窗口提高到引擎上限**：
+`conjunction_window()` = `max(CONJUNCTION_CANDIDATE_LIMIT, max_total_hits())`（10 000 → 200 000），
+`_conjunction_rank` 改成按 `METADATA_SCAN_CHUNK`(10 k) 分页拉 id —— 一次要 20 万条 id 的响应有几十 MB，
+会把 worker 顶住；`_conjunction_search` 的总数与缓存键同步改用新窗口。
+
+**改动 2（用户选项 2）——书级聚合**：`POST /search/advanced` 新增 `aggregate: chapter|book`。
+当 `aggregate=book`、`match=and`、且**全部条件都是正文**时走 `_content_book_and`：
+
+- 每个条件单独问引擎（精准=短语、模糊=词元 AND），`attributesToRetrieve=["id","book_id"]`，分页到 200 000；
+- 按 `book_id` 求交集，按各书命中数排序；每本书返回**最稀有那个条件**命中的章节（片段就展示这个最特征性的词）；
+- 任一条件命中数超过 `BOOK_LEVEL_CONDITION_LIMIT`(50 000) 就返回 `None` 回退章节级 —— 否则"的"+"他"这种词
+  会拉几十万条 id、把请求拖到分钟级，而那种查询按书聚合本来也没有意义。
+
+前端：高级搜索面板在 AND 时显示「按书聚合（不同章节也算）」勾选，请求带 `aggregate`，
+分页缓存键与会话快照都带上它（否则切换聚合方式会读到另一种模式缓存的页）。
+
+**验证**：新增 5 条用例（窗口到顶、`_conjunction_rank` 分页、书级交集、`advanced_search` 路由、
+非正文条件不被改道）；`pytest -q` → **1173 passed**；前端 `vue-tsc --noEmit` 与 `vite build` 通过。
+
+**性能提醒**：书级聚合要额外拉两遍 id 列表，在这台 NAS 上引擎一次 10 k 半径的响应实测 5~60 s 波动，
+所以默认关闭、由用户显式勾选；勾选后前端已有 loading 态。
+
+**顺带**：索引重建已于 2026-10-25 03:03 完成（716 373/716 373 章，books 46 412），
+meili `chapters` 716 373 条、`isIndexing=false`、队列 0、库 **102.2 GB**。

@@ -184,6 +184,11 @@ class SearchService(SearchIndexMixin):
     # into a backend container limited to 1 GB.
 
     CONJUNCTION_CANDIDATE_LIMIT = 10_000
+    #: A book-level 正文 AND collects one match set per condition.  Past
+    #: this size the request is about "books containing a very common
+    #: word" (thousands of books, minutes of ranking), so it degrades to
+    #: the chapter-level conjunction instead of stalling the worker.
+    BOOK_LEVEL_CONDITION_LIMIT = 50_000
 
     # How many candidates one gram-narrowed condition may walk, per index.  A
 
@@ -3302,118 +3307,70 @@ class SearchService(SearchIndexMixin):
 
 
     def _conjunction_rank(
-
         self,
-
         index_name: str,
-
         attr: str,
-
         active: list[dict],
-
         filters: str | None,
-
         window: int,
-
     ) -> tuple[list[tuple[int, str, str]], int | None]:
-
         """Engine-ranked ids for ``cond1 AND cond2 AND …`` on one attribute.
 
-
-
         The query is the whitespace-joined values with ``matchingStrategy:
-
         "all"``, which makes Meilisearch return only documents that carry every
-
         term (measured on the live chapters index: 铃 + 仙 -> 1 299 documents,
-
         versus 0 through the per-condition windows).
 
-
-
         Only ``id`` is retrieved.  Asking for the searched attribute instead
-
         costs 12 s per 1 000 chapters on that index, and the *page* re-checks
-
         the real text anyway (``_conjunction_search``) -- the engine is only
-
         trusted to narrow tens of thousands of matches down to the window.
 
-
+        The window can now be the engine ceiling (200 000), so the ids are
+        fetched in :data:`METADATA_SCAN_CHUNK` pages instead of one request: a
+        single 200k-hit response is tens of MB and stalls the worker.
 
         Returns the ranked ``(score, id, "")`` list and the engine's hit count;
-
         the count is ``None`` when the engine does not report one.
-
         """
-
         query = self._conjunction_query(active)
-
         if not query:
-
             return [], 0
-
-        options = {
-
-            "limit": window,
-
-            "offset": 0,
-
-            "attributesToSearchOn": [attr],
-
-            "attributesToRetrieve": ["id"],
-
-            "matchingStrategy": "all",
-
-        }
-
-        if filters:
-
-            options["filter"] = filters
-
+        limit = max(1, min(int(window or 1), self.max_total_hits()))
+        step = max(1, min(self.METADATA_SCAN_CHUNK, limit))
         index = self.client.index(index_name)
-
-        try:
-
-            result = index.search(query, options)
-
-        except meilisearch.errors.MeilisearchApiError as exc:
-
-            # ``matchingStrategy`` needs Meilisearch >= 1.3; an older engine (or
-
-            # an attribute that is not searchable yet) must not turn a search
-
-            # into a hard failure.
-
-            logger.warning("Conjunction search fell back for {}: {}", attr, exc)
-
-            options.pop("matchingStrategy", None)
-
-            options.pop("attributesToSearchOn", None)
-
-            result = index.search(query, options)
-
-        # Every hit passed the engine's "all terms" gate, so they all satisfy
-
-        # the conjunction; the page-level gate decides what is displayed.  The
-
-        # snippet slot stays empty: the page is hydrated with its body cropped
-
-        # around the match instead (``_serialize_scored_hit``).
-
-        ranked = [
-
-            (len(active), str(hit.get("id")), "")
-
-            for hit in result.get("hits", []) or []
-
-        ]
-
-        total = result.get("estimatedTotalHits")
-
-        return ranked, (int(total) if isinstance(total, int) else None)
-
-
+        ranked: list[tuple[int, str, str]] = []
+        engine_total: int | None = None
+        fetched = 0
+        while fetched < limit:
+            options = {
+                "limit": min(step, limit - fetched),
+                "offset": fetched,
+                "attributesToSearchOn": [attr],
+                "attributesToRetrieve": ["id"],
+                "matchingStrategy": "all",
+            }
+            if filters:
+                options["filter"] = filters
+            try:
+                result = index.search(query, options)
+            except meilisearch.errors.MeilisearchApiError as exc:
+                # ``matchingStrategy`` needs Meilisearch >= 1.3; an older engine
+                # (or an attribute that is not searchable yet) must not turn a
+                # search into a hard failure.
+                logger.warning("Conjunction search fell back for {}: {}", attr, exc)
+                options.pop("matchingStrategy", None)
+                options.pop("attributesToSearchOn", None)
+                result = index.search(query, options)
+            hits = result.get("hits", []) or []
+            if engine_total is None:
+                total = result.get("estimatedTotalHits")
+                engine_total = int(total) if isinstance(total, int) else None
+            ranked.extend((len(active), str(hit.get("id")), "") for hit in hits)
+            fetched += len(hits)
+            if len(hits) < options["limit"]:
+                break
+        return ranked, engine_total
 
     def _conjunction_values(
 
@@ -3468,6 +3425,121 @@ class SearchService(SearchIndexMixin):
         return values
 
 
+
+    def conjunction_window(self) -> int:
+        """How many ranked ids one same-field AND may rank.
+
+        Exact phrase conjunctions used to stop at 10 000 ids.  On the rebuilt
+        index the engine can hand back up to ``maxTotalHits`` (200 000), and a
+        phrase query that broad is rare enough that ranking every match costs
+        less than silently dropping the tail.
+        """
+        return max(int(self.CONJUNCTION_CANDIDATE_LIMIT), self.max_total_hits())
+
+    def _content_book_and(
+        self,
+        active: list[dict],
+        *,
+        filters: str | None,
+        offset: int,
+        limit: int,
+    ) -> dict | None:
+        """Book-level 正文 AND: "same book, not necessarily the same chapter".
+
+        The chapter-level conjunction requires every condition to appear in one
+        chapter; a reader looking for a story element often means "somewhere in
+        this book".  Each condition is asked of the engine separately (phrase
+        query for exact, token AND for fuzzy), the engine reports the chapter's
+        ``book_id``, and the book ids are intersected here.
+
+        Only the ids and book ids are transferred, so the cost is bounded by the
+        two match sets (measured on the live 716k-chapter index: 2 211 + 12 023
+        hits for 「乳环」/「师妹」 in exact mode, 51 304 + 117 926 in fuzzy mode).
+        The page then hydrates one representative chapter per book -- the one
+        from the rarest condition -- so the snippet shows the distinctive term.
+        """
+        if len(active) < 2 or any(cond.get("field") != "content" for cond in active):
+            return None
+        index = self.client.index(self.INDEX_CHAPTERS)
+        ceiling = self.max_total_hits()
+        book_maps: list[dict[str, str]] = []
+        book_counts: list[dict[str, int]] = []
+        totals: list[int] = []
+        for cond in active:
+            query = self._conjunction_query([cond])
+            if not query:
+                return None
+            mapping: dict[str, str] = {}
+            counts: dict[str, int] = {}
+            fetched = 0
+            engine_total: int | None = None
+            while fetched < ceiling:
+                step = min(self.METADATA_SCAN_CHUNK, ceiling - fetched)
+                options = {
+                    "limit": step,
+                    "offset": fetched,
+                    "attributesToSearchOn": ["content"],
+                    "attributesToRetrieve": ["id", "book_id"],
+                    "matchingStrategy": "all",
+                }
+                if filters:
+                    options["filter"] = filters
+                try:
+                    result = index.search(query, options)
+                except meilisearch.errors.MeilisearchApiError as exc:
+                    logger.warning("Book-level 正文 collect fell back: {}", exc)
+                    return None
+                hits = result.get("hits", []) or []
+                if engine_total is None:
+                    value = result.get("estimatedTotalHits")
+                    engine_total = int(value) if isinstance(value, int) else None
+                    if engine_total is not None and engine_total > self.BOOK_LEVEL_CONDITION_LIMIT:
+                        logger.info(
+                            "Book-level 正文 AND falls back to chapters: {} matches for {!r}",
+                            engine_total, cond["value"],
+                        )
+                        return None
+                for hit in hits:
+                    book_id = str(hit.get("book_id") or "")
+                    if not book_id:
+                        continue
+                    counts[book_id] = counts.get(book_id, 0) + 1
+                    mapping.setdefault(book_id, str(hit.get("id")))
+                fetched += len(hits)
+                if len(hits) < step:
+                    break
+            if not mapping:
+                return {"hits": [], "total": 0, "offset": offset, "limit": limit}
+            book_maps.append(mapping)
+            book_counts.append(counts)
+            totals.append(engine_total or len(mapping))
+
+        common = set(book_maps[0])
+        for mapping in book_maps[1:]:
+            common &= set(mapping)
+        if not common:
+            return {"hits": [], "total": 0, "offset": offset, "limit": limit}
+
+        # Rarer condition first: its chapter is the one worth showing.
+        rarest = min(range(len(active)), key=lambda i: totals[i])
+        ranked = sorted(
+            common,
+            key=lambda book_id: (
+                -sum(counts[book_id] for counts in book_counts),
+                book_id,
+            ),
+        )
+        page_books = ranked[offset:offset + limit]
+        ids = [book_maps[rarest][book_id] for book_id in page_books]
+        query = self._conjunction_query(active)
+        docs = self._hydrate_around(self.INDEX_CHAPTERS, ids, query, "content")
+        hits = []
+        for doc_id in ids:
+            hit = docs.get(doc_id) or {"id": doc_id}
+            hits.append(
+                self._serialize_scored_hit(hit, len(active), ["content"], "chapters")
+            )
+        return {"hits": hits, "total": len(common), "offset": offset, "limit": limit}
 
     def _conjunction_search(
 
@@ -3545,7 +3617,7 @@ class SearchService(SearchIndexMixin):
 
             ",".join(cond.get("mode") or "exact" for cond in active),
 
-            str(self.CONJUNCTION_CANDIDATE_LIMIT),
+            str(self.conjunction_window()),
 
         ))
 
@@ -3571,7 +3643,7 @@ class SearchService(SearchIndexMixin):
 
                 index_name, attr, active, filters,
 
-                self.CONJUNCTION_CANDIDATE_LIMIT,
+                self.conjunction_window(),
 
             )
 
@@ -3745,7 +3817,7 @@ class SearchService(SearchIndexMixin):
 
         # the window cannot serve is worse than a slightly smaller total.  The
 
-        # cap is the *window* (``CONJUNCTION_CANDIDATE_LIMIT``), not the engine's
+        # cap is the *window* (``conjunction_window``), not the engine's
 
         # ``maxTotalHits``: the engine ceiling was raised to cover the whole
 
@@ -3757,7 +3829,7 @@ class SearchService(SearchIndexMixin):
 
             engine_total if engine_total is not None else len(ranked),
 
-            max(len(ranked), self.CONJUNCTION_CANDIDATE_LIMIT),
+            max(len(ranked), self.conjunction_window()),
 
         )
 
@@ -3830,6 +3902,8 @@ class SearchService(SearchIndexMixin):
         *,
 
         match: str = "and",
+
+        aggregate: str = "chapter",
 
         scope: str = "all",
 
@@ -3982,6 +4056,19 @@ class SearchService(SearchIndexMixin):
             allow_r18, allow_all_ages, tag, source_id, kind, owner_clause,
 
         )
+
+        if (
+            aggregate == "book"
+            and match == "and"
+            and effective_scope == "chapters"
+            and len(active) >= 2
+            and all(cond["field"] == "content" for cond in active)
+        ):
+            book_result = self._content_book_and(
+                active, filters=filters, offset=offset, limit=limit,
+            )
+            if book_result is not None:
+                return book_result
 
         # Several conditions on one chapter field (the 正文 「铃」 AND 正文 「仙」
 

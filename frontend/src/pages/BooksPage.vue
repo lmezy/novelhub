@@ -122,6 +122,8 @@ const searchTab = ref<SearchTab>("local")
 const advancedOpen = ref(false)
 const advancedActive = ref(false)
 const match = ref<"and" | "or">("and")
+// Book-level 正文 AND: each condition may hit a different chapter of the same book.
+const aggregate = ref<"chapter" | "book">("chapter")
 const conditions = ref<Condition[]>([
   { enabled: true, field: "title", mode: "exact", value: "" },
 ])
@@ -199,15 +201,19 @@ function writeCachedPage(key: string, page: CachedPage) {
 // watcher restores from it on every query change: writing only the offset-keyed
 // page made the watched route change reload the page being left behind, so
 // "上一页" moved the page number while the list stayed on the current page.
-function advancedCacheKey(conds: ActiveCondition[], matchMode: "and" | "or", offset: number) {
-  return `adv|${bookKind.value}|${matchMode}|${JSON.stringify(conds)}|${offset}`
+function advancedCacheKey(conds: ActiveCondition[], matchMode: "and" | "or", offset: number,
+                          aggregateMode: "chapter" | "book" = "chapter") {
+  return `adv|${bookKind.value}|${matchMode}|${aggregateMode}|${JSON.stringify(conds)}|${offset}`
 }
 
-function rememberAdvancedPage(conds: ActiveCondition[], matchMode: "and" | "or", hits: SearchHit[], total: number, offset: number) {
-  writeCachedPage(advancedCacheKey(conds, matchMode, offset), { hits, total })
+function rememberAdvancedPage(conds: ActiveCondition[], matchMode: "and" | "or", hits: SearchHit[],
+                              total: number, offset: number,
+                              aggregateMode: "chapter" | "book" = "chapter") {
+  writeCachedPage(advancedCacheKey(conds, matchMode, offset, aggregateMode), { hits, total })
   writeSessionCache(ADVANCED_CACHE_KEY, {
     conditions: conditions.value,
     match: matchMode,
+    aggregate: aggregateMode,
     kind: bookKind.value,
     results: hits,
     total,
@@ -375,16 +381,17 @@ async function loadCurrentView() {
   try {
     if (isSearching.value) await loadSearch()
     else if (isAdvancedRoute.value) {
-      const cached = readSessionCache<{ conditions: Condition[]; match: "and" | "or"; kind?: string; results: SearchHit[]; total: number; offset: number }>(ADVANCED_CACHE_KEY)
+      const cached = readSessionCache<{ conditions: Condition[]; match: "and" | "or"; aggregate?: "chapter" | "book"; kind?: string; results: SearchHit[]; total: number; offset: number }>(ADVANCED_CACHE_KEY)
       // A cache filled on /novels must not leak into /comics.
       if (cached && (cached.kind || "") === bookKind.value) {
         conditions.value = cached.conditions
         match.value = cached.match
+        aggregate.value = cached.aggregate === "book" ? "book" : "chapter"
         advancedActive.value = true
         // The snapshot only remembers the last page visited; prefer the page
         // cached for the offset in the URL, so an offset change (上一页 / 下一页)
         // does not repaint the previous page.
-        const page = readCachedPage(advancedCacheKey(activeConditions(), cached.match, currentOffset.value))
+        const page = readCachedPage(advancedCacheKey(activeConditions(), cached.match, currentOffset.value, aggregate.value))
         advancedResults.value = page ? page.hits : cached.results
         advancedTotal.value = page ? page.total : cached.total
       } else {
@@ -500,10 +507,11 @@ function changePage(offset: number) {
 
 function changeAdvancedPage(offset: number) {
   const nextOffset = Math.max(0, offset)
-  const cached = readSessionCache<{ conditions: Condition[]; match: "and" | "or" }>(ADVANCED_CACHE_KEY)
+  const cached = readSessionCache<{ conditions: Condition[]; match: "and" | "or"; aggregate?: "chapter" | "book" }>(ADVANCED_CACHE_KEY)
   if (cached) {
     conditions.value = cached.conditions
     match.value = cached.match
+    aggregate.value = cached.aggregate === "book" ? "book" : "chapter"
   }
   void runAdvancedSearch(nextOffset)
 }
@@ -544,7 +552,7 @@ async function runAdvancedSearch(offset = 0) {
     advancedError.value = i18n.t("search_condition_placeholder")
     return
   }
-  const cacheKey = advancedCacheKey(conds, match.value, offset)
+  const cacheKey = advancedCacheKey(conds, match.value, offset, aggregate.value)
   const cachedPage = readCachedPage(cacheKey)
   if (cachedPage) {
     advancedResults.value = cachedPage.hits
@@ -553,7 +561,7 @@ async function runAdvancedSearch(offset = 0) {
     // Refresh the session snapshot as well.  The route watcher below re-reads it
     // on every query change, so leaving the *previous* page in it put that page
     // straight back on screen ("上一页" changed the number but not the list).
-    rememberAdvancedPage(conds, match.value, cachedPage.hits, cachedPage.total, offset)
+    rememberAdvancedPage(conds, match.value, cachedPage.hits, cachedPage.total, offset, aggregate.value)
     await router.replace({ path: listPath.value, query: { advanced: "1", offset: String(offset) } })
     return
   }
@@ -563,6 +571,7 @@ async function runAdvancedSearch(offset = 0) {
     const res = await api.post<{ hits: SearchHit[]; total: number }>("/search/advanced", {
       conditions: conds,
       match: match.value,
+      aggregate: aggregate.value,
       scope: "all",
       ...(bookKind.value ? { kind: bookKind.value } : {}),
       offset,
@@ -571,7 +580,7 @@ async function runAdvancedSearch(offset = 0) {
     advancedResults.value = res.hits
     advancedTotal.value = res.total
     advancedActive.value = true
-    rememberAdvancedPage(conds, match.value, res.hits, res.total, offset)
+    rememberAdvancedPage(conds, match.value, res.hits, res.total, offset, aggregate.value)
     await router.replace({ path: listPath.value, query: { advanced: "1", offset: String(offset) } })
   } catch (e) {
     advancedError.value = e instanceof Error ? e.message : i18n.t("search_failed")
@@ -848,6 +857,15 @@ onBeforeUnmount(() => {
             >{{ i18n.t('search_match_or') }}</button>
           </div>
           <span class="text-muted dark:text-gray-400 text-xs">{{ i18n.t('search_mode_label') }}</span>
+          <label
+            v-if="match === 'and'"
+            class="flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-2 text-xs transition-colors"
+            :class="aggregate === 'book' ? 'border-accent text-accent' : 'border-border text-muted dark:border-gray-700'"
+            :title="i18n.t('search_aggregate_hint')"
+          >
+            <input v-model="aggregate" type="checkbox" true-value="book" false-value="chapter" class="rounded" />
+            <span>{{ i18n.t('search_aggregate_book') }}</span>
+          </label>
         </div>
 
         <div class="space-y-3">
