@@ -1792,14 +1792,14 @@ def test_same_field_and_page_rechecks_the_real_text():
     gate -- the engine already required the contiguous phrase.)
     """
     service, _, chapters_index = _service_with_indexes()
-    chapters_index.search.side_effect = [
-        {"hits": [{"id": "c1"}, {"id": "c2"}], "estimatedTotalHits": 2},
-        {"hits": []},
-        {"hits": [
-            {"id": "c1", "content": "小镇上的铃铛，仙人来了"},
-            {"id": "c2", "content": "铛的一声，仙子来了"},
-        ]},
-    ]
+    chapters_index.search.side_effect = _route_chapters(
+        [{"id": "c1"}, {"id": "c2"}],
+        {
+            "c1": "小镇上的铃铛，仙人来了",
+            "c2": "铛的一声，仙子来了",
+        },
+        2,
+    )
 
     result = service.advanced_search(
         [
@@ -1817,11 +1817,17 @@ def test_same_field_and_page_rechecks_the_real_text():
 def test_same_field_and_keeps_engine_hits_when_the_text_is_unavailable():
     """Verification needs the stored field; a failed fetch must not empty a page."""
     service, _, chapters_index = _service_with_indexes()
-    chapters_index.search.side_effect = [
-        {"hits": [{"id": "c1"}], "estimatedTotalHits": 1},
-        {"hits": []},
-        {"hits": []},
-    ]
+
+    def _search(query, options):
+        if options.get("matchingStrategy"):
+            return {"hits": [{"id": "c1"}], "estimatedTotalHits": 1}
+        if "content" in (options.get("attributesToRetrieve") or []):
+            return {"hits": []}  # the stored body cannot be read back
+        return {"hits": [
+            {"id": "c1", "title": "第1章", "book_title": "铃仙传"},
+        ]}
+
+    chapters_index.search.side_effect = _search
 
     result = service.advanced_search(
         _conjunction_condition(), match="and", scope="chapters",
@@ -2821,6 +2827,126 @@ def test_advanced_search_book_aggregate_uses_the_book_path():
 
     assert result["total"] == 1
     assert [hit["id"] for hit in result["hits"]] == ["c3"]
+
+
+def _book_and_route(docs):
+    """Answer the book-level scan and the page hydration the way the engine does.
+
+    ``docs`` maps chapter id -> (book_id, title, book_title, body).  The scan
+    (``attributesToSearchOn``) lists every chapter carrying the phrase; the
+    hydration (``attributesToCrop``) is filtered by ``id IN [...]`` and answers
+    with the documents matching the **most** query terms -- ``matchingStrategy``
+    defaults to ``last`` -- so a chapter holding fewer of them is absent.
+    """
+    def _search(query, options):
+        if options.get("attributesToSearchOn") == ["content"]:
+            term = (query or "").strip('"')
+            hits = [
+                {"id": doc_id, "book_id": docs[doc_id][0]}
+                for doc_id in sorted(docs)
+                if term in docs[doc_id][3]
+            ]
+            return {"hits": hits, "estimatedTotalHits": len(hits)}
+        asked = [
+            doc_id for doc_id in sorted(docs)
+            if f'"{doc_id}"' in str(options.get("filter"))
+        ]
+        terms = [token.strip('"') for token in (query or "").split()]
+        matched = {
+            doc_id: sum(1 for term in terms if term in docs[doc_id][3])
+            for doc_id in asked
+        }
+        best = max(matched.values(), default=0)
+        return {"hits": [
+            {
+                "id": doc_id,
+                "book_id": docs[doc_id][0],
+                "title": docs[doc_id][1],
+                "book_title": docs[doc_id][2],
+                "_formatted": {"content": docs[doc_id][3]},
+            }
+            for doc_id in asked
+            if not terms or (best and matched[doc_id] == best)
+        ]}
+
+    return _search
+
+
+def _spread_across_chapters():
+    """Two books qualify through different chapters, one book in one chapter."""
+    return {
+        "c1": ("b1", "第1章 雨夜", "雨夜谭", "她戴上了乳环。"),
+        "c2": ("b1", "第2章 门口", "雨夜谭", "师妹站在门口。"),
+        "c3": ("b2", "第3章 灯下", "灯下集", "师妹的乳环在灯下泛光。"),
+        "c4": ("b3", "第4章 别处", "别处志", "他只看见了乳环。"),
+    }
+
+
+def test_book_level_and_centres_the_excerpt_on_the_rarest_condition():
+    """The representative chapter is picked for carrying the rarest term.
+
+    Hydrating it with the whole conjunction dropped it instead: a filtered
+    hydration answers with the documents matching the most query terms, and a
+    chapter carrying just the rarest one was not among them.  The book then
+    serialized as a bare id -- an empty card with no title and no body.
+    """
+    service, _, chapters_index = _service_with_indexes()
+    chapters_index.search.side_effect = _book_and_route(_spread_across_chapters())
+
+    result = service._content_book_and(
+        [{"field": "content", "mode": "exact", "value": "乳环"},
+         {"field": "content", "mode": "exact", "value": "师妹"}],
+        filters=None, offset=0, limit=10,
+    )
+
+    hydration = [
+        call for call in chapters_index.search.call_args_list
+        if call.args[1].get("attributesToCrop")
+    ]
+    assert hydration[0].args[0] == '"师妹"', "excerpt must centre on the rarest term"
+    assert [hit["id"] for hit in result["hits"]] == ["c2", "c3"]
+    for hit in result["hits"]:
+        assert hit["title"] and hit["book_title"], hit
+        assert hit["snippet"], hit
+
+
+def test_advanced_search_book_aggregate_never_serves_a_blank_card():
+    service, _, chapters_index = _service_with_indexes()
+    chapters_index.search.side_effect = _book_and_route(_spread_across_chapters())
+
+    result = service.advanced_search(
+        [{"field": "content", "mode": "exact", "value": "乳环"},
+         {"field": "content", "mode": "exact", "value": "师妹"}],
+        match="and", aggregate="book", scope="all", limit=10,
+    )
+
+    assert result["total"] == 2
+    assert [hit["id"] for hit in result["hits"]] == ["c2", "c3"]
+    for hit in result["hits"]:
+        assert hit.get("title"), hit
+        assert hit.get("book_title"), hit
+        assert hit.get("snippet"), hit
+
+
+def test_hydration_retries_without_the_query_when_the_engine_drops_ids():
+    """A dropped id used to serialize as ``{"id": ...}``: no title, no body."""
+    service, _, chapters_index = _service_with_indexes()
+
+    def _search(query, options):
+        if query:
+            return {"hits": []}
+        return {"hits": [
+            {"id": "c1", "title": "第1章", "_formatted": {"content": "章节开头"}},
+        ]}
+
+    chapters_index.search.side_effect = _search
+
+    docs = service._hydrate_around(
+        SearchService.INDEX_CHAPTERS, ["c1"], "铃 仙", "content",
+    )
+
+    assert docs["c1"]["title"] == "第1章"
+    assert chapters_index.search.call_count == 2
 
 
 def test_book_aggregate_is_ignored_without_two_content_conditions():

@@ -2998,3 +2998,40 @@ Node（前端构建 + 执行书源 JS 规则的运行时）、nginx、PostgreSQL
 
 **顺带**：索引重建已于 2026-10-25 03:03 完成（716 373/716 373 章，books 46 412），
 meili `chapters` 716 373 条、`isIndexing=false`、队列 0、库 **102.2 GB**。
+
+## 73. 「按书聚合」的正文 AND 卡片整条空白：代表章节被自己的查询丢掉（2026-11-07）
+
+用户报：三条件正文搜索（母狗 / 乳环 / 师妹）出来一堆**只有类型徽标、没有标题也没有正文**的卡片。
+本地复现（Meilisearch 1.12.0 + 真实 `SearchService`，不连库）：`aggregate=book` 时三本书各把一个词放在
+不同章节，`total=4`，其中三条输出
+`{"type":"chapter","id":"x1c1","book_id":"","title":"","book_title":"","author":"","content":"","snippet":""}`。
+
+**根因**在 §72 新增的 `_content_book_and`：它按**最稀有的条件**给每本书挑一个代表章节，却拿**完整的三词
+conjunction query** 去 `_hydrate_around` 取片段。`_hydrate_around` 只带 `filter: id IN [...]`、不带
+`matchingStrategy`，引擎默认 `last` —— 只回答命中词最多的那批文档。代表章节通常只含那一个词，于是
+**被整条丢掉**；`docs.get(doc_id)` 落空，`hit = {"id": doc_id}`，book_id / title / book_title / author /
+content / snippet 全空，前端 `v-if="hit.snippet"`（BooksPage.vue:1093）不渲染正文，卡片只剩类型徽标。
+
+**顺带排除的旧猜测**：`_hydrate_around` 的 `attributesToRetrieve` 不含 `content` **不影响**
+`_formatted.content`。Meilisearch 1.12 的 `compute_formatted_options` / `add_crop_to_formatted_options`
+（crates/meilisearch/src/search/mod.rs）只要求字段在 `displayedAttributes` 里、裁剪在完整文档上做；
+实测 `_formatted.content` 正常返回（crop 285/302 字）。空白只能是「该 id 没被水合回来」或「该章本身没有正文」。
+
+**改动**（`backend/app/services/search.py`）：
+
+1. `_content_book_and` 改用 `self._conjunction_query([active[rarest]])` 只按**最稀有词**水合，并把该词作为
+   `values` 传给 `_serialize_scored_hit`，片段锚定在这个特征词上（代表章节本来就是为它挑的）；
+2. `_hydrate_around` 兜底：水合后 `missing = [id for id in ids if id not in docs]`，非空就记一条 debug
+   日志、再用**空 query** 的 `_hydrate` 补一次 —— 掉队的 id 至少拿到元数据和章节开头片段，不再序列化成裸 id。
+   （空 query 的调用走的是 `_hydrate`，`_hydrate_around` 的 query 只决定裁剪起点，补出来的片段是章节开头。）
+
+**验证**：本地真实引擎复现，修复后四条命中全部有 book_title / author，片段落在「母狗」上；新增 3 条回归用例
+`test_book_level_and_centres_the_excerpt_on_the_rarest_condition`、
+`test_advanced_search_book_aggregate_never_serves_a_blank_card`、
+`test_hydration_retries_without_the_query_when_the_engine_drops_ids`，
+在撤掉修复后分别**失败**（`assert hydration[0].args[0] == '"师妹"'` 拿到完整 conjunction；
+空卡片断言拿到 `{'type': 'chapter', 'id': 'c2', 'book_id': '', ...}`），改动后通过。
+`cd backend && pytest -q` → **1176 passed**。
+
+**未做**：没有给「索引里正文本来就是空」的章节加特殊标记 —— 那种卡片仍只显示标题，属于数据问题（重建索引时
+`storage.read_chapter` 读失败会写 `content=""`），与本次的查询逻辑无关。

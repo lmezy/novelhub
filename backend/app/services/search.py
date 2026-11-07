@@ -2556,7 +2556,35 @@ class SearchService(SearchIndexMixin):
 
             return {}
 
-        return {str(hit.get("id")): hit for hit in result.get("hits", []) or []}
+        docs = {str(hit.get("id")): hit for hit in result.get("hits", []) or []}
+
+        # The query only decides where the crop starts.  A document holding
+
+        # fewer query terms than the rest of the filtered page is dropped by
+
+        # ``matchingStrategy: "last"``, and a dropped id then serialized as
+
+        # ``{"id": ...}`` -- a result card with no title and no body.  Ask
+
+        # again without a query so every requested id keeps its metadata and
+
+        # a head crop (the body still shows, just not anchored at the hit).
+
+        missing = [doc_id for doc_id in ids if str(doc_id) not in docs]
+
+        if missing:
+
+            logger.debug(
+
+                "Hydration dropped {} of {} ids; retrying without a query",
+
+                len(missing), len(ids),
+
+            )
+
+            docs.update(self._hydrate(index_name, missing))
+
+        return docs
 
 
 
@@ -3531,13 +3559,25 @@ class SearchService(SearchIndexMixin):
         )
         page_books = ranked[offset:offset + limit]
         ids = [book_maps[rarest][book_id] for book_id in page_books]
-        query = self._conjunction_query(active)
-        docs = self._hydrate_around(self.INDEX_CHAPTERS, ids, query, "content")
+        # A representative chapter was picked because it carries the
+        # **rarest** condition, so that is the term its excerpt must be
+        # centred on.  Asking for the whole conjunction here dropped every
+        # chapter that carried only that one term: a filtered hydration
+        # answers with the documents holding the most query terms
+        # (``matchingStrategy`` defaults to ``last``), so those books came
+        # back as a bare id -- an empty card with no body at all.
+        rarest_term = str(active[rarest]["value"])
+        docs = self._hydrate_around(
+            self.INDEX_CHAPTERS, ids, self._conjunction_query([active[rarest]]),
+            "content",
+        )
         hits = []
         for doc_id in ids:
             hit = docs.get(doc_id) or {"id": doc_id}
             hits.append(
-                self._serialize_scored_hit(hit, len(active), ["content"], "chapters")
+                self._serialize_scored_hit(
+                    hit, len(active), ["content"], "chapters", [rarest_term],
+                )
             )
         return {"hits": hits, "total": len(common), "offset": offset, "limit": limit}
 
