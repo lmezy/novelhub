@@ -354,8 +354,14 @@ async def library_search(payload: LibrarySearchRequest,
     if not best:
         return {"items": [], "query": query}
 
+    # ``Book.tags`` is a joined-eager collection, so the Result has to be
+    # de-duplicated before it is consumed -- without ``unique()`` SQLAlchemy
+    # raises InvalidRequestError and this endpoint 500s for every query that
+    # has at least one hit.
     books = list(
-        (await db.scalars(select(Book).where(Book.id.in_(list(best))))).all()
+        (await db.scalars(select(Book).where(Book.id.in_(list(best)))))
+        .unique()
+        .all()
     )
     by_id = {book.id: book for book in books}
     items = []

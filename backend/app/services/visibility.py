@@ -43,6 +43,12 @@ def can_view_all_ages(user: User) -> bool:
 def ensure_book_visible(user: User, book: Book | None) -> bool:
     if book is None:
         return False
+    if getattr(book, "hidden", False):
+        # Same rule as ``apply_book_visibility``: quarantined rows stay
+        # invisible to everyone, admins included.  Without this the object-level
+        # helper disagreed with the query-level one and quarantined books leaked
+        # out of every endpoint that loads a book by id (discovery included).
+        return False
     if (
         book.owner_id
         and not book.is_public

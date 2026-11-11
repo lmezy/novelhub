@@ -75,6 +75,20 @@ def test_batch_refuses_more_than_the_hard_cap():
         rag_jobs.start_batch([f"b{i}" for i in range(rag_jobs.MAX_BATCH_BOOKS + 1)])
 
 
+def test_batch_ceiling_allows_a_thousand_books():
+    """「本次最多几本」 has to be big enough to be worth a run on a large library.
+
+    The ceiling went 200 -> 1000 after the admin panel needed dozens of rounds
+    for a 24k-book library; this test pins the decision so a future cleanup does
+    not quietly shrink it back.
+    """
+    assert rag_jobs.MAX_BATCH_BOOKS >= 1000
+
+    rag_jobs.start_batch([f"b{i}" for i in range(1000)], max_chunks=100)
+
+    assert len(rag_jobs.read_state()["queue"]) == 1000
+
+
 def test_batch_caps_chunks_per_book():
     rag_jobs.start_batch(["b1"], max_chunks=10_000)
 

@@ -40,8 +40,10 @@ LOCK_FILE = ".rag-jobs.lock"
 
 #: Hard ceilings.  The embedding API bills per token and every chunk becomes a
 #: JSONB row (a 1 024-dim vector as JSON is ~20 KB), so these are limits rather
-#: than defaults: a whole-library run is not a supported operation.
-MAX_BATCH_BOOKS = 200
+#: than defaults: a whole-library run is not a supported operation.  One run may
+#: still queue a thousand books (24k+ book libraries otherwise need dozens of
+#: manual rounds); the run stays one book at a time and can be stopped.
+MAX_BATCH_BOOKS = 1000
 MAX_CHUNKS_PER_BOOK = 2000
 DEFAULT_BATCH_CHUNKS = 400
 DEFAULT_AUTO_CHUNKS = 300

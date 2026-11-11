@@ -3035,3 +3035,64 @@ content / snippet 全空，前端 `v-if="hit.snippet"`（BooksPage.vue:1093）�
 
 **未做**：没有给「索引里正文本来就是空」的章节加特殊标记 —— 那种卡片仍只显示标题，属于数据问题（重建索引时
 `storage.read_chapter` 读失败会写 `content=""`），与本次的查询逻辑无关。
+
+## 74. 「找相似」必 500（joined-eager 缺 `unique()`）+ 批量建索引上限 200→1000 + 隔离书兜底（2026-11-11）
+
+用户报两件事：1）用「找相似」就报错；2）批量建索引的数量要能多些。
+
+### 74.1 找相似：只要**有命中**就 500
+
+前端拿到的原文是
+`InvalidRequestError: The unique() method must be invoked on this Result, as it contains results that include joined eager loads against collections`
+（`backend/app/api/routes/rag.py` 的 `library_search` 原样冒泡）。
+
+根因：`backend/app/models/book.py` 里 `tags = relationship("BookTag", lazy="joined")` 是「联接式预加载的**集合**」，
+SQLAlchemy 2.0 消费这种 Result 必须先 `.unique()`：
+`backend/app/api/routes/rag.py:357` 的 `(await db.scalars(select(Book).where(Book.id.in_(...)))).all()` 少了它。
+只有命中非空时才会执行这段（`:354` 的 `if not best: return {"items": []}` 会提前返回），所以**画像没建时一切正常，
+建完画像才必炸** —— 现象像是「功能一上线就坏」。
+
+同类第二处在 `backend/app/services/rag.py:397`（`RAGService.list_indexed_books`，管理端「已建索引的书」列表），
+同样 `select(Book)` + 直接迭代。仓库里其它 12 处消费 `select(Book)` 的地方都调了 `.unique()`，只漏了这两处。
+
+**改动**：
+- `backend/app/api/routes/rag.py:357` 补 `.unique().all()`（这里要的是 ORM 实体，`ensure_book_visible` 需要整本书）；
+- `backend/app/services/rag.py:396` 改成 `select(Book.id, Book.title)` 取列：只要标题，顺势绕开联接式预加载，也不会再被
+  别人加回 `lazy="joined"` 时重新踩到。
+
+**顺带修的漏光**：`ensure_book_visible`（`backend/app/services/visibility.py:43`）只查 owner/R18，**不查 `hidden`**，
+而它的「孪生」查询级函数 `apply_book_visibility`（同文件 :72）明确写着「隔离行对所有人不可见，管理员也一样」。
+结果 `hidden=True` 的书能从按 id 加载的所有端点（正文、书签、进度、AI、本次的找相似）读出来 —— 而
+`docs/ai-assistant.md:144` 已经对外承诺「已隔离的书」会被过滤。补 `getattr(book, "hidden", False)`（沿用邻居
+`can_view_r18` 的 getattr 写法，`SimpleNamespace` 桩对象不带该字段时不炸）。
+
+### 74.2 批量建索引：每次最多 200 → 1000 本
+
+`MAX_BATCH_BOOKS`（`backend/app/services/rag_jobs.py:44`）从 200 提到 **1000**，每本片段上限仍是 2000。
+运行方式不变（仍是逐本、可取消、失败连续 3 次即停），只是允许一次排队更多书。同步的口子：
+- `frontend/src/stores/adminAI.ts:419` 的 `Math.min(200, ...)` → 1000；
+- `frontend/src/components/admin/AiPanel.vue:490` 的 `max="200"` → 1000；
+- `frontend/src/stores/i18n.ts:187` / `:1134` 的中英文标签「（≤200）」→「（≤1000）」；
+- `docs/ai-assistant.md:79`、`:93`。
+
+默认值仍保持 20 本/次（不把「悄悄花掉几十万次向量请求」变成默认行为），要跑大的就手填 1000。
+
+### 74.3 验证
+
+新增 `backend/tests/test_rag_library_search.py`（3 条，走**真 ORM 会话**而不是 mock —— 这个缺陷就在「Result 怎么被消费」上，
+mock 出来的会话对任何写法都点头）：
+- `test_library_search_returns_hits_for_books_with_tag_collections`：一本带两个标签的书 + 两段命中，断言 200 且合成一张卡；
+- `test_library_search_drops_hidden_hits`：隔离书不出现在结果里；
+- `test_list_indexed_books_titles_come_from_a_column_query`：管理端列表拿得到标题、chunks、chapters。
+
+SQLite 编译不了 `JSONB`（`users`/`sources`/`chapter_embeddings` 等 6 张表带它），测试里用 fixture 把这些列临时换成通用
+`JSON`、跑完还原，不污染其它用例。
+
+另外在 `backend/tests/test_rag_jobs.py` 加 `test_batch_ceiling_allows_a_thousand_books`（断言上限 ≥1000 且 1000 本能排进队列），
+把「上限是多少」这个产品决定钉住。
+
+撤掉三处修复后三条用例分别失败（找相似两条返回 `{"detail":"Internal server error"}`，管理端列表抛
+`InvalidRequestError`），改动后通过。`cd backend && pytest -q` → **1180 passed**；`cd frontend && npx vue-tsc --noEmit` 无报错。
+
+**未做**：没动 `frontend/src/pages/DiscoverPage.vue` 的错误展示 —— 它把后端 detail 原样显示，之前看到的那句英文就是
+SQLAlchemy 的原文；根因修掉后不再出现，真要改也是「把 5xx 换成友好中文」，与本次缺陷无关。

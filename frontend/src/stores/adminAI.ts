@@ -416,7 +416,7 @@ export const useAdminAIStore = defineStore("adminAI", () => {
     try {
       // The server enforces the same ceilings; clamping here keeps the box from
       // showing a value that was silently reduced.
-      const limit = Math.max(1, Math.min(200, Number(ragBatchLimit.value) || 20))
+      const limit = Math.max(1, Math.min(1000, Number(ragBatchLimit.value) || 20))
       const maxChunks = Math.max(1, Math.min(2000, Number(ragBatchChunks.value) || 400))
       ragBatchLimit.value = limit
       ragBatchChunks.value = maxChunks

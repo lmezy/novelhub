@@ -487,7 +487,7 @@ onUnmounted(() => {
       <div class="grid grid-cols-2 gap-2 max-w-sm mb-3">
         <label class="text-[11px] text-muted">
           {{ i18n.t('admin_ai_rag_batch_limit') }}
-          <input v-model.number="aiStore.ragBatchLimit" type="number" min="1" max="200" :disabled="jobRunning" class="mt-1 w-full px-2 py-1 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 disabled:opacity-60" />
+          <input v-model.number="aiStore.ragBatchLimit" type="number" min="1" max="1000" :disabled="jobRunning" class="mt-1 w-full px-2 py-1 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 disabled:opacity-60" />
         </label>
         <label class="text-[11px] text-muted">
           {{ i18n.t('admin_ai_rag_batch_chunks') }}

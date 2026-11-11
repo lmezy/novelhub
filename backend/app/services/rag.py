@@ -394,11 +394,16 @@ class RAGService:
             return []
 
         titles: dict[str, str] = {}
-        books = await self.db.scalars(
-            select(Book).where(Book.id.in_([e["book_id"] for e in entries]))
+        # Only the title is needed here, so fetch columns instead of ORM
+        # entities: that skips the joined-eager ``Book.tags`` load entirely
+        # (which would otherwise demand ``Result.unique()``).
+        rows = await self.db.execute(
+            select(Book.id, Book.title).where(
+                Book.id.in_([e["book_id"] for e in entries])
+            )
         )
-        for book in books:
-            titles[book.id] = book.title
+        for book_id, title in rows:
+            titles[book_id] = title
         for entry in entries:
             entry["title"] = titles.get(entry["book_id"], "")
         return entries
