@@ -1,9 +1,10 @@
 ﻿from datetime import datetime
-from pydantic import BaseModel
+from typing import Annotated
+from pydantic import BaseModel, StringConstraints
 
 
 class CategoryCreate(BaseModel):
-    name: str
+    name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
     description: str | None = None
     color: str | None = None
     is_r18: bool = False

@@ -1074,6 +1074,66 @@ class SearchIndexMixin:
             return False
         return bool(result.get("hits"))
 
+    @staticmethod
+    def _update_indexed_categories(index, docs: list[dict]) -> None:
+        # PUT also inserts missing IDs, which would expose incomplete documents.
+        ids = [doc["id"] for doc in docs]
+        existing = index.get_documents({
+            "filter": f"id IN {json.dumps(ids)}",
+            "fields": ["id"],
+            "limit": len(ids),
+        })
+        existing_ids = {doc.id for doc in existing.results}
+        updates = [doc for doc in docs if doc["id"] in existing_ids]
+        if updates:
+            index.update_documents(updates)
+
+    async def sync_book_categories(self, db, book_ids: list[str]) -> None:
+        """Refresh category names on affected books and chapters."""
+        from sqlalchemy import or_, select
+
+        from app.models import Book, BookCategory, Category, Chapter
+
+        await asyncio.to_thread(self.ensure_indexes)
+        books_index = self.client.index(self.INDEX_BOOKS)
+        chapters_index = self.client.index(self.INDEX_CHAPTERS)
+        batch_size = self.KIND_BACKFILL_BATCH
+        for start in range(0, len(book_ids), batch_size):
+            batch = book_ids[start : start + batch_size]
+            visible_ids = list(await db.scalars(
+                select(Book.id).where(Book.id.in_(batch), Book.hidden.is_(False))
+            ))
+            names_by_book: dict[str, list[str]] = {book_id: [] for book_id in visible_ids}
+            if not names_by_book:
+                continue
+            rows = await db.execute(
+                select(BookCategory.book_id, Category.name)
+                .join(Category, Category.id == BookCategory.category_id)
+                .join(Book, Book.id == BookCategory.book_id)
+                .where(BookCategory.book_id.in_(visible_ids), or_(Book.is_r18.is_(True), Category.is_r18.is_(False)))
+                .order_by(Category.name)
+            )
+            for book_id, name in rows:
+                names_by_book[book_id].append(name)
+            await asyncio.to_thread(self._update_indexed_categories, books_index, [
+                {"id": book_id, "category_names": names} for book_id, names in names_by_book.items()
+            ])
+            last_id = ""
+            while True:
+                rows = (await db.execute(
+                    select(Chapter.id, Chapter.book_id)
+                    .where(Chapter.book_id.in_(visible_ids), Chapter.id > last_id)
+                    .order_by(Chapter.id)
+                    .limit(batch_size)
+                )).all()
+                if not rows:
+                    break
+                await asyncio.to_thread(self._update_indexed_categories, chapters_index, [
+                    {"id": chapter_id, "category_names": names_by_book[book_id]}
+                    for chapter_id, book_id in rows
+                ])
+                last_id = rows[-1][0]
+
     async def sync_book_kinds(
         self,
         *,
@@ -1105,8 +1165,7 @@ class SearchIndexMixin:
         chapters index, so without it a search started on /novels or /comics
         would silently return nothing.
         """
-        self._ensure_index(self.INDEX_BOOKS)
-        self._ensure_index(self.INDEX_CHAPTERS)
+        await asyncio.to_thread(self.ensure_indexes)
         targets = None
         missing: dict[str, list[str]] = {}
         if book_ids is not None:
@@ -1213,19 +1272,19 @@ class SearchIndexMixin:
                 for batch in batches:
                     if need_books:
                         docs = await _book_docs(
-                            select(Book.id, Book.kind).where(Book.id.in_(batch))
+                            select(Book.id, Book.kind).where(Book.id.in_(batch), Book.hidden.is_(False))
                         )
                         if docs:
-                            books_index.update_documents(docs)
+                            await asyncio.to_thread(books_index.update_documents, docs)
                             result["books"] += len(docs)
                     if need_chapters:
                         docs = await _chapter_docs(
                             select(Chapter.id, Book.kind)
-                            .outerjoin(Book, Book.id == Chapter.book_id)
-                            .where(Chapter.book_id.in_(batch))
+                            .join(Book, Book.id == Chapter.book_id)
+                            .where(Chapter.book_id.in_(batch), Book.hidden.is_(False))
                         )
                         if docs:
-                            chapters_index.update_documents(docs)
+                            await asyncio.to_thread(chapters_index.update_documents, docs)
                             result["chapters"] += len(docs)
             else:
                 if need_books:

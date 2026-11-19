@@ -73,6 +73,7 @@ class BookOut(BaseModel):
     is_public: bool = False
     all_ages_confirmed: bool = False
     kind: str = "novel"
+    kind_override: str | None = None
     is_favorite: bool = False
     created_at: datetime | None = None
     updated_at: datetime | None = None

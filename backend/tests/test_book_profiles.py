@@ -78,6 +78,21 @@ def test_unreadable_chapters_yield_no_profile():
     assert book_profiles.segment_texts(book, chapters, read) == []
 
 
+def test_profiles_use_prose_when_the_initial_sample_contains_galleries():
+    chapters = fake_chapters(12)
+
+    def read(path):
+        if path == "p2":
+            return "十年后，故乡的邮差寄来一封迟到的信。" * 30
+        return '# 全话阅读\n\n<picture><source srcset="page.webp"><img src="page.jpg"></picture>\n第 1 页'
+
+    assert book_profiles.segment_texts(fake_book(kind="comic"), chapters, read) == []
+    assert book_profiles.segment_texts(fake_book(), chapters, lambda _: read("p1")) == []
+    texts = book_profiles.segment_texts(fake_book(), chapters, read)
+    assert any("故乡的邮差" in item for item in texts)
+    assert all("page.jpg" not in item and "第 1 页" not in item for item in texts)
+
+
 def test_vector_literal_round_trip():
     literal = book_profiles.vector_literal([0.5, -1.25, 3.0])
     assert literal == "[0.5000000,-1.2500000,3.0000000]"

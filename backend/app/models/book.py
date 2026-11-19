@@ -36,6 +36,8 @@ class Book(Base):
         server_default="novel",
         nullable=False,
     )
+    kind_override = Column(String(16), nullable=True)
+    categories_manually_set = Column(Boolean, nullable=False, default=False, server_default="0")
     cover = Column(String(255))
     display_cover = Column(String(255))
     description = Column(Text)

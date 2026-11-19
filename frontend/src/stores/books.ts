@@ -13,6 +13,7 @@ export interface Book {
   status: string | null
   is_r18?: boolean
   kind?: "novel" | "comic"
+  kind_override?: "novel" | "comic" | null
   is_favorite?: boolean
   owner_id?: string | null
   is_public?: boolean

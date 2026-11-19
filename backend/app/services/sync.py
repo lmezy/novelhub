@@ -46,11 +46,12 @@ from app.services.source_interval import apply_source_interval, source_sync_inte
 from app.services.book_kind import (
     KIND_COMIC,
     chapter_comic_vote,
-    is_ambiguous_chapter,
-    is_comic_content,
+    classify_stored_book,
+    is_comic_labels,
+    is_comic_source,
     normalize_kind,
+    refresh_search_kinds,
     resolve_kind,
-    should_promote_to_comic,
 )
 
 
@@ -656,9 +657,7 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
 
         author = await self._get_or_create_author(author_name)
         author_id = author.id
-        # ``_get_or_create_book`` also reports whether the row is new; nothing
-        # consumes that flag any more (it only fed the retired event bus).
-        book, _is_new = await self._get_or_create_book(
+        book, is_new = await self._get_or_create_book(
             source.id,
             author_id,
             remote_book,
@@ -703,16 +702,11 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             book.id,
             sorted([*source_tags, classification_tag]),
         )
-        # Novel or comic is a property of the source and the book's own labels
-        # (a book source that declares ``bookSourceType: 2`` is an image
-        # source); the chapter bodies below can still promote the book when a
-        # comic source wrongly declares itself as text.
-        book.kind = resolve_kind(
-            source=source,
-            labels=[*source_tags, *candidate_categories],
-            current=book.kind,
-        )
+        # Existing books retain their format until we can weigh stored chapters.
+        if is_new:
+            book.kind = resolve_kind(source=source, labels=source_tags)
         book_kind = normalize_kind(book.kind)
+        source_config = source.config
         # Persist the book before chapter downloads so a later chapter failure
         # cannot leave chapters pointing at an uncommitted book row.
         await self.db.commit()
@@ -941,15 +935,7 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         )
         pending_chapter_writes = 0
         pending_index_docs: list[dict] = []
-        # What the *database* holds, as opposed to ``book_kind`` which follows
-        # the chapter being indexed: a rolled-back batch must re-issue the comic
-        # classification instead of believing it was already written.
-        stored_kind = book_kind
-        # One vote per chapter written so far.  A single image-only chapter
-        # does not make the book a comic: novels routinely ship a cover or a
-        # placeholder as chapter 1, and a sync can only ever upgrade, so that
-        # mistake used to be permanent.
-        kind_votes: list[bool] = []
+        check_kind = book_kind == KIND_COMIC or is_comic_source(source_config) or is_comic_labels(source_tags)
         max_consecutive_transient = max(
             1,
             int(
@@ -1077,23 +1063,8 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                         book_row_verified = True
                     self.db.add(chapter)
                     pending_chapter_writes += 1
-                    # A chapter that is nothing but image markup is a gallery
-                    # page: the book is a comic even when its source claims to
-                    # be a text source -- but only once *several* chapters say
-                    # so, because a lone placeholder image is not a gallery.
-                    if stored_kind != KIND_COMIC:
-                        # ``None`` means "one lone image, could be either a
-                        # novel's placeholder or a one-page album": not a vote.
-                        vote = chapter_comic_vote(content)
-                        if vote is not None:
-                            kind_votes.append(vote)
-                    if stored_kind != KIND_COMIC and should_promote_to_comic(kind_votes):
-                        book_kind = KIND_COMIC
-                        await self.db.execute(
-                            update(Book)
-                            .where(Book.id == book_id)
-                            .values(kind=KIND_COMIC)
-                        )
+                    if not check_kind and chapter_comic_vote(content):
+                        check_kind = True
                     await self.db.flush()
                     pending_index_docs.append({
                         "id": chapter.id,
@@ -1115,7 +1086,6 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                     if pending_chapter_writes >= commit_batch:
                         await self._flush_chapter_writes(pending_index_docs)
                         pending_chapter_writes = 0
-                        stored_kind = book_kind
 
                     consecutive_transient = 0
                     created += 1
@@ -1179,6 +1149,10 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                 pending_chapter_writes = 0
             await asyncio.to_thread(search_service.flush_chapters)
 
+        final_kind = await self._resolve_synced_kind(book_id, source_config, source_tags, book_kind, check_kind)
+        if final_kind != book_kind:
+            await self.db.commit()
+            await refresh_search_kinds([book_id])
         if source_owner_id is None:
             await self._handle_global_r18_conflicts(book_id)
         logger.info(
@@ -1897,18 +1871,9 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         chapter.source_chapter_id = remote_chapter.source_chapter_id
         chapter.content_path = content_path
         chapter.hash = content_hash
-        # Re-syncing a single chapter: one chapter is all we can see, so only a
-        # page that is unmistakably a gallery promotes the book.  A cover or a
-        # placeholder image (one image, no words) is what novels use as their
-        # first chapter, and promoting on it used to lock the whole book as a
-        # comic for good.
-        if (
-            normalize_kind(book_kind_value) != KIND_COMIC
-            and is_comic_content(content)
-            and not is_ambiguous_chapter(content)
-        ):
-            book.kind = KIND_COMIC
-            book_kind_value = KIND_COMIC
+        current_kind = normalize_kind(book_kind_value)
+        check_kind = current_kind == KIND_COMIC or bool(chapter_comic_vote(content))
+        final_kind = await self._resolve_synced_kind(book_id, source.config, book_tags, current_kind, check_kind)
         await self.db.commit()
 
         await asyncio.to_thread(search_service.index_chapter, {
@@ -1926,8 +1891,10 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             "is_r18": book_is_r18,
             "owner_id": book.owner_id or None,
             "is_public": bool(book.is_public),
-            "kind": normalize_kind(book_kind_value),
+            "kind": final_kind,
         })
+        if final_kind != current_kind:
+            await refresh_search_kinds([book_id])
 
         return {
             "chapter_id": chapter.id,
@@ -1938,6 +1905,22 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             "content_path": content_path,
             "content_length": len(content),
         }
+
+    async def _resolve_synced_kind(self, book_id: str, source_config, labels, current: str, scan_content: bool) -> str:
+        if scan_content:
+            override = await self._book_column(book_id, Book.kind_override)
+            if override:
+                return normalize_kind(override)
+            kind = await classify_stored_book(
+                self.db, self.storage, book_id, source=source_config, labels=labels, current=current,
+            )
+            if kind != current:
+                await self.db.execute(
+                    update(Book)
+                    .where(Book.id == book_id, Book.kind_override.is_(None), Book.kind != kind)
+                    .values(kind=kind)
+                )
+        return normalize_kind(await self._book_column(book_id, Book.kind) or current)
 
     async def _book_plugin(self, book: Book) -> tuple[Source, object]:
         """Load a book's source and plugin instance for re-sync operations."""
@@ -2187,7 +2170,10 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                         "Stopping discovery for {} at page {} after syncing {} books: {}",
                         source_id, page, books_synced, message,
                     )
-                    return _result_so_far(done_state=True, next_page=page)
+                    return {
+                        **_result_so_far(done_state=True, next_page=page),
+                        "discovery_error": f"发现目录第 {page} 页中断：{message}",
+                    }
                 raise
             if not page_books:
                 done = True

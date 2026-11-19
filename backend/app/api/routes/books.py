@@ -1,5 +1,6 @@
 from uuid import uuid4
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse, Response
@@ -13,7 +14,7 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.models import Book, BookCategory, BookFavorite, BookFavoriteGroup, BookTag, Category, Chapter, Source, Tag, User
 from app.services.book_enrichment import analyze_book_text
-from app.services.book_kind import KINDS, normalize_kind
+from app.services.book_kind import KINDS, classify_stored_book, normalize_kind, refresh_search_kinds
 from app.services import reclassify_progress
 from app.services.auth import get_current_user, get_current_user_or_token, require_admin
 from app.services.book_cleanup import delete_books
@@ -69,6 +70,10 @@ class BatchDeleteByCategoryRequest(BaseModel):
 class SetBookCoverRequest(BaseModel):
     source_book_id: str | None = None
     cover: str | None = None
+
+
+class SetBookKindRequest(BaseModel):
+    kind: Literal["novel", "comic"] | None
 
 
 class PublishBookRequest(BaseModel):
@@ -133,6 +138,7 @@ def _serialize_book(
         is_public=book.is_public,
         all_ages_confirmed=book.all_ages_confirmed,
         kind=normalize_kind(getattr(book, "kind", None)),
+        kind_override=getattr(book, "kind_override", None),
         is_favorite=is_favorite,
         created_at=book.created_at,
         updated_at=book.updated_at,
@@ -908,6 +914,32 @@ async def get_book(book_id: str, user: User = Depends(get_current_user_or_token)
     custom_tags = await list_book_custom_tags_map(db, [book.id], user)
     shelf_groups = await favorite_group_ids_by_book(db, user.id, [book.id])
     return _serialize_book(book, user, book.is_favorite, custom_tags, shelf_groups)
+
+
+@router.patch("/{book_id}/kind", response_model=BookOut)
+async def set_book_kind(
+    book_id: str,
+    payload: SetBookKindRequest,
+    user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    book = await db.get(Book, book_id)
+    if not ensure_book_visible(user, book):
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    kind = payload.kind
+    if kind is None:
+        source = await db.get(Source, book.source_id) if book.source_id else None
+        kind = await classify_stored_book(
+            db, BookStorage(), book_id, source=source, labels=[*book.tag_names, *book.category_names],
+        )
+    await db.refresh(book, attribute_names=["kind", "kind_override"], with_for_update=True)
+    book.kind_override = payload.kind
+    book.kind = kind
+    await db.commit()
+    await db.refresh(book, attribute_names=["updated_at"])
+    await refresh_search_kinds([book_id])
+    return await get_book(book_id, user, db)
 
 
 @router.get("/{book_id}/sources", response_model=BookSourceAlternatesOut)

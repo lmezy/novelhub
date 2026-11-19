@@ -206,6 +206,7 @@ def test_majority_of_galleries_does_make_the_book_a_comic():
 def test_no_readable_chapter_leaves_the_verdict_unknown():
     # A comic that has not synced yet must not be re-labelled as a novel.
     assert content_verdict([]) is None
+    assert chapter_comic_vote("#第一章\n\n") is None
 
 
 def test_content_clears_a_wrong_comic_label():
@@ -306,6 +307,9 @@ class _FakeSession:
     async def execute(self, query):
         return _FakeResult(self._chapter_rows)
 
+    async def refresh(self, book, **kwargs):
+        pass
+
     async def commit(self):
         self.commits += 1
 
@@ -385,6 +389,22 @@ async def test_reclassify_books_can_skip_content_scan(monkeypatch):
     assert result["scanned"] == 0
     assert result["comics"] == 0
     assert result["novels"] == 1
+
+
+@pytest.mark.asyncio
+async def test_reclassification_keeps_a_manual_novel_override(monkeypatch):
+    book = SimpleNamespace(
+        id="b1", source_id="s1", kind=KIND_NOVEL, kind_override=KIND_NOVEL,
+        tag_names=["漫画"], category_names=["漫画"],
+    )
+    monkeypatch.setattr(BookStorage, "read_chapter", lambda self, path: pytest.fail("manual book was scanned"))
+    session = _FakeSession([_source({"bookSourceType": 2})], [[book]], [("b1", "gallery.md")])
+
+    result = await reclassify_books(session, force=True)
+
+    assert book.kind == KIND_NOVEL
+    assert result["updated"] == 0
+    assert result["scanned"] == 0
 
 
 @pytest.mark.asyncio

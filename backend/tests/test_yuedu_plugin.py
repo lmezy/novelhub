@@ -4076,10 +4076,42 @@ async def test_fetch_explore_reports_upstream_catalog_error():
 async def test_fetch_explore_reports_js_explore_url_without_kinds():
     plugin = YueduPlugin({
         "bookSourceUrl": "UAA小说xh",
-        "exploreUrl": "<js>\neval(String(Reload('https://qyyuapi.com/qt/js/UAA小说/exploreUrl.js')));\n</js>",
+        "exploreUrl": '<js>""</js>',
     })
     with pytest.raises(RuntimeError, match="Legado"):
         await plugin.fetch_explore(page=1)
+
+
+@pytest.mark.asyncio
+async def test_discovery_reuses_successful_js_catalog_and_stops_exhausted_categories():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "exploreUrl": "@js:getCatalog()",
+    })
+    catalog = [
+        {"title": "完结", "url": "/complete/{{page}}"},
+        {"title": "连载", "url": "/ongoing/{{page}}"},
+    ]
+
+    async def fetch(url, **kwargs):
+        if url.endswith("/complete/2"):
+            request = httpx.Request("GET", url)
+            response = httpx.Response(404, request=request)
+            raise httpx.HTTPStatusError("not found", request=request, response=response)
+        return [{"bookUrl": url}]
+
+    with (
+        patch.object(plugin.engine, "_try_eval_js", return_value=catalog) as evaluate,
+        patch.object(plugin, "_fetch_explore_url", side_effect=fetch) as fetch_url,
+    ):
+        assert len(await plugin.fetch_explore(page=1)) == 2
+        assert len(await plugin.fetch_explore(page=2)) == 1
+        assert len(await plugin.fetch_explore(page=3)) == 1
+
+    evaluate.assert_called_once()
+    assert all(
+        not call.args[0].endswith("/complete/3") for call in fetch_url.await_args_list
+    )
 
 
 def test_inside_navigation_detects_site_menu_blocks():
@@ -5059,6 +5091,41 @@ def test_icu_explore_js_builds_category_list_from_java_connect():
     assert [kind["title"] for kind in kinds] == ["风流", "阿宾", "秘密教学"]
     assert kinds[0]["url"] == "/so/novel/风流/{{page}}"
     assert kinds[2]["url"] == "/so/comic/秘密教学/{{page}}"
+
+
+@pytest.mark.asyncio
+async def test_icu_discovery_distinguishes_upstream_error_from_js_error():
+    from app.crawler.plugins.yuedu.js_runtime import JsEvaluationError, JsRuntime
+    from app.services.crawl_runner import _is_transient_task_error
+
+    runtime = JsRuntime.get_instance()
+    if not runtime.start_sync():
+        pytest.skip("Node.js runtime failed to start")
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://icu.example.com",
+        "exploreUrl": ICU_EXPLORE_JS,
+    })
+
+    try:
+        runtime.eval_js_sync(
+            "globalThis.__NH_SAVED_EXEC_FILE = require('child_process').execFileSync;"
+            "require('child_process').execFileSync = () => 'upstream error503';"
+        )
+        with pytest.raises(ConnectionError, match="HTTP 503") as exc:
+            await plugin.fetch_explore()
+        assert _is_transient_task_error(exc.value)
+
+        runtime.eval_js_sync(
+            "require('child_process').execFileSync = () => 'easy_slider_html200';"
+        )
+        with pytest.raises(JsEvaluationError, match="人机验证") as exc:
+            await plugin.fetch_explore()
+        assert not _is_transient_task_error(exc.value)
+    finally:
+        runtime.eval_js_sync(
+            "require('child_process').execFileSync = globalThis.__NH_SAVED_EXEC_FILE;"
+            "delete globalThis.__NH_SAVED_EXEC_FILE;"
+        )
 
 
 def test_host_only_book_url_pattern_does_not_filter_candidates():

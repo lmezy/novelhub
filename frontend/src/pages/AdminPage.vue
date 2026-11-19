@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, onMounted, onUnmounted, ref } from "vue"
+import { computed, defineAsyncComponent, onMounted, onUnmounted, ref, watch } from "vue"
 import { useRoute, useRouter } from "vue-router"
 import { api } from "../api/client"
 import { useI18nStore } from "../stores/i18n"
@@ -40,26 +40,50 @@ const usersStore = useAdminUsersStore()
 const approvalsStore = useAdminApprovalsStore()
 const aiStore = useAdminAIStore()
 
-const tab = ref<"sources" | "cookies" | "sync" | "logs" | "tokens" | "index" | "status" | "yuedu" | "add" | "creds" | "users" | "approvals" | "proxy" | "ai" | "prefs">("yuedu")
+const settingsGroups = [
+  { id: "personal", panels: [{ id: "prefs" }, { id: "tokens" }] },
+  { id: "sources", panels: [{ id: "sources" }, { id: "yuedu" }, { id: "add", admin: true }] },
+  { id: "sync", panels: [{ id: "sync" }, { id: "logs" }] },
+  { id: "search", panels: [{ id: "index", admin: true }, { id: "ai", admin: true }] },
+  { id: "access", panels: [{ id: "users", admin: true }, { id: "approvals", admin: true }] },
+  { id: "system", panels: [{ id: "status", admin: true }, { id: "proxy", admin: true }] },
+] as const
 
-const availableTabs = computed(() => {
-  const common = ["yuedu", "sources", "sync", "logs", "tokens", "prefs"] as const
-  if (!auth.isAdmin) return common
-  return [
-    ...common,
-    "add",
-    "users",
-    "approvals",
-    "index",
-    "status",
-    "proxy",
-    "ai",
-  ] as const
+type SettingsGroup = typeof settingsGroups[number]["id"]
+type SettingsPanel = typeof settingsGroups[number]["panels"][number]["id"]
+
+const visibleGroups = computed(() => settingsGroups.flatMap((group) => {
+  const panels: readonly { id: SettingsPanel; admin?: boolean }[] = group.panels
+  const visible = panels.filter((panel) => !panel.admin || auth.isAdmin)
+  return visible.length ? [{ id: group.id, panels: visible }] : []
+}))
+
+const tab = computed<SettingsPanel>(() => {
+  const fromUrl = route.query.tab ?? route.hash.slice(1)
+  const requested = fromUrl === "cookies" || fromUrl === "creds" ? "sources" : fromUrl
+  return visibleGroups.value.flatMap((group) => group.panels)
+    .find((panel) => panel.id === requested)?.id ?? "prefs"
 })
 
+const selectedGroup = computed(() => visibleGroups.value.find((group) =>
+  group.panels.some((panel) => panel.id === tab.value),
+))
+const previousPanel: Partial<Record<SettingsGroup, SettingsPanel>> = {}
+watch(tab, (panel) => {
+  const group = selectedGroup.value
+  if (group) previousPanel[group.id] = panel
+}, { immediate: true })
+
+function panelLocation(panel: SettingsPanel) {
+  return { name: "settings", query: { ...route.query, tab: panel } }
+}
+
+function openGroup(group: typeof visibleGroups.value[number]) {
+  const previous = group.panels.find((panel) => panel.id === previousPanel[group.id])
+  void router.push(panelLocation((previous ?? group.panels[0]).id))
+}
+
 const prefs = ref({
-  font: "sans",
-  font_size: 16,
   language: "zh",
   theme: "light",
   show_covers: true,
@@ -262,8 +286,8 @@ async function yueduImport() {
       yueduResult.value.status !== "pending_approval" &&
       yueduResult.value.sources?.length
     ) {
-      tab.value = "sources"
       sourcesStore.expandedSourceId = yueduResult.value.sources[0].id
+      await router.push(panelLocation("sources"))
       window.scrollTo({ top: 0, behavior: "smooth" })
     }
   } catch (e) {
@@ -679,37 +703,55 @@ async function loadLogs() {
   }
 }
 
-onMounted(async () => {
-  // Deep link: the reader's "open AI settings" button navigates to
-  // /admin?tab=ai so the user lands on the right panel.
-  const requested = route.query.tab
-  if (typeof requested === "string" && (availableTabs.value as readonly string[]).includes(requested)) {
-    tab.value = requested as typeof tab.value
-  }
-  await sourcesStore.loadSources()
-  await loadPrefs()
+onMounted(() => {
+  void loadPrefs()
   accountForm.value.nickname = auth.user?.nickname || ""
-  await credsStore.loadCreds()
-  await cookiesStore.loadCookies()
-  if (auth.isAdmin) {
-    await loadStatus()
-    await loadIndexStats()
-    await loadIndexProgress(true)
-    await loadKindProgress(true)
-    await usersStore.loadUsers()
-    await usersStore.loadRegistrationApproval()
-    await approvalsStore.loadApprovals()
-    await importStore.loadLocalRoots()
-    loadProxyConfig()
-    await aiStore.loadAIConfig()
-    await aiStore.loadIndexedBooks()
-  }
-  await loadTokens()
-  await loadLogs()
-  if (crawlStore.activeTask?.id && !["completed", "failed", "cancelled", "completed_with_errors"].includes(crawlStore.activeTask.status)) {
-    crawlStore.startPolling(crawlStore.activeTask.id)
-  }
 })
+
+watch(tab, async (panel) => {
+  try {
+    switch (panel) {
+      case "sources":
+        await Promise.all([sourcesStore.loadSources(), credsStore.loadCreds(), cookiesStore.loadCookies()])
+        break
+      case "sync":
+      case "logs":
+        await loadLogs()
+        if (crawlStore.activeTask?.id && ["pending", "running"].includes(crawlStore.activeTask.status)) {
+          crawlStore.startPolling(crawlStore.activeTask.id)
+        }
+        break
+      case "tokens":
+        await loadTokens()
+        break
+      case "add":
+        await importStore.loadLocalRoots()
+        break
+      case "status":
+        await loadStatus()
+        break
+      case "index":
+        await Promise.all([loadIndexStats(), loadIndexProgress(true), loadKindProgress(true)])
+        break
+      case "users":
+        await Promise.all([usersStore.loadUsers(), usersStore.loadRegistrationApproval()])
+        break
+      case "approvals":
+        await approvalsStore.loadApprovals()
+        break
+      case "proxy":
+        await loadProxyConfig()
+        break
+      case "ai":
+        await Promise.all([aiStore.loadAIConfig(), aiStore.loadIndexedBooks()])
+        break
+    }
+  } catch (error) {
+    if (panel === "sources") {
+      sourcesStore.sourceError = error instanceof Error ? error.message : i18n.t("admin_failed")
+    }
+  }
+}, { immediate: true })
 
 onUnmounted(() => {
   // Polling lives in the global crawl store so the task survives route changes.
@@ -722,83 +764,48 @@ onUnmounted(() => {
   <div class="min-h-screen bg-paper dark:bg-gray-950 dark:text-gray-100">
     <NavBar />
 
-    <main class="max-w-4xl mx-auto px-4 py-8">
-      <h1 class="text-2xl font-bold mb-6">{{ i18n.t('admin_title') }}</h1>
+    <main class="mx-auto max-w-6xl px-4 pb-16 pt-7 sm:px-6 sm:pt-10">
+      <h1 class="mb-5 text-3xl font-semibold tracking-tight sm:mb-8 sm:text-4xl">{{ i18n.t('admin_title') }}</h1>
 
-      <div class="flex gap-1 mb-8 border-b border-border flex-wrap">
-        <button
-          v-for="t in availableTabs"
-          :key="t"
-          @click="tab = t"
-          class="px-4 py-2 text-sm transition-colors -mb-px"
-          :class="tab === t
-            ? 'border-b-2 border-accent text-accent font-medium'
-            : 'text-muted dark:text-gray-400 hover:text-ink'"
-        >{{ i18n.t('admin_tab_' + t) }}</button>
-      </div>
+      <div class="grid items-start gap-5 md:grid-cols-[11rem_minmax(0,1fr)] md:gap-8">
+        <nav :aria-label="i18n.t('admin_category_navigation')" class="grid grid-cols-2 gap-1 rounded-xl border border-border bg-surface p-1.5 dark:border-gray-800 dark:bg-gray-900 min-[420px]:grid-cols-3 md:sticky md:top-24 md:grid-cols-1 md:gap-1.5 md:p-2">
+          <button
+            v-for="group in visibleGroups"
+            :key="group.id"
+            type="button"
+            :aria-pressed="selectedGroup?.id === group.id"
+            class="min-h-10 rounded-lg px-2.5 py-2 text-left text-sm font-medium transition-colors md:min-h-11 md:px-3"
+            :class="selectedGroup?.id === group.id
+              ? 'bg-accent text-white'
+              : 'text-muted hover:bg-paper dark:text-gray-300 dark:hover:bg-gray-800'"
+            @click="openGroup(group)"
+          >{{ i18n.t('admin_group_' + group.id) }}</button>
+        </nav>
+
+        <div class="min-w-0">
+          <nav v-if="selectedGroup" :aria-label="i18n.t('admin_panel_navigation')" class="mb-4 flex flex-wrap items-center gap-1.5 border-b border-border pb-3 dark:border-gray-800 sm:mb-6">
+            <button
+              v-for="panel in selectedGroup.panels"
+              :key="panel.id"
+              type="button"
+              :aria-pressed="panel.id === tab"
+              class="min-h-10 rounded-lg px-3 py-2 text-sm font-medium transition-colors"
+              :class="panel.id === tab ? 'bg-accent/10 text-accent' : 'text-muted hover:bg-accent/5 dark:text-gray-400'"
+              @click="router.push(panelLocation(panel.id))"
+            >{{ i18n.t('admin_tab_' + panel.id) }}</button>
+            <router-link v-if="selectedGroup.id === 'sync'" to="/sync" class="ml-auto inline-flex min-h-10 items-center gap-2 rounded-lg px-3 text-sm font-medium text-accent hover:bg-accent/10">
+              {{ i18n.t('sync_title') }} <span aria-hidden="true">→</span>
+            </router-link>
+          </nav>
 
       <SourcesPanel v-if="tab === 'sources'" />
-
-      <section v-if="tab === 'cookies'" class="space-y-6">
-        <div class="mb-4 p-4 rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950 text-sm">
-          <p class="font-medium mb-1">{{ i18n.t('admin_cookie_help_title') }}</p>
-          <ol class="list-decimal list-inside space-y-1 text-muted dark:text-gray-300">
-            <li>{{ i18n.t('admin_cookie_help_step1') }}</li>
-            <li>{{ i18n.t('admin_cookie_help_step2') }}</li>
-            <li>{{ i18n.t('admin_cookie_help_step3') }}</li>
-            <li>{{ i18n.t('admin_cookie_help_step4') }}</li>
-          </ol>
-          <p class="mt-2">
-            <a href="/docs/cookie-guide.md" target="_blank" class="text-accent hover:underline">{{ i18n.t('admin_cookie_help_link') }}</a>
-          </p>
-        </div>
-        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
-          <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_add_cookie') }}</h2>
-          <div class="space-y-3 mb-3">
-            <input v-model="cookiesStore.cookieForm.source" :placeholder="i18n.t('admin_placeholder_source')" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-            <input v-model="cookiesStore.cookieForm.expired_at" type="datetime-local" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-            <textarea v-model="cookiesStore.cookieForm.cookie_data" :placeholder="i18n.t('admin_placeholder_cookie')" rows="3" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 resize-y" />
-          </div>
-          <p v-if="cookiesStore.cookieError" class="text-sm text-red-600 mb-2">{{ cookiesStore.cookieError }}</p>
-          <div class="flex gap-3">
-            <button @click="cookiesStore.createCookie" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90">{{ i18n.t('admin_save_cookie') }}</button>
-            <button @click="cookiesStore.testCookie" :disabled="cookiesStore.cookieTesting" class="px-4 py-2 rounded border border-accent text-accent text-sm font-medium hover:bg-accent/10 disabled:opacity-50">
-              {{ cookiesStore.cookieTesting ? i18n.t('admin_testing') : i18n.t('admin_test_cookie') }}
-            </button>
-            <button v-if="cookiesStore.cookieEditingId" @click="cookiesStore.cookieEditingId = ''; cookiesStore.cookieForm = { source: '', cookie_data: '', expired_at: '' }" class="px-4 py-2 rounded border border-border dark:border-gray-700 text-sm hover:bg-accent/5">{{ i18n.t('admin_cancel') }}</button>
-          </div>
-          <div v-if="cookiesStore.cookieTestResult" class="mt-3 p-3 rounded bg-green-50 dark:bg-green-950 text-sm">
-            <p class="font-medium text-green-700 dark:text-green-400">{{ cookiesStore.cookieTestResult.message }}</p>
-            <div v-if="cookiesStore.cookieTestResult.sample_books" class="mt-2 space-y-1 text-xs text-muted dark:text-gray-400">
-              <p v-for="b in cookiesStore.cookieTestResult.sample_books" :key="b.title">{{ b.title }} &mdash; {{ b.author }}</p>
-            </div>
-          </div>
-          <p v-if="cookiesStore.cookieTestError" class="text-sm text-red-600 mt-2">{{ cookiesStore.cookieTestError }}</p>
-        </div>
-
-        <div class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900">
-          <div v-for="c in cookiesStore.cookies" :key="c.id" class="px-4 py-3 flex items-center justify-between">
-            <div class="flex items-center gap-3">
-              <span class="text-sm font-medium">{{ c.source }}</span>
-              <span v-if="c.expired_at" class="text-xs px-1.5 py-0.5 rounded-full" :class="new Date(c.expired_at) < new Date() ? 'bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300' : new Date(c.expired_at) < new Date(Date.now() + 3*86400000) ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900 dark:text-yellow-300' : 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300'">
-                {{ new Date(c.expired_at) < new Date() ? i18n.t('admin_cookie_expired') : new Date(c.expired_at) < new Date(Date.now() + 3*86400000) ? i18n.t('admin_cookie_expiring') : i18n.t('admin_cookie_valid') }}
-              </span>
-            </div>
-            <div class="flex items-center gap-3">
-              <button @click="cookiesStore.editCookie(c)" class="text-xs text-accent hover:underline">{{ i18n.t('admin_edit') }}</button>
-              <button @click="cookiesStore.deleteCookie(c.id)" class="text-xs text-red-500 hover:text-red-700">{{ i18n.t('admin_delete') }}</button>
-            </div>
-          </div>
-          <p v-if="cookiesStore.cookies.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">{{ i18n.t('admin_no_cookies') }}</p>
-        </div>
-      </section>
 
       <section v-if="tab === 'sync'" class="space-y-6">
         <div v-if="auth.isAdmin" class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
           <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_trigger_sync') }}</h2>
-          <div class="flex gap-3 mb-3">
-            <input v-model="syncSourceId" :placeholder="i18n.t('admin_placeholder_source')" class="flex-1 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-            <input v-model="syncUrl" :placeholder="i18n.t('admin_placeholder_book_url')" class="flex-1 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+          <div class="mb-3 grid gap-3 sm:grid-cols-2">
+            <input v-model="syncSourceId" :placeholder="i18n.t('admin_placeholder_source')" class="min-w-0 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+            <input v-model="syncUrl" :placeholder="i18n.t('admin_placeholder_book_url')" class="min-w-0 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
           </div>
           <p v-if="syncError" class="text-sm text-red-600 mb-2">{{ syncError }}</p>
           <button @click="triggerSync" :disabled="syncing" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50">
@@ -1079,11 +1086,11 @@ onUnmounted(() => {
         <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
           <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_create_token') }}</h2>
           <p class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('admin_token_hint') }}</p>
-          <div class="flex gap-3 mb-3">
-            <input v-model="tokenName" :placeholder="i18n.t('admin_placeholder_token_name')" class="flex-1 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-            <input v-model.number="tokenExpires" type="number" :placeholder="i18n.t('admin_placeholder_days')" class="w-32 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" min="1" max="365" />
-            <button @click="createToken" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 shrink-0">{{ i18n.t('admin_create') }}</button>
-          </div>
+          <form @submit.prevent="createToken" class="mb-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_8rem_auto]">
+            <input v-model="tokenName" :placeholder="i18n.t('admin_placeholder_token_name')" :aria-label="i18n.t('admin_placeholder_token_name')" class="min-w-0 rounded border border-border bg-paper px-3 py-2 text-base dark:border-gray-700 dark:bg-gray-800 sm:text-sm" />
+            <input v-model.number="tokenExpires" type="number" :placeholder="i18n.t('admin_placeholder_days')" :aria-label="i18n.t('admin_placeholder_days')" class="min-w-0 rounded border border-border bg-paper px-3 py-2 text-base dark:border-gray-700 dark:bg-gray-800 sm:text-sm" min="1" max="365" />
+            <button type="submit" class="min-h-10 rounded bg-accent px-4 py-2 text-sm font-medium text-white hover:opacity-90">{{ i18n.t('admin_create') }}</button>
+          </form>
           <p v-if="tokenError" class="text-xs text-red-600 mb-2">{{ tokenError }}</p>
           <div v-if="newToken" class="mt-3 p-3 rounded bg-green-50 text-sm">
             <p class="font-medium mb-1">{{ i18n.t('admin_new_token') }}</p>
@@ -1092,8 +1099,8 @@ onUnmounted(() => {
         </div>
 
         <div class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900">
-          <div v-for="t in tokens" :key="t.id" class="px-4 py-3 flex items-center justify-between">
-            <div>
+          <div v-for="t in tokens" :key="t.id" class="flex flex-wrap items-center justify-between gap-2 px-4 py-3">
+            <div class="min-w-0 break-words">
               <span class="text-sm font-medium">{{ t.name }}</span>
               <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ t.prefix }}...</span>
               <span v-if="t.last_used_at" class="text-xs text-muted dark:text-gray-400 ml-2">{{ i18n.t('admin_last') }}: {{ new Date(t.last_used_at).toLocaleDateString() }}</span>
@@ -1109,20 +1116,8 @@ onUnmounted(() => {
 
       <section v-if="tab === 'prefs'" class="space-y-6">
         <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
-          <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_tab_prefs') }}</h2>
+          <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_pref_display') }}</h2>
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
-            <label class="block">
-              <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_pref_font') }}</span>
-              <select v-model="prefs.font" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800">
-                <option value="sans">Sans</option>
-                <option value="serif">Serif</option>
-                <option value="mono">Mono</option>
-              </select>
-            </label>
-            <label class="block">
-              <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_pref_font_size') }}</span>
-              <input v-model.number="prefs.font_size" type="number" min="12" max="32" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-            </label>
             <label class="block">
               <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_pref_language') }}</span>
               <select v-model="prefs.language" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800">
@@ -1146,6 +1141,7 @@ onUnmounted(() => {
               <input type="checkbox" v-model="prefs.show_content_images" class="rounded" />
             </label>
           </div>
+          <p class="text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_pref_reader_hint') }}</p>
           <div class="border-t border-border dark:border-gray-700 pt-4 mt-4">
             <div class="flex items-center justify-between mb-2">
               <h3 class="text-sm font-semibold">{{ i18n.t('admin_pref_tap_areas') }}</h3>
@@ -1304,42 +1300,6 @@ onUnmounted(() => {
 
       <AddPanel v-if="tab === 'add'" />
 
-      <section v-if="tab === 'creds'" class="space-y-6">
-        <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">
-          <h2 class="text-sm font-semibold mb-4">{{ i18n.t('admin_add_cred') }}</h2>
-          <p class="text-xs text-muted dark:text-gray-400 mb-3">{{ i18n.t('admin_cred_hint') }}</p>
-          <div class="grid grid-cols-3 gap-3 mb-3">
-            <input v-model="credsStore.credForm.source" :placeholder="i18n.t('admin_placeholder_source')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-            <input v-model="credsStore.credForm.username" :placeholder="i18n.t('admin_placeholder_username')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-            <input v-model="credsStore.credForm.password" type="password" :placeholder="i18n.t('admin_placeholder_password')" class="px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-          </div>
-          <p v-if="credsStore.credError" class="text-sm text-red-600 mb-2">{{ credsStore.credError }}</p>
-          <button @click="credsStore.createCred" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90">{{ i18n.t('admin_save_cred') }}</button>
-        </div>
-
-        <div class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900">
-          <div v-for="c in credsStore.creds" :key="c.id" class="px-4 py-3 flex items-center justify-between flex-wrap gap-2">
-            <div>
-              <span class="text-sm font-medium">{{ c.source }}</span>
-              <span class="text-xs text-muted dark:text-gray-400 ml-2">{{ c.username }}</span>
-            </div>
-            <div class="flex items-center gap-3">
-              <button @click="credsStore.autoLogin(c.id)" :disabled="credsStore.credLoggingIn[c.id]" class="px-3 py-1.5 rounded border border-green-500 text-green-600 text-xs font-medium hover:bg-green-50 dark:hover:bg-green-950 disabled:opacity-50">
-                {{ credsStore.credLoggingIn[c.id] ? i18n.t('admin_logging_in') : i18n.t('admin_auto_login') }}
-              </button>
-              <button @click="credsStore.startManualLogin(c.id)" :disabled="credsStore.manualLoginLoading" class="px-3 py-1.5 rounded border border-blue-500 text-blue-600 text-xs font-medium hover:bg-blue-50 dark:hover:bg-blue-950 disabled:opacity-50">
-                {{ i18n.t('admin_manual_login') }}
-              </button>
-              <button @click="credsStore.deleteCred(c.id)" class="text-xs text-red-500 hover:text-red-700">{{ i18n.t('admin_delete') }}</button>
-            </div>
-            <div v-if="credsStore.credLoginResult[c.id]" class="w-full mt-1 p-2 rounded bg-green-50 dark:bg-green-950 text-xs text-green-700 dark:text-green-400">
-              {{ credsStore.credLoginResult[c.id].message }}
-            </div>
-            <p v-if="credsStore.credLoginError[c.id]" class="w-full text-xs text-red-600 mt-1">{{ credsStore.credLoginError[c.id] }}</p>
-          </div>
-          <p v-if="credsStore.creds.length === 0" class="px-4 py-3 text-sm text-muted dark:text-gray-400">{{ i18n.t('admin_no_creds') }}</p>
-        </div>
-      </section>
       <UsersPanel v-if="tab === 'users'" />
 
       <ApprovalsPanel v-if="tab === 'approvals'" />
@@ -1369,6 +1329,8 @@ onUnmounted(() => {
       </section>
 
       <AiPanel v-if="tab === 'ai'" />
+        </div>
+      </div>
     </main>
   </div>
 </template>

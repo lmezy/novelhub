@@ -23,8 +23,9 @@ from typing import Any, Iterable, Sequence
 from loguru import logger
 from sqlalchemy import exists, select, text
 
-from app.services.ai import strip_markup
+from app.services.ai import indexable_chapter_text, strip_markup
 from app.services.ai_client import AIError, LLMClient
+from app.services.book_kind import KIND_COMIC, normalize_kind
 
 #: How many profile vectors one book gets.
 PROFILE_SEGMENTS = 4
@@ -52,7 +53,7 @@ def metadata_line(book: Any) -> str:
     ][:4]
     if categories:
         parts.append("分类：" + "、".join(categories))
-    description = str(getattr(book, "description", "") or "").strip()
+    description = strip_markup(getattr(book, "description", "") or "")
     if description:
         parts.append("简介：" + description[:160])
     return "｜".join(parts)
@@ -78,11 +79,12 @@ def segment_texts(book: Any, chapters: Sequence[Any], read) -> list[str]:
     ``read`` is a callable taking a ``content_path`` and returning the stored
     chapter text (it is called from a worker thread by the caller).
     """
-    if not chapters:
+    if not chapters or normalize_kind(getattr(book, "kind", None)) == KIND_COMIC:
         return []
     sampled = pick_chapters(chapters)
+    extra = [chapter for chapter in pick_chapters(chapters, SAMPLE_CHAPTERS) if chapter not in sampled]
     bodies: list[str] = []
-    for chapter in sampled:
+    for chapter in (*sampled, *extra):
         path = getattr(chapter, "content_path", None)
         if not path:
             continue
@@ -91,9 +93,11 @@ def segment_texts(book: Any, chapters: Sequence[Any], read) -> list[str]:
         except Exception as exc:  # noqa: BLE001 - one unreadable chapter is not fatal
             logger.debug("book profile: cannot read {}: {}", path, exc)
             continue
-        cleaned = strip_markup(raw)
+        cleaned = indexable_chapter_text(raw)
         if cleaned:
             bodies.append(cleaned)
+        if len(bodies) == PROFILE_SEGMENTS:
+            break
     if not bodies:
         return []
 
@@ -145,17 +149,13 @@ async def index_book(db: Any, book: Any, client: LLMClient, *, read) -> int:
                 f"向量模型返回了 {len(vector)} 维，书库画像索引要求 {EMBEDDING_DIMS} 维。"
                 "请改用 1024 维的向量模型（如 BAAI/bge-m3、text-embedding-v3、embedding-3）。"
             )
-    await db.execute(
-        text("DELETE FROM book_profiles WHERE book_id = :book_id"),
-        {"book_id": str(book.id)},
-    )
     await insert_profiles(db, book.id, texts, vectors, model=client.cfg.effective_embedding_model)
     return len(texts)
 
 
 async def insert_profiles(db: Any, book_id: str, texts: Sequence[str],
                           vectors: Sequence[Sequence[float]], *, model: str) -> None:
-    """Write profile rows through raw SQL so no pgvector Python driver is needed."""
+    """Replace one book's profile segments, including any leftover tail."""
     if not texts:
         return
     rows = [
@@ -178,6 +178,11 @@ async def insert_profiles(db: Any, book_id: str, texts: Sequence[str],
         ),
         rows,
     )
+    if len(rows) < PROFILE_SEGMENTS:
+        await db.execute(
+            text("DELETE FROM book_profiles WHERE book_id = :book_id AND segment >= :segments"),
+            {"book_id": str(book_id), "segments": len(rows)},
+        )
 
 
 async def similar_books(db: Any, vector: Sequence[float], *, limit: int = 20,
@@ -195,13 +200,14 @@ async def similar_books(db: Any, vector: Sequence[float], *, limit: int = 20,
     rows = (
         await db.execute(
             text(
-                "SELECT book_id, segment, excerpt, model, "
-                "       1 - (embedding <=> CAST(:query AS vector)) AS similarity "
-                "FROM book_profiles "
-                "ORDER BY embedding <=> CAST(:query AS vector) "
+                "SELECT p.book_id, p.segment, p.excerpt, p.model, "
+                "       1 - (p.embedding <=> CAST(:query AS vector)) AS similarity "
+                "FROM book_profiles p JOIN books b ON b.id = p.book_id "
+                "WHERE b.kind != :comic_kind AND coalesce(p.excerpt, '') !~* '(<|&lt;)img' "
+                "ORDER BY p.embedding <=> CAST(:query AS vector) "
                 "LIMIT :fetch"
             ),
-            {"query": vector_literal(vector), "fetch": fetch},
+            {"query": vector_literal(vector), "fetch": fetch, "comic_kind": KIND_COMIC},
         )
     ).all()
     results = []
@@ -223,10 +229,11 @@ async def book_vector(db: Any, book_id: str) -> list[float] | None:
     rows = (
         await db.execute(
             text(
-                "SELECT embedding::text FROM book_profiles "
-                "WHERE book_id = :book_id ORDER BY segment"
+                "SELECT p.embedding::text FROM book_profiles p JOIN books b ON b.id = p.book_id "
+                "WHERE p.book_id = :book_id AND b.kind != :comic_kind "
+                "AND coalesce(p.excerpt, '') !~* '(<|&lt;)img' ORDER BY p.segment"
             ),
-            {"book_id": str(book_id)},
+            {"book_id": str(book_id), "comic_kind": KIND_COMIC},
         )
     ).all()
     vectors = [parse_vector_literal(row[0]) for row in rows if row[0]]
@@ -268,6 +275,7 @@ def candidate_query(*, force: bool, limit: int):
     query = (
         select(Book)
         .where(Book.hidden == False)  # noqa: E712
+        .where(Book.kind != KIND_COMIC)
         .where(
             exists().where(
                 Chapter.book_id == Book.id,

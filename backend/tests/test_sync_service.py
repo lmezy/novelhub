@@ -2621,6 +2621,7 @@ async def test_discover_and_sync_all_keeps_books_when_a_later_page_breaks():
 
     assert result["books_synced"] == 2
     assert result["chapters_created"] == 4
+    assert "第 2 页" in result["discovery_error"]
     # The run is over; reporting it as unfinished would re-queue it forever.
     assert result["done"] is True
 

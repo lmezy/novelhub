@@ -138,6 +138,7 @@ def _is_transient_task_error(exc: BaseException) -> bool:
             "writetimeout",
             "pooltimeout",
             "connecterror",
+            "connectionerror",
             "readerror",
             "writeerror",
             "proxyerror",
@@ -518,9 +519,14 @@ async def run_crawl_task_async(task_id: str) -> dict:
             await _apply_task_state(task_obj, db, task_id, {
                 "status": (
                     "completed_with_errors"
-                    if merged.get("books_failed", 0) or merged.get("chapters_failed", 0)
+                    if (
+                        merged.get("books_failed", 0)
+                        or merged.get("chapters_failed", 0)
+                        or result.get("discovery_error")
+                    )
                     else "completed"
                 ),
+                "error": result.get("discovery_error"),
                 "result": merged,
                 "progress": {
                     "pages_checked": merged.get("pages_checked", 0),

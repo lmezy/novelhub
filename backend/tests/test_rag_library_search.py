@@ -17,6 +17,7 @@ proves nothing.
 """
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -28,7 +29,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.api.routes import rag as rag_routes
 from app.core.database import get_db
 from app.main import app
-from app.models import Book, BookTag, ChapterEmbedding, Tag
+from app.models import Book, BookTag, Chapter, ChapterEmbedding, Tag
 from app.models.base import Base
 from app.services import book_profiles
 from app.services.auth import get_current_user
@@ -193,3 +194,42 @@ async def test_list_indexed_books_titles_come_from_a_column_query(session_factor
     assert entries[0]["title"] == "带标签的书"
     assert entries[0]["chunks"] == 2
     assert entries[0]["chapters"] == 2
+
+
+@pytest.mark.asyncio
+async def test_chapter_index_excludes_comics_and_images(session_factory, tmp_path):
+    # Sync writes comic panels as HTML, not only as Markdown image references.
+    gallery = tmp_path / "gallery.md"
+    gallery.write_text('# 全话阅读\n\n<img src="/panel.webp">\n第 1 页', encoding="utf-8")
+    illustrated = tmp_path / "novel.md"
+    paragraph = "黄昏时，她沿着石阶回到窗前，悄悄把书放回原位。" * 10
+    illustrated.write_text(
+        f'# 第一章\n\n&lt;img src=&quot;/cover.webp&quot;&gt;\n\n{paragraph}\n\n![插图](/picture.jpg)',
+        encoding="utf-8",
+    )
+    await _seed_books(
+        session_factory,
+        Book(id="comic", title="画册", kind="comic"),
+        Book(id="novel", title="故事", kind="novel"),
+        Chapter(id="gallery", book_id="novel", chapter_number=1, content_path=str(gallery)),
+        Chapter(id="prose", book_id="novel", chapter_number=2, content_path=str(illustrated)),
+    )
+
+    client = SimpleNamespace(embed=AsyncMock(return_value=[[1.0, 0.0]]))
+    config = SimpleNamespace(effective_embedding_model="test-model")
+    async with session_factory() as session:
+        service = RAGService(session, config=config)
+        service._client = AsyncMock(return_value=client)
+        assert (await service.index_book("comic", force=True))["skipped"]
+        service._client.assert_not_awaited()
+        result = await service.index_book("novel", force=True)
+        assert result["indexed_chapters"] == 1
+        client.embed.assert_awaited_once_with([paragraph], batch_size=service.EMBED_BATCH_SIZE)
+        rows = (await session.scalars(select(ChapterEmbedding))).all()
+        assert [(row.chapter_id, row.content) for row in rows] == [("prose", paragraph)]
+        session.add(ChapterEmbedding(
+            id="old-gallery", book_id="novel", chapter_id="gallery", chunk_index=0,
+            content='&lt;img src="/panel.webp"&gt;', embedding=[1.0, 0.0],
+        ))
+        await session.commit()
+        assert [hit["chapter_id"] for hit in await service.search("novel", "她回哪里？")] == ["prose"]

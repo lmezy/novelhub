@@ -1,15 +1,34 @@
 ﻿from fastapi import APIRouter, Depends, HTTPException
+from fastapi import BackgroundTasks
+from loguru import logger
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.core.database import get_db
+from app.core.database import SessionLocal, get_db
 from app.models import Book, BookCategory, Category, User
 from app.repositories.category import CategoryRepository
 from app.schemas.category import BookCategoryAssign, CategoryCreate, CategoryOut
 from app.services.auth import get_current_user, require_admin
+from app.services.auto_categorize import DEFAULT_CATEGORY_RULES, AutoCategorizationService
 from app.services.book_kind import KINDS
+from app.services.search import search_service
 from app.services.visibility import apply_book_visibility, can_view_r18, ensure_book_visible
 
 router = APIRouter(prefix="/categories", tags=["categories"])
+
+
+async def _refresh_search_categories(db: AsyncSession, book_ids: list[str]) -> None:
+    if not book_ids:
+        return
+    try:
+        await search_service.sync_book_categories(db, book_ids)
+    except Exception as exc:
+        logger.warning("Could not refresh book categories in search: {}", exc)
+
+
+async def _refresh_deleted_category(book_ids: list[str]) -> None:
+    async with SessionLocal() as db:
+        await _refresh_search_categories(db, book_ids)
 
 
 @router.get("", response_model=list[CategoryOut])
@@ -46,19 +65,26 @@ async def create_category(payload: CategoryCreate, db: AsyncSession = Depends(ge
     existing = await repo.get_by_name(payload.name)
     if existing:
         raise HTTPException(status_code=409, detail="Category already exists")
-    return await repo.create(
-        name=payload.name,
-        description=payload.description,
-        color=payload.color,
-        is_r18=payload.is_r18,
-    )
+    try:
+        return await repo.create(
+            name=payload.name,
+            description=payload.description,
+            color=payload.color,
+            is_r18=payload.is_r18,
+        )
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="Category already exists") from exc
 
 
 @router.delete("/{category_id}", status_code=204, dependencies=[Depends(require_admin)])
-async def delete_category(category_id: str, db: AsyncSession = Depends(get_db)):
+async def delete_category(category_id: str, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
     repo = CategoryRepository(db)
-    if not await repo.delete(category_id):
+    affected = await repo.delete(category_id, DEFAULT_CATEGORY_RULES)
+    if affected is None:
         raise HTTPException(status_code=404, detail="Category not found")
+    if affected:
+        background_tasks.add_task(_refresh_deleted_category, affected)
 
 
 @router.get("/book/{book_id}", response_model=list[CategoryOut])
@@ -76,25 +102,26 @@ async def set_book_categories(book_id: str, payload: BookCategoryAssign, user: U
     if not ensure_book_visible(user, book):
         raise HTTPException(status_code=404, detail="Book not found")
     repo = CategoryRepository(db)
-    allowed_ids = []
-    for category_id in payload.category_ids:
-        cat = await repo.get(category_id)
-        if cat and (book.is_r18 or not cat.is_r18):
-            allowed_ids.append(category_id)
+    await db.refresh(book, attribute_names=["categories_manually_set"], with_for_update=True)
+    query = select(Category.id).where(Category.id.in_(payload.category_ids))
+    if not book.is_r18:
+        query = query.where(Category.is_r18 == False)
+    allowed_ids = list(await db.scalars(query))
+    book.categories_manually_set = True
     await repo.set_book_categories(book_id, allowed_ids)
+    await _refresh_search_categories(db, [book_id])
     return await repo.get_book_categories(book_id, include_r18=can_view_r18(user))
 
 
 @router.post("/auto", status_code=200, dependencies=[Depends(require_admin)])
 async def auto_categorize_all(db: AsyncSession = Depends(get_db)):
     """Auto-categorize all books based on their tags."""
-    from app.services.auto_categorize import AutoCategorizationService
     return await AutoCategorizationService.categorize_all_books(db)
 
 
 @router.post("/auto/{book_id}", status_code=200, dependencies=[Depends(require_admin)])
 async def auto_categorize_book(book_id: str, db: AsyncSession = Depends(get_db)):
     """Auto-categorize a single book based on its tags."""
-    from app.services.auto_categorize import AutoCategorizationService
-    cats = await AutoCategorizationService.categorize_book(db, book_id)
+    cats = await AutoCategorizationService.categorize_book(db, book_id, reset_manual=True)
+    await _refresh_search_categories(db, [book_id])
     return {"book_id": book_id, "categories": cats}

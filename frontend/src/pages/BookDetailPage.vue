@@ -7,6 +7,7 @@ import { useI18nStore } from "../stores/i18n"
 import { api } from "../api/client"
 import { useChunkedList } from "../utils/useChunkedList"
 import NavBar from "../components/NavBar.vue"
+import ImageViewer from "../components/ImageViewer.vue"
 
 const route = useRoute()
 const router = useRouter()
@@ -44,6 +45,7 @@ const newTagShowUser = ref(true)
 const tagSaving = ref(false)
 const tagError = ref("")
 const coverPickerOpen = ref(false)
+const coverPreviewOpen = ref(false)
 const coverError = ref("")
 const shelfGroups = ref<ShelfGroup[]>([])
 const bookGroupIds = ref<string[]>([])
@@ -60,6 +62,10 @@ const editing = ref(false)
 const newCategoryName = ref("")
 const newCategoryR18 = ref(false)
 const categoryCreating = ref(false)
+const kindOverride = ref<NonNullable<Book["kind"]> | "">("")
+const kindSaving = ref(false)
+const kindStatus = ref("")
+const kindError = ref("")
 
 const canPublish = computed(() =>
   auth.isAdmin || book.value?.owner_id === auth.user?.id
@@ -201,6 +207,30 @@ async function autoCategorizeBook() {
     categoryError.value = e instanceof Error ? e.message : i18n.t('book_category_failed')
   } finally {
     autoCategorizing.value = false
+  }
+}
+
+async function saveKind() {
+  const id = book.value?.id
+  if (!id || kindSaving.value) return
+  kindSaving.value = true
+  kindStatus.value = ""
+  kindError.value = ""
+  try {
+    const res = await api.patch<Book>("/books/" + id + "/kind", {
+      kind: kindOverride.value || null,
+    })
+    if (book.value?.id !== id) return
+    book.value.kind = res.kind
+    book.value.kind_override = res.kind_override
+    kindOverride.value = res.kind_override ?? ""
+    kindStatus.value = i18n.t('book_kind_saved')
+  } catch (e) {
+    if (book.value?.id === id) {
+      kindError.value = e instanceof Error ? e.message : i18n.t('book_kind_failed')
+    }
+  } finally {
+    kindSaving.value = false
   }
 }
 
@@ -436,6 +466,9 @@ async function loadBook(bookId: string) {
   bookmarks.value = []
   alternates.value = []
   showSources.value = false
+  coverPickerOpen.value = false
+  coverPreviewOpen.value = false
+  coverError.value = ""
   savedChapterId.value = null
   favorite.value = false
   customTags.value = []
@@ -443,8 +476,11 @@ async function loadBook(bookId: string) {
   selectedCategoryIds.value = []
   bookGroupIds.value = []
   editing.value = false
+  kindStatus.value = ""
+  kindError.value = ""
   try {
     book.value = await store.fetchBook(bookId)
+    kindOverride.value = book.value.kind_override ?? ""
     favorite.value = book.value.is_favorite || false
     chapters.value = await store.fetchChapters(bookId)
   } catch (e) {
@@ -484,59 +520,91 @@ watch(
 </script>
 
 <template>
-  <div class="min-h-screen bg-paper dark:bg-gray-800 dark:bg-gray-950 dark:text-gray-100">
+  <div class="min-h-screen bg-paper dark:bg-gray-950 dark:text-gray-100">
     <NavBar />
 
-    <main class="max-w-3xl mx-auto px-4 py-8">
+    <main class="max-w-4xl mx-auto px-4 pt-3 pb-10 sm:px-6 sm:pt-6">
       <button
         @click="goBack"
-        class="text-sm text-muted dark:text-gray-400 hover:text-ink mb-6 inline-flex items-center gap-1 transition-colors"
+        class="text-sm text-muted dark:text-gray-400 hover:text-accent mb-2 inline-flex min-h-11 items-center gap-1 transition-colors"
       >&larr; {{ i18n.t('book_back') }}</button>
 
       <p v-if="loading" class="text-muted dark:text-gray-400">{{ i18n.t('book_loading') }}</p>
       <p v-else-if="error" class="text-red-600">{{ error }}</p>
 
       <template v-else-if="book">
-        <div class="mb-6 flex flex-wrap items-center gap-2">
-          <button
-            @click="startReading"
-            :disabled="chapters.length === 0"
-            class="inline-flex items-center gap-1 px-5 py-2.5 rounded-lg bg-accent text-white text-sm font-medium hover:opacity-90 transition-opacity disabled:opacity-40 no-underline"
-          >{{ savedChapterId ? i18n.t('book_continue_reading') : i18n.t('book_start_reading') }} &rarr;</button>
-        </div>
-
-        <header class="mb-8">
-          <div class="mb-4">
-            <img
-              v-if="showCovers && book.cover"
-              :src="book.cover"
-              :alt="book.title"
-              class="w-40 h-56 object-cover rounded-lg border border-border dark:border-gray-700"
-            />
+        <header class="mb-5 rounded-2xl border border-border/80 bg-surface p-4 shadow-sm dark:border-gray-800 dark:bg-gray-900 sm:p-6">
+          <div class="flex items-start gap-4 sm:gap-6">
             <button
-              v-if="alternates.length > 1"
-              @click="coverPickerOpen = true"
-              class="mt-2 px-3 py-1 text-xs border border-border dark:border-gray-700 rounded hover:bg-accent/5 transition-colors"
-            >{{ i18n.t('book_cover_select') }}</button>
-            <p v-if="coverError" class="text-xs text-red-600 mt-1">{{ coverError }}</p>
+              v-if="showCovers && book.cover"
+              type="button"
+              @click="coverPreviewOpen = true"
+              :aria-label="i18n.t('image_viewer_open') + ' · ' + book.title"
+              :title="i18n.t('image_viewer_open')"
+              class="relative aspect-[2/3] w-24 shrink-0 cursor-zoom-in overflow-hidden rounded-xl bg-paper shadow-md dark:bg-gray-800 sm:w-36"
+            >
+              <img :src="book.cover" :alt="book.title" class="h-full w-full object-cover" />
+              <span aria-hidden="true" class="absolute bottom-1.5 right-1.5 rounded-md bg-black/65 px-1.5 py-0.5 text-sm text-white">
+                ⤢
+              </span>
+            </button>
+            <div class="min-w-0 flex-1">
+              <h1 class="mb-2 break-words text-xl font-bold leading-tight sm:text-3xl">{{ book.title }}</h1>
+              <button
+                v-if="book.author_name"
+                @click="searchByField('author', book.author_name)"
+                :title="i18n.t('book_author_search')"
+                class="mb-2 break-words text-left text-sm text-muted transition-colors hover:text-accent dark:text-gray-400"
+              >{{ book.author_name }}</button>
+              <div class="flex flex-wrap items-center gap-1.5">
+                <span
+                  v-if="book.kind"
+                  class="rounded-full bg-accent/10 px-2 py-1 text-xs font-medium text-accent"
+                >{{ i18n.t(book.kind === 'comic' ? 'kind_comics' : 'kind_novels') }}</span>
+                <span
+                  class="rounded-full px-2 py-1 text-xs"
+                  :class="book.status === 'completed'
+                    ? 'bg-green-100 text-green-800 dark:bg-green-900/60 dark:text-green-200'
+                    : 'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300'"
+                >{{ book.status || i18n.t('book_unknown_status') }}</span>
+                <span
+                  v-if="book.is_public && book.all_ages_confirmed"
+                  class="rounded-full bg-green-100 px-2 py-1 text-xs text-green-800 dark:bg-green-900/60 dark:text-green-200"
+                >{{ i18n.t('book_all_ages_confirmed') }}</span>
+              </div>
+              <p class="mt-2 text-xs text-muted dark:text-gray-400">
+                {{ i18n.t('book_updated', { date: new Date(book.updated_at).toLocaleDateString() }) }}
+              </p>
+            </div>
           </div>
-          <h1 class="text-3xl font-bold mb-2">{{ book.title }}</h1>
-          <button
-            v-if="book.author_name"
-            @click="searchByField('author', book.author_name)"
-            :title="i18n.t('book_author_search')"
-            class="text-muted dark:text-gray-400 mb-1 hover:text-accent transition-colors"
-          >{{ book.author_name }}</button>
-          <div v-if="book.tag_names?.length" class="flex flex-wrap gap-1 mb-2">
+
+          <div class="mt-4 flex flex-wrap items-stretch gap-2">
+            <button
+              @click="startReading"
+              :disabled="chapters.length === 0"
+              class="inline-flex min-h-11 flex-1 items-center justify-center whitespace-nowrap rounded-xl bg-accent px-4 text-sm font-semibold text-white transition-opacity hover:opacity-90 disabled:opacity-40 sm:flex-none"
+            >{{ savedChapterId ? i18n.t('book_continue_reading') : i18n.t('book_start_reading') }}</button>
+            <button
+              @click="toggleFavorite"
+              :aria-pressed="favorite"
+              class="detail-action"
+              :class="{ 'text-accent': favorite }"
+            >{{ favorite ? i18n.t('book_favorite_added') : i18n.t('book_favorite') }}</button>
+            <a v-if="chapters.length" href="#book-chapters" class="detail-action">
+              {{ i18n.t('reader_toc') }}
+            </a>
+          </div>
+
+          <div v-if="book.tag_names?.length || book.category_names?.length" class="mt-4 flex flex-wrap gap-1.5">
             <template
               v-for="tag in book.tag_names"
-              :key="tag"
+              :key="'tag-' + tag"
             >
               <button
                 v-if="!editing"
                 @click="searchByField('tags', tag)"
                 :title="i18n.t('book_tag_search')"
-                class="text-xs px-2 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-muted dark:text-gray-400 hover:text-accent transition-colors"
+                class="rounded-full bg-gray-100 px-2.5 py-1.5 text-xs text-muted transition-colors hover:text-accent dark:bg-gray-800 dark:text-gray-300"
               >{{ tag }}</button>
               <span
                 v-else
@@ -551,115 +619,133 @@ watch(
                 >&times;</button>
               </span>
             </template>
-          </div>
-          <div v-if="book.category_names?.length" class="flex flex-wrap gap-1 mb-2">
             <template
               v-for="cat in book.category_names"
-              :key="cat"
+              :key="'category-' + cat"
             >
               <button
                 v-if="!editing"
                 @click="searchByField('category', cat)"
                 :title="i18n.t('book_category_search')"
-                class="text-xs px-2 py-0.5 rounded bg-accent/10 text-accent hover:bg-accent/20 transition-colors"
+                class="rounded-full bg-accent/10 px-2.5 py-1.5 text-xs text-accent transition-colors hover:bg-accent/20"
               >{{ cat }}</button>
               <span v-else class="text-xs px-2 py-0.5 rounded bg-accent/10 text-accent">{{ cat }}</span>
             </template>
           </div>
-          <p v-if="book.description" class="text-muted dark:text-gray-400 mb-3">{{ book.description }}</p>
-          <div class="flex items-center gap-3">
-            <span
-              class="text-xs px-2 py-0.5 rounded-full"
-              :class="book.status === 'completed' ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'"
-            >{{ book.status || i18n.t('book_unknown_status') }}</span>
-            <span class="text-xs text-muted dark:text-gray-400">
-              {{ i18n.t('book_updated', { date: new Date(book.updated_at).toLocaleDateString() }) }}
-            </span>
-          </div>
-          <div v-if="alternates.length > 1" class="mt-4">
+        </header>
+
+        <section v-if="book.description" class="mb-5 rounded-2xl border border-border/80 bg-surface p-4 dark:border-gray-800 dark:bg-gray-900 sm:p-6">
+          <h2 class="mb-2 text-base font-semibold">{{ i18n.t('book_description') }}</h2>
+          <p class="whitespace-pre-line break-words text-sm leading-relaxed text-muted dark:text-gray-300">{{ book.description }}</p>
+        </section>
+
+        <div class="mb-8 space-y-2">
+          <div class="flex flex-wrap items-center gap-2">
             <button
+              v-if="alternates.length > 1"
               @click="showSources = !showSources"
-              class="px-3 py-1 text-xs border border-border dark:border-gray-700 rounded hover:bg-accent/5 transition-colors"
+              :aria-expanded="showSources"
+              class="detail-action"
             >{{ i18n.t('book_switch_source') }} ({{ alternates.length }})</button>
-            <div
-              v-if="showSources"
-              class="mt-2 divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900"
-            >
-              <button
-                v-for="alt in alternates"
-                :key="alt.id"
-                @click="switchSource(alt.id)"
-                class="w-full flex items-center justify-between px-3 py-2 text-left text-sm hover:bg-accent/5 transition-colors"
-                :class="alt.is_current ? 'text-accent font-medium' : ''"
-              >
-                <span>
-                  {{ alt.source_name || alt.source_id || i18n.t('book_unknown_source') }}
-                  <span class="text-xs text-muted dark:text-gray-400">
-                    ({{ i18n.t('book_chapters_count', { n: alt.chapter_count }) }})
-                  </span>
-                </span>
-                <span class="text-xs text-muted dark:text-gray-400">
-                  {{ alt.is_current ? i18n.t('book_current') : i18n.t('book_switch') }}
-                </span>
-              </button>
-            </div>
+            <button
+              v-if="alternates.length > 1"
+              @click="coverPickerOpen = true"
+              class="detail-action"
+            >{{ i18n.t('book_cover_select') }}</button>
+            <router-link
+              :to="'/discover?book_id=' + book.id"
+              class="detail-action"
+            >{{ i18n.t('book_find_similar') }}</router-link>
+            <a :href="'/api/books/' + book.id + '/epub'" class="detail-action" download>
+              {{ i18n.t('book_download_epub') }}
+            </a>
+            <button
+              @click="editing = !editing"
+              :aria-pressed="editing"
+              class="detail-action text-accent"
+            >{{ editing ? i18n.t('book_edit_done') : i18n.t('book_edit') }}</button>
           </div>
-          <div class="flex items-center gap-2 mt-4">
+          <p v-if="coverError" class="text-xs text-red-600 dark:text-red-400">{{ coverError }}</p>
+          <div
+            v-if="showSources && alternates.length > 1"
+            class="divide-y divide-border rounded-xl border border-border bg-surface dark:divide-gray-800 dark:border-gray-800 dark:bg-gray-900"
+          >
+            <button
+              v-for="alt in alternates"
+              :key="alt.id"
+              @click="switchSource(alt.id)"
+              class="flex min-h-11 w-full items-center justify-between gap-2 px-3 py-2 text-left text-sm transition-colors hover:bg-accent/5"
+              :class="alt.is_current ? 'font-medium text-accent' : ''"
+            >
+              <span class="min-w-0 break-words">
+                {{ alt.source_name || alt.source_id || i18n.t('book_unknown_source') }}
+                <span class="text-xs text-muted dark:text-gray-400">
+                  ({{ i18n.t('book_chapters_count', { n: alt.chapter_count }) }})
+                </span>
+              </span>
+              <span class="shrink-0 text-xs text-muted dark:text-gray-400">
+                {{ alt.is_current ? i18n.t('book_current') : i18n.t('book_switch') }}
+              </span>
+            </button>
+          </div>
+          <div v-if="editing && (auth.isAdmin || canPublish)" class="flex flex-wrap items-center gap-2">
             <button
               v-if="canPublish && !book.is_r18"
               @click="convertToR18"
               :disabled="convertingToR18"
-              class="px-3 py-1 text-xs border border-purple-500 text-purple-700 dark:text-purple-400 rounded hover:bg-purple-50 dark:hover:bg-purple-950 disabled:opacity-50"
+              class="detail-action text-purple-700 dark:text-purple-400"
             >{{ convertingToR18 ? i18n.t('book_converting_r18') : i18n.t('book_convert_r18') }}</button>
             <button
               v-if="canPublish && book.is_public"
               @click="unpublishBook"
               :disabled="publishing"
-              class="px-3 py-1 text-xs border border-border dark:border-gray-700 rounded hover:bg-accent/5 disabled:opacity-50"
+              class="detail-action"
             >{{ i18n.t('book_unpublish') }}</button>
-            <span
-              v-if="book.is_public && book.all_ages_confirmed"
-              class="text-xs px-2 py-0.5 rounded-full bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300"
-            >{{ i18n.t('book_all_ages_confirmed') }}</span>
-            <button
-              @click="toggleFavorite"
-              class="px-3 py-1 text-xs border border-border dark:border-gray-700 rounded hover:bg-accent/5 transition-colors"
-            >{{ favorite ? i18n.t('book_favorite_added') : i18n.t('book_favorite') }}</button>
-            <router-link
-              :to="'/discover?book_id=' + book.id"
-              class="px-3 py-1 text-xs border border-border dark:border-gray-700 rounded hover:bg-accent/5 transition-colors no-underline"
-            >{{ i18n.t('book_find_similar') }}</router-link>
-            <button
-              @click="editing = !editing"
-              class="px-3 py-1 text-xs border border-accent/50 text-accent rounded hover:bg-accent/5 transition-colors"
-            >{{ editing ? i18n.t('book_edit_done') : i18n.t('book_edit') }}</button>
-            <button
-              v-if="auth.isAdmin"
-              @click="deleteThisBook"
-              class="px-3 py-1 text-xs text-red-500 border border-red-200 rounded hover:bg-red-50 transition-colors"
-            >{{ i18n.t('book_delete') }}</button>
-            <a
-              :href="'/api/books/' + book.id + '/epub'"
-              class="inline-flex items-center gap-1 px-4 py-2 rounded-lg border border-border dark:border-gray-700 text-sm hover:bg-accent/5 transition-colors no-underline"
-              download
-            >{{ i18n.t('book_download_epub') }}</a>
             <button
               v-if="auth.isAdmin && book.source_id"
               @click="resyncBook"
               :disabled="syncing"
-              class="px-3 py-1 text-xs border border-border dark:border-gray-700 rounded hover:bg-accent/5 transition-colors disabled:opacity-50"
+              class="detail-action"
             >{{ syncing ? i18n.t('book_syncing') : i18n.t('book_resync') }}</button>
             <button
               v-if="auth.isAdmin && book.source_id"
               @click="refetchBookContent"
               :disabled="syncing"
               :title="i18n.t('book_refetch_hint')"
-              class="px-3 py-1 text-xs border border-border dark:border-gray-700 rounded hover:bg-accent/5 transition-colors disabled:opacity-50"
+              class="detail-action"
             >{{ i18n.t('book_refetch') }}</button>
+            <button
+              v-if="auth.isAdmin"
+              @click="deleteThisBook"
+              class="detail-action text-red-600 dark:text-red-400"
+            >{{ i18n.t('book_delete') }}</button>
           </div>
-        </header>
+        </div>
 
-        <section v-if="auth.isAdmin && editing" class="mb-8">
+        <section v-if="auth.isAdmin && editing" class="mb-5 rounded-2xl border border-border/80 bg-surface p-4 dark:border-gray-800 dark:bg-gray-900 sm:p-6">
+          <form class="flex flex-wrap items-end gap-2" @submit.prevent="saveKind">
+            <label class="flex flex-col gap-1.5 text-sm font-medium">
+              {{ i18n.t('book_kind_manage') }}
+              <select
+                v-model="kindOverride"
+                @change="kindStatus = ''; kindError = ''"
+                :disabled="kindSaving"
+                class="min-h-11 rounded-xl border border-border bg-paper px-3 text-sm dark:border-gray-700 dark:bg-gray-800"
+              >
+                <option value="">{{ i18n.t('book_kind_auto') }}</option>
+                <option value="novel">{{ i18n.t('kind_novels') }}</option>
+                <option value="comic">{{ i18n.t('kind_comics') }}</option>
+              </select>
+            </label>
+            <button type="submit" :disabled="kindSaving || kindOverride === (book.kind_override ?? '')" class="detail-action">
+              {{ i18n.t('book_kind_save') }}
+            </button>
+          </form>
+          <p v-if="kindStatus" role="status" class="mt-2 text-xs text-green-700 dark:text-green-300">{{ kindStatus }}</p>
+          <p v-if="kindError" role="alert" class="mt-2 text-xs text-red-600 dark:text-red-400">{{ kindError }}</p>
+        </section>
+
+        <section v-if="auth.isAdmin && editing" class="mb-8 rounded-2xl border border-border/80 bg-surface p-4 dark:border-gray-800 dark:bg-gray-900 sm:p-6">
           <h2 class="text-lg font-semibold mb-3">{{ i18n.t('book_category_manage') }}</h2>
           <div v-if="allCategories.length" class="flex flex-wrap gap-3 mb-3">
             <label
@@ -802,7 +888,7 @@ watch(
           </div>
         </section>
 
-        <section>
+        <section id="book-chapters" class="scroll-mt-20">
           <h2 class="text-lg font-semibold mb-3">
             {{ i18n.t('book_chapters') }}
             <span class="text-sm font-normal text-muted dark:text-gray-400">({{ chapters.length }})</span>
@@ -810,18 +896,18 @@ watch(
 
           <p v-if="chapters.length === 0" class="text-muted dark:text-gray-400 text-sm">{{ i18n.t('book_no_chapters') }}</p>
 
-          <div class="divide-y divide-border border border-border dark:border-gray-700 rounded-lg bg-surface dark:bg-gray-900">
+          <div v-else class="divide-y divide-border overflow-hidden rounded-2xl border border-border bg-surface dark:divide-gray-800 dark:border-gray-800 dark:bg-gray-900">
             <router-link
               v-for="ch in visibleChapters"
               :key="ch.id"
               :to="'/books/' + book.id + '/chapters/' + ch.id"
-              class="flex items-center justify-between px-4 py-3 hover:bg-accent/5 transition-colors no-underline"
+              class="flex min-h-12 items-center justify-between gap-3 px-4 py-3 transition-colors hover:bg-accent/5"
             >
-              <span class="text-sm">
-                <span class="text-muted dark:text-gray-400 mr-2">{{ ch.chapter_number }}.</span>
-                {{ ch.title || i18n.t('book_chapter', { n: ch.chapter_number }) }}
+              <span class="flex min-w-0 items-baseline gap-2 text-sm">
+                <span class="shrink-0 tabular-nums text-muted dark:text-gray-400">{{ ch.chapter_number }}.</span>
+                <span class="break-words">{{ ch.title || i18n.t('book_chapter', { n: ch.chapter_number }) }}</span>
               </span>
-              <span class="text-xs text-muted dark:text-gray-400">&rarr;</span>
+              <span aria-hidden="true" class="shrink-0 text-xs text-muted dark:text-gray-400">&rarr;</span>
             </router-link>
             <div v-if="hasMoreChapters" ref="chaptersSentinel" class="px-4 py-3 text-center text-xs text-muted dark:text-gray-400">
               {{ i18n.t('book_chapters_more', { n: chapters.length - visibleChapters.length }) }}
@@ -830,8 +916,15 @@ watch(
         </section>
       </template>
 
+      <ImageViewer
+        v-if="coverPreviewOpen && showCovers && book?.cover"
+        :src="book.cover"
+        :alt="book.title"
+        @close="coverPreviewOpen = false"
+      />
+
       <div v-if="coverPickerOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" @click.self="coverPickerOpen = false">
-        <div class="w-full max-w-lg rounded-lg border border-border dark:border-gray-700 bg-white dark:bg-gray-900 p-4">
+        <div class="max-h-[90dvh] w-full max-w-lg overflow-y-auto rounded-xl border border-border bg-white p-4 dark:border-gray-700 dark:bg-gray-900">
           <h3 class="text-sm font-semibold mb-3">{{ i18n.t('book_cover_choose') }}</h3>
           <div class="grid grid-cols-3 gap-3">
             <button
@@ -844,11 +937,11 @@ watch(
                 v-if="alt.cover"
                 :src="alt.cover"
                 :alt="alt.title"
-                class="h-32 w-24 object-cover rounded border border-border dark:border-gray-700"
+                class="aspect-[2/3] w-full max-w-24 object-cover rounded border border-border dark:border-gray-700"
               />
               <span
                 v-else
-                class="h-32 w-24 flex items-center justify-center text-xs text-muted dark:text-gray-400 rounded border border-border dark:border-gray-700"
+                class="flex aspect-[2/3] w-full max-w-24 items-center justify-center rounded border border-border text-xs text-muted dark:border-gray-700 dark:text-gray-400"
               >{{ i18n.t('book_cover_none') }}</span>
               <span class="text-xs text-muted dark:text-gray-400 truncate w-full text-center">
                 {{ alt.source_name || alt.id }}<template v-if="alt.is_current"> · {{ i18n.t('book_cover_current') }}</template>
@@ -885,3 +978,10 @@ watch(
     </main>
   </div>
 </template>
+
+<style scoped>
+.detail-action {
+  @apply inline-flex min-h-11 items-center justify-center rounded-xl border border-border bg-surface px-3
+    text-center text-sm transition-colors hover:bg-accent/5 disabled:opacity-50 dark:border-gray-700 dark:bg-gray-900;
+}
+</style>

@@ -19,31 +19,40 @@ export interface User {
 
 export const useAuthStore = defineStore("auth", () => {
   const user = ref<User | null>(null)
-const isDark = ref(localStorage.getItem('novelhub_dark') === 'true')
+  const isDark = ref(localStorage.getItem("novelhub_dark") === "true")
   const token = ref<string | null>(localStorage.getItem("novelhub_token"))
 
   const isAuthenticated = computed(() => !!token.value)
   const isAdmin = computed(() => user.value?.role === "admin" || user.value?.role === "super_admin")
-const isSuperAdmin = computed(() => user.value?.role === "super_admin")
+  const isSuperAdmin = computed(() => user.value?.role === "super_admin")
 
-function toggleDark() {
-  setDark(!isDark.value)
-}
+  function applyDocumentTheme() {
+    document.documentElement.classList.toggle("dark", isDark.value)
+    document.querySelector('meta[name="theme-color"]')?.setAttribute(
+      "content", isDark.value ? "#101816" : "#f6f4ed",
+    )
+  }
 
-function setDark(value: boolean) {
-  isDark.value = value
-  localStorage.setItem('novelhub_dark', String(isDark.value))
-  document.documentElement.classList.toggle('dark', isDark.value)
-}
+  applyDocumentTheme()
 
-function applyUserSettings(u: User) {
-  if (u.settings?.theme === "dark") setDark(true)
-  else if (u.settings?.theme === "light") setDark(false)
-}
+  function toggleDark() {
+    setDark(!isDark.value)
+  }
 
-function emitAuthenticated() {
-  window.dispatchEvent(new CustomEvent("novelhub:authenticated"))
-}
+  function setDark(value: boolean) {
+    isDark.value = value
+    localStorage.setItem("novelhub_dark", String(value))
+    applyDocumentTheme()
+  }
+
+  function applyUserSettings(u: User) {
+    if (u.settings?.theme === "dark") setDark(true)
+    else if (u.settings?.theme === "light") setDark(false)
+  }
+
+  function emitAuthenticated() {
+    window.dispatchEvent(new CustomEvent("novelhub:authenticated"))
+  }
 
   async function login(username: string, password: string) {
     const res = await api.post<{ access_token: string; user: User }>("/auth/login", {
@@ -104,5 +113,5 @@ function emitAuthenticated() {
     localStorage.removeItem("novelhub_token")
   }
 
- return { user, token, isDark, isAuthenticated, isAdmin, isSuperAdmin, toggleDark, setDark, login, register, fetchMe, updateVisibility, logout }
+  return { user, token, isDark, isAuthenticated, isAdmin, isSuperAdmin, toggleDark, setDark, login, register, fetchMe, updateVisibility, logout }
 })

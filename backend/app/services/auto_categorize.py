@@ -4,11 +4,16 @@ Default mapping rules cover common Chinese novel genres. Admins can
 customize categories and rules through the API.
 """
 
+from uuid import uuid4
+
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.models import Book, BookTag, Tag
-from app.repositories.category import CategoryRepository
+from app.models import Book, BookTag, Category, Tag
+from app.models.app_setting import AppSetting
+from app.repositories.category import DISABLED_DEFAULT_PREFIX, CategoryRepository
 
 
 DEFAULT_CATEGORY_RULES: dict[str, list[str]] = {
@@ -127,7 +132,6 @@ class AutoCategorizationService:
     @staticmethod
     async def ensure_default_categories(db: AsyncSession) -> None:
         """Create default categories if they don't exist."""
-        repo = CategoryRepository(db)
         colors = {
             "玄幻": "#8B0000", "都市": "#006400", "言情": "#FF69B4",
             "科幻": "#00008B", "历史": "#8B4513", "悬疑": "#4B0082",
@@ -138,30 +142,47 @@ class AutoCategorizationService:
             "乱伦": "#A52A2A", "母系": "#D2691E", "肉文": "#B22222",
             "露出": "#DC143C", "绿帽": "#006400",
         }
-        for name in DEFAULT_CATEGORY_RULES:
-            existing = await repo.get_by_name(name)
-            if existing is None:
-                await repo.create(
-                    name=name,
-                    description=f"Auto-generated: {name} novels",
-                    color=colors.get(name),
-                    is_r18=name in R18_CATEGORY_NAMES,
-                )
+        # Read active and explicitly removed defaults in one snapshot.
+        names = await db.scalars(select(Category.name).union(
+            select(func.substr(AppSetting.key, len(DISABLED_DEFAULT_PREFIX) + 1))
+            .where(AppSetting.key.startswith(DISABLED_DEFAULT_PREFIX, autoescape=True))
+        ))
+        existing = set(names)
+        missing = [
+            {
+                "id": str(uuid4()),
+                "name": name,
+                "description": f"Auto-generated: {name} novels",
+                "color": colors.get(name),
+                "is_r18": name in R18_CATEGORY_NAMES,
+            }
+            for name in DEFAULT_CATEGORY_RULES
+            if name not in existing
+        ]
+        if missing:
+            insert = sqlite_insert if db.get_bind().dialect.name == "sqlite" else pg_insert
+            await db.execute(insert(Category).values(missing).on_conflict_do_nothing(index_elements=[Category.name]))
+            await db.commit()
 
     @staticmethod
-    async def categorize_book(db: AsyncSession, book_id: str) -> list[str]:
+    async def categorize_book(db: AsyncSession, book_id: str, *, reset_manual: bool = False) -> list[str]:
         """Auto-categorize a single book based on its tags. Returns assigned category names."""
         await AutoCategorizationService.ensure_default_categories(db)
         book = await db.get(Book, book_id)
         if book is None:
             return []
+        repo = CategoryRepository(db)
+        await db.refresh(book, attribute_names=["categories_manually_set"], with_for_update=True)
+        current = await repo.get_book_categories(book_id, include_r18=book.is_r18)
+        current_names = [category.name for category in current]
+        if book.categories_manually_set and not reset_manual:
+            await db.commit()
+            return current_names
+
         tags = await db.scalars(
             select(Tag).join(BookTag).where(BookTag.book_id == book_id)
         )
         tag_texts = [t.name for t in tags]
-        if not tag_texts and not book.title and not book.description:
-            logger.debug("No text for book {}, skipping auto-categorization", book_id)
-            return []
         matched_categories = classify_category_names(
             tag_texts,
             title=book.title or "",
@@ -169,17 +190,16 @@ class AutoCategorizationService:
             is_r18=book.is_r18,
         )
 
-        if matched_categories:
-            repo = CategoryRepository(db)
-            cat_ids = []
-            for name in matched_categories:
-                cat = await repo.get_by_name(name)
-                if cat:
-                    cat_ids.append(cat.id)
-            if cat_ids:
-                await repo.set_book_categories(book_id, cat_ids)
-                logger.info("Auto-categorized book {} as {}", book_id, matched_categories)
-        return matched_categories
+        candidates = await db.scalars(select(Category).where(Category.name.in_(matched_categories)))
+        available = {category.name: category.id for category in candidates if book.is_r18 or not category.is_r18}
+        assigned = [name for name in matched_categories if name in available]
+        book.categories_manually_set = False
+        if set(assigned) == set(current_names):
+            await db.commit()
+            return assigned
+        await repo.set_book_categories(book_id, [available[name] for name in assigned])
+        logger.debug("Auto-categorized book {} as {}", book_id, assigned)
+        return assigned
 
     @staticmethod
     async def categorize_all_books(db: AsyncSession) -> dict:

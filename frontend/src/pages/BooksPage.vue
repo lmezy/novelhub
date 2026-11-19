@@ -15,7 +15,7 @@ type SearchField = "title" | "author" | "chapter_title" | "description" | "conte
 type MatchMode = "exact" | "fuzzy"
 type SearchTab = "local" | "sources"
 
-interface CategoryItem { id: string; name: string; color?: string | null }
+interface CategoryItem { id: string; name: string; color?: string | null; is_r18?: boolean }
 interface SourceItem { id: string; name: string }
 interface HomeSection { category_id: string; category_name: string; category_color?: string | null; total: number; books: Book[] }
 interface HomeData { total: number; latest: Book[]; sections: HomeSection[] }
@@ -95,15 +95,19 @@ const kindTitle = computed(() =>
       ? i18n.t("novels_title")
       : i18n.t("books_title"),
 )
-const kindSubtitle = computed(() =>
-  bookKind.value === "comic"
-    ? i18n.t("comics_subtitle")
-    : bookKind.value === "novel"
-      ? i18n.t("novels_subtitle")
-      : i18n.t("books_subtitle"),
-)
+const libraryKinds = [
+  { path: "/books", value: "", label: "kind_all" },
+  { path: "/novels", value: "novel", label: "kind_novels" },
+  { path: "/comics", value: "comic", label: "kind_comics" },
+] as const
 
 const categories = ref<CategoryItem[]>([])
+const categoryManagerOpen = ref(false)
+const managedCategories = ref<CategoryItem[]>([])
+const categoryName = ref("")
+const categoryR18 = ref(false)
+const categoryBusy = ref(false)
+const categoryError = ref("")
 const sources = ref<SourceItem[]>([])
 const home = ref<HomeData | null>(null)
 const homeSources = ref<{ source: SourceItem; total: number; books: Book[] }[]>([])
@@ -113,6 +117,7 @@ const searchTotal = ref(0)
 const loading = ref(false)
 const error = ref("")
 const selectedIds = ref<string[]>([])
+const managingBooks = ref(false)
 const actionBusy = ref(false)
 const searchQuery = ref("")
 const searchField = ref<SearchField>("title")
@@ -313,6 +318,55 @@ async function loadNavigation() {
   }
 }
 
+async function toggleCategoryManager() {
+  categoryManagerOpen.value = !categoryManagerOpen.value
+  if (!categoryManagerOpen.value) return
+  categoryError.value = ""
+  categoryBusy.value = true
+  try {
+    managedCategories.value = await api.get<CategoryItem[]>("/categories")
+  } catch {
+    categoryError.value = i18n.t("books_categories_load_failed")
+  } finally {
+    categoryBusy.value = false
+  }
+}
+
+async function addCategory() {
+  const name = categoryName.value.trim()
+  if (!name || categoryBusy.value) return
+  categoryBusy.value = true
+  categoryError.value = ""
+  try {
+    const created = await api.post<CategoryItem>("/categories", { name, is_r18: categoryR18.value })
+    managedCategories.value = [...managedCategories.value, created].sort((a, b) => a.name.localeCompare(b.name))
+    categoryName.value = ""
+    categoryR18.value = false
+    if (!bookKind.value) categories.value = managedCategories.value
+  } catch (e) {
+    categoryError.value = e instanceof Error ? e.message : i18n.t("book_category_create_failed")
+  } finally {
+    categoryBusy.value = false
+  }
+}
+
+async function deleteCategory(category: CategoryItem) {
+  if (categoryBusy.value || !confirm(i18n.t("books_category_remove_confirm", { name: category.name }))) return
+  categoryBusy.value = true
+  categoryError.value = ""
+  try {
+    await api.delete("/categories/" + encodeURIComponent(category.id))
+    managedCategories.value = managedCategories.value.filter((item) => item.id !== category.id)
+    categories.value = categories.value.filter((item) => item.id !== category.id)
+    if (activeCategory.value === category.name) await router.push(listPath.value)
+    else if (!isSearching.value && !isAdvancedRoute.value) await loadCurrentView()
+  } catch (e) {
+    categoryError.value = e instanceof Error ? e.message : i18n.t("books_category_remove_failed")
+  } finally {
+    categoryBusy.value = false
+  }
+}
+
 async function loadHome() {
   const params = new URLSearchParams({ section_limit: "6" })
   if (bookKind.value) params.set("kind", bookKind.value)
@@ -425,9 +479,20 @@ function openCategory(name: string) {
   router.push({ path: listPath.value, query: { category: name } })
 }
 
+function selectCategory(event: Event) {
+  const category = (event.target as HTMLSelectElement).value
+  router.push({ path: listPath.value, query: {
+    ...(category ? { category } : { all: "1" }),
+    ...(activeSource.value ? { source: activeSource.value } : {}),
+  } })
+}
+
 function changeSource(event: Event) {
   const source = (event.target as HTMLSelectElement).value
-  router.push({ path: listPath.value, query: { ...(activeCategory.value ? { category: activeCategory.value } : {}), ...(source ? { source } : {}) } })
+  router.push({ path: listPath.value, query: {
+    ...(activeCategory.value ? { category: activeCategory.value } : { all: "1" }),
+    ...(source ? { source } : {}),
+  } })
 }
 
 function searchByField(field: "author" | "tags" | "category", value: string) {
@@ -442,6 +507,11 @@ function goToHit(hit: SearchHit) {
 
 function toggleSelect(id: string) {
   selectedIds.value = selectedIds.value.includes(id) ? selectedIds.value.filter((item) => item !== id) : [...selectedIds.value, id]
+}
+
+function toggleBookManagement() {
+  managingBooks.value = !managingBooks.value
+  if (!managingBooks.value) selectedIds.value = []
 }
 
 function toggleAll() {
@@ -769,80 +839,98 @@ onBeforeUnmount(() => {
     <NavBar />
 
     <main class="mx-auto max-w-6xl px-4 pb-12 pt-7">
-      <header class="mb-6 text-center">
-        <h1 class="text-2xl font-bold">{{ kindTitle }}</h1>
-        <p class="mt-1 text-sm text-muted dark:text-gray-400">{{ kindSubtitle }}</p>
-
-        <div class="mt-4 flex items-center justify-center gap-2" :title="i18n.t('books_kind_switch')">
-          <button
-            @click="router.push('/books')"
-            class="rounded border px-3 py-1.5 text-xs transition-colors"
-            :class="bookKind === '' ? 'border-accent bg-accent text-white' : 'border-border text-muted hover:bg-accent/5 dark:border-gray-700 dark:text-gray-400'"
-          >{{ i18n.t('kind_all') }}</button>
-          <button
-            @click="router.push('/novels')"
-            class="rounded border px-3 py-1.5 text-xs transition-colors"
-            :class="bookKind === 'novel' ? 'border-accent bg-accent text-white' : 'border-border text-muted hover:bg-accent/5 dark:border-gray-700 dark:text-gray-400'"
-          >{{ i18n.t('kind_novels') }}</button>
-          <button
-            @click="router.push('/comics')"
-            class="rounded border px-3 py-1.5 text-xs transition-colors"
-            :class="bookKind === 'comic' ? 'border-accent bg-accent text-white' : 'border-border text-muted hover:bg-accent/5 dark:border-gray-700 dark:text-gray-400'"
-          >{{ i18n.t('kind_comics') }}</button>
-        </div>
-
-        <div class="mx-auto mt-5 flex max-w-2xl items-center justify-center gap-2">
-          <div class="flex rounded-lg border border-border bg-surface overflow-hidden dark:border-gray-700 dark:bg-gray-900">
-            <button
-              @click="searchTab = 'local'"
-              class="px-3 py-2 text-xs transition-colors"
-              :class="searchTab === 'local' ? 'bg-accent text-white' : 'text-muted hover:bg-black/5 dark:hover:bg-white/5'"
-            >{{ i18n.t('search_tab_local') }}</button>
-            <button
-              @click="searchTab = 'sources'"
-              class="px-3 py-2 text-xs transition-colors"
-              :class="searchTab === 'sources' ? 'bg-accent text-white' : 'text-muted hover:bg-black/5 dark:hover:bg-white/5'"
-            >{{ i18n.t('search_tab_sources') }}</button>
-          </div>
-        </div>
-
-        <form v-if="searchTab === 'local'" @submit.prevent="submitSearch" class="mx-auto mt-3 flex max-w-2xl overflow-hidden rounded-lg border border-border bg-surface shadow-sm focus-within:border-accent dark:border-gray-700 dark:bg-gray-900">
-          <select v-model="searchField" class="border-r border-border bg-transparent px-3 text-xs outline-none dark:border-gray-700">
-            <option v-for="field in searchFields" :key="field.value" :value="field.value">{{ i18n.t(field.label) }}</option>
-          </select>
-          <input v-model="searchQuery" type="search" :placeholder="i18n.t('search_placeholder')" class="min-w-0 flex-1 bg-transparent px-4 py-3 text-sm outline-none" />
-          <button type="submit" class="flex w-12 items-center justify-center bg-accent text-lg text-white" :title="i18n.t('nav_search')">⌕</button>
-        </form>
-
-        <form v-else @submit.prevent="runSourceSearch" class="mx-auto mt-3 flex max-w-2xl overflow-hidden rounded-lg border border-border bg-surface shadow-sm focus-within:border-accent dark:border-gray-700 dark:bg-gray-900">
-          <button
-            type="button"
-            class="border-r border-border px-3 py-3 text-xs whitespace-nowrap dark:border-gray-700"
-            :class="sourceScope === 'all' ? 'text-accent' : 'text-muted dark:text-gray-400'"
-            :title="i18n.t('search_scope_hint')"
-            @click="sourceScope = sourceScope === 'all' ? 'one' : 'all'"
-          >{{ sourceScope === 'all' ? i18n.t('search_scope_all') : i18n.t('search_scope_one') }}</button>
-          <select v-if="sourceScope === 'one'" v-model="sourceSearchId" class="max-w-36 border-r border-border bg-transparent px-3 py-3 text-xs outline-none dark:border-gray-700">
-            <option v-for="source in sources" :key="source.id" :value="source.id">{{ source.name }}</option>
-          </select>
-          <input v-model="sourceQuery" type="search" :placeholder="i18n.t('search_source_query_placeholder')" class="min-w-0 flex-1 bg-transparent px-4 py-3 text-sm outline-none" />
-          <select v-model.number="sourceLimit" class="border-l border-border bg-transparent px-2 py-3 text-xs outline-none dark:border-gray-700" :title="i18n.t('search_source_limit_hint')">
-            <option v-for="n in [10, 20, 30, 50, 100]" :key="n" :value="n">{{ n }}{{ i18n.t('search_source_limit_suffix') }}</option>
-          </select>
-          <button type="submit" class="flex w-12 items-center justify-center bg-accent text-lg text-white" :title="i18n.t('search_button')">⌕</button>
-        </form>
-
-        <div v-if="searchTab === 'local'" class="mt-3 flex flex-wrap items-center justify-center gap-2 text-xs">
-          <button
-            @click="toggleAdvanced"
-            class="rounded border px-3 py-1.5 transition-colors"
-            :class="advancedOpen ? 'border-accent text-accent' : 'border-border text-muted hover:bg-accent/5 dark:border-gray-700 dark:text-gray-400'"
-          >{{ advancedOpen ? i18n.t('books_search_advanced_off') : i18n.t('search_advanced') }}</button>
-          <span class="text-muted dark:text-gray-400">{{ i18n.t('books_advanced_search_hint') }}</span>
-        </div>
+      <header class="mb-5 flex flex-wrap items-end justify-between gap-4 sm:mb-7">
+        <h1 class="font-serif text-4xl font-semibold tracking-tight sm:text-5xl">{{ kindTitle }}</h1>
+        <nav :aria-label="i18n.t('books_kind_switch')" class="flex flex-wrap items-center gap-1 rounded-xl border border-border bg-surface p-1 dark:border-gray-800 dark:bg-gray-900">
+          <router-link
+            v-for="kind in libraryKinds"
+            :key="kind.path"
+            :to="kind.path"
+            class="library-choice"
+            :aria-current="bookKind === kind.value ? 'page' : undefined"
+          >{{ i18n.t(kind.label) }}</router-link>
+        </nav>
       </header>
 
-      <div v-if="searchTab === 'local' && advancedOpen" class="mx-auto mb-6 max-w-2xl rounded-lg border border-border bg-surface p-4 dark:border-gray-700 dark:bg-gray-900">
+      <section class="library-search-panel mb-5" :aria-label="i18n.t('nav_search')">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div class="flex flex-wrap gap-1" :aria-label="i18n.t('nav_search')" role="group">
+            <button
+              type="button"
+              class="library-choice"
+              :aria-pressed="searchTab === 'local'"
+              @click="searchTab = 'local'"
+            >{{ i18n.t('search_tab_local') }}</button>
+            <button
+              type="button"
+              class="library-choice"
+              :aria-pressed="searchTab === 'sources'"
+              @click="searchTab = 'sources'"
+            >{{ i18n.t('search_tab_sources') }}</button>
+          </div>
+          <button
+            v-if="searchTab === 'local'"
+            type="button"
+            class="library-utility"
+            :aria-expanded="advancedOpen"
+            aria-controls="library-advanced-search"
+            @click="toggleAdvanced"
+          >{{ i18n.t(advancedOpen ? 'books_search_advanced_off' : 'search_advanced') }}</button>
+        </div>
+
+        <form
+          v-if="searchTab === 'local'"
+          class="library-search-row mt-3"
+          role="search"
+          :aria-label="i18n.t('search_tab_local')"
+          @submit.prevent="submitSearch"
+        >
+          <select v-model="searchField" :aria-label="i18n.t('books_search_field')" class="max-w-[32%] shrink-0 border-r border-border bg-transparent px-2 text-xs dark:border-gray-700 sm:px-3">
+            <option v-for="field in searchFields" :key="field.value" :value="field.value">{{ i18n.t(field.label) }}</option>
+          </select>
+          <input
+            v-model="searchQuery"
+            type="search"
+            :aria-label="i18n.t('search_placeholder')"
+            :placeholder="i18n.t('search_placeholder')"
+            class="min-w-0 flex-1 bg-transparent px-2.5 text-sm outline-none sm:px-4"
+          />
+          <button type="submit" class="library-submit">{{ i18n.t('search_button') }}</button>
+        </form>
+
+        <form
+          v-else
+          class="mt-3 space-y-3"
+          role="search"
+          :aria-label="i18n.t('search_tab_sources')"
+          @submit.prevent="runSourceSearch"
+        >
+          <div class="library-search-row">
+            <input
+              v-model="sourceQuery"
+              type="search"
+              :aria-label="i18n.t('search_source_query_placeholder')"
+              :placeholder="i18n.t(sourceScope === 'all' ? 'search_source_query_placeholder' : 'search_condition_placeholder')"
+              class="min-w-0 flex-1 bg-transparent px-3 text-sm outline-none sm:px-4"
+            />
+            <button type="submit" class="library-submit">{{ i18n.t('search_button') }}</button>
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            <select v-model="sourceScope" class="library-select" :aria-label="i18n.t('books_search_scope')">
+              <option value="all">{{ i18n.t('search_scope_all') }}</option>
+              <option value="one">{{ i18n.t('search_scope_one') }}</option>
+            </select>
+            <select v-if="sourceScope === 'one'" v-model="sourceSearchId" class="library-select max-w-full sm:max-w-64" :aria-label="i18n.t('search_select_source')">
+              <option v-for="source in sources" :key="source.id" :value="source.id">{{ source.name }}</option>
+            </select>
+            <select v-model.number="sourceLimit" class="library-select" :aria-label="i18n.t('search_source_limit_hint')">
+              <option v-for="n in [10, 20, 30, 50, 100]" :key="n" :value="n">{{ n }}{{ i18n.t('search_source_limit_suffix') }}</option>
+            </select>
+          </div>
+        </form>
+      </section>
+
+      <section v-if="searchTab === 'local' && advancedOpen" id="library-advanced-search" class="mb-5 rounded-2xl border border-border bg-surface p-4 dark:border-gray-800 dark:bg-gray-900 sm:p-5">
         <div class="mb-3 flex flex-wrap items-center gap-2">
           <div class="flex rounded-lg border border-border dark:border-gray-700 overflow-hidden">
             <button
@@ -918,13 +1006,65 @@ onBeforeUnmount(() => {
           >{{ i18n.t('search_button') }}</button>
           <span v-if="advancedSearching" class="text-xs text-muted dark:text-gray-400">{{ i18n.t('search_searching') }}</span>
         </div>
-      </div>
+      </section>
 
-      <nav class="mb-7 flex flex-wrap items-center gap-2 border-y border-border py-3 dark:border-gray-800">
-        <button @click="router.push(listPath)" class="shrink-0 rounded px-3 py-1.5 text-xs" :class="!activeCategory && !activeSource && !browseAll && !isSearching && !advancedActive ? 'bg-accent text-white' : 'text-muted hover:bg-black/5 dark:text-gray-400 dark:hover:bg-white/5'">{{ i18n.t('books_all_categories') }}</button>
-        <button @click="router.push({ path: listPath, query: { all: '1' } })" class="shrink-0 rounded px-3 py-1.5 text-xs" :class="browseAll && !activeCategory && !activeSource ? 'bg-accent text-white' : 'text-muted hover:bg-black/5 dark:text-gray-400 dark:hover:bg-white/5'">{{ i18n.t('books_all_books') }}</button>
-        <button v-for="category in categories" :key="category.id" @click="openCategory(category.name)" class="shrink-0 rounded px-3 py-1.5 text-xs" :class="activeCategory === category.name ? 'bg-accent text-white' : 'text-muted hover:bg-black/5 dark:text-gray-400 dark:hover:bg-white/5'">{{ category.name }}</button>
-      </nav>
+      <section v-if="searchTab === 'local'" class="mb-7 flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-border bg-surface p-2.5 dark:border-gray-800 dark:bg-gray-900 sm:px-4" :aria-label="i18n.t('nav_library')">
+        <div class="flex min-w-0 flex-wrap gap-1">
+          <button
+            type="button"
+            class="library-choice"
+            :aria-pressed="!isBrowsing && !isSearching && !isAdvancedRoute"
+            @click="router.push(listPath)"
+          >{{ i18n.t('books_latest') }}</button>
+          <button
+            type="button"
+            class="library-choice"
+            :aria-pressed="browseAll && !activeCategory && !activeSource"
+            @click="router.push({ path: listPath, query: { all: '1' } })"
+          >{{ i18n.t('books_all_books') }}</button>
+        </div>
+        <div class="flex min-w-0 flex-wrap items-center gap-2">
+          <select :value="activeCategory" :aria-label="i18n.t('search_field_category')" class="library-select max-w-40" @change="selectCategory">
+            <option value="">{{ i18n.t('books_all_categories') }}</option>
+            <option v-if="activeCategory && !activeCategoryItem" :value="activeCategory">{{ activeCategory }}</option>
+            <option v-for="category in categories" :key="category.id" :value="category.name">{{ category.name }}</option>
+          </select>
+          <select
+            :value="activeSource"
+            :aria-label="i18n.t('search_source')"
+            class="library-select max-w-40"
+            @change="changeSource"
+          >
+            <option value="">{{ i18n.t('books_all_sources') }}</option>
+            <option v-for="source in sources" :key="source.id" :value="source.id">{{ source.name }}</option>
+          </select>
+          <button
+            v-if="auth.isAdmin"
+            type="button"
+            :aria-expanded="categoryManagerOpen"
+            aria-controls="library-category-manager"
+            class="library-utility"
+            @click="toggleCategoryManager"
+          >{{ i18n.t('books_categories_manage') }}</button>
+        </div>
+      </section>
+
+      <section v-if="searchTab === 'local' && auth.isAdmin && categoryManagerOpen" id="library-category-manager" class="mb-7 rounded-2xl border border-border bg-surface p-4 dark:border-gray-800 dark:bg-gray-900" :aria-busy="categoryBusy">
+        <form class="flex flex-wrap items-center gap-3" @submit.prevent="addCategory">
+          <input v-model="categoryName" :placeholder="i18n.t('book_category_name_placeholder')" :aria-label="i18n.t('book_category_name_placeholder')" maxlength="100" required class="min-h-11 w-full rounded-lg border border-border bg-paper px-3 text-sm dark:border-gray-700 dark:bg-gray-800 sm:w-auto" />
+          <label v-if="auth.user?.r18_enabled" class="flex min-h-11 items-center gap-2 text-sm">
+            <input v-model="categoryR18" type="checkbox" />{{ i18n.t('book_category_r18') }}
+          </label>
+          <button type="submit" :disabled="categoryBusy || !categoryName.trim()" class="min-h-11 rounded-lg bg-accent px-4 text-sm font-medium text-white disabled:opacity-50">{{ i18n.t('book_category_add') }}</button>
+        </form>
+        <p v-if="categoryError" role="alert" class="mt-3 text-sm text-red-600 dark:text-red-400">{{ categoryError }}</p>
+        <ul v-if="managedCategories.length" class="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+          <li v-for="category in managedCategories" :key="category.id" class="flex min-w-0 items-center justify-between gap-3 rounded-lg bg-black/5 px-3 text-sm dark:bg-white/5">
+            <span class="break-all">{{ category.name }}</span>
+            <button type="button" :disabled="categoryBusy" :aria-label="i18n.t('books_category_remove_label', { name: category.name })" @click="deleteCategory(category)" class="min-h-11 shrink-0 px-2 text-red-600 disabled:opacity-50 dark:text-red-400">{{ i18n.t('books_category_remove') }}</button>
+          </li>
+        </ul>
+      </section>
 
       <p v-if="loading" class="py-16 text-center text-sm text-muted dark:text-gray-400">{{ i18n.t('home_loading') }}</p>
       <p v-else-if="error" class="py-10 text-center text-sm text-red-600">{{ error }}</p>
@@ -1059,7 +1199,7 @@ onBeforeUnmount(() => {
                 >{{ i18n.t('books_source_delete', { n: section.total }) }}</button>
               </div>
             </div>
-            <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+            <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5 xl:grid-cols-6">
               <BookCard v-for="book in section.books" :key="book.id" :book="book" :show-cover="showCovers" :source-name="book.source_id ? sourceNameMap[book.source_id] : ''" @favorite="toggleFavorite" @search="searchByField" />
             </div>
           </div>
@@ -1075,8 +1215,8 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <p v-if="!advancedSearching && advancedResults.length === 0" class="py-12 text-center text-sm text-muted dark:text-gray-400">{{ i18n.t('search_no_results') }}</p>
-        <div v-if="advancedResults.length" class="divide-y divide-border border-y border-border dark:divide-gray-800 dark:border-gray-800">
-          <div v-for="hit in advancedResults" :key="hit.type + '-' + hit.id" class="flex items-start gap-3 px-2 py-4 transition-colors hover:bg-accent/5">
+        <div v-if="advancedResults.length" class="divide-y divide-border overflow-hidden rounded-2xl border border-border bg-surface dark:divide-gray-800 dark:border-gray-800 dark:bg-gray-900">
+          <div v-for="hit in advancedResults" :key="hit.type + '-' + hit.id" class="flex items-start gap-2 px-3 py-3 transition-colors hover:bg-accent/5 sm:gap-3 sm:px-4 sm:py-4">
             <button @click="goToHit(hit)" class="flex min-w-0 flex-1 items-start gap-3 text-left">
               <div class="h-[74px] w-[56px] shrink-0 overflow-hidden rounded bg-gray-100 dark:bg-gray-800">
                 <img v-if="showCovers && hitCover(hit)" :src="hitCover(hit)" :alt="hit.type === 'book' ? hit.title : (hit.book_title || hit.title)" class="h-full w-full object-cover" loading="lazy" @error="hitCoverFailed(hit)" />
@@ -1137,8 +1277,8 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <p v-if="!results.length" class="py-12 text-center text-sm text-muted dark:text-gray-400">{{ i18n.t('search_no_results') }}</p>
-        <div v-else class="divide-y divide-border border-y border-border dark:divide-gray-800 dark:border-gray-800">
-          <div v-for="hit in results" :key="hit.type + '-' + hit.id" class="flex items-start gap-3 px-2 py-4 transition-colors hover:bg-accent/5">
+        <div v-else class="divide-y divide-border overflow-hidden rounded-2xl border border-border bg-surface dark:divide-gray-800 dark:border-gray-800 dark:bg-gray-900">
+          <div v-for="hit in results" :key="hit.type + '-' + hit.id" class="flex items-start gap-2 px-3 py-3 transition-colors hover:bg-accent/5 sm:gap-3 sm:px-4 sm:py-4">
             <button @click="goToHit(hit)" class="flex min-w-0 flex-1 items-start gap-3 text-left">
               <div class="h-[74px] w-[56px] shrink-0 overflow-hidden rounded bg-gray-100 dark:bg-gray-800">
                 <img v-if="showCovers && hitCover(hit)" :src="hitCover(hit)" :alt="hit.type === 'book' ? hit.title : (hit.book_title || hit.title)" class="h-full w-full object-cover" loading="lazy" @error="hitCoverFailed(hit)" />
@@ -1196,13 +1336,16 @@ onBeforeUnmount(() => {
             <h2 class="mt-1 text-xl font-semibold">{{ activeCategory || sourceNameMap[activeSource] || kindTitle }}</h2>
             <p class="mt-1 text-xs text-muted dark:text-gray-400">{{ i18n.t('home_books_count', { n: page.total }) }}</p>
           </div>
-          <select :value="activeSource" @change="changeSource" class="rounded border border-border bg-surface px-3 py-2 text-xs dark:border-gray-700 dark:bg-gray-900">
-            <option value="">{{ i18n.t('books_all_sources') }}</option>
-            <option v-for="source in sources" :key="source.id" :value="source.id">{{ source.name }}</option>
-          </select>
+          <button
+            v-if="auth.isAdmin"
+            type="button"
+            :aria-pressed="managingBooks"
+            class="library-utility"
+            @click="toggleBookManagement"
+          >{{ i18n.t(managingBooks ? 'home_manage_done' : 'books_manage') }}</button>
         </div>
 
-        <div v-if="auth.isAdmin" class="mb-4 flex flex-wrap items-center gap-2 border-y border-border py-3 text-xs dark:border-gray-800">
+        <div v-if="auth.isAdmin && managingBooks" class="mb-4 flex flex-wrap items-center gap-2 rounded-xl border border-accent/25 bg-accent/5 p-3 text-xs dark:border-gray-700 dark:bg-gray-900">
           <label class="inline-flex items-center gap-1.5"><input type="checkbox" :checked="allSelected" @change="toggleAll" class="rounded" />{{ i18n.t('books_select_all') }}</label>
           <span class="text-muted dark:text-gray-400">{{ i18n.t('books_selected_count', { n: selectedIds.length }) }}</span>
           <button v-if="selectedIds.length" @click="batchFavorite" :disabled="actionBusy" class="rounded border border-accent px-2 py-1 text-accent">{{ i18n.t('books_batch_add_shelf') }}</button>
@@ -1212,8 +1355,8 @@ onBeforeUnmount(() => {
         </div>
 
         <p v-if="!page.items.length" class="py-12 text-center text-sm text-muted dark:text-gray-400">{{ i18n.t('books_filter_empty') }}</p>
-        <div v-else class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-          <BookCard v-for="book in page.items" :key="book.id" :book="book" :show-cover="showCovers" :source-name="book.source_id ? sourceNameMap[book.source_id] : ''" :selectable="auth.isAdmin" :selected="selectedIds.includes(book.id)" @select="toggleSelect" @favorite="toggleFavorite" @search="searchByField" />
+        <div v-else class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5 xl:grid-cols-6">
+          <BookCard v-for="book in page.items" :key="book.id" :book="book" :show-cover="showCovers" :source-name="book.source_id ? sourceNameMap[book.source_id] : ''" :selectable="auth.isAdmin && managingBooks" :selected="selectedIds.includes(book.id)" @select="toggleSelect" @favorite="toggleFavorite" @search="searchByField" />
         </div>
         <div v-if="page.total > page.limit" class="mt-8 flex flex-wrap items-center justify-center gap-3 text-xs">
           <button @click="changePage(page.offset - page.limit)" :disabled="page.offset === 0" class="rounded border border-border px-3 py-2 disabled:opacity-40 dark:border-gray-700">{{ i18n.t('books_previous') }}</button>
@@ -1243,7 +1386,7 @@ onBeforeUnmount(() => {
             <div><h2 class="text-lg font-semibold">{{ i18n.t('books_latest') }}</h2><p class="mt-1 text-xs text-muted dark:text-gray-400">{{ i18n.t('home_books_count', { n: home.total }) }}</p></div>
             <button @click="router.push({ path: listPath, query: { all: '1' } })" class="text-xs text-accent hover:underline">{{ i18n.t('books_view_all') }} ›</button>
           </div>
-          <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+          <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5 xl:grid-cols-6">
             <BookCard v-for="book in home.latest" :key="book.id" :book="book" :show-cover="showCovers" :source-name="book.source_id ? sourceNameMap[book.source_id] : ''" @favorite="toggleFavorite" @search="searchByField" />
           </div>
         </section>
@@ -1253,7 +1396,7 @@ onBeforeUnmount(() => {
             <div class="flex items-center gap-2"><span class="h-4 w-1 rounded" :style="{ backgroundColor: section.category_color || '#9b4a32' }"></span><h2 class="text-lg font-semibold">{{ section.category_name }}</h2><span class="text-xs text-muted dark:text-gray-500">{{ section.total }}</span></div>
             <button @click="openCategory(section.category_name)" class="text-xs text-accent hover:underline">{{ i18n.t('books_view_all') }} ›</button>
           </div>
-          <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+          <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5 xl:grid-cols-6">
             <BookCard v-for="book in section.books" :key="book.id" :book="book" :show-cover="showCovers" :source-name="book.source_id ? sourceNameMap[book.source_id] : ''" @favorite="toggleFavorite" @search="searchByField" />
           </div>
         </section>
@@ -1263,3 +1406,35 @@ onBeforeUnmount(() => {
     </main>
   </div>
 </template>
+
+<style scoped>
+.library-choice {
+  @apply inline-flex min-h-9 items-center rounded-lg px-3 text-sm font-semibold text-muted no-underline transition-colors hover:bg-accent/10 dark:text-gray-400 dark:hover:bg-gray-800;
+}
+
+.library-choice[aria-pressed="true"],
+.library-choice[aria-current="page"] {
+  @apply bg-accent/10 text-accent dark:bg-emerald-300/10 dark:text-emerald-200;
+}
+
+.library-search-panel {
+  @apply rounded-2xl border border-border bg-surface p-3 dark:border-gray-800 dark:bg-gray-900 sm:p-5;
+  background-image: linear-gradient(135deg, rgb(74 129 106 / 8%), transparent 60%);
+}
+
+.library-search-row {
+  @apply flex min-h-11 min-w-0 rounded-xl border border-border bg-surface focus-within:border-accent focus-within:ring-1 focus-within:ring-accent dark:border-gray-700 dark:bg-gray-950;
+}
+
+.library-submit {
+  @apply shrink-0 rounded-r-[10px] bg-accent px-3.5 text-sm font-medium text-white transition-colors hover:bg-[#194d40] sm:px-5;
+}
+
+.library-select {
+  @apply min-h-9 min-w-0 rounded-lg border border-border bg-paper px-2 text-xs text-ink dark:border-gray-700 dark:bg-gray-800 dark:text-gray-100;
+}
+
+.library-utility {
+  @apply inline-flex min-h-9 items-center rounded-lg border border-border px-2.5 text-xs font-semibold text-accent transition-colors hover:border-accent/45 hover:bg-accent/5 dark:border-gray-700 dark:text-emerald-200 sm:px-3;
+}
+</style>

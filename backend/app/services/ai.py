@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from html import unescape
 from typing import Any, AsyncIterator, Sequence
 
 from loguru import logger
@@ -34,6 +35,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import Book, Chapter
 from app.services.ai_client import AIError, LLMClient
 from app.services.ai_config import AIConfig, get_ai_config, not_configured_reason
+from app.services.book_kind import IMAGE_REF_RE, is_comic_content, is_gallery_chapter
+from app.services.content_quality import IMAGE_RE
 from app.services.storage import BookStorage
 
 #: Characters of a single chapter kept when building a prompt.
@@ -62,6 +65,9 @@ ANALYSIS_MIN_TOKENS = 4096
 ANALYSIS_TIMEOUT_SECONDS = 300.0
 
 IMAGE_MARKDOWN_RE = re.compile(r"!\[[^\]]*\]\([^)\s]+(?:\s+[\"'][^\"']*[\"'])?\)")
+PICTURE_TAG_RE = re.compile(r"</?(?:picture|source)\b[^>]*>", re.IGNORECASE)
+ESCAPED_IMAGE_TAG_RE = re.compile(r"&lt;/?(?:img|picture|source)\b.*?&gt;", re.I | re.S)
+STORED_TITLE_RE = re.compile(r"\A[\ufeff\s]*# [^\r\n]*(?:\r?\n|$)")
 
 SYSTEM_CHAT = (
     "你是一位博学的小说阅读助手，帮助读者理解他正在读的这本小说。\n"
@@ -124,12 +130,25 @@ def _trim(text: str, limit: int) -> str:
 
 
 def strip_markup(text: str) -> str:
-    """Drop markdown image markers and normalise blank lines for prompts."""
-    cleaned = IMAGE_MARKDOWN_RE.sub("", str(text or ""))
-    if cleaned.startswith("# "):
-        cleaned = cleaned.split("\n", 1)[-1] if "\n" in cleaned else ""
+    """Drop the stored chapter title and image markup from prompt text."""
+    cleaned = STORED_TITLE_RE.sub("", str(text or ""))
+    cleaned = IMAGE_MARKDOWN_RE.sub(" ", cleaned)
+    cleaned = PICTURE_TAG_RE.sub("", IMAGE_RE.sub(" ", cleaned))
+    cleaned = ESCAPED_IMAGE_TAG_RE.sub(" ", cleaned)
+    cleaned = re.sub(r"(?m)^[ \t]+$", "", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
+
+
+def indexable_chapter_text(content: str) -> str:
+    """Use prose from illustrated chapters and skip galleries with captions."""
+    content = ESCAPED_IMAGE_TAG_RE.sub(lambda match: unescape(match[0]), content or "")
+    if is_comic_content(content) or (is_gallery_chapter(content) and IMAGE_REF_RE.search(content)):
+        return ""
+    cleaned = strip_markup(content)
+    if not re.search(r"[^\W_]", re.sub(r"<[^>]+>", "", cleaned)):
+        return ""
+    return cleaned
 
 
 def parse_json_list(raw: str) -> tuple[list[dict[str, Any]], bool]:

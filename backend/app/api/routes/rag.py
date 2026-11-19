@@ -11,7 +11,7 @@ from sqlalchemy import exists, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.models import Book, ChapterEmbedding, User
+from app.models import Book, Chapter, ChapterEmbedding, User
 from app.services import book_profiles, library_jobs, rag_jobs
 from app.services.ai_client import AIError, LLMClient
 from app.services.ai_config import get_ai_config
@@ -183,21 +183,24 @@ async def start_batch(payload: RAGBatchRequest, db: AsyncSession = Depends(get_d
     """Queue up to ``MAX_BATCH_BOOKS`` books for background indexing."""
     if library_jobs.read_state().get("running"):
         raise HTTPException(status_code=409, detail="书库画像正在构建，等它结束再建索引")
+    candidates = select(Book.id, Book.title).where(
+        or_(Book.kind.is_(None), Book.kind != KIND_COMIC),
+        exists().where(Chapter.book_id == Book.id, Chapter.content_path.is_not(None)),
+    )
     titles: dict[str, str] = {}
     if payload.scope == "book_ids":
         requested = list(dict.fromkeys(str(i) for i in payload.book_ids if i))[: payload.limit]
         if not requested:
             raise HTTPException(status_code=400, detail="没有提供书籍 ID")
         rows = (
-            await db.execute(select(Book.id, Book.title).where(Book.id.in_(requested)))
+            await db.execute(candidates.where(Book.id.in_(requested)))
         ).all()
         titles = {row[0]: row[1] for row in rows}
         ids = [book_id for book_id in requested if book_id in titles]
     else:
         rows = (
             await db.execute(
-                select(Book.id, Book.title)
-                .where(or_(Book.kind.is_(None), Book.kind != KIND_COMIC))
+                candidates
                 .where(~exists().where(ChapterEmbedding.book_id == Book.id))
                 .order_by(Book.updated_at.desc())
                 .limit(payload.limit)
@@ -210,7 +213,7 @@ async def start_batch(payload: RAGBatchRequest, db: AsyncSession = Depends(get_d
         return {
             "queued": 0,
             "candidates": 0,
-            "message": "没有符合条件的书（都建过索引，或没有可读章节）",
+            "message": "没有符合条件的小说。请检查章节和现有索引。",
         }
     result = rag_jobs.start_batch(ids, max_chunks=payload.max_chunks, titles=titles)
     result["candidates"] = len(ids)

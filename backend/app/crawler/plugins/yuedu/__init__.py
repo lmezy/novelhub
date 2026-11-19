@@ -156,6 +156,9 @@ class YueduPlugin(UrlsMixin, ParsingMixin, ExploreMixin, BookMixin, ChapterMixin
         # so Legado/NovelHub have to page through ``.../page/2`` themselves.
         # ``{base_url: template}`` where the template contains ``{page}``.
         self._explore_page_templates: dict[str, str] = {}
+        self._explore_kinds_lock = asyncio.Lock()
+        self._explore_js_kinds: list[dict[str, str]] = []
+        self._explore_kind_ends: dict[str, int] = {}
         # ``{fetched_url: one-line page summary}`` for catalog pages that
         # parsed to zero books, so the "returned no books" warning can say
         # what the site actually answered instead of only the URL.
@@ -212,6 +215,10 @@ class YueduPlugin(UrlsMixin, ParsingMixin, ExploreMixin, BookMixin, ChapterMixin
         self.engine = YueduRuleEngine(self.config)
         self.base_url = self.config.get("bookSourceUrl", "")
         self._chapter_image_manifest = []
+        self._explore_js_kinds = []
+        self._explore_kind_ends.clear()
+        self._explore_page_templates.clear()
+        self._explore_kind_bases.clear()
         # A Cookie may have been set before this engine existed.
         self._sync_cookie_to_engine()
 

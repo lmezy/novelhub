@@ -374,14 +374,16 @@ export const useAdminAIStore = defineStore("adminAI", () => {
     }
   }
 
-  async function indexBookForRAG() {
+  async function indexBookForRAG(force = false) {
     const id = aiIndexBookId.value.trim()
     if (!id) return
     aiIndexBusy.value = true
     aiIndexError.value = ""
     aiIndexResult.value = null
     try {
-      aiIndexResult.value = await api.post<any>("/rag/index/" + encodeURIComponent(id))
+      aiIndexResult.value = await api.post<any>(
+        "/rag/index/" + encodeURIComponent(id) + (force ? "?force=true" : ""),
+      )
       await loadIndexedBooks()
     } catch (e) {
       aiIndexError.value = e instanceof Error ? e.message : i18n.t('admin_ai_index_failed')

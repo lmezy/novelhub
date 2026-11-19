@@ -90,69 +90,90 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="min-h-screen bg-paper dark:bg-gray-800 dark:bg-gray-950 dark:text-gray-100">
+  <div class="min-h-screen bg-paper dark:bg-gray-950 dark:text-gray-100">
     <NavBar />
 
-    <main class="max-w-sm mx-auto px-4 py-16">
-      <h1 class="text-2xl font-bold mb-6 text-center">
-        {{ isRegister ? i18n.t('login_title_create') : i18n.t('login_title_login') }}
-      </h1>
+    <main class="mx-auto max-w-md px-4 py-9 sm:py-16">
+      <section class="rounded-3xl border border-border bg-surface px-5 py-7 shadow-sm dark:border-gray-800 dark:bg-gray-900 sm:px-8 sm:py-9">
+        <h1 class="mb-6 text-2xl font-semibold tracking-tight sm:text-3xl">
+          {{ isRegister ? i18n.t('login_title_create') : i18n.t('login_title_login') }}
+        </h1>
 
-      <form @submit.prevent="submit" class="space-y-4">
-        <div>
-          <label class="block text-sm text-muted dark:text-gray-400 mb-1">{{ isRegister ? i18n.t('login_username') : i18n.t('login_username_or_email') }}</label>
-          <input
-            v-model="username"
-            type="text"
-            class="w-full px-3 py-2 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-ink placeholder:text-muted dark:text-gray-400 focus:outline-none focus:ring-2 focus:ring-accent/30 text-sm"
-            :placeholder="isRegister ? i18n.t('login_username_placeholder') : i18n.t('login_username_or_email_placeholder')"
-          />
-        </div>
-        <div v-if="isRegister">
-          <label class="block text-sm text-muted dark:text-gray-400 mb-1">{{ i18n.t('login_email_optional') }}</label>
-          <input
-            v-model="email"
-            type="email"
-            class="w-full px-3 py-2 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-ink placeholder:text-muted dark:text-gray-400 focus:outline-none focus:ring-2 focus:ring-accent/30 text-sm"
-            :placeholder="i18n.t('login_email_placeholder')"
-          />
-        </div>
-        <div v-if="isRegister">
-          <label class="block text-sm text-muted dark:text-gray-400 mb-1">{{ i18n.t('login_invite_code') }}</label>
-          <input
-            v-model="inviteCode"
-            type="text"
-            class="w-full px-3 py-2 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-ink placeholder:text-muted dark:text-gray-400 focus:outline-none focus:ring-2 focus:ring-accent/30 text-sm"
-            :placeholder="i18n.t('login_invite_placeholder')"
-          />
-        </div>
-        <div>
-          <label class="block text-sm text-muted dark:text-gray-400 mb-1">{{ i18n.t('login_password') }}</label>
-          <input
-            v-model="password"
-            type="password"
-            class="w-full px-3 py-2 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900 text-ink placeholder:text-muted dark:text-gray-400 focus:outline-none focus:ring-2 focus:ring-accent/30 text-sm"
-            :placeholder="i18n.t('login_password_placeholder')"
-          />
-        </div>
+        <form @submit.prevent="submit" class="space-y-4">
+          <div>
+            <label for="login-username" class="login-label">{{ isRegister ? i18n.t('login_username') : i18n.t('login_username_or_email') }}</label>
+            <input
+              id="login-username"
+              v-model="username"
+              type="text"
+              autocomplete="username"
+              autocapitalize="none"
+              class="login-input"
+              :placeholder="isRegister ? i18n.t('login_username_placeholder') : i18n.t('login_username_or_email_placeholder')"
+            />
+          </div>
+          <div v-if="isRegister">
+            <label for="login-email" class="login-label">{{ i18n.t('login_email_optional') }}</label>
+            <input
+              id="login-email"
+              v-model="email"
+              type="email"
+              autocomplete="email"
+              class="login-input"
+              :placeholder="i18n.t('login_email_placeholder')"
+            />
+          </div>
+          <div v-if="isRegister">
+            <label for="login-invite" class="login-label">{{ i18n.t('login_invite_code') }}</label>
+            <input
+              id="login-invite"
+              v-model="inviteCode"
+              type="text"
+              autocomplete="off"
+              class="login-input"
+              :placeholder="i18n.t('login_invite_placeholder')"
+            />
+          </div>
+          <div>
+            <label for="login-password" class="login-label">{{ i18n.t('login_password') }}</label>
+            <input
+              id="login-password"
+              v-model="password"
+              type="password"
+              :autocomplete="isRegister ? 'new-password' : 'current-password'"
+              class="login-input"
+              :placeholder="i18n.t('login_password_placeholder')"
+            />
+          </div>
 
-        <p v-if="error" class="text-sm text-red-600">{{ error }}</p>
-        <p v-if="notice" class="text-sm text-green-600">{{ notice }}</p>
+          <p v-if="error" role="alert" class="text-sm text-red-700 dark:text-red-300">{{ error }}</p>
+          <p v-if="notice" role="status" class="text-sm text-accent">{{ notice }}</p>
 
-        <button
-          type="submit"
-          :disabled="loading"
-          class="w-full py-2.5 rounded-lg bg-accent text-white text-sm font-medium hover:opacity-90 transition-opacity disabled:opacity-50"
-        >{{ loading ? i18n.t('login_loading') : isRegister ? i18n.t('login_register') : i18n.t('login_login') }}</button>
-      </form>
+          <button
+            type="submit"
+            :disabled="loading"
+            class="w-full rounded-xl bg-accent py-3 text-sm font-semibold text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+          >{{ loading ? i18n.t('login_loading') : isRegister ? i18n.t('login_register') : i18n.t('login_login') }}</button>
+        </form>
 
-      <p class="text-sm text-muted dark:text-gray-400 text-center mt-6">
-        {{ isRegister ? i18n.t('login_have_account') : i18n.t('login_no_account') }}
-        <button
-          @click="isRegister = !isRegister; error = ''; notice = ''"
-          class="text-accent hover:underline"
-        >{{ isRegister ? i18n.t('login_login') : i18n.t('login_register') }}</button>
-      </p>
+        <p class="mt-6 border-t border-border pt-5 text-center text-sm text-muted dark:border-gray-800 dark:text-gray-400">
+          {{ isRegister ? i18n.t('login_have_account') : i18n.t('login_no_account') }}
+          <button
+            @click="isRegister = !isRegister; error = ''; notice = ''"
+            class="text-accent hover:underline"
+          >{{ isRegister ? i18n.t('login_login') : i18n.t('login_register') }}</button>
+        </p>
+      </section>
     </main>
   </div>
 </template>
+
+<style scoped>
+.login-label {
+  @apply mb-1.5 block text-sm font-medium text-ink dark:text-gray-200;
+}
+
+.login-input {
+  @apply min-h-11 w-full rounded-xl border border-border bg-paper px-3 py-2 text-base text-ink placeholder:text-muted focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/20 dark:border-gray-700 dark:bg-gray-950 dark:text-gray-100 dark:placeholder:text-gray-400;
+}
+</style>

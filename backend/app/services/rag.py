@@ -22,8 +22,13 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Book, Chapter, ChapterEmbedding
+from app.services.ai import (
+    ESCAPED_IMAGE_TAG_RE, IMAGE_MARKDOWN_RE, PICTURE_TAG_RE, indexable_chapter_text,
+)
 from app.services.ai_client import AIError, LLMClient
 from app.services.ai_config import AIConfig, get_ai_config
+from app.services.book_kind import KIND_COMIC, normalize_kind
+from app.services.content_quality import IMAGE_RE
 from app.services.storage import BookStorage
 
 try:  # numpy ships with the backend image; keep a pure-Python fallback.
@@ -144,8 +149,11 @@ class RAGService:
         book = await self.db.get(Book, book_id)
         if book is None:
             raise ValueError(f"Book not found: {book_id}")
-
-        client = await self._client()
+        if normalize_kind(book.kind) == KIND_COMIC:
+            return {
+                "book_id": book_id, "title": book.title, "skipped": True,
+                "reason": "漫画不建立文字向量索引。",
+            }
 
         query = select(Chapter).where(Chapter.book_id == book_id)
         if chapter_start is not None:
@@ -164,17 +172,11 @@ class RAGService:
                 return {
                     "book_id": book_id,
                     "chapters": len(chapters),
+                    "indexed_chapters": status["indexed_chapters"],
                     "chunks": status["chunks"],
                     "skipped": True,
                     "reason": "已索引且章节数一致；需要强制重建时使用 force=true。",
                 }
-
-        # Re-indexing a range would leave the rest of the book pointing at
-        # deleted chapters, so a partial index always replaces everything.
-        await self.db.execute(
-            delete(ChapterEmbedding).where(ChapterEmbedding.book_id == book_id)
-        )
-        await self.db.flush()
 
         limit_chunks = int(max_chunks or self.MAX_CHUNKS_PER_BOOK)
         total_chunks = 0
@@ -187,6 +189,12 @@ class RAGService:
             nonlocal total_chunks, batch_texts, batch_metas
             if not batch_texts:
                 return
+            if not total_chunks:
+                # A partial index replaces the old index too. Keep the old data
+                # if there's no usable prose or building the replacement fails.
+                await self.db.execute(
+                    delete(ChapterEmbedding).where(ChapterEmbedding.book_id == book_id)
+                )
             await self._store_batch(book_id, batch_texts, batch_metas)
             total_chunks += len(batch_texts)
             batch_texts = []
@@ -196,7 +204,7 @@ class RAGService:
             # Reading a chapter file is synchronous; yielding keeps the uvicorn
             # worker answering requests while a 1 000-chapter book is indexed.
             await asyncio.sleep(0)
-            if total_chunks >= limit_chunks:
+            if total_chunks + len(batch_texts) >= limit_chunks:
                 skipped += 1
                 continue
             try:
@@ -204,12 +212,7 @@ class RAGService:
             except Exception as exc:
                 logger.warning("RAG: cannot read chapter {}: {}", chapter.id, exc)
                 continue
-            from app.services.ai import strip_markup
-
-            content = strip_markup(content)
-            if not content:
-                continue
-            chunks = self.chunk_text(content)
+            chunks = self.chunk_text(indexable_chapter_text(content))
             if not chunks:
                 continue
             indexed_chapters += 1
@@ -227,7 +230,11 @@ class RAGService:
                 await flush_batch()
 
         await flush_batch()
-        # ``_store_batch`` flushes; commit so a cancelled request keeps progress.
+        if not total_chunks:
+            return {
+                "book_id": book_id, "title": book.title, "chapters": len(chapters),
+                "skipped": True, "reason": "没有可向量化的章节正文。",
+            }
         await self.db.commit()
 
         cfg = await self.config()
@@ -273,9 +280,19 @@ class RAGService:
 
         # Load the stored chunks first: an un-indexed book must not cost an
         # embedding round-trip (the reader asks on every question).
-        rows = list(await self.db.scalars(
-            select(ChapterEmbedding).where(ChapterEmbedding.book_id == book_id)
-        ))
+        stored = await self.db.scalars(
+            select(ChapterEmbedding)
+            .join(Book, Book.id == ChapterEmbedding.book_id)
+            .where(ChapterEmbedding.book_id == book_id, Book.kind != KIND_COMIC)
+        )
+        # Existing rows may have been built before the chapter text was cleaned.
+        rows = [
+            row for row in stored
+            if row.content and not any(
+                pattern.search(row.content)
+                for pattern in (IMAGE_RE, PICTURE_TAG_RE, IMAGE_MARKDOWN_RE, ESCAPED_IMAGE_TAG_RE)
+            )
+        ]
         if not rows:
             return []
 

@@ -28,6 +28,9 @@ class AuthMixin:
 
     def set_cookie(self, cookie: str) -> None:
         """Set cookie for authenticated requests."""
+        if cookie != self._configured_cookie:
+            self._explore_js_kinds = []
+            self._explore_kind_ends.clear()
         self._cookie = cookie
         self._configured_cookie = cookie
         self._sync_cookie_to_engine()

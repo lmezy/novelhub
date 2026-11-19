@@ -5,12 +5,12 @@ export default {
   theme: {
     extend: {
       colors: {
-        paper: "#faf8f5",
-        ink: "#1a1a2e",
-        muted: "#6b7280",
-        accent: "#8b5cf6",
-        surface: "#ffffff",
-        border: "#e5e7eb",
+        paper: "#f6f4ed",
+        ink: "#202924",
+        muted: "#626d66",
+        accent: "#236454",
+        surface: "#fffefa",
+        border: "#dedfd5",
       },
       fontFamily: {
         sans: ["Inter", "ui-sans-serif", "system-ui", "sans-serif"],

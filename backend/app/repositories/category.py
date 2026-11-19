@@ -2,7 +2,13 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.category import Category
 from app.models.book_category import BookCategory
+from typing import Iterable
 from uuid import uuid4
+
+from app.models.app_setting import AppSetting
+
+
+DISABLED_DEFAULT_PREFIX = "disabled_category:"
 
 
 class CategoryRepository:
@@ -41,13 +47,21 @@ class CategoryRepository:
         await self.db.refresh(cat)
         return cat
 
-    async def delete(self, category_id: str) -> bool:
+    async def delete(self, category_id: str, default_names: Iterable[str] = ()) -> list[str] | None:
         cat = await self.get(category_id)
         if cat is None:
-            return False
+            return None
+        if cat.name in default_names:
+            key = DISABLED_DEFAULT_PREFIX + cat.name
+            if await self.db.get(AppSetting, key) is None:
+                self.db.add(AppSetting(key=key, value="true"))
+        affected = await self.db.scalars(
+            delete(BookCategory).where(BookCategory.category_id == category_id).returning(BookCategory.book_id)
+        )
+        book_ids = list(affected)
         await self.db.delete(cat)
         await self.db.commit()
-        return True
+        return book_ids
 
     async def get_book_categories(
         self,
@@ -67,7 +81,7 @@ class CategoryRepository:
 
     async def set_book_categories(self, book_id: str, category_ids: list[str]) -> None:
         await self.db.execute(delete(BookCategory).where(BookCategory.book_id == book_id))
-        for cid in category_ids:
+        for cid in dict.fromkeys(category_ids):
             bc = BookCategory(book_id=book_id, category_id=cid)
             self.db.add(bc)
         await self.db.commit()

@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted } from "vue"
+import { computed, onMounted, onUnmounted, ref } from "vue"
 import { useI18nStore } from "../../stores/i18n"
 import { useAdminAIStore } from "../../stores/adminAI"
 
 const i18n = useI18nStore()
 const aiStore = useAdminAIStore()
+const forceChapterIndex = ref(false)
 
 // -- background RAG indexing (batch + "打开即建") --------------------------
 //
@@ -465,19 +466,25 @@ onUnmounted(() => {
     <p class="text-xs text-muted dark:text-gray-400 mb-4">{{ i18n.t('admin_ai_index_hint') }}</p>
 
     <div class="flex gap-2 mb-3">
-      <input v-model="aiStore.aiIndexBookId" :placeholder="i18n.t('admin_ai_index_placeholder')" class="flex-1 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-      <button @click="aiStore.indexBookForRAG" :disabled="aiStore.aiIndexBusy || !aiStore.aiIndexBookId.trim()" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50 shrink-0">
+      <input v-model="aiStore.aiIndexBookId" :placeholder="i18n.t('admin_ai_index_placeholder')" class="min-w-0 flex-1 px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+      <button @click="aiStore.indexBookForRAG(forceChapterIndex)" :disabled="aiStore.aiIndexBusy || !aiStore.aiIndexBookId.trim()" class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50 shrink-0">
         {{ aiStore.aiIndexBusy ? i18n.t('admin_ai_index_running') : i18n.t('admin_ai_index_run') }}
       </button>
     </div>
+    <label class="flex items-center gap-2 mb-3 text-xs text-muted dark:text-gray-400">
+      <input v-model="forceChapterIndex" type="checkbox" :disabled="aiStore.aiIndexBusy" />
+      {{ i18n.t('admin_ai_index_force') }}
+    </label>
     <p v-if="aiStore.aiIndexError" class="text-xs text-red-500 mb-3 break-words">{{ aiStore.aiIndexError }}</p>
     <p v-if="aiStore.aiIndexResult" class="text-xs text-muted dark:text-gray-400 mb-3">
-      {{ i18n.t('admin_ai_index_done', {
+      <template v-if="aiStore.aiIndexResult.skipped">
+        {{ aiStore.aiIndexResult.reason || i18n.t('admin_ai_index_skipped') }}
+      </template>
+      <template v-else>{{ i18n.t('admin_ai_index_done', {
         chapters: aiStore.aiIndexResult.indexed_chapters ?? aiStore.aiIndexResult.chapters ?? 0,
         chunks: aiStore.aiIndexResult.chunks ?? 0,
         model: aiStore.aiIndexResult.model || '',
-      }) }}
-      <span v-if="aiStore.aiIndexResult.skipped">{{ i18n.t('admin_ai_index_skipped') }}</span>
+      }) }}</template>
     </p>
 
     <div class="mt-4 pt-4 border-t border-border dark:border-gray-700">

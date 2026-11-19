@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue"
+import { computed, nextTick, onMounted, onUnmounted, ref, shallowRef, watch } from "vue"
 import { useRoute, useRouter } from "vue-router"
 import { useBooksStore, type Chapter, type ChapterContent } from "../stores/books"
 import { useAuthStore } from "../stores/auth"
@@ -8,6 +8,16 @@ import { api } from "../api/client"
 import { useChunkedList } from "../utils/useChunkedList"
 import AIChat from "../components/AIChat.vue"
 import AISelectionToolbar from "../components/AISelectionToolbar.vue"
+import ImageViewer from "../components/ImageViewer.vue"
+import ReaderAppearancePanel from "../components/ReaderAppearancePanel.vue"
+import {
+  originalText,
+  readReaderAppearance,
+  readerAppearanceKey,
+  readerPalettes,
+  readerTextConverter,
+  type ReaderScript,
+} from "../utils/readerAppearance"
 import {
   DEFAULT_TAP_ACTIONS,
   TAP_ACTIONS,
@@ -40,11 +50,19 @@ const { visible: visibleTocChapters, hasMore: hasMoreTocChapters, sentinel: tocS
   useChunkedList(chapters)
 const loading = ref(true)
 const error = ref("")
-const fontSize = ref(18)
-const cnFont = ref(localStorage.getItem("novelhub_cn_font") || "default")
-const enFont = ref(localStorage.getItem("novelhub_en_font") || "default")
-const showFontMenu = ref(false)
-const isDark = ref(localStorage.getItem("novelhub_dark") === "true")
+const appearance = ref(readReaderAppearance())
+const showAppearance = ref(false)
+const isDark = computed(() => auth.isDark)
+const converter = shallowRef(originalText)
+const activeScript = ref<ReaderScript>("original")
+const scriptLoading = ref(false)
+const scriptFailed = ref(false)
+const scriptAttempt = ref(0)
+const readingLanguage = computed(() => {
+  if (activeScript.value === "simplified") return "zh-Hans"
+  if (activeScript.value === "traditional") return "zh-Hant"
+  return undefined
+})
 const showToc = ref(false)
 const showAI = ref(false)
 // Text container the selected-passage AI toolbar attaches to (desktop article
@@ -70,6 +88,7 @@ const alternates = ref<any[]>([])
 const showSourceMenu = ref(false)
 
 const showContentImages = computed(() => auth.user?.settings?.show_content_images !== false)
+const viewedImage = ref<{ src: string; alt: string } | null>(null)
 
 const isMobileLayout = ref(false)
 const menuVisible = ref(false)
@@ -213,14 +232,36 @@ const nextChapter = computed(() =>
 )
 
 const readerFontStyle = computed(() => {
-  const cn = cnFontStack[cnFont.value] || ""
-  const en = enFontStack[enFont.value] || ""
+  const cn = cnFontStack[appearance.value.cnFont] || ""
+  const en = enFontStack[appearance.value.enFont] || ""
   const stack = [en, cn].filter(Boolean).join(", ")
   return {
-    fontSize: fontSize.value + "px",
+    fontSize: appearance.value.fontSize + "px",
     ...(stack ? { fontFamily: stack } : {}),
   }
 })
+
+const readerCanvasStyle = computed(() => {
+  const current = appearance.value
+  const palette = current.palette === "custom" ? current
+    : readerPalettes[current.palette === "system" ? (isDark.value ? "night" : "day") : current.palette]
+  return {
+    "--reader-background": palette.background,
+    "--reader-foreground": palette.foreground,
+    "--reader-paragraph-indent": `${current.indent}em`,
+    "--reader-line-height": current.lineHeight,
+  }
+})
+
+function displayText(text: string): string {
+  return converter.value(text)
+}
+
+function chapterLabel(item: Pick<Chapter, "title" | "chapter_number">): string {
+  return item.title
+    ? displayText(item.title)
+    : i18n.t('reader_chapter_fallback', { n: item.chapter_number })
+}
 
 function escapeHtml(text: string): string {
   return text
@@ -234,7 +275,7 @@ function escapeHtml(text: string): string {
 // Only real image URLs are allowed through; anything scheme-relative or
 // javascript:-like is dropped before it can reach v-html.
 function safeImageUrl(url: string): string | null {
-  if (/^(https?:\/\/|\/)/i.test(url)) return url
+  if (/^(https?:\/\/|\/(?![/\\]))/i.test(url)) return url
   return null
 }
 
@@ -250,46 +291,53 @@ function decodeEntities(text: string): string {
 /**
  * Chapter content -> reader HTML.
  *
- * Content is escaped first (it is crawled from third-party sites, so raw markup
- * would be an XSS hole), then Markdown images are turned back into `<img>`.
- *
- * The crawler stores manga pages as plain HTML `<img>` tags, and a "全话阅读"
- * chapter is nothing *but* those tags -- so escaping them rendered every comic
- * chapter as literal text with no pictures at all.  Those tags are therefore
- * lifted out before escaping and re-inserted as sanitized `<img>` elements
- * afterwards; every other tag stays escaped text.
+ * Lift out validated images first. Convert and escape the remaining text
+ * before inserting rendered image elements with their original URLs.
  */
-function renderChapterHtml(content: string): string {
+function renderChapterHtml(content: string, title: string | null, openImageLabel: string): string {
   const images: string[] = []
-  let text = String(content || "")
+  function captureImage(url: string, alt: string): string {
+    const safe = safeImageUrl(decodeEntities(url))
+    if (!safe) return ""
+    const label = alt ? openImageLabel + " · " + decodeEntities(alt) : openImageLabel
+    images.push(
+      '<button type="button" class="chapter-image-trigger" aria-label="' + escapeHtml(label) + '">' +
+      '<img src="' + escapeHtml(safe) + '" alt="' + escapeHtml(decodeEntities(alt)) + '" loading="lazy" decoding="async">' +
+      '</button>',
+    )
+    return "\u0000img" + (images.length - 1) + "\u0000"
+  }
+  const source = String(content || "").replace(/\r\n?/g, "\n")
+  const storedTitle = /^#[ \t]*([^\n]+)\n/.exec(source)
+  const body = storedTitle && storedTitle[1].trim() === title?.trim()
+    ? source.slice(storedTitle[0].length)
+    : source
+  const text = body
     // Some sources store the chapter markup already escaped ("&lt;img ...&gt;"),
     // and the reader then showed the tag itself as text.  Decode just those
     // image tags first; everything else stays escaped.
     .replace(/&lt;img\b[\s\S]*?&gt;/gi, (escaped: string) => decodeEntities(escaped))
     .replace(/<img\b[^>]*>/gi, (tag: string) => {
-    const src = /src\s*=\s*["']([^"']+)["']/i.exec(tag)?.[1] ?? ""
-    const alt = /alt\s*=\s*["']([^"']*)["']/i.exec(tag)?.[1] ?? ""
-    const safe = safeImageUrl(decodeEntities(src))
-    if (!safe) return ""
-    images.push(`<img src="${safe}" alt="${escapeHtml(decodeEntities(alt))}" loading="lazy">`)
-    return `\u0000img${images.length - 1}\u0000`
-  })
-  let html = escapeHtml(text).replace(
-    /!\[([^\]]*)\]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)/g,
-    (_match, alt: string, url: string) => {
-      const safe = safeImageUrl(url)
-      return safe ? `<img src="${safe}" alt="${alt}" loading="lazy">` : ""
-    },
-  )
-  html = html.replace(/\u0000img(\d+)\u0000/g, (_match, index: string) => images[Number(index)] ?? "")
-  html = html
-    .replace(/\n\n/g, "</p><p>")
-    .replace(/\n/g, "<br>")
-  return "<p>" + html + "</p>"
+      const src = /\ssrc\s*=\s*(?:"([^"]+)"|'([^']+)')/i.exec(tag)
+      const alt = /\salt\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(tag)
+      return captureImage(src?.[1] ?? src?.[2] ?? "", alt?.[1] ?? alt?.[2] ?? "")
+    })
+    .replace(
+      /!\[([^\]]*)\]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)/g,
+      (_match, alt: string, url: string) => captureImage(url, alt),
+    )
+  return text.split("\n").filter((paragraph) => paragraph.trim()).map((paragraph) => {
+    const parts = paragraph.replace(/^[\t \u00a0\u3000]+/, "").split(/\u0000img(\d+)\u0000/g)
+    const hasText = parts.some((part, index) => index % 2 === 0 && part.trim())
+    const html = parts.map((part, index) => index % 2 === 0
+      ? escapeHtml(displayText(part))
+      : images[Number(part)] ?? "").join("")
+    return hasText ? `<p>${html}</p>` : `<p class="reader-illustration">${html}</p>`
+  }).join("")
 }
 
 const chapterBodyHtml = computed(() =>
-  chapter.value ? renderChapterHtml(chapter.value.content) : "",
+  chapter.value ? renderChapterHtml(chapter.value.content, chapter.value.title, i18n.t('image_viewer_open')) : "",
 )
 
 const pageProgress = computed(() => {
@@ -329,29 +377,6 @@ function onScroll() {
     if (!auth.user || isMobileLayout.value) return
     savePosition(desktopScrollPercent())
   }, 2000)
-}
-
-function toggleDark() {
-  isDark.value = !isDark.value
-  localStorage.setItem("novelhub_dark", String(isDark.value))
-  document.documentElement.classList.toggle("dark", isDark.value)
-}
-
-function changeFontSize(delta: number) {
-  fontSize.value = Math.min(26, Math.max(14, fontSize.value + delta))
-  if (isMobileLayout.value) nextTick(refreshMobileLayout)
-}
-
-function setCnFont(f: string) {
-  cnFont.value = f
-  localStorage.setItem("novelhub_cn_font", f)
-  if (isMobileLayout.value) nextTick(refreshMobileLayout)
-}
-
-function setEnFont(f: string) {
-  enFont.value = f
-  localStorage.setItem("novelhub_en_font", f)
-  if (isMobileLayout.value) nextTick(refreshMobileLayout)
 }
 
 function applyPageTransform() {
@@ -676,6 +701,7 @@ function handleTap(event: MouseEvent) {
     suppressClick = false
     return
   }
+  if (openChapterImage(event)) return
   const action = tapActionFor(event)
   if (action === "prev_page") prevPageOrChapter()
   else if (action === "next_page") nextPageOrChapter()
@@ -686,6 +712,15 @@ function handleTap(event: MouseEvent) {
   } else if (action === "menu") {
     menuVisible.value = true
   }
+}
+
+function openChapterImage(event: MouseEvent): boolean {
+  const target = event.target
+  if (!showContentImages.value || !(target instanceof Element)) return false
+  const image = target.closest(".chapter-image-trigger")?.querySelector("img")
+  if (!image) return false
+  viewedImage.value = { src: image.currentSrc || image.src, alt: image.alt }
+  return true
 }
 
 function selectTapRegion(region: ReaderTapRegion) {
@@ -740,6 +775,10 @@ function tapActionFor(event: MouseEvent): ReaderTapAction {
 
 function onTouchStart(event: TouchEvent) {
   if (menuVisible.value) return
+  if (event.touches.length !== 1) {
+    touchStartTime = 0
+    return
+  }
   const touch = event.changedTouches[0]
   touchStartX = touch.clientX
   touchStartY = touch.clientY
@@ -748,7 +787,7 @@ function onTouchStart(event: TouchEvent) {
 }
 
 function onTouchEnd(event: TouchEvent) {
-  if (menuVisible.value || pageMode.value === "scroll") return
+  if (menuVisible.value || pageMode.value === "scroll" || !touchStartTime || event.touches.length) return
   const touch = event.changedTouches[0]
   const dx = touch.clientX - touchStartX
   const dy = touch.clientY - touchStartY
@@ -765,18 +804,19 @@ function onTouchEnd(event: TouchEvent) {
 
 function closeMenu() {
   menuVisible.value = false
-  showFontMenu.value = false
+  showAppearance.value = false
   showSourceMenu.value = false
   showPageModeMenu.value = false
   showTapAreaMenu.value = false
 }
 
 function goBackToBook() {
+  const destination = { name: "book-detail", params: { id: bookId.value } }
   const back = (window.history.state as { back?: string | null } | null)?.back
-  if (back) {
+  if (back && router.resolve(back).path === router.resolve(destination).path) {
     router.back()
   } else {
-    router.replace("/books/" + bookId.value)
+    router.replace(destination)
   }
 }
 
@@ -878,6 +918,7 @@ async function loadChapter(id: string) {
   flushPageProgress()
   loading.value = true
   error.value = ""
+  viewedImage.value = null
   currentPage.value = 0
   pageCount.value = 1
   mobileScrollProgress.value = 0
@@ -979,8 +1020,54 @@ async function switchSource(alt: any) {
   }
 }
 
-watch([fontSize, cnFont, enFont], () => {
-  if (isMobileLayout.value) nextTick(refreshMobileLayout)
+watch(appearance, (value) => {
+  try {
+    localStorage.setItem(readerAppearanceKey, JSON.stringify(value))
+  } catch { /* private browsing can disable persistence */ }
+}, { deep: true })
+
+watch([() => appearance.value.script, scriptAttempt], async ([script], _previous, onCleanup) => {
+  let current = true
+  onCleanup(() => { current = false })
+  scriptFailed.value = false
+  scriptLoading.value = script !== "original"
+  try {
+    const nextConverter = await readerTextConverter(script)
+    if (!current) return
+    converter.value = nextConverter
+    activeScript.value = script
+  } catch {
+    if (!current) return
+    converter.value = originalText
+    activeScript.value = "original"
+    scriptFailed.value = true
+  } finally {
+    if (current) scriptLoading.value = false
+  }
+}, { immediate: true })
+
+watch([
+  () => appearance.value.fontSize,
+  () => appearance.value.cnFont,
+  () => appearance.value.enFont,
+  () => appearance.value.indent,
+  () => appearance.value.lineHeight,
+  converter,
+], async (_value, _previous, onCleanup) => {
+  if (!chapter.value || loading.value) return
+  let cancelled = false
+  onCleanup(() => { cancelled = true })
+  const id = chapter.value.id
+  const hasAdvance = isMobileLayout.value
+    ? (pageMode.value === "scroll" ? (scrollViewport.value?.scrollTop ?? 0) > 0 : currentPage.value > 0)
+    : window.scrollY > 0
+  const position = pendingRestorePercent.value ?? (hasAdvance ? currentPosition() : 0)
+  await nextTick()
+  if (cancelled || id !== chapter.value?.id || loading.value) return
+  if (isMobileLayout.value) await refreshMobileLayout()
+  if (cancelled || id !== chapter.value?.id || loading.value) return
+  pendingRestorePercent.value = position
+  applyRestoredPosition()
 })
 
 watch(
@@ -1027,7 +1114,6 @@ watch(
 )
 
 onMounted(async () => {
-  document.documentElement.classList.toggle("dark", isDark.value)
   window.addEventListener("scroll", onScroll, { passive: true })
   window.addEventListener("resize", onResize, { passive: true })
   mediaQuery = window.matchMedia("(max-width: 900px) and (pointer: coarse), (max-width: 700px)")
@@ -1062,16 +1148,24 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="min-h-screen" :class="isDark ? 'bg-gray-950 text-gray-100' : 'bg-paper text-ink'">
+  <div class="reader-canvas min-h-screen" :style="readerCanvasStyle">
     <div
       v-if="bookmarkToast"
       class="bookmark-toast"
       :class="isDark ? 'bookmark-toast-dark' : 'bookmark-toast-light'"
     >{{ bookmarkToast }}</div>
-    <div v-if="isMobileLayout" class="mobile-reader" :class="isDark ? 'mobile-reader-dark' : 'mobile-reader-light'">
+    <div v-if="isMobileLayout" class="mobile-reader">
+      <header v-if="!menuVisible || loading || error" class="reader-quickbar">
+        <button type="button" @click="goBackToBook" class="reader-quick-action">
+          <span aria-hidden="true">&larr;</span> {{ i18n.t('reader_book') }}
+        </button>
+        <button v-if="chapter && !loading && !error" type="button" @click="menuVisible = true" class="reader-quick-action">
+          {{ i18n.t('reader_controls') }} <span aria-hidden="true">&ctdot;</span>
+        </button>
+      </header>
       <p
         v-if="loading"
-        class="absolute inset-0 flex items-center justify-center text-sm text-muted dark:text-gray-400"
+        class="absolute inset-0 flex items-center justify-center text-sm opacity-70"
       >{{ i18n.t('reader_loading') }}</p>
       <p v-else-if="error" class="absolute inset-0 flex items-center justify-center px-8 text-sm text-red-500">{{ error }}</p>
 
@@ -1086,10 +1180,10 @@ onUnmounted(() => {
           @load.capture="onMobileContentLoad"
         >
           <div ref="pageViewport" class="page-viewport">
-            <article ref="pageContent" class="page-columns" :style="readerFontStyle">
+            <article ref="pageContent" class="page-columns" :style="readerFontStyle" :lang="readingLanguage">
               <div class="page-inner">
                 <h1 class="page-title">
-                  {{ chapter.title || i18n.t('reader_chapter_fallback', { n: chapter.chapter_number }) }}
+                  {{ chapterLabel(chapter) }}
                 </h1>
                 <div
                   class="page-body"
@@ -1118,9 +1212,9 @@ onUnmounted(() => {
           @click="handleTap"
           @load.capture="onMobileScrollContentLoad"
         >
-          <article ref="mobileTextRef" class="scroll-page-content" :style="readerFontStyle">
+          <article ref="mobileTextRef" class="scroll-page-content" :style="readerFontStyle" :lang="readingLanguage">
             <h1 class="page-title">
-              {{ chapter.title || i18n.t('reader_chapter_fallback', { n: chapter.chapter_number }) }}
+              {{ chapterLabel(chapter) }}
             </h1>
             <div
               class="page-body"
@@ -1141,22 +1235,25 @@ onUnmounted(() => {
         <div
           v-if="menuVisible"
           class="fixed inset-0 z-50 reader-menu-layer"
-          :class="isDark ? 'reader-menu-dark' : 'reader-menu-light'"
+          :class="{ 'reader-menu-dark': isDark }"
           @click.self="closeMenu"
+          @keydown.esc="closeMenu"
         >
           <div
-            v-if="showFontMenu || showSourceMenu || showPageModeMenu || showTapAreaMenu"
+            v-if="showAppearance || showSourceMenu || showPageModeMenu || showTapAreaMenu"
             class="fixed inset-0"
             @click="closeMenu"
           />
           <header class="reader-topbar" @click.stop>
-            <button @click="goBackToBook" class="reader-top-action" :title="i18n.t('reader_book')">&larr;</button>
-            <span class="reader-top-title">
-              {{ chapter.title || i18n.t('reader_chapter_fallback', { n: chapter.chapter_number }) }}
+            <button @click="goBackToBook" class="reader-top-action" :aria-label="i18n.t('reader_book')" :title="i18n.t('reader_book')">
+              &larr;
+            </button>
+            <span class="reader-top-title" :lang="readingLanguage">
+              {{ chapterLabel(chapter) }}
             </span>
             <button
               v-if="alternates.length > 1"
-              @click="showSourceMenu = !showSourceMenu; showFontMenu = false; showPageModeMenu = false; showTapAreaMenu = false"
+              @click="showSourceMenu = !showSourceMenu; showAppearance = false; showPageModeMenu = false; showTapAreaMenu = false"
               class="reader-top-action text-xs"
               :class="showSourceMenu ? 'text-accent' : ''"
               :title="i18n.t('reader_sources')"
@@ -1192,20 +1289,16 @@ onUnmounted(() => {
               </button>
             </div>
 
-            <div v-if="showFontMenu" class="reader-bottom-panel">
-              <div class="reader-font-size-row">
-                <button @click="changeFontSize(-2)" class="reader-size-btn" :title="i18n.t('reader_smaller_font')">A-</button>
-                <span class="text-sm">{{ fontSize }}px</span>
-                <button @click="changeFontSize(2)" class="reader-size-btn" :title="i18n.t('reader_larger_font')">A+</button>
-              </div>
-              <p class="reader-panel-label">{{ i18n.t('reader_cn_font') }}</p>
-              <div class="reader-option-grid">
-                <button v-for="f in cnFonts" :key="f.value" @click="setCnFont(f.value)" class="reader-option-btn" :class="cnFont === f.value ? 'reader-option-active' : ''">{{ f.label }}</button>
-              </div>
-              <p class="reader-panel-label">{{ i18n.t('reader_en_font') }}</p>
-              <div class="reader-option-grid">
-                <button v-for="f in enFonts" :key="f.value" @click="setEnFont(f.value)" class="reader-option-btn" :class="enFont === f.value ? 'reader-option-active' : ''">{{ f.label }}</button>
-              </div>
+            <div v-if="showAppearance" class="reader-bottom-panel">
+              <ReaderAppearancePanel
+                v-model="appearance"
+                :system-dark="isDark"
+                :cn-fonts="cnFonts"
+                :en-fonts="enFonts"
+                :script-loading="scriptLoading"
+                :script-failed="scriptFailed"
+                @retry="scriptAttempt++"
+              />
             </div>
 
             <div v-if="showPageModeMenu" class="reader-bottom-panel">
@@ -1264,10 +1357,9 @@ onUnmounted(() => {
             <nav class="reader-actions">
               <button @click="showToc = true; closeMenu()" class="reader-action-btn"><span class="reader-action-icon">&#9776;</span><span>{{ i18n.t('reader_toc') }}</span></button>
               <button @click="showAI = true; closeMenu()" class="reader-action-btn"><span class="reader-action-icon text-sm font-semibold">AI</span><span>{{ i18n.t('reader_ai') }}</span></button>
-              <button @click="showFontMenu = !showFontMenu; showPageModeMenu = false; showSourceMenu = false; showTapAreaMenu = false" class="reader-action-btn" :class="showFontMenu ? 'text-accent' : ''"><span class="reader-action-icon font-serif">Aa</span><span>{{ i18n.t('reader_interface') }}</span></button>
-              <button @click="showPageModeMenu = !showPageModeMenu; showFontMenu = false; showSourceMenu = false; showTapAreaMenu = false" class="reader-action-btn" :class="showPageModeMenu ? 'text-accent' : ''"><span class="reader-action-icon">&#8596;</span><span>{{ i18n.t('reader_page_mode') }}</span></button>
-              <button @click="showTapAreaMenu = !showTapAreaMenu; showFontMenu = false; showSourceMenu = false; showPageModeMenu = false" class="reader-action-btn" :class="showTapAreaMenu ? 'text-accent' : ''"><span class="reader-action-icon">&#9638;</span><span>{{ i18n.t('reader_tap_area_short') }}</span></button>
-              <button @click="toggleDark" class="reader-action-btn"><span class="reader-action-icon">{{ isDark ? '\u2600' : '\u263e' }}</span><span>{{ isDark ? i18n.t('reader_light_mode_short') : i18n.t('reader_dark_mode_short') }}</span></button>
+              <button @click="showAppearance = !showAppearance; showPageModeMenu = false; showSourceMenu = false; showTapAreaMenu = false" class="reader-action-btn" :aria-expanded="showAppearance" :class="showAppearance ? 'text-accent' : ''"><span class="reader-action-icon font-serif" aria-hidden="true">Aa</span><span>{{ i18n.t('reader_appearance') }}</span></button>
+              <button @click="showPageModeMenu = !showPageModeMenu; showAppearance = false; showSourceMenu = false; showTapAreaMenu = false" class="reader-action-btn" :aria-expanded="showPageModeMenu" :class="showPageModeMenu ? 'text-accent' : ''"><span class="reader-action-icon" aria-hidden="true">&#8596;</span><span>{{ i18n.t('reader_page_mode') }}</span></button>
+              <button @click="showTapAreaMenu = !showTapAreaMenu; showAppearance = false; showSourceMenu = false; showPageModeMenu = false" class="reader-action-btn" :aria-expanded="showTapAreaMenu" :class="showTapAreaMenu ? 'text-accent' : ''"><span class="reader-action-icon" aria-hidden="true">&#9638;</span><span>{{ i18n.t('reader_tap_area_short') }}</span></button>
             </nav>
           </footer>
         </div>
@@ -1276,8 +1368,8 @@ onUnmounted(() => {
 
     <template v-else>
       <header
-        class="sticky top-0 z-40 border-b h-12 flex items-center justify-between px-4"
-        :class="isDark ? 'bg-gray-900/90 border-gray-800' : 'bg-surface/80 border-border'"
+        class="sticky top-0 z-40 border-b h-12 flex items-center justify-between gap-2 px-4 backdrop-blur"
+        :class="isDark ? 'bg-gray-900/95 border-gray-800 text-gray-100' : 'bg-surface/95 border-border text-ink'"
       >
         <div class="flex items-center gap-3 min-w-0">
           <button
@@ -1293,8 +1385,8 @@ onUnmounted(() => {
             class="text-sm hover:opacity-70 transition-opacity"
             :class="showAI ? 'text-accent' : ''"
           >{{ i18n.t('reader_ai') }}</button>
-          <span v-if="chapter" class="text-sm truncate max-w-[200px]">
-            {{ chapter.title || i18n.t('reader_chapter_fallback', { n: chapter.chapter_number }) }}
+          <span v-if="chapter" class="text-sm truncate max-w-[200px]" :lang="readingLanguage">
+            {{ chapterLabel(chapter) }}
           </span>
         </div>
         <div class="flex items-center gap-2">
@@ -1307,7 +1399,7 @@ onUnmounted(() => {
           >{{ chapterSyncing ? i18n.t('reader_chapter_syncing') : i18n.t('reader_chapter_resync') }}</button>
           <div v-if="alternates.length > 1" class="relative">
             <button
-              @click="showSourceMenu = !showSourceMenu"
+              @click="showSourceMenu = !showSourceMenu; showAppearance = false"
               class="w-7 h-7 flex items-center justify-center rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors text-sm"
               :class="showSourceMenu ? 'text-accent' : ''"
               :title="i18n.t('reader_sources')"
@@ -1342,66 +1434,36 @@ onUnmounted(() => {
             :class="currentBookmark() ? 'text-amber-400' : ''"
             :title="currentBookmark() ? i18n.t('reader_bookmark_remove') : i18n.t('reader_bookmark_add')"
           >{{ currentBookmark() ? '\u2605' : '\u2606' }}</button>
-          <button
-            @click="changeFontSize(-2)"
-            class="w-7 h-7 flex items-center justify-center rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors text-sm"
-            :title="i18n.t('reader_smaller_font')"
-          >A-</button>
-          <button
-            @click="changeFontSize(2)"
-            class="w-7 h-7 flex items-center justify-center rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors text-sm"
-            :title="i18n.t('reader_larger_font')"
-          >A+</button>
-          <div class="relative">
+          <div class="relative" @keydown.esc="showAppearance = false">
             <button
-              @click="showFontMenu = !showFontMenu"
-              class="w-7 h-7 flex items-center justify-center rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors text-sm"
-              :class="(cnFont !== 'default' || enFont !== 'default') ? 'text-accent' : ''"
-              :title="i18n.t('reader_font_settings')"
-            >F</button>
+              @click="showAppearance = !showAppearance; showSourceMenu = false"
+              class="flex min-h-9 items-center gap-1.5 rounded-lg px-2 text-sm transition-colors hover:bg-black/10 dark:hover:bg-white/10"
+              :aria-expanded="showAppearance"
+              :class="showAppearance ? 'text-accent dark:text-emerald-200' : ''"
+            ><span aria-hidden="true" class="font-serif text-base font-semibold">Aa</span>{{ i18n.t('reader_appearance') }}</button>
             <div
-              v-if="showFontMenu"
-              class="absolute right-0 top-full mt-1 w-48 rounded-lg border shadow-lg p-3 z-50"
-              :class="isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-border'"
+              v-if="showAppearance"
+              class="reader-appearance-popover absolute right-0 top-full z-50 mt-2 rounded-xl border p-4 shadow-xl"
+              :class="isDark ? 'border-gray-700 bg-gray-800' : 'border-border bg-surface'"
             >
-              <div class="text-xs font-medium mb-2 text-muted dark:text-gray-400">{{ i18n.t('reader_cn_font') }}</div>
-              <div class="flex flex-wrap gap-1 mb-3">
-                <button
-                  v-for="f in cnFonts"
-                  :key="f.value"
-                  @click="setCnFont(f.value)"
-                  class="text-xs px-2 py-1 rounded transition-colors"
-                  :class="cnFont === f.value
-                    ? 'bg-accent text-white'
-                    : isDark ? 'bg-gray-700 hover:bg-gray-600' : 'bg-gray-100 hover:bg-gray-200'"
-                >{{ f.label }}</button>
-              </div>
-              <div class="text-xs font-medium mb-2 text-muted dark:text-gray-400">{{ i18n.t('reader_en_font') }}</div>
-              <div class="flex flex-wrap gap-1">
-                <button
-                  v-for="f in enFonts"
-                  :key="f.value"
-                  @click="setEnFont(f.value)"
-                  class="text-xs px-2 py-1 rounded transition-colors"
-                  :class="enFont === f.value
-                    ? 'bg-accent text-white'
-                    : isDark ? 'bg-gray-700 hover:bg-gray-600' : 'bg-gray-100 hover:bg-gray-200'"
-                >{{ f.label }}</button>
-              </div>
+              <ReaderAppearancePanel
+                v-model="appearance"
+                :system-dark="isDark"
+                :cn-fonts="cnFonts"
+                :en-fonts="enFonts"
+                :script-loading="scriptLoading"
+                :script-failed="scriptFailed"
+                @retry="scriptAttempt++"
+              />
             </div>
           </div>
-          <button
-            @click="toggleDark"
-            class="w-7 h-7 flex items-center justify-center rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors text-sm"
-            :title="isDark ? i18n.t('reader_light_mode') : i18n.t('reader_dark_mode')"
-          >{{ isDark ? '\u2600' : '\u263e' }}</button>
         </div>
       </header>
 
       <div
-        v-if="showFontMenu"
+        v-if="showAppearance"
         class="fixed inset-0 z-30"
-        @click="showFontMenu = false"
+        @click="showAppearance = false"
       />
 
       <main class="max-w-3xl mx-auto px-4 py-10">
@@ -1414,12 +1476,13 @@ onUnmounted(() => {
           class="reader-content prose"
           :class="{ 'hide-content-images': !showContentImages }"
           :style="readerFontStyle"
+          :lang="readingLanguage"
           @load.capture="onContentLoad"
         >
           <h1 class="text-2xl font-bold mb-8 text-center">
-            {{ chapter.title || i18n.t('reader_chapter_fallback', { n: chapter.chapter_number }) }}
+            {{ chapterLabel(chapter) }}
           </h1>
-          <div v-html="chapterBodyHtml" />
+          <div v-html="chapterBodyHtml" @click="openChapterImage" />
         </article>
 
         <div
@@ -1453,7 +1516,8 @@ onUnmounted(() => {
             v-if="prevChapter"
             @click="openChapter(prevChapter.id)"
             class="text-sm hover:opacity-70 transition-opacity"
-          >&larr; {{ prevChapter.title || i18n.t('reader_ch_short', { n: prevChapter.chapter_number }) }}</button>
+            :lang="readingLanguage"
+          >&larr; {{ prevChapter.title ? displayText(prevChapter.title) : i18n.t('reader_ch_short', { n: prevChapter.chapter_number }) }}</button>
           <span v-else class="text-sm text-muted">{{ i18n.t('reader_start') }}</span>
           <!-- The end of a chapter is only the end once every chunk is loaded:
                saying "已经到结尾" while content was still missing is what made a
@@ -1462,7 +1526,8 @@ onUnmounted(() => {
             v-if="nextChapter"
             @click="openChapter(nextChapter.id)"
             class="text-sm hover:opacity-70 transition-opacity"
-          >{{ nextChapter.title || i18n.t('reader_ch_short', { n: nextChapter.chapter_number }) }} &rarr;</button>
+            :lang="readingLanguage"
+          >{{ nextChapter.title ? displayText(nextChapter.title) : i18n.t('reader_ch_short', { n: nextChapter.chapter_number }) }} &rarr;</button>
           <span v-else-if="contentHasMore" class="text-sm text-muted">
             {{ i18n.t('reader_chunk_more_above') }}
           </span>
@@ -1503,12 +1568,13 @@ onUnmounted(() => {
               :key="ch.id"
               @click="openChapter(ch.id)"
               class="block w-full text-left py-1.5 text-sm truncate"
+              :lang="readingLanguage"
               :class="
                 ch.id === chapterId
                   ? 'text-accent font-medium'
                   : isDark ? 'text-gray-400 hover:text-gray-200' : 'text-muted hover:text-ink'
               "
-            >{{ ch.chapter_number }}. {{ ch.title || i18n.t('reader_chapter_fallback', { n: ch.chapter_number }) }}</button>
+            >{{ ch.chapter_number }}. {{ chapterLabel(ch) }}</button>
             <div v-if="hasMoreTocChapters" ref="tocSentinel" class="py-2 text-center text-xs text-muted dark:text-gray-400">
               {{ i18n.t('book_chapters_more', { n: chapters.length - visibleTocChapters.length }) }}
             </div>
@@ -1522,7 +1588,7 @@ onUnmounted(() => {
                 class="min-w-0 flex-1 text-left"
                 :class="isDark ? 'text-gray-300 hover:text-accent' : 'text-ink hover:text-accent'"
               >
-                <span class="block truncate text-sm">{{ bm.chapter_title || i18n.t('reader_bookmark_chapter', { n: bm.chapter_number || '' }) }}</span>
+                <span class="block truncate text-sm" :lang="readingLanguage">{{ bm.chapter_title ? displayText(bm.chapter_title) : i18n.t('reader_bookmark_chapter', { n: bm.chapter_number || '' }) }}</span>
                 <span class="block text-xs text-muted dark:text-gray-400">{{ i18n.t('reader_bookmark_position', { p: bm.position }) }}</span>
               </button>
               <button
@@ -1570,17 +1636,38 @@ onUnmounted(() => {
       :container="aiSelectionContainer"
       @ask="askAIAbout"
     />
+    <ImageViewer
+      v-if="viewedImage"
+      :src="viewedImage.src"
+      :alt="viewedImage.alt"
+      @close="viewedImage = null"
+    />
   </div>
 </template>
 
 <style scoped>
-.prose p {
-  text-indent: 2em;
+.reader-canvas,
+.mobile-reader {
+  background: var(--reader-background);
+  color: var(--reader-foreground);
+}
+
+.prose :deep(p),
+.page-body :deep(p) {
+  text-indent: var(--reader-paragraph-indent);
   margin-bottom: 0.75em;
-  line-height: 1.8;
+  line-height: var(--reader-line-height);
+}
+
+.reader-appearance-popover {
+  width: min(24rem, calc(100vw - 2rem));
+  max-height: calc(100dvh - 4.5rem);
+  overflow: auto;
+  overscroll-behavior: contain;
 }
 
 .mobile-reader {
+  --quickbar-height: calc(3rem + env(safe-area-inset-top));
   position: fixed;
   inset: 0;
   height: 100vh;
@@ -1588,19 +1675,9 @@ onUnmounted(() => {
   overflow: hidden;
 }
 
-.mobile-reader-light {
-  background: #faf8f5;
-  color: #1f2937;
-}
-
-.mobile-reader-dark {
-  background: #111318;
-  color: #d1d5db;
-}
-
 .page-surface {
   position: absolute;
-  inset: 0;
+  inset: var(--quickbar-height) 0 0;
   overflow: hidden;
   touch-action: pan-y;
   user-select: none;
@@ -1631,14 +1708,35 @@ onUnmounted(() => {
    the first line of page N+1" (reported 2026-10-21 on a chapter with images).
    Comic pages are 2-3x the viewport, and markdown links can hold a very long
    word, so cap both here instead of trusting the source markup. */
-.page-columns :deep(img) {
+.reader-content :deep(.chapter-image-trigger),
+.page-body :deep(.chapter-image-trigger) {
   display: block;
+  width: fit-content;
   max-width: 100%;
-  max-height: calc(100vh - 190px);
-  object-fit: contain;
-  margin: 0.5rem auto;
+  margin: 0.75rem auto;
+  text-indent: 0;
+  cursor: zoom-in;
   break-inside: avoid;
   page-break-inside: avoid;
+}
+
+.reader-content :deep(.chapter-image-trigger img),
+.page-body :deep(.chapter-image-trigger img) {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin-inline: auto;
+  object-fit: contain;
+}
+
+.hide-content-images :deep(.chapter-image-trigger),
+.hide-content-images :deep(.reader-illustration) {
+  display: none;
+}
+
+.page-columns :deep(.chapter-image-trigger img) {
+  max-height: calc(100vh - 190px);
+  max-height: max(70px, calc(100dvh - var(--quickbar-height) - 145px));
 }
 
 .page-columns :deep(p),
@@ -1686,15 +1784,6 @@ onUnmounted(() => {
   margin: 0 0 1.1em;
 }
 
-.page-body {
-  line-height: 1.9;
-}
-
-.page-body p {
-  text-indent: 2em;
-  margin: 0 0 0.75em;
-}
-
 .page-meta {
   position: absolute;
   left: 50%;
@@ -1738,7 +1827,7 @@ onUnmounted(() => {
 
 .scroll-page-surface {
   position: absolute;
-  inset: 0;
+  inset: var(--quickbar-height) 0 0;
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior-y: contain;
@@ -1750,7 +1839,7 @@ onUnmounted(() => {
   box-sizing: border-box;
   min-height: 100%;
   padding: 24px 22px max(52px, env(safe-area-inset-bottom));
-  line-height: 1.9;
+  line-height: var(--reader-line-height);
 }
 
 .scroll-page-meta {
@@ -1768,20 +1857,42 @@ onUnmounted(() => {
 
 .reader-menu-layer {
   background: transparent;
+  --reader-control-accent: #236454;
+  --reader-control-ink: #fff;
+  --reader-control-surface: #fbf9f3;
+  --reader-control-text: #202924;
 }
 
-.reader-menu-light .reader-topbar,
-.reader-menu-light .reader-bottombar,
-.reader-menu-light .reader-bottom-panel {
-  background: rgba(255, 255, 255, 0.97);
-  color: #1f2937;
+.reader-menu-dark {
+  --reader-control-accent: #94cbb6;
+  --reader-control-ink: #10251e;
+  --reader-control-surface: #1b2522;
+  --reader-control-text: #e5eae6;
 }
 
-.reader-menu-dark .reader-topbar,
-.reader-menu-dark .reader-bottombar,
-.reader-menu-dark .reader-bottom-panel {
-  background: rgba(24, 27, 33, 0.97);
-  color: #e5e7eb;
+.reader-quickbar {
+  position: absolute;
+  inset: 0 0 auto;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: var(--quickbar-height);
+  padding: env(safe-area-inset-top) max(0.75rem, env(safe-area-inset-right)) 0 max(0.75rem, env(safe-area-inset-left));
+  border-bottom: 1px solid rgba(128, 128, 128, 0.2);
+}
+
+.reader-quick-action {
+  min-height: 2.75rem;
+  padding-inline: 0.5rem;
+  font-size: 0.875rem;
+}
+
+.reader-topbar,
+.reader-bottombar,
+.reader-bottom-panel {
+  background: var(--reader-control-surface);
+  color: var(--reader-control-text);
 }
 
 .reader-topbar,
@@ -1849,8 +1960,10 @@ onUnmounted(() => {
   z-index: 2;
   max-height: min(56vh, 28rem);
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 0.85rem 1rem 1rem;
   border-top: 1px solid rgba(128, 128, 128, 0.25);
+  border-radius: 1rem 1rem 0 0;
   box-shadow: 0 -10px 25px rgba(0, 0, 0, 0.12);
 }
 
@@ -1887,12 +2000,12 @@ onUnmounted(() => {
 .reader-progress {
   width: 100%;
   min-width: 0;
-  accent-color: #8b5cf6;
+  accent-color: var(--reader-control-accent);
 }
 
 .reader-actions {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   border-top: 1px solid rgba(128, 128, 128, 0.2);
 }
 
@@ -1918,30 +2031,10 @@ onUnmounted(() => {
   line-height: 1;
 }
 
-.reader-font-size-row {
-  display: grid;
-  grid-template-columns: 1fr auto 1fr;
-  align-items: center;
-  gap: 1rem;
-  margin-bottom: 0.8rem;
-}
-
-.reader-size-btn {
-  height: 2.25rem;
-  border: 1px solid rgba(128, 128, 128, 0.3);
-  border-radius: 4px;
-}
-
 .reader-panel-label {
   margin: 0.7rem 0 0.4rem;
   font-size: 0.7rem;
   opacity: 0.65;
-}
-
-.reader-option-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 0.35rem;
 }
 
 .reader-mode-grid {
@@ -1970,12 +2063,12 @@ onUnmounted(() => {
 }
 
 .tap-area-cell-active {
-  border-color: #8b5cf6;
-  box-shadow: inset 0 0 0 1px #8b5cf6;
+  border-color: var(--reader-control-accent);
+  box-shadow: inset 0 0 0 1px var(--reader-control-accent);
 }
 
 .tap-area-cell-menu {
-  background: rgba(139, 92, 246, 0.14);
+  background: color-mix(in srgb, var(--reader-control-accent) 14%, transparent);
 }
 
 .tap-area-cell-none {
@@ -2021,8 +2114,8 @@ onUnmounted(() => {
 }
 
 .reader-tap-save-btn {
-  background: #8b5cf6;
-  color: white;
+  background: var(--reader-control-accent);
+  color: var(--reader-control-ink);
 }
 
 .reader-tap-save-btn:disabled {
@@ -2042,9 +2135,9 @@ onUnmounted(() => {
 }
 
 .reader-option-active {
-  border-color: #8b5cf6;
-  background: #8b5cf6;
-  color: white;
+  border-color: var(--reader-control-accent);
+  background: var(--reader-control-accent);
+  color: var(--reader-control-ink);
 }
 
 .bookmark-toast {

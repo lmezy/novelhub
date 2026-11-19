@@ -7,6 +7,11 @@
     @apply bg-paper text-ink antialiased;
   }
 
+  input[type="checkbox"],
+  input[type="radio"] {
+    @apply accent-accent;
+  }
+
   .dark body,
   body.dark {
     @apply bg-gray-950 text-gray-100;
@@ -20,6 +25,12 @@
 
   .reader-content p {
     @apply mb-4;
+  }
+}
+
+@layer utilities {
+  .dark .text-accent {
+    color: #8bd1b8;
   }
 }
 

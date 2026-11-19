@@ -2503,22 +2503,58 @@ def test_rule_variables_do_not_leak_between_engines():
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
-def test_a_failed_evaluation_does_not_wipe_the_variables():
+def test_a_failed_evaluation_does_not_wipe_the_variables(monkeypatch):
     """The delete-diff only runs when the evaluation actually reported its store.
 
-    `_read_result` leaves the store empty when the subprocess died or the
-    evaluation timed out.  Reading that as "the script deleted everything" would
-    throw away every variable the book had accumulated.
+    A timeout returns no store to merge. Treating it as an empty store would
+    discard the variables already accumulated by the book.
     """
     engine = _vars_engine()
     engine.put_variable("keep", "V")
     runtime = engine._get_js_runtime()
-    runtime._last_rule_vars = {}
-    runtime._last_rule_vars_seen = False
+    assert runtime.eval_js_sync("'ready';") == "ready"
+    assert runtime.last_rule_vars_seen
 
-    engine._absorb_js_rule_vars(runtime)
+    from app.crawler.plugins.yuedu import js_runtime
+
+    monkeypatch.setattr(js_runtime, "_EVAL_TIMEOUT_SECONDS", 0.05)
+    engine._try_eval_js(
+        "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);", "",
+    )
+
+    assert not runtime.last_rule_vars_seen
 
     assert engine.get_variable("keep") == "V"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node.js not available")
+def test_concurrent_rule_evaluations_keep_their_own_variable_snapshots():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    runtime = _vars_engine()._get_js_runtime()
+    first_returned = Event()
+    second_returned = Event()
+
+    def first():
+        runtime.eval_js_sync("java.put('token', 'first');", rule_vars={})
+        first_returned.set()
+        assert second_returned.wait(5)
+        return runtime.last_rule_vars
+
+    def second():
+        assert first_returned.wait(5)
+        try:
+            runtime.eval_js_sync("java.put('token', 'second');", rule_vars={})
+            return runtime.last_rule_vars
+        finally:
+            second_returned.set()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_result = executor.submit(first)
+        second_result = executor.submit(second)
+        assert first_result.result() == {"token": "first"}
+        assert second_result.result() == {"token": "second"}
 
 
 # ---------------------------------------------------------------------------
@@ -2610,6 +2646,43 @@ def test_curl_raw_applies_the_default_headers():
     assert engine._try_eval_js(
         "String(__nhCurlRaw).indexOf('__nhFinalHeaders(headers)') >= 0;", ""
     ) is True
+
+
+def test_js_runtime_restarts_after_an_interrupted_response(monkeypatch):
+    from app.crawler.plugins.yuedu import js_runtime
+
+    runtime = js_runtime.JsRuntime.get_instance()
+    if not runtime.start_sync():
+        pytest.skip("Node.js runtime failed to start")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(js_runtime, "_EVAL_TIMEOUT_SECONDS", 0.05)
+        with pytest.raises(TimeoutError):
+            runtime.eval_js_sync(
+                "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);"
+                "'outdated response';",
+                raise_errors=True,
+            )
+
+    assert runtime.eval_js_sync("'fresh response';", raise_errors=True) == "fresh response"
+
+
+def test_js_runtime_does_not_replay_a_rule_with_side_effects():
+    from app.crawler.plugins.yuedu.js_runtime import JsEvaluationError, JsRuntime
+
+    runtime = JsRuntime.get_instance()
+    if not runtime.start_sync():
+        pytest.skip("Node.js runtime failed to start")
+
+    with pytest.raises(JsEvaluationError):
+        runtime.eval_js_sync(
+            "globalThis.__NH_TEST_CALLS = (globalThis.__NH_TEST_CALLS || 0) + 1;"
+            "throw new TypeError('bad rule');",
+            raise_errors=True,
+        )
+    assert runtime.eval_js_sync(
+        "var calls = globalThis.__NH_TEST_CALLS; delete globalThis.__NH_TEST_CALLS; calls;"
+    ) == 1
 
 
 # ===========================================================================

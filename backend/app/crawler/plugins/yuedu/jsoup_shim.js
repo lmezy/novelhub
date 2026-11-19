@@ -927,30 +927,32 @@ function __nhFinalHeaders(headers) {
   return out;
 }
 
+var __nhHttpFailure = '';
+
 function __nhCurlRaw(url, method, body, headers, timeoutSec) {
-  var execSync = require('child_process').execSync;
+  var execFileSync = require('child_process').execFileSync;
   headers = __nhFinalHeaders(headers);
-  var args = [];
-  if (__nhProxy) {
-    args.push("-x '" + String(__nhProxy).replace(/'/g, "'\\''") + "' -k");
-  } else {
-    args.push('-k');
-  }
+  var t = parseInt(timeoutSec, 10) || 30;
+  var args = ['-s', '-L', '-k', '--max-time', String(t), '--write-out', '%{http_code}'];
+  if (__nhProxy) args.push('--proxy', __nhProxy);
   if (headers) {
     for (var k in headers) {
       if (k == null) continue;
-      var hv = String(headers[k]).replace(/'/g, "'\\''");
-      args.push("-H '" + String(k) + ': ' + hv + "'");
+      args.push('-H', String(k) + ': ' + String(headers[k]));
     }
   }
-  var t = parseInt(timeoutSec, 10) || 30;
-  var cmd = 'curl -s -L --max-time ' + t +
-    (method === 'POST' ? ' -X POST' : '') +
-    (body ? " --data '" + String(body).replace(/'/g, "'\\''") + "'" : '') +
-    (args.length ? ' ' + args.join(' ') : '') + ' "' + String(url).replace(/"/g, '\\"') + '"';
+  if (method === 'POST') args.push('-X', 'POST');
+  if (body) args.push('--data', String(body));
+  args.push('--', String(url));
   try {
-    return execSync(cmd, { maxBuffer: 64 * 1024 * 1024, timeout: (t + 10) * 1000 }).toString('utf-8');
+    var output = execFileSync('curl', args, {
+      encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024, timeout: (t + 10) * 1000,
+    });
+    var status = Number(output.slice(-3));
+    if (status >= 400) __nhHttpFailure = 'http:' + status;
+    return output.slice(0, -3);
   } catch (e) {
+    __nhHttpFailure = 'curl:' + (e.status || 0);
     return null;
   }
 }

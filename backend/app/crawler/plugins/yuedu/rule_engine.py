@@ -1783,7 +1783,10 @@ class YueduRuleEngine:
                 return text
         return text
 
-    def _try_eval_js(self, js_code: str, raw: Any, extra_context: dict | None = None) -> Any:
+    def _try_eval_js(
+        self, js_code: str, raw: Any, extra_context: dict | None = None,
+        *, raise_errors: bool = False,
+    ) -> Any:
         """Evaluate JavaScript against raw input.
         
         Uses real Node.js JS runtime when available; falls back to
@@ -1842,6 +1845,7 @@ class YueduRuleEngine:
                 context=self._build_js_context(extra_context),
                 content=self._js_content,
                 rule_vars=self._js_rule_vars(),
+                raise_errors=raise_errors,
             )
             # `java.put` writes to the same store `@put` does in Legado, so what
             # the script stored has to come back before the next rule runs.
@@ -1849,7 +1853,8 @@ class YueduRuleEngine:
             if result is not None:
                 return result
         except Exception:
-            pass
+            if raise_errors:
+                raise
 
         # Last resort: return input as-is if it's a string
         return None if not isinstance(raw, str) else raw

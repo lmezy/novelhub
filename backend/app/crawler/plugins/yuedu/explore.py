@@ -12,6 +12,7 @@ then looks like 'the TOC ended after one page'.
 
 from app.crawler.base import RemoteShelfBook
 from app.crawler.plugins.yuedu.common import logger
+from app.crawler.plugins.yuedu.js_runtime import JsEvaluationError
 from html import unescape as html_unescape
 from typing import Any
 from urllib.parse import parse_qsl
@@ -28,7 +29,7 @@ import re
 class ExploreMixin:
     """Methods extracted from ``YueduPlugin``."""
 
-    def get_explore_kinds(self) -> list[dict[str, str]]:
+    def get_explore_kinds(self, *, raise_errors: bool = False) -> list[dict[str, str]]:
         """Parse exploreUrl to get discover categories.
 
         Returns list of {title, url} dicts. Ported from
@@ -44,8 +45,8 @@ class ExploreMixin:
 
         # If it starts with <js> or @js:, evaluate the script and parse
         # the returned JSON array of {title, url} kinds.
-        if rule_str.startswith("<js>") or rule_str.startswith("@js:"):
-            return self._parse_explore_js(rule_str)
+        if rule_str.lower().startswith(("<js>", "@js:")):
+            return self._parse_explore_js(rule_str, raise_errors=raise_errors)
 
         # Try to parse as JSON array directly
         if rule_str.startswith("["):
@@ -66,54 +67,36 @@ class ExploreMixin:
                 # Header/separator lines have no URL; fetch_explore skips them.
                 kinds.append({"title": line, "url": ""})
         return kinds
-    def _parse_explore_js(self, text: str) -> list[dict[str, str]]:
-        """Evaluate a <js>/@js: exploreUrl script into a kinds array.
-
-        Never raises: unsupported JS returns an empty list so the caller
-        falls through to the generic ranking-page fallback instead of
-        failing the whole discover task with an 'Unsupported URL' error.
-        """
-        if text.startswith("<js>") and text.endswith("</js>"):
-            code = text[4:-5].strip()
-        elif text.startswith("<js"):
-            code = text[4:].strip()
-        elif text.startswith("@js:"):
-            code = text[4:].strip()
-        else:
-            code = text
+    def _parse_explore_js(self, text: str, *, raise_errors: bool = False) -> list[dict[str, str]]:
+        """Evaluate the discovery rule and parse its returned categories."""
+        code = text[4:-5] if text.lower().endswith("</js>") else text[4:]
         try:
             result = self.engine._try_eval_js(
                 code, None, extra_context={"page": "1"},
+                **({"raise_errors": True} if raise_errors else {}),
             )
+        except TimeoutError as exc:
+            if raise_errors:
+                raise TimeoutError("发现规则执行超时，可能仍在等待源站响应") from exc
+            return []
         except Exception as exc:
+            if raise_errors:
+                raise
             logger.warning(
                 "exploreUrl JS evaluation failed for %s: %s",
                 self.config.get("bookSourceName", self.config.get("bookSourceUrl", "?")),
                 exc,
             )
             return []
-        if result is None:
-            # A Legado JS exploreUrl that needs the full Android runtime
-            # (window/document/jsoup/remote obfuscated scripts) evaluates to
-            # nothing here. Surface that instead of silently returning an
-            # empty discovery result.
-            logger.warning(
-                "exploreUrl JS for %s produced no result; the source may "
-                "require the full Legado JS runtime (remote <js>/@js: rules)",
-                self.config.get("bookSourceName", self.config.get("bookSourceUrl", "?")),
-            )
-            return []
         if isinstance(result, str):
             result = result.strip()
-            if not result:
-                return []
             try:
-                parsed = json.loads(result)
-            except (ValueError, TypeError):
+                result = json.loads(result)
+            except ValueError:
+                # ICU catches the shim's error and returns it as plain text.
+                if raise_errors and result.startswith("Error: startBrowserAwait:"):
+                    raise JsEvaluationError("源站要求浏览器人机验证") from None
                 return []
-            if not isinstance(parsed, list):
-                return []
-            result = parsed
         if not isinstance(result, list):
             return []
         kinds = []
@@ -124,6 +107,20 @@ class ExploreMixin:
                     "url": str(item.get("url", "")),
                 })
         return kinds
+
+    async def _get_catalog_kinds(self) -> list[dict[str, str]]:
+        rule = str(self.config.get("exploreUrl") or "").strip().lower()
+        if not rule.startswith(("<js>", "@js:")):
+            return self.get_explore_kinds()
+        async with self._explore_kinds_lock:
+            if not self._explore_js_kinds:
+                # JS can fetch the source's category menu over the network.
+                # Cache a successful menu on this plugin instance (one sync
+                # run), and keep the crawler loop free while it is evaluated.
+                self._explore_js_kinds = await asyncio.to_thread(
+                    self.get_explore_kinds, raise_errors=True,
+                )
+            return self._explore_js_kinds
     def _parse_explore_json(self, text: str) -> list[dict[str, str]]:
         """Try to parse explore kind JSON array."""
         if text.startswith("<js>") and text.endswith("</js>"):
@@ -158,10 +155,10 @@ class ExploreMixin:
             explore_url = self._resolve_kind_url(explore_url, page)
             if not explore_url:
                 return []
-            explore_kind = self._explore_kind_for_url(explore_url, page)
+            explore_kind = await self._explore_kind_for_url(explore_url, page)
             return await self._fetch_explore_url(explore_url, explore_kind)
 
-        kinds = self.get_explore_kinds()
+        kinds = await self._get_catalog_kinds()
         if kinds:
             blocked_errors: list[str] = []
             unavailable_errors: list[str] = []
@@ -205,6 +202,11 @@ class ExploreMixin:
                         )
                     return items
                 except Exception as exc:
+                    if page > 1 and self._is_missing_page_error(exc):
+                        # A paginated category reported a definite end. Other
+                        # categories may continue for many pages.
+                        self._explore_kind_ends[kind_url] = page
+                        return []
                     message = str(exc)
                     described = (
                         f"{type(exc).__name__}: {message}"
@@ -277,19 +279,10 @@ class ExploreMixin:
                 )
             return results
 
-        explore_url_rule = str(self.config.get("exploreUrl", "") or "").strip()
-        if (
-            explore_url_rule
-            and (explore_url_rule.startswith("<js") or explore_url_rule.startswith("@js:"))
-        ):
-            # A JS exploreUrl that produced no kinds: either the script needs
-            # the full Legado Android runtime, or it failed to evaluate.
-            # Report it so the user is not left wondering why 0 books were
-            # discovered.
-            raise RuntimeError(
-                "该书源的发现规则是 Legado JS 脚本（<js>/@js:），当前环境无法执行；"
-                "请在 Legado 中搜索书籍后通过书源搜索/手动链接同步，"
-                f"或更换该网站的其他书源。source={self.display_name}"
+        explore_url_rule = str(self.config.get("exploreUrl") or "").strip().lower()
+        if explore_url_rule.startswith(("<js>", "@js:")):
+            raise JsEvaluationError(
+                "Legado JS 发现规则没有返回可用分类，请检查源站页面和书源规则"
             )
 
         explore_url = self.engine.build_explore_url(page=page)
@@ -442,6 +435,9 @@ class ExploreMixin:
         options: dict[str, Any] | None,
     ) -> list[dict[str, Any]]:
         """Fetch one catalog page, paging URLs that lack a page placeholder."""
+        end_page = self._explore_kind_ends.get(kind_url)
+        if end_page is not None and page >= end_page:
+            return []
         base = self._explore_page_base(kind_url)
         if page <= 1 or not base or resolved.rstrip("/") != base:
             # Either the first page, or the source rule already paginates
@@ -456,17 +452,11 @@ class ExploreMixin:
         template = self._explore_page_templates.get(base)
         if template:
             candidate = self._page_url_from_template(template, page)
-            try:
-                return await self._fetch_explore_url(
-                    candidate,
-                    explore_kind=explore_kind,
-                    options=self._options_for_url(options, candidate),
-                )
-            except Exception as exc:
-                if self._is_missing_page_error(exc):
-                    # Past the last page: the catalog is exhausted.
-                    return []
-                raise
+            return await self._fetch_explore_url(
+                candidate,
+                explore_kind=explore_kind,
+                options=self._options_for_url(options, candidate),
+            )
 
         # No template learned yet (e.g. a task resumed straight at page > 1):
         # probe the common paging shapes until one returns books.
@@ -580,10 +570,15 @@ class ExploreMixin:
         body = re.sub(r"<(script|style)\b.*?</\1\s*>", " ", text, flags=re.I | re.S)
         body = " ".join(re.sub(r"<[^>]+>", " ", body).split())[:80]
         return f"bytes={len(text)} title={title!r} text={body!r}"
-    def _explore_kind_for_url(self, url: str, page: int) -> str:
+    async def _explore_kind_for_url(self, url: str, page: int) -> str:
         """Recover a configured category when the caller selects one URL."""
         selected = url.rstrip("/")
-        for kind in self.get_explore_kinds():
+        try:
+            kinds = await self._get_catalog_kinds()
+        except (JsEvaluationError, TimeoutError, ConnectionError):
+            # Category labels are optional for an explicit URL.
+            return ""
+        for kind in kinds:
             kind_url = str(kind.get("url") or "").strip()
             if not kind_url:
                 continue

@@ -31,8 +31,7 @@ Votes are combined as follows:
 * chapters stored     -> content wins, in both directions.  This is what lets
   「重新识别」 rescue the novels that a stray 漫画 tag locked as comics.
 
-Kinds still only ever move *up* to ``comic`` during a routine sync; the admin
-re-classification endpoint is what re-derives a wrong value.
+A manual override takes precedence over evidence during sync and reclassification.
 """
 
 import asyncio
@@ -200,7 +199,7 @@ def chapter_comic_vote(content: str | None) -> bool | None:
     one-chapter album is left alone instead of being demoted on a guess.
     """
     if not is_comic_content(content):
-        return False
+        return False if strip_chapter_text(content or "") else None
     if is_ambiguous_chapter(content):
         return None
     return True
@@ -289,6 +288,9 @@ def classify_book(
     ``current`` defaults to the book's stored kind (upgrade-only).  Pass
     ``None`` to re-derive the value from scratch.
     """
+    override = getattr(book, "kind_override", None)
+    if override in KINDS:
+        return override
     if current is ...:
         current = getattr(book, "kind", None)
     labels = [*getattr(book, "tag_names", []), *getattr(book, "category_names", [])]
@@ -373,6 +375,35 @@ async def scan_book_votes(
         if not _undecided_after(votes, len(indexes)):
             break
     return votes, reads
+
+
+async def classify_stored_book(db, storage, book_id: str, *, source=None, labels=(), current=None) -> str:
+    """Apply the same sampled chapter evidence to an individual book."""
+    from sqlalchemy import select
+
+    from app.models import Chapter
+
+    paths = await db.scalars(
+        select(Chapter.content_path)
+        .where(Chapter.book_id == book_id, Chapter.content_path.is_not(None))
+        .order_by(Chapter.chapter_number, Chapter.id)
+    )
+    votes, _ = await scan_book_votes(storage, [path for path in paths.all() if path])
+    return resolve_kind(source=source, labels=labels, content_votes=votes, current=current)
+
+
+async def refresh_search_kinds(book_ids: list[str]) -> None:
+    if not book_ids:
+        return
+
+    from loguru import logger
+
+    from app.services.search import search_service
+
+    try:
+        await search_service.sync_book_kinds(book_ids=book_ids)
+    except Exception as exc:
+        logger.warning("Could not update book kinds in search: {}", exc)
 
 
 async def reclassify_books(
@@ -464,18 +495,18 @@ async def reclassify_books(
         if not books:
             break
         last_id = books[-1].id
-        books_by_id = {book.id: book for book in books}
+        automatic_ids = [book.id for book in books if not getattr(book, "kind_override", None)]
 
         # Content scan.  Every book with stored chapters is scanned, including
         # the ones the cheap rules already call a comic: that is the only way a
         # stray 漫画 tag or a placeholder first chapter can be cleared.
         verdicts: dict[str, bool] = {}
         paths: dict[str, list[str]] = {}
-        if scan_content:
+        if scan_content and automatic_ids:
             chapter_rows = (
                 await db.execute(
                     select(Chapter.book_id, Chapter.content_path)
-                    .where(Chapter.book_id.in_(list(books_by_id)))
+                    .where(Chapter.book_id.in_(automatic_ids))
                     .order_by(Chapter.book_id, Chapter.chapter_number)
                 )
             ).all()
@@ -496,11 +527,14 @@ async def reclassify_books(
                     result["content_comics"] += 1
                 else:
                     result["content_novels"] += 1
-            result["no_chapters"] += sum(1 for book in books if not paths.get(book.id))
+            result["no_chapters"] += sum(1 for book_id in automatic_ids if not paths.get(book_id))
 
         for book in books:
             verdict = verdicts.get(book.id)
-            if verdict is not None:
+            override = getattr(book, "kind_override", None)
+            if override in KINDS:
+                kind = override
+            elif verdict is not None:
                 # Content decides, in both directions.
                 kind = KIND_COMIC if verdict else KIND_NOVEL
             elif is_comic_source(sources.get(book.source_id)) or is_comic_labels(
@@ -518,9 +552,13 @@ async def reclassify_books(
                 # of re-labelling a comic whose chapters simply are not here.
                 kind = normalize_kind(book.kind)
             if kind != normalize_kind(book.kind):
-                book.kind = kind
-                result["updated"] += 1
-                result["changed_book_ids"].append(book.id)
+                # The chapter scan can outlast a reader's manual correction.
+                await db.refresh(book, attribute_names=["kind", "kind_override"], with_for_update=True)
+                kind = getattr(book, "kind_override", None) or kind
+                if kind != book.kind:
+                    book.kind = kind
+                    result["updated"] += 1
+                    result["changed_book_ids"].append(book.id)
             if normalize_kind(book.kind) == KIND_COMIC:
                 result["comics"] += 1
             else:
