@@ -16,8 +16,10 @@ from app.crawler.plugins.yuedu.errors import is_transient_transport_error
 from app.crawler.plugins.yuedu.selectors import TOC_LINK_PATH_RE
 from app.crawler.plugins.yuedu.selectors import TOC_LINK_TEXTS
 from bs4 import BeautifulSoup
+from collections import deque
+from collections.abc import Awaitable, Callable
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urldefrag, urljoin
 from urllib.parse import urlparse
 import asyncio
 import random
@@ -102,6 +104,11 @@ class BookMixin:
                 prefix = match.group(1).rsplit("/", 1)[0] + "/"
         return f"{self.base_url.rstrip('/')}{prefix}{book_id}"
     async def fetch_book(self, url: str) -> RemoteBook:
+        return await self.fetch_book_with_progress(url)
+
+    async def fetch_book_with_progress(
+        self, url: str, progress_cb: Callable[[str, int], Awaitable[None]] | None = None,
+    ) -> RemoteBook:
         """Fetch book info + chapter list from a book page URL."""
         if not self.engine:
             raise RuntimeError("YueduPlugin not configured")
@@ -238,45 +245,9 @@ class BookMixin:
                 for chapter in generic_toc["chapters"]
             ]
 
-        # Follow nextTocUrl for paginated tables of contents
-        max_toc_pages = 20
-        seen_toc_urls = {toc_url}
-        toc_pages_fetched = 1
-        toc_semaphore = asyncio.Semaphore(self._thread_count())
-
-        async def _fetch_toc_page(page_url: str) -> str:
-            async with toc_semaphore:
-                return await self._get(page_url)
-
-        toc_pending = [
-            next_toc_url
-            for next_toc_url in self.engine.get_next_toc_urls(toc_html, toc_url)
-            if next_toc_url not in seen_toc_urls
-        ]
-        seen_toc_urls.update(toc_pending)
-        while toc_pending and toc_pages_fetched < max_toc_pages:
-            batch = toc_pending
-            toc_pending = []
-            htmls = await asyncio.gather(
-                *(_fetch_toc_page(page_url) for page_url in batch)
-            )
-            for page_url, page_html in zip(batch, htmls):
-                if toc_pages_fetched >= max_toc_pages:
-                    break
-                toc_pages_fetched += 1
-                toc.extend(
-                    self._resolve_toc_entries(
-                        self.engine.parse_toc(page_html),
-                        page_url,
-                    )
-                )
-                for next_toc_url in self.engine.get_next_toc_urls(
-                    page_html,
-                    page_url,
-                ):
-                    if next_toc_url not in seen_toc_urls:
-                        seen_toc_urls.add(next_toc_url)
-                        toc_pending.append(next_toc_url)
+        await self._extend_paginated_toc(
+            toc, toc_html, toc_url, str(info.get("name") or identity_url), progress_cb,
+        )
 
         generic = self._parse_book_generic(html, url)
         if not str(info.get("name") or "").strip():
@@ -468,6 +439,69 @@ class BookMixin:
             tags=tags,
             cover_url=cover_url or None,
         )
+
+    async def _extend_paginated_toc(
+        self, toc: list[dict[str, Any]], toc_html: str, toc_url: str,
+        progress_title: str, progress_cb: Callable[[str, int], Awaitable[None]] | None,
+    ) -> None:
+        # Queue URLs in rule order. A page selector may list the entire
+        # catalogue at once, so bound the actual batch of HTML responses.
+        def page_key(page_url: str) -> str:
+            # Keep Legado request options (including POST bodies) in the key.
+            if "#" not in page_url:
+                return page_url
+            bare, options = self._split_options_suffix(page_url)
+            return page_url if options else urldefrag(bare).url
+
+        seen_toc_urls = {page_key(toc_url)}
+        pending: deque[str] = deque()
+
+        def enqueue_links(page_html: str, page_url: str) -> None:
+            for link in self.engine.get_next_toc_urls(page_html, page_url):
+                key = page_key(link)
+                if key not in seen_toc_urls:
+                    seen_toc_urls.add(key)
+                    pending.append(link)
+
+        enqueue_links(toc_html, toc_url)
+        parallelism = self._thread_count()
+        pages_read = 1
+        if pending and progress_cb:
+            await progress_cb(progress_title, pages_read)
+        previous_chapters: tuple | None = None
+        repeated_pages = 0
+        while pending:
+            batch = [pending.popleft() for _ in range(min(parallelism, len(pending)))]
+            fetches = [asyncio.create_task(self._get(link)) for link in batch]
+            try:
+                htmls = await asyncio.gather(*fetches)
+            except BaseException:
+                for fetch in fetches:
+                    fetch.cancel()
+                await asyncio.gather(*fetches, return_exceptions=True)
+                raise
+            for page_url, page_html in zip(batch, htmls):
+                if self._looks_like_upstream_error(page_html):
+                    raise RuntimeError(f"Upstream server returned a transient 5xx TOC page: {page_url}")
+                self.engine.set_page_url(page_url)
+                entries = self._resolve_toc_entries(self.engine.parse_toc(page_html), page_url)
+                toc.extend(entries)
+                enqueue_links(page_html, page_url)
+            # Some sites keep generating fresh "next" URLs for the same last
+            # page. Only flag a repeating single chain, never a page dropdown.
+            if len(batch) == 1 and len(pending) == 1:
+                chapters = tuple((e.get("chapterUrl"), e.get("chapterName")) for e in entries)
+                repeated_pages = repeated_pages + 1 if chapters == previous_chapters else 0
+                if repeated_pages >= 3:
+                    raise ValueError("目录分页连续返回相同章节，请检查书源的 nextTocUrl 规则")
+                previous_chapters = chapters
+            else:
+                previous_chapters = None
+                repeated_pages = 0
+            pages_read += len(batch)
+            if progress_cb:
+                await progress_cb(progress_title, pages_read)
+
     def _find_toc_url(self, html: str, book_url: str) -> str:
         """Find a full chapter-list URL from a book detail page.
 

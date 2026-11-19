@@ -331,7 +331,7 @@ class CheckpointThrottle:
         return True
 
 
-async def run_crawl_task_async(task_id: str) -> dict:
+async def run_crawl_task_async(task_id: str, *, book_concurrency: int | None = None) -> dict:
     """Execute one pending crawl task with pause/cancel/progress support."""
     from app.services.sync import SyncPaused, SyncService
 
@@ -418,6 +418,7 @@ async def run_crawl_task_async(task_id: str) -> dict:
                 progress_state.update({
                     "current_book": info.get("book_title") or "",
                     "current_chapter": info.get("chapter_title") or "",
+                    "current_toc_pages_done": int(info.get("toc_pages_done") or 0),
                     "current_content_pages_done": int(
                         info.get("content_pages_done", 0) or 0
                     ),
@@ -461,6 +462,7 @@ async def run_crawl_task_async(task_id: str) -> dict:
                 before_step=_wait_if_paused,
                 checkpoint_cb=_wait_if_paused,
                 start_page=start_page,
+                book_concurrency=book_concurrency,
                 page_batch_size=int(getattr(settings, "SYNC_PAGE_BATCH_SIZE", 0) or 0),
                 exclude_tags=list(getattr(task_obj, "exclude_tags", None) or []),
                 exclude_categories=list(getattr(task_obj, "exclude_categories", None) or []),
@@ -643,30 +645,12 @@ _TASK_CONNECTION_RESERVE = 4
 
 
 def _task_slot_budget() -> int:
-    """How many crawl tasks this process's connection pool can actually serve.
-
-    A task does not hold one connection: ``run_crawl_task_async`` keeps its own
-    session for the whole full-site sync **and** ``discover_and_sync_all`` opens
-    one session per concurrently syncing book (``sync_book_concurrency()``,
-    default 3).  Dividing by that fan-out is what keeps the loop from starting
-    26 tasks that together need ~100 connections out of a pool of 30 -- the
-    "QueuePool limit of size 10 overflow 20 reached" outage of 2026-09-23.
-    """
-    per_task = 1 + sync_book_concurrency()
-    return max(1, (db_pool_capacity() - _TASK_CONNECTION_RESERVE) // per_task)
+    """Split usable connections between source tasks and book workers."""
+    return max(1, (db_pool_capacity() - _TASK_CONNECTION_RESERVE) // 2)
 
 
 def task_concurrency_limit() -> int:
-    """Effective ceiling on concurrently running crawl tasks.
-
-    ``SYNC_WORKER_CONCURRENCY`` is the operator's ceiling and ``0`` means "one
-    worker per source".  The pool budget is a *hard* one: a running task holds
-    ``1 + SYNC_BOOK_CONCURRENCY`` pooled connections for the entire full-site
-    sync (one session of its own, plus one per concurrently syncing book -- see
-    ``_task_slot_budget``), so tasks beyond the pool cannot make progress at
-    all -- they just wait ``pool_timeout`` and then fail with "QueuePool limit
-    of size 10 overflow 20 reached".  Whichever ceiling is lower wins.
-    """
+    """Source slots, bounded by the queue pool and the operator's ceiling."""
     configured = sync_source_concurrency()
     budget = _task_slot_budget()
     return budget if configured <= 0 else min(configured, budget)
@@ -691,6 +675,7 @@ class _ActiveTask:
         "task_id",
         "source",
         "started_at",
+        "book_workers",
         "stop_seen_at",
         "marker",
         "marker_at",
@@ -698,9 +683,10 @@ class _ActiveTask:
         "released",
     )
 
-    def __init__(self, task_id: str, source: str, now: float) -> None:
+    def __init__(self, task_id: str, source: str, now: float, book_workers: int = 1) -> None:
         self.task_id = task_id
         self.source = source
+        self.book_workers = book_workers
         self.started_at = now
         #: When the row first said "this must not run any more", so the task
         #: keeps a grace period to stop at its own checkpoint.
@@ -734,6 +720,7 @@ def _progress_marker(progress: Any) -> tuple:
         progress.get("current_book"),
         progress.get("current_chapter"),
         progress.get("current_content_pages_done"),
+        progress.get("current_toc_pages_done"),
         progress.get("current_chapters_created"),
         progress.get("current_images_done"),
         progress.get("current_images_total"),
@@ -962,6 +949,8 @@ async def _worker_loop() -> None:
     so the container supervisor can restart a worker that stops ticking.
     """
     limit = task_concurrency_limit()
+    connection_budget = max(2, db_pool_capacity() - _TASK_CONNECTION_RESERVE)
+    max_book_workers = sync_book_concurrency()
     supervise_interval = task_supervise_interval_seconds()
     stop_grace = task_stop_grace_seconds()
     claimed: set[str] = set()
@@ -971,7 +960,7 @@ async def _worker_loop() -> None:
 
     async def _run_guarded(entry: _ActiveTask) -> None:
         try:
-            await run_crawl_task_async(entry.task_id)
+            await run_crawl_task_async(entry.task_id, book_concurrency=entry.book_workers)
         except Exception as exc:
             logger.error("Crawl task {} stopped: {}", entry.task_id, exc)
         finally:
@@ -980,12 +969,6 @@ async def _worker_loop() -> None:
             # Explain what just failed, if the feature is on.  Fire-and-forget:
             # a slow model call must never hold up the queue for this source.
             _spawn_auto_diagnosis(entry.task_id)
-
-    def _free_slots() -> int:
-        # Bounded batch: enough to fill every free slot without loading an
-        # unbounded pending backlog into memory.  Never more than the pool can
-        # serve, so the loop can only start tasks that can get a connection.
-        return max(1, limit - len(active))
 
     while True:
         try:
@@ -997,9 +980,18 @@ async def _worker_loop() -> None:
             mark_alive()
 
             while len(active) < limit:
-                candidates = await _next_pending_tasks(_free_slots(), running_sources)
+                # A source needs its task session and at least one independent
+                # book session. Divide remaining connections across this batch
+                # so a large backlog can use more sources and a small one can
+                # still fetch books concurrently within each source.
+                available = connection_budget - sum(1 + e.book_workers for e in active.values())
+                slots = min(limit - len(active), available // 2)
+                if slots < 1:
+                    break
+                candidates = await _next_pending_tasks(slots, running_sources)
                 if not candidates:
                     break
+                book_workers = min(max_book_workers, available // len(candidates) - 1)
                 started_any = False
                 for task_id, source in candidates:
                     if len(active) >= limit:
@@ -1008,7 +1000,7 @@ async def _worker_loop() -> None:
                         continue
                     claimed.add(task_id)
                     running_sources.add(source)
-                    entry = _ActiveTask(task_id, source, time.monotonic())
+                    entry = _ActiveTask(task_id, source, time.monotonic(), book_workers)
                     task = asyncio.create_task(_run_guarded(entry))
                     active[task] = entry
                     started_any = True

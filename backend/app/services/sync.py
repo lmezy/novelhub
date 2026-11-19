@@ -2,6 +2,7 @@ import asyncio
 import re
 from uuid import uuid4
 from collections.abc import Awaitable, Callable
+from html import escape, unescape
 from urllib.parse import urljoin, urlparse
 
 from sqlalchemy import delete, select, update
@@ -47,6 +48,7 @@ from app.services.book_kind import (
     KIND_COMIC,
     chapter_comic_vote,
     classify_stored_book,
+    is_comic_content,
     is_comic_labels,
     is_comic_source,
     normalize_kind,
@@ -142,7 +144,6 @@ CONTENT_IMAGE_RE = re.compile(
     r"!\[[^\]]*\]\([^)]*\)|<img\b[^>]*\bsrc=",
     re.IGNORECASE,
 )
-MAX_CONTENT_IMAGES_PER_CHAPTER = 512
 
 # The transient *exception* taxonomy lives in exactly one place:
 # ``app.core.transient``.  This module used to keep its own list, which drifted
@@ -172,19 +173,12 @@ def describe_error(exc: BaseException | None) -> str:
     return text or type(exc).__name__
 
 
-def content_image_limit() -> int:
-    """How many images one chapter may download (``MAX_CONTENT_IMAGES_PER_CHAPTER``)."""
-    try:
-        value = int(
-            getattr(
-                settings,
-                "MAX_CONTENT_IMAGES_PER_CHAPTER",
-                MAX_CONTENT_IMAGES_PER_CHAPTER,
-            )
-        )
-    except (TypeError, ValueError):
-        value = MAX_CONTENT_IMAGES_PER_CHAPTER
-    return max(1, value)
+def content_image_limit(*, comic: bool = False) -> int:
+    """A positive override applies to all chapters. By default only prose is capped."""
+    limit = int(getattr(settings, "MAX_CONTENT_IMAGES_PER_CHAPTER", 0) or 0)
+    if limit > 0:
+        return limit
+    return 0 if comic else 512
 
 
 def _last_explore_diagnosis(plugin) -> str:
@@ -467,12 +461,7 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
     ) -> str:
         """Download in-content images and rewrite references to local URLs.
 
-        ``image_progress_cb`` is awaited with ``(handled, total)`` before each
-        image is fetched.  Images are downloaded one at a time and one album
-        chapter can hold hundreds of them, so on a slow or failing image host
-        this is the only progress a whole book produces for hours -- see
-        ``crawl_runner._progress_marker``, whose stall watchdog would otherwise
-        read a working task as hung.
+        Report each download so the queue watchdog sees progress during long albums.
         """
         if not content:
             return content
@@ -480,84 +469,77 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         if fetcher is None:
             return content
 
-        refs: list[tuple[str, str, str]] = []
-        for tag in HTML_IMG_RE.findall(content):
+        # Record source positions before downloading. Replacing each reference
+        # by searching the growing chapter again is quadratic for long albums.
+        refs: list[tuple[int, int, str, str]] = []
+        for match in HTML_IMG_RE.finditer(content):
+            tag = match.group()
             src = self._img_src_from_tag(tag)
-            if not src:
-                continue
-            alt_match = re.search(r'alt\s*=\s*["\']([^"\']*)["\']', tag, re.I)
-            refs.append((tag, src, alt_match.group(1) if alt_match else ""))
+            if src:
+                alt = re.search(r'alt\s*=\s*["\']([^"\']*)["\']', tag, re.I)
+                refs.append((*match.span(), unescape(src), unescape(alt.group(1)) if alt else ""))
         for match in MD_IMG_RE.finditer(content):
-            refs.append((match.group(0), match.group(2), match.group(1)))
+            refs.append((*match.span(), match.group(2), match.group(1)))
         if not refs:
             return content
-        refs = refs[:content_image_limit()]
-        replaced: dict[str, str] = {}
-        total_images = len(refs)
-
-        # Images are fetched a few at a time.  They are pure network waits and an
-        # album chapter can hold hundreds of them: one at a time, a single comic
-        # chapter spent minutes doing nothing but waiting for the image host
-        # (``image_progress_cb`` used to be the *reason* for the sequential loop,
-        # and it still fires once per image -- before that image's fetch -- so
-        # the stall watchdog keeps seeing movement).
-        concurrency = max(
-            1, int(getattr(settings, "SYNC_IMAGE_CONCURRENCY", 3) or 3)
+        comic = (
+            getattr(book, "kind", None) == KIND_COMIC or is_comic_source(getattr(plugin, "config", None))
+            or bool(getattr(plugin, "_chapter_image_manifest", None)) or is_comic_content(content)
         )
-        semaphore = asyncio.Semaphore(concurrency)
-        progress_lock = asyncio.Lock()
-        progress: list[int] = [0]
+        limit = content_image_limit(comic=comic)
+        if limit:
+            refs = refs[:limit]
 
-        async def fetch_one(original: str, src: str, alt: str) -> None:
-            async with semaphore:
-                if image_progress_cb is not None:
-                    async with progress_lock:
-                        progress[0] += 1
-                        handled = progress[0]
-                    await image_progress_cb(handled, total_images)
-                if src.startswith("data:"):
-                    return
-                abs_url = urljoin(base_url or "", src).split("#", 1)[0]
-                if abs_url in replaced:
-                    return
-                replacement = ""
-                try:
-                    result = await fetcher(abs_url, referer=base_url or None)
-                except Exception:
-                    result = None
-                if result is not None:
-                    data, _content_type = result
-                    try:
-                        rel_path = self.storage.save_chapter_image(
-                            book.id,
-                            abs_url,
-                            data,
-                        )
-                        filename = rel_path.split("/")[-1]
-                        replacement = (
-                            f'<img src="/api/chapters/{chapter_id}/images/'
-                            f'{filename}" alt="{alt}" loading="lazy">'
-                        )
-                    except Exception:
-                        replacement = ""
-                if not replacement:
-                    replacement = (
-                        f'<img src="{abs_url}" alt="{alt}" loading="lazy">'
-                    )
-                replaced[abs_url] = replacement
-
-        await asyncio.gather(*(fetch_one(*ref) for ref in refs))
-        # The rewriting pass stays sequential: ``content.replace(..., 1)`` in
-        # order is what keeps the first occurrence of each reference mapped to
-        # its own fetch, exactly like the sequential loop did.
-        for original, src, alt in refs:
-            if src.startswith("data:"):
+        images: list[tuple[int, int, str, str]] = []
+        last_end = 0
+        for start, end, src, alt in sorted(refs):
+            if start < last_end or src.startswith("data:"):
                 continue
-            abs_url = urljoin(base_url or "", src).split("#", 1)[0]
-            replacement = replaced.get(abs_url)
-            if replacement:
-                content = content.replace(original, replacement, 1)
-        return content
+            images.append((start, end, urljoin(base_url or "", src).split("#", 1)[0], alt))
+            last_end = end
+        if not images:
+            return content
+
+        # Workers share an iterator. Only currently active downloads allocate
+        # coroutines, even when one chapter lists thousands of distinct images.
+        urls = dict.fromkeys(item[2] for item in images)
+        downloads = iter(enumerate(urls, 1))
+        local_urls: dict[str, str] = {}
+
+        async def download() -> None:
+            for index, url in downloads:
+                if image_progress_cb is not None:
+                    await image_progress_cb(index, len(urls))
+                try:
+                    result = await fetcher(url, referer=base_url or None)
+                    if result is not None:
+                        data, _content_type = result
+                        path = self.storage.save_chapter_image(book.id, url, data)
+                        filename = path.rsplit("/", 1)[-1]
+                        local_urls[url] = f"/api/chapters/{chapter_id}/images/{filename}"
+                except Exception:
+                    # Keep the original remote image available to the reader.
+                    continue
+
+        concurrency = max(1, int(getattr(settings, "SYNC_IMAGE_CONCURRENCY", 3) or 3))
+        workers = [asyncio.create_task(download()) for _ in range(min(concurrency, len(urls)))]
+        try:
+            await asyncio.gather(*workers)
+        except BaseException:
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            raise
+
+        parts = []
+        cursor = 0
+        for start, end, url, alt in images:
+            parts.append(content[cursor:start])
+            src = escape(local_urls.get(url, url), quote=True)
+            parts.append(f'<img src="{src}" alt="{escape(alt, quote=True)}" loading="lazy">')
+            cursor = end
+        parts.append(content[cursor:])
+        return "".join(parts)
 
     async def sync_book(
         self,
@@ -587,11 +569,23 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         # A single transient Cloudflare 5xx / browser timeout on the book page
         # should not fail the whole book.  Retry a few times with backoff for
         # transient upstream errors before giving up.
+        async def report_toc_progress(title: str, pages: int) -> None:
+            if checkpoint_cb is not None:
+                await checkpoint_cb()
+            if progress_cb is not None:
+                await progress_cb({"book_title": title, "toc_pages_done": pages})
+
+        track_toc = (progress_cb is not None or checkpoint_cb is not None) and callable(
+            getattr(type(plugin), "fetch_book_with_progress", None)
+        )
         remote_book = None
         last_book_exc: Exception | None = None
         for book_attempt in range(3):
             try:
-                remote_book = await plugin.fetch_book(url)
+                if track_toc:
+                    remote_book = await plugin.fetch_book_with_progress(url, report_toc_progress)
+                else:
+                    remote_book = await plugin.fetch_book(url)
                 break
             except Exception as exc:
                 last_book_exc = exc
@@ -2072,6 +2066,7 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         page_batch_size: int = 0,
         exclude_tags: list[str] | None = None,
         exclude_categories: list[str] | None = None,
+        book_concurrency: int | None = None,
     ) -> dict:
         """Discover every book across catalog pages and optionally sync them."""
         source = await self.db.get(Source, source_id)
@@ -2144,6 +2139,12 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                 await self.db.rollback()
                 return False
 
+        # Queue progress/checkpoints use the task session, including callbacks
+        # from concurrent chapter producers. Give queued books their own
+        # session even when the dispatcher assigns only one book at a time.
+        queued = book_concurrency is not None
+        if book_concurrency is None:
+            book_concurrency = sync_book_concurrency()
         page = start_page
         while max_pages <= 0 or page <= max_pages:
             pages_in_run += 1
@@ -2192,7 +2193,6 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                 done = True
                 break
 
-            book_concurrency = sync_book_concurrency()
             continuous_books = bool(
                 getattr(settings, "SYNC_BOOK_CONTINUOUS", False)
             )
@@ -2402,7 +2402,7 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                         if progress_cb is not None:
                             await progress_cb(pages_checked, books_found, books_synced, books_failed)
                         continue
-                    if book_concurrency <= 1:
+                    if book_concurrency <= 1 and not queued:
                         try:
                             result = await self.sync_book(
                                 source_id,

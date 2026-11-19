@@ -303,12 +303,12 @@ def test_anyio_and_deque_transport_noise_counts_as_transient():
     assert SyncService._is_transient_chapter_error(KeyError("chapters")) is False
 
 
-def test_content_image_limit_defaults_above_manga_album_size(monkeypatch):
-    """Albums hold 100+ images; the old 50-image cap silently dropped the rest."""
+def test_chapter_image_downloads_are_unlimited_by_default(monkeypatch):
     from app.core.config import settings
     from app.services.sync import content_image_limit
 
-    assert content_image_limit() >= 100
+    assert content_image_limit(comic=True) == 0
+    assert content_image_limit() == 512
     monkeypatch.setattr(
         settings, "MAX_CONTENT_IMAGES_PER_CHAPTER", 7, raising=False
     )
@@ -547,6 +547,49 @@ async def test_process_content_images_downloads_and_rewrites_references():
     assert result.count("/api/chapters/chapter-1/images/abc.jpg") == 2
     assert plugin.fetch_content_image.await_count == 2
     assert storage.save_chapter_image.call_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cap", [0, 7])
+async def test_long_album_localises_images_in_order_with_bounded_workers(tmp_path, monkeypatch, cap):
+    from app.core.config import settings
+    from app.services.storage import BookStorage
+    from bs4 import BeautifulSoup
+
+    storage = BookStorage(root=str(tmp_path))
+    service = SyncService(_mock_db(), storage=storage)
+    count = 530
+    content = "\n".join(f"![{n}](/images/{n}.jpg)" for n in range(count))
+    content += '\n<img src="/images/0.jpg" alt="repeat">'
+    # HTML refs are processed first under a user-specified positive cap.
+    monkeypatch.setattr(settings, "MAX_CONTENT_IMAGES_PER_CHAPTER", cap)
+    monkeypatch.setattr(settings, "SYNC_IMAGE_CONCURRENCY", 3)
+    active = peak = 0
+    downloaded = []
+
+    async def fetch(url, *, referer):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        downloaded.append(url)
+        await asyncio.sleep(0)
+        active -= 1
+        return url.encode(), "image/jpeg"
+
+    result = await service._process_content_images(
+        SimpleNamespace(id="book"), "ch", content, "https://example.test/ch",
+        SimpleNamespace(fetch_content_image=fetch),
+    )
+    expected = cap - 1 if cap else count
+    urls = [f"https://example.test/images/{n}.jpg" for n in range(expected)]
+    assert downloaded == urls
+    assert peak == 3
+    tags = BeautifulSoup(result, "lxml").find_all("img")
+    assert [t["alt"] for t in tags] == [str(n) for n in range(expected)] + ["repeat"]
+    for tag, url in zip(tags, [*urls, urls[0]]):
+        assert tag["src"].startswith("/api/chapters/ch/images/")
+        file = storage.chapter_image_path("book", tag["src"].rsplit("/", 1)[1])
+        assert file.read_bytes() == url.encode()
 
 
 @pytest.mark.asyncio
@@ -3003,6 +3046,35 @@ async def test_discover_and_sync_all_page_batch_requeues():
     assert result["books_found"] == 2
     assert result["done"] is False
     assert result["next_page"] == 2
+
+
+@pytest.mark.asyncio
+async def test_queued_serial_book_has_a_separate_session_from_task_progress():
+    db = _mock_db()
+    db.get.return_value = _source()
+    book_db = _mock_db()
+    session = MagicMock()
+    session.__aenter__ = AsyncMock(return_value=book_db)
+    session.__aexit__ = AsyncMock(return_value=False)
+    plugin = AsyncMock()
+    plugin.discover_books.return_value = [
+        RemoteShelfBook(source_book_id="a", title="A", author="Author",
+                        url="https://example.com/a")
+    ]
+
+    async def sync_book(service, source_id, url, **kwargs):
+        assert service.db is book_db
+        return {"book_id": "a", "created_chapters": 1, "skipped_chapters": 0}
+
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.SessionLocal", return_value=session),
+        patch.object(SyncService, "sync_book", sync_book),
+    ):
+        result = await SyncService(db).discover_and_sync_all("src1", max_pages=1, book_concurrency=1)
+
+    assert result["books_synced"] == 1
+    session.__aexit__.assert_awaited_once()
 
 
 @pytest.mark.asyncio

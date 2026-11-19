@@ -308,6 +308,7 @@ def test_progress_marker_moves_for_gallery_pages_and_images():
 
     assert _progress_marker(base) == _progress_marker(dict(base))
     assert _progress_marker({**base, "current_content_pages_done": 19}) != _progress_marker(base)
+    assert _progress_marker({**base, "current_toc_pages_done": 21}) != _progress_marker(base)
     assert _progress_marker({**base, "current_images_done": 101}) != _progress_marker(base)
     assert _progress_marker({**base, "current_images_total": 513}) != _progress_marker(base)
 
@@ -604,7 +605,7 @@ async def test_worker_loop_picks_up_new_task_while_another_is_running():
             return [("task-b", "yuedu_b")]
         return []
 
-    async def fake_run(task_id: str) -> dict:
+    async def fake_run(task_id: str, *, book_concurrency: int) -> dict:
         started_tasks.add(task_id)
         if len(started_tasks) >= 2:
             all_started.set()
@@ -660,7 +661,7 @@ async def test_worker_loop_runs_one_worker_per_source_when_uncapped():
         served = True
         return list(tasks)
 
-    async def fake_run(task_id: str) -> dict:
+    async def fake_run(task_id: str, *, book_concurrency: int) -> dict:
         started.append(task_id)
         if len(started) >= len(tasks):
             all_started.set()
@@ -706,7 +707,7 @@ async def test_worker_loop_never_runs_two_tasks_of_the_same_source():
             return []
         return list(pending)
 
-    async def fake_run(task_id: str) -> dict:
+    async def fake_run(task_id: str, *, book_concurrency: int) -> dict:
         nonlocal overlapping
         if concurrency_seen:
             overlapping = True
@@ -854,29 +855,21 @@ def test_pool_capacity_never_reaches_zero():
 
 
 def test_task_slots_stay_below_the_pool():
-    """Tasks are always fewer than the connections they will each hold.
-
-    Every running task keeps one pooled connection for its whole life plus one
-    per concurrently syncing book (``sync_book_concurrency()``, default 3), so
-    a task count at or above the pool means the surplus waits ``pool_timeout``
-    and then fails with "QueuePool limit of size 10 overflow 20 reached" --
-    which is exactly what happened online on 2026-09-23.
-    """
     with patch.object(settings, "DB_POOL_SIZE", 10), patch.object(
         settings, "DB_MAX_OVERFLOW", 20
     ), patch.object(settings, "SYNC_BOOK_CONCURRENCY", 3), patch.object(
         settings, "SYNC_THREAD_COUNT", 9
     ):
-        # (30 - 4 reserve) // (1 + 3 per task) = 6 tasks.
-        assert _task_slot_budget() == 6
-        assert _task_slot_budget() * 4 < db_pool_capacity()
+        # Half the usable pool is available for source sessions.
+        assert _task_slot_budget() == 13
+        assert _task_slot_budget() * 2 + 4 == db_pool_capacity()
 
     with patch.object(settings, "DB_POOL_SIZE", 3), patch.object(
         settings, "DB_MAX_OVERFLOW", 3
     ), patch.object(settings, "SYNC_BOOK_CONCURRENCY", 3), patch.object(
         settings, "SYNC_THREAD_COUNT", 9
     ):
-        # (6 - 4 reserve) // 4 = 0 -> clamped to the 1 usable slot.
+        # Two usable connections allow one source slot.
         assert _task_slot_budget() == 1
 
     # A pool too small to reserve anything still yields one usable slot.
@@ -895,7 +888,7 @@ def test_task_concurrency_limit_cannot_exceed_the_pool():
     ):
         # Default: "one worker per source", bounded by the pool.
         with patch.object(settings, "SYNC_WORKER_CONCURRENCY", 0):
-            assert task_concurrency_limit() == 6
+            assert task_concurrency_limit() == 13
         # A ceiling below the budget is honoured.
         with patch.object(settings, "SYNC_WORKER_CONCURRENCY", 5):
             assert task_concurrency_limit() == 5
@@ -903,18 +896,19 @@ def test_task_concurrency_limit_cannot_exceed_the_pool():
         # regression: it used to return the number asked for (or a flat 32)
         # regardless of how many connections the pool could actually serve.
         with patch.object(settings, "SYNC_WORKER_CONCURRENCY", 100):
-            assert task_concurrency_limit() == 6
+            assert task_concurrency_limit() == 13
 
 
 @pytest.mark.asyncio
-async def test_worker_loop_starts_no_more_tasks_than_the_pool_can_serve():
+@pytest.mark.parametrize(("backlog", "workers"), [(40, 1), (8, 2), (2, 3)])
+async def test_worker_loop_starts_no_more_tasks_than_the_pool_can_serve(backlog, workers):
     """The loop itself must stop at the budget, not at the requested batch.
 
     Reproduces the online failure shape: many sources pending, a pool that can
     serve far fewer.  Before the clamp the loop started a flat batch of 32.
     """
-    pending = [(f"task-{i}", f"src-{i}") for i in range(40)]
-    started: list[str] = []
+    pending = [(f"task-{i}", f"src-{i}") for i in range(backlog)]
+    started: list[int] = []
     release = asyncio.Event()
     filled = asyncio.Event()
 
@@ -923,21 +917,20 @@ async def test_worker_loop_starts_no_more_tasks_than_the_pool_can_serve():
         ready = [pair for pair in pending if pair[1] not in running]
         return ready[:limit]
 
-    async def fake_run(task_id: str) -> dict:
-        started.append(task_id)
-        if len(started) >= budget:
+    async def fake_run(task_id: str, *, book_concurrency: int) -> dict:
+        started.append(book_concurrency)
+        if len(started) >= min(budget, backlog):
             filled.set()
         await release.wait()
         return {"status": "completed", "task_id": task_id}
 
-    with patch.object(settings, "DB_POOL_SIZE", 3), patch.object(
-        settings, "DB_MAX_OVERFLOW", 3
+    with patch.object(settings, "DB_POOL_SIZE", 10), patch.object(
+        settings, "DB_MAX_OVERFLOW", 20
     ), patch.object(settings, "SYNC_BOOK_CONCURRENCY", 3), patch.object(
         settings, "SYNC_THREAD_COUNT", 9
     ), patch.object(settings, "SYNC_WORKER_CONCURRENCY", 0):
         budget = task_concurrency_limit()
-        # (6 - 4 reserve) // (1 + 3 per task) = 0 -> clamped to 1.
-        assert budget == 1
+        assert budget == 13
         with (
             patch(
                 "app.services.crawl_runner._next_pending_tasks",
@@ -961,7 +954,8 @@ async def test_worker_loop_starts_no_more_tasks_than_the_pool_can_serve():
                 except asyncio.CancelledError:
                     pass
 
-    assert len(started) == budget
+    assert started == [workers] * min(backlog, budget)
+    assert len(started) + sum(started) <= 30 - 4
 
 
 # ---------------------------------------------------------------------------
@@ -1023,7 +1017,7 @@ def test_abandoned_tasks_never_touches_a_running_task_that_reports_progress():
             stall_seconds=600.0,
         )
         assert abandoned == []
-        assert entry.marker == (step, None, None, None, None, None, None, None, None)
+        assert entry.marker == _progress_marker({"pages_checked": step})
     assert entry.stop_seen_at is None
 
 
@@ -1129,7 +1123,7 @@ async def test_worker_loop_stops_a_paused_task_and_lets_its_source_run_again():
             return [("task-a", "yuedu_a")]
         return [("task-b", "yuedu_a")]
 
-    async def fake_run(task_id: str) -> dict:
+    async def fake_run(task_id: str, *, book_concurrency: int) -> dict:
         started.append(task_id)
         if task_id == "task-b":
             second_started.set()

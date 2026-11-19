@@ -40,20 +40,16 @@ curl -X POST http://localhost:8088/api/crawl/tasks \
 - 请求间隔优先用书源 JSON 里的 `concurrentRate`，未配置时用 `CRAWL_DELAY_MS`（默认 1200ms），
   另叠加 200–600ms 随机抖动；长任务每 `SYNC_RATE_COOLDOWN_EVERY`（默认 300）次请求暂停
   `SYNC_RATE_COOLDOWN_SECONDS`（默认 10）秒。
-- **书源之间互不排队**：`SYNC_WORKER_CONCURRENCY` 默认 `0` = 每个书源一个 worker 并行跑；
-  设成正数才限制同时运行的书源数。同一个书源同时只会跑一个任务（不同任务按优先级排队）。
+- 默认可同时同步 **13 个不同书源**。同一书源按优先级逐个执行任务。
+  `SYNC_WORKER_CONCURRENCY` 为正数时还受该值限制。[连接池预算与队列说明](crawl-queue.md)
+- 发起任务时的页数限制用于书源发现页。单本书会沿 `ruleToc.nextTocUrl` 读完整个章节目录，
+  识别已访问的分页链接并分批下载。旧版只抓到前 20 页的书，可在书籍详情页再次同步以补入后续章节。
 - 并发模型对齐 Legado：`SYNC_THREAD_COUNT`（默认 9，封顶 9）；单任务内书籍并发
   `SYNC_BOOK_CONCURRENCY`（默认 3）、章节并发 `SYNC_CHAPTER_CONCURRENCY`（默认 9）。
 - 书源目录里的多个分类默认 4 个并发抓取（`YUEDU_EXPLORE_CONCURRENCY`）。
   **并发数不等于请求频率**：每个书源自己的 `concurrentRate` / `CRAWL_DELAY_MS` 限速器仍然
   逐个放行请求，并发只是把“等上一页”的空闲时间填满，站点看到的请求频率不变。
 
-> 每个书源同时最多用 1 个任务 session + `SYNC_BOOK_CONCURRENCY` 个书 session，而连接池是
-> `pool_size=10 + max_overflow=20`。同时跑 12 个书源时会接近上限，此时多出来的取连接请求会
-> 排队（不会报错）。如果日志里出现 `PoolTimeout`，把 `SYNC_WORKER_CONCURRENCY` 设成 8 左右即可。
-> 另外线上 crawler 容器限制为 0.5 CPU / 1G 内存，同时跑很多书源时会成为瓶颈；
-> 想真正并行更多书源，需要在 NAS 的 compose 里放宽 crawler 的 `cpus`/`memory`
-> （以及 `YUEDU_PLAYWRIGHT_CONCURRENCY`，每只 Chromium 约 200–300MB）。
 - 无头浏览器（webJs / webView 书源）受 `YUEDU_PLAYWRIGHT_CONCURRENCY`（默认 3）限制，
   并且同样走书源限速，避免几十个 Chromium 同时打一个站点。
 - 429/5xx 自动退避重试，Cloudflare 的 520-527 一律按瞬态上游故障处理（它们会单独计数、
@@ -401,8 +397,11 @@ XPath，而服务端 JS 环境旧版只支持 CSS，取到空串后 `split(...)[
 绅士漫画这类相册站书源的 `chapterList` 脚本只把**第 1 个相册索引页**（12 条）写进
 `imgInfoList`，而旧代码把这份清单的长度当成了整个相册的页数上限，于是每本都被截到 12 张
 （相册实际 90+ 张）。2026-09-14 起：清单只用来判断“这是图片相册”，正文沿站点的
-“下一张/下一页”链一直走到相册结束，上限由 `YUEDU_GALLERY_MAX_PAGES`（默认 512）兜底；
-正文图片下载上限也从 50 提到 `MAX_CONTENT_IMAGES_PER_CHAPTER`（默认 512）。
+“下一张/下一页”链读取整章。现在漫画默认读到末页，章内图片也默认全部下载。
+`YUEDU_GALLERY_MAX_PAGES` 控制入口页之后最多再翻多少页，`MAX_CONTENT_IMAGES_PER_CHAPTER`
+控制单章最多下载多少张图；旧部署若显式设了正数，要取消漫画限制就将两项设为 `0`。
+已经因旧上限截短的漫画，可以在阅读器点「重同步本章」补全，整本可在详情页点「重新抓取正文」。
+
 同一版修复还纠正了 XPath 规则 `li[1]` 被当成 0-based 索引的问题（现在 `[1]` = 第一个，
 与 Legado `AnalyzeRule` 的 XPath 模式一致），相册封面（第 1 张）不再丢失。
 已经存成 12 张的章节会在**下一次同步同一本书**时自动重抓（内容只比清单长度多不出图片时判为

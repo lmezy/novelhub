@@ -1,0 +1,52 @@
+[
+  {
+    "bookSourceName": "春色书阁",
+    "bookSourceGroup": "春色书阁",
+    "bookSourceUrl": "https://chunsebooks.com",
+    "bookSourceType": 0,
+    "bookSourceComment": "支持按书名或作者搜索、分类发现、目录翻页及在线阅读。",
+    "bookUrlPattern": "https?://(?:www\\.)?chunsebooks\\.com/info/\\d+\\.html(?:[?#].*)?$",
+    "enabled": true,
+    "enabledExplore": true,
+    "enabledCookieJar": false,
+    "searchUrl": "@js:'https://chunsebooks.com/search/' + encodeURIComponent(key) + '/' + page + '.html'",
+    "exploreUrl": "[\n  {\"title\": \"最近更新\", \"url\": \"https://chunsebooks.com/top/lastupdate/{{page}}.html\"},\n  {\"title\": \"热门排行\", \"url\": \"https://chunsebooks.com/top/allvisit/{{page}}.html\"},\n  {\"title\": \"全本\", \"url\": \"https://chunsebooks.com/wanben/{{page}}.html\"},\n  {\"title\": \"都市情感\", \"url\": \"https://chunsebooks.com/list/3/{{page}}.html\"},\n  {\"title\": \"玄幻修真\", \"url\": \"https://chunsebooks.com/list/1/{{page}}.html\"},\n  {\"title\": \"武侠江湖\", \"url\": \"https://chunsebooks.com/list/2/{{page}}.html\"},\n  {\"title\": \"奇幻异世\", \"url\": \"https://chunsebooks.com/list/11/{{page}}.html\"},\n  {\"title\": \"科幻末世\", \"url\": \"https://chunsebooks.com/list/7/{{page}}.html\"},\n  {\"title\": \"历史架空\", \"url\": \"https://chunsebooks.com/list/4/{{page}}.html\"},\n  {\"title\": \"游戏竞技\", \"url\": \"https://chunsebooks.com/list/6/{{page}}.html\"},\n  {\"title\": \"同人衍生\", \"url\": \"https://chunsebooks.com/list/12/{{page}}.html\"},\n  {\"title\": \"悬疑惊悚\", \"url\": \"https://chunsebooks.com/list/5/{{page}}.html\"},\n  {\"title\": \"其他作品\", \"url\": \"https://chunsebooks.com/list/10/{{page}}.html\"}\n]",
+    "ruleSearch": {
+      "bookList": "@css:.book-grid > article.book-card",
+      "name": "@css:h2 > a@text",
+      "author": "@css:a[href^='/author/']@text",
+      "bookUrl": "@css:h2 > a@href",
+      "coverUrl": "@css:a.cover img@src",
+      "intro": "@css:div > p@text",
+      "kind": "@css:.tag@text"
+    },
+    "ruleExplore": {
+      "bookList": "@css:.book-grid > article.book-card",
+      "name": "@css:h2 > a@text",
+      "author": "@css:a[href^='/author/']@text",
+      "bookUrl": "@css:h2 > a@href",
+      "coverUrl": "@css:a.cover img@src",
+      "intro": "@css:div > p@text",
+      "kind": "@css:.tag@text"
+    },
+    "ruleBookInfo": {
+      "name": "@css:h1.book-title@text",
+      "author": "@css:meta[property='og:novel:author']@content",
+      "coverUrl": "@css:.book-detail a.cover img@src",
+      "intro": "@css:.description-section .intro-text@text",
+      "kind": "@css:.book-detail .tag@text",
+      "status": "@css:meta[property='og:novel:status']@content",
+      "lastChapter": "@css:meta[property='og:novel:latest_chapter_name']@content",
+      "tocUrl": "@css:.detail-actions a[href$='/index.html']@href"
+    },
+    "ruleToc": {
+      "chapterList": "@css:.directory .chapter-grid > a[href]",
+      "chapterName": "@text",
+      "chapterUrl": "@href",
+      "nextTocUrl": "@css:.directory .pagination a[href*='?after=']@href"
+    },
+    "ruleContent": {
+      "content": "@css:article.reader-body@html"
+    }
+  }
+]

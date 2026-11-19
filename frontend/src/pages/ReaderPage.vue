@@ -5,7 +5,7 @@ import { useBooksStore, type Chapter, type ChapterContent } from "../stores/book
 import { useAuthStore } from "../stores/auth"
 import { useI18nStore } from "../stores/i18n"
 import { api } from "../api/client"
-import { useChunkedList } from "../utils/useChunkedList"
+import ChapterDirectory from "../components/ChapterDirectory.vue"
 import AIChat from "../components/AIChat.vue"
 import AISelectionToolbar from "../components/AISelectionToolbar.vue"
 import ImageViewer from "../components/ImageViewer.vue"
@@ -45,9 +45,6 @@ const i18n = useI18nStore()
 
 const chapter = ref<ChapterContent | null>(null)
 const chapters = ref<Chapter[]>([])
-// The TOC drawer mounts chapters in chunks of 200 instead of all at once.
-const { visible: visibleTocChapters, hasMore: hasMoreTocChapters, sentinel: tocSentinel } =
-  useChunkedList(chapters)
 const loading = ref(true)
 const error = ref("")
 const appearance = ref(readReaderAppearance())
@@ -1583,12 +1580,11 @@ onUnmounted(() => {
             <button @click="showToc = false" class="text-muted text-lg">&times;</button>
           </div>
 
-          <template v-if="tocTab === 'toc'">
+          <ChapterDirectory v-if="tocTab === 'toc'" :key="bookId" :chapters="chapters" :display-title="chapterLabel" v-slot="{ chapter: ch }">
             <button
-              v-for="ch in visibleTocChapters"
-              :key="ch.id"
+              :aria-current="ch.id === chapterId ? 'page' : undefined"
               @click="openChapter(ch.id)"
-              class="block w-full text-left py-1.5 text-sm truncate"
+              class="block min-h-10 w-full text-left py-2 text-sm break-words"
               :lang="readingLanguage"
               :class="
                 ch.id === chapterId
@@ -1596,10 +1592,7 @@ onUnmounted(() => {
                   : isDark ? 'text-gray-400 hover:text-gray-200' : 'text-muted hover:text-ink'
               "
             >{{ ch.chapter_number }}. {{ chapterLabel(ch) }}</button>
-            <div v-if="hasMoreTocChapters" ref="tocSentinel" class="py-2 text-center text-xs text-muted dark:text-gray-400">
-              {{ i18n.t('book_chapters_more', { n: chapters.length - visibleTocChapters.length }) }}
-            </div>
-          </template>
+          </ChapterDirectory>
 
           <template v-else>
             <p v-if="bookmarks.length === 0" class="text-xs text-muted dark:text-gray-400 py-6 text-center">{{ i18n.t('reader_bookmark_empty') }}</p>

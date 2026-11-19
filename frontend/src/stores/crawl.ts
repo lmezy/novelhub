@@ -14,59 +14,52 @@ export const useCrawlStore = defineStore("crawl", () => {
   const loading = ref(false)
   let timer: number | null = null
 
-  async function refresh(taskId: string) {
-    try {
-      activeTask.value = await api.get<any>(`/crawl/tasks/${taskId}`)
-      if (!POLLABLE.includes(activeTask.value.status)) {
-        stopPolling()
-      }
-    } catch (e) {
-      error.value = e instanceof Error ? e.message : "Failed to load crawl task"
-      stopPolling()
-    }
+  let pollVersion = 0
+  let pollingId: string | null = null
+
+  function stopPolling() {
+    pollVersion++
+    pollingId = null
+    if (timer !== null) window.clearTimeout(timer)
+    timer = null
   }
 
   async function startPolling(taskId: string) {
-    if (timer !== null) return
-    await refresh(taskId)
-    if (!activeTask.value || !POLLABLE.includes(activeTask.value.status)) {
-      return
+    if (pollingId === taskId) return
+    stopPolling()
+    pollingId = taskId
+    const version = pollVersion
+    async function refresh() {
+      try {
+        const task = await api.get<any>(`/crawl/tasks/${taskId}`)
+        if (version !== pollVersion) return
+        activeTask.value = task
+        if (POLLABLE.includes(task.status)) {
+          timer = window.setTimeout(refresh, 2000)
+        } else {
+          stopPolling()
+        }
+      } catch (e) {
+        if (version !== pollVersion) return
+        error.value = e instanceof Error ? e.message : "Failed to load crawl task"
+        stopPolling()
+      }
     }
-    timer = window.setInterval(() => refresh(taskId), 2000)
-  }
-
-  function stopPolling() {
-    if (timer !== null) {
-      window.clearInterval(timer)
-      timer = null
-    }
+    await refresh()
   }
 
   async function setTask(task: any) {
-    if (activeTask.value?.id && activeTask.value.id !== task?.id) {
-      stopPolling()
-    }
+    stopPolling()
     activeTask.value = task
     error.value = ""
-    if (task?.id && POLLABLE.includes(task.status)) {
-      await startPolling(task.id)
-    }
+    if (task?.id && POLLABLE.includes(task.status)) await startPolling(task.id)
   }
 
-  async function pauseTask() {
-    if (!activeTask.value?.id) return
-    activeTask.value = await api.post(`/crawl/tasks/${activeTask.value.id}/pause`)
-  }
-
-  async function resumeTask() {
-    if (!activeTask.value?.id) return
-    activeTask.value = await api.post(`/crawl/tasks/${activeTask.value.id}/resume`)
-  }
-
-  async function cancelTask() {
-    if (!activeTask.value?.id) return
-    activeTask.value = await api.post(`/crawl/tasks/${activeTask.value.id}/cancel`)
-    stopPolling()
+  async function changeStatus(action: "pause" | "resume" | "cancel") {
+    const id = activeTask.value?.id
+    if (!id) return
+    const update = await api.post<any>(`/crawl/tasks/${id}/${action}`)
+    if (activeTask.value?.id === id) await setTask({ ...activeTask.value, ...update })
   }
 
   function clear() {
@@ -81,9 +74,9 @@ export const useCrawlStore = defineStore("crawl", () => {
     loading,
     setTask,
     startPolling,
-    pauseTask,
-    resumeTask,
-    cancelTask,
+    pauseTask: () => changeStatus("pause"),
+    resumeTask: () => changeStatus("resume"),
+    cancelTask: () => changeStatus("cancel"),
     clear,
   }
 })

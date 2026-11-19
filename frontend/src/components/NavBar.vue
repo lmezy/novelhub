@@ -15,7 +15,7 @@ const toolsOpen = ref(false)
 const displayName = computed(() => auth.user?.nickname?.trim() || auth.user?.username || "")
 const initial = computed(() => Array.from(displayName.value)[0]?.toUpperCase() ?? "N")
 const libraryActive = computed(() => ["books", "novels", "comics", "book-detail"].includes(String(route.name)))
-const inTools = computed(() => route.name === "sync" || route.name === "settings")
+const inTools = computed(() => route.name === "settings")
 const themeLabel = computed(() => i18n.t(auth.isDark ? "reader_light_mode" : "reader_dark_mode"))
 const localeLabel = computed(() => i18n.t(i18n.isZh ? "nav_switch_en" : "nav_switch_zh"))
 
@@ -57,6 +57,7 @@ onUnmounted(() => document.removeEventListener("pointerdown", onOutsidePointer))
         <router-link to="/" :class="{ selected: route.name === 'home' }">{{ i18n.t('nav_shelf') }}</router-link>
         <router-link to="/books" :class="{ selected: libraryActive }">{{ i18n.t('nav_library') }}</router-link>
         <router-link to="/discover" :class="{ selected: route.name === 'discover' }">{{ i18n.t('nav_discover') }}</router-link>
+        <router-link to="/sync" :class="{ selected: route.name === 'sync' }">{{ i18n.t('nav_sync') }}</router-link>
       </nav>
 
       <div v-if="auth.user" ref="tools" class="header-actions" @keydown.esc="onEscape">
@@ -87,7 +88,6 @@ onUnmounted(() => document.removeEventListener("pointerdown", onOutsidePointer))
 
           <div class="tool-group">
             <p>{{ i18n.t('nav_library_tools') }}</p>
-            <router-link to="/sync" @click="closeTools">{{ i18n.t('nav_sync_tasks') }}</router-link>
             <router-link :to="{ name: 'settings', query: { tab: 'sources' } }" @click="closeTools">{{ i18n.t('nav_sources') }}</router-link>
             <router-link v-if="auth.isAdmin" :to="{ name: 'settings', query: { tab: 'add' } }" @click="closeTools">{{ i18n.t('nav_add_books') }}</router-link>
           </div>

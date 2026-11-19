@@ -8,11 +8,13 @@ the chapter.
 """
 
 from app.crawler.base import RemoteChapter
+from app.services.book_kind import is_comic_content, is_comic_source
 from app.crawler.plugins.yuedu.common import logger
 from app.crawler.plugins.yuedu.rule_engine import YueduRuleEngine
 from app.crawler.plugins.yuedu.selectors import CHAPTER_CHROME_PHRASES
 from bs4 import BeautifulSoup
 from bs4 import Tag
+from collections import deque
 from collections.abc import Awaitable, Callable
 from itertools import groupby
 from typing import Any
@@ -102,11 +104,16 @@ class ChapterMixin:
         # ``imgInfoList`` manifest is used up: that manifest only describes the
         # first album index page (12 entries for 绅士漫画), and stopping there
         # truncated every album to 12 images no matter how many it really has.
-        gallery_limit = len(self._chapter_image_manifest)
-        gallery_mode = gallery_limit > 1
+        has_manifest = bool(self._chapter_image_manifest)
+        image_source = is_comic_source(self.config)
+        gallery_mode = has_manifest or image_source or is_comic_content(content)
+        # A declared pagination rule is authoritative for ordinary image
+        # sources. Manifest-based albums also expose a separate viewer link.
+        use_gallery_link = has_manifest or (
+            gallery_mode and not (self.config.get("ruleContent") or {}).get("nextContentUrl")
+        )
         max_pages = self._gallery_page_limit() if gallery_mode else 20
-        seen_content_urls = {chapter.url}
-        content_semaphore = asyncio.Semaphore(self._thread_count())
+        parallelism = self._thread_count()
         page_progress_lock = asyncio.Lock()
 
         async def _report_content_page_fetch() -> None:
@@ -118,85 +125,91 @@ class ChapterMixin:
                 await progress_cb(page_fetches_completed)
 
         async def _fetch_content_page(page_url: str) -> str:
-            async with content_semaphore:
-                if web_js:
-                    page_html = await self._get_with_web_js(
-                        page_url, web_js,
-                        fallback_http=not chapter_web_view,
-                    )
-                else:
-                    page_html = await self._get(page_url)
+            if web_js:
+                page_html = await self._get_with_web_js(
+                    page_url, web_js,
+                    fallback_http=not chapter_web_view,
+                )
+            else:
+                page_html = await self._get(page_url)
             await _report_content_page_fetch()
             return page_html
 
-        pending_content_urls = [
-            url
-            for url in chapter_engine.get_next_content_urls(html, fetch_url)
-            if (
-                url not in seen_content_urls
-                and url.startswith(("http://", "https://"))
-            )
-        ]
-        if gallery_mode:
-            gallery_next = self._gallery_next_url(html, fetch_url)
-            if gallery_next and gallery_next not in seen_content_urls:
-                pending_content_urls.append(gallery_next)
-        seen_content_urls.update(pending_content_urls)
-        pages_fetched = 0
-        while pending_content_urls and pages_fetched < max_pages:
-            eligible = [
-                url
-                for url in pending_content_urls
-                if not (
-                    getattr(chapter, "next_url", None)
-                    and url == chapter.next_url
+        def page_key(url: str) -> str:
+            bare, options = self._split_options_suffix(url)
+            # Fragments and a webView rendering flag can differ between a
+            # chapter's TOC entry and its link. POST bodies identify pages.
+            key = bare.split("#", 1)[0]
+            if options:
+                render_only = (
+                    options["web_view"] and options["method"] == "GET" and not options["body"]
+                    and not options["headers"] and not options["charset"] and not options["web_js"]
                 )
-            ]
-            batch = eligible[: max_pages - pages_fetched]
-            pending_content_urls = eligible[max_pages - pages_fetched:]
-            if not batch:
-                break
-            htmls = await asyncio.gather(
-                *(_fetch_content_page(page_url) for page_url in batch)
-            )
+                if not render_only:
+                    key += url[len(bare):]
+            return key
+
+        seen = {page_key(chapter.url)}
+        for neighbour in (getattr(chapter, "previous_url", None), getattr(chapter, "next_url", None)):
+            if neighbour:
+                seen.add(page_key(neighbour))
+        pending: deque[str] = deque()
+
+        def enqueue(page_html: str, page_url: str) -> None:
+            links = chapter_engine.get_next_content_urls(page_html, page_url)
+            if use_gallery_link:
+                gallery_next = self._gallery_next_url(
+                    page_html, page_url, require_page_label=not (has_manifest or image_source),
+                )
+                if gallery_next:
+                    links.append(gallery_next)
+            for link in links:
+                if link.startswith(("http://", "https://")):
+                    key = page_key(link)
+                    if key not in seen:
+                        seen.add(key)
+                        pending.append(link)
+
+        enqueue(html, fetch_url)
+        pages_fetched = 0
+        seen_gallery_parts = {content} if gallery_mode else set()
+        repeats = 0
+        while pending and (not max_pages or pages_fetched < max_pages):
+            batch_size = min(parallelism, len(pending))
+            if max_pages:
+                batch_size = min(batch_size, max_pages - pages_fetched)
+            batch = [pending.popleft() for _ in range(batch_size)]
+            fetches = [asyncio.create_task(_fetch_content_page(url)) for url in batch]
+            try:
+                htmls = await asyncio.gather(*fetches)
+            except BaseException:
+                for fetch in fetches:
+                    fetch.cancel()
+                await asyncio.gather(*fetches, return_exceptions=True)
+                raise
             for next_url, next_html in zip(batch, htmls):
-                if pages_fetched >= max_pages:
-                    break
+                if self._looks_like_upstream_error(next_html):
+                    raise RuntimeError(f"Upstream server returned a transient 5xx error page: {next_url}")
                 chapter_engine.set_page_url(next_url)
-                if self._uses_android_js_rule("ruleContent", "content"):
-                    next_part = self._parse_chapter_content_generic(next_html, next_url)
-                else:
-                    try:
-                        next_part = chapter_engine.parse_content(next_html)
-                    except Exception:
-                        next_part = ""
-                    if not next_part or self._looks_like_rule_diagnostic(next_part, next_html):
-                        next_part = self._parse_chapter_content_generic(next_html, next_url)
+                next_part = self._extract_chapter_page(chapter_engine, next_html, next_url)
                 if next_part and next_part != next_html:
                     parts.append(next_part)
                 pages_fetched += 1
-                next_candidates = [
-                    url
-                    for url in chapter_engine.get_next_content_urls(next_html, next_url)
-                    if (
-                        url not in seen_content_urls
-                        and url.startswith(("http://", "https://"))
-                    )
-                ]
+                enqueue(next_html, next_url)
+                # A broken next rule can mint a fresh URL forever for the
+                # same viewer page. Report the loop instead of saving a
+                # partial album as a successful chapter.
+                if gallery_mode and len(batch) == 1 and len(pending) == 1 and next_part in seen_gallery_parts:
+                    repeats += 1
+                    if repeats >= 4:
+                        raise ValueError("图集分页连续返回相同内容，请检查书源的下一页规则")
+                else:
+                    repeats = 0
                 if gallery_mode:
-                    gallery_next = self._gallery_next_url(next_html, next_url)
-                    if gallery_next and gallery_next not in seen_content_urls:
-                        next_candidates.append(gallery_next)
-                pending_content_urls.extend(next_candidates)
-            seen_content_urls.update(pending_content_urls)
+                    seen_gallery_parts.add(next_part)
 
-        if gallery_mode and pages_fetched >= max_pages:
-            logger.warning(
-                "Gallery walk stopped at the page cap (%s pages) for %s; "
-                "raise YUEDU_GALLERY_MAX_PAGES if this album is really larger",
-                max_pages,
-                chapter.url,
-            )
+        if gallery_mode and pending:
+            logger.warning("Gallery reached YUEDU_GALLERY_MAX_PAGES=%s at %s", max_pages, chapter.url)
 
         content = self._dedupe_content_images("\n".join(parts))
 
@@ -210,7 +223,7 @@ class ChapterMixin:
             content = self._parse_chapter_content_generic(html, fetch_url)
         content = content.strip()
         previous_url = getattr(chapter, "previous_url", None)
-        if previous_url and pages_fetched == 0 and not gallery_mode:
+        if previous_url and pages_fetched == 0 and not has_manifest:
             content = await self._trim_cumulative_gallery(
                 content, fetch_url, previous_url, _fetch_content_page,
             )
@@ -376,19 +389,14 @@ class ChapterMixin:
         return manifest
     @staticmethod
     def _gallery_page_limit() -> int:
-        """Upper bound for one image-album walk (``YUEDU_GALLERY_MAX_PAGES``).
-
-        Album pages hand out exactly one image per request, so the walk stops
-        when the source stops offering a next page; this cap only exists to
-        keep a broken/looping "next" link from fetching forever.
-        """
+        """Optional maximum number of follow-up pages, zero reads to the end."""
         try:
-            value = int(os.getenv("YUEDU_GALLERY_MAX_PAGES", "512") or 512)
-        except (TypeError, ValueError):
-            value = 512
-        return max(20, min(value, 5000))
+            return max(0, int(os.getenv("YUEDU_GALLERY_MAX_PAGES", "0") or 0))
+        except ValueError:
+            return 0
+
     @staticmethod
-    def _gallery_next_url(html: str, current_url: str) -> str:
+    def _gallery_next_url(html: str, current_url: str, *, require_page_label: bool = False) -> str:
         """Find the next page of an image gallery.
 
         Manga/photo sites usually expose this as ``a.btnnext`` / ``rel=next``
@@ -425,6 +433,12 @@ class ChapterMixin:
             if marker in seen:
                 continue
             seen.add(marker)
+            label = " ".join((anchor.get_text(" ", strip=True), str(anchor.get("title") or ""),
+                              str(anchor.get("aria-label") or "")))
+            if require_page_label and not re.search(r"下一?[張张页頁]|next\s+(?:image|page)", label, re.I):
+                continue
+            if re.search(r"下[一個个]?[章回話话卷集]|next\s+(?:chapter|episode|volume)", label, re.I):
+                continue
             href = str(anchor.get("href") or "").strip()
             if not href or href.startswith(("javascript:", "#")):
                 continue

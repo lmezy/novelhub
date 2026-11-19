@@ -18,6 +18,7 @@ const selectedSourceIds = ref<string[]>([])
 const starting = ref(false)
 const loadingTasks = ref(false)
 const pageError = ref("")
+const statusFilter = ref("")
 const autoSyncEnabled = ref(false)
 const autoSyncTime = ref("03:00")
 const autoSyncIntervalHours = ref(0)
@@ -76,17 +77,32 @@ const activeProgress = computed(() => {
 const taskStatusRank: Record<string, number> = { running: 0, pending: 1, paused: 2 }
 const orderedTasks = computed(() =>
   [...tasks.value].sort((a: any, b: any) => {
-    const rankDiff = (taskStatusRank[a.status] ?? 2) - (taskStatusRank[b.status] ?? 2)
+    const rankDiff = (taskStatusRank[a.status] ?? 3) - (taskStatusRank[b.status] ?? 3)
     if (rankDiff !== 0) return rankDiff
     return new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime()
   })
 )
 
 const terminal = ["completed", "failed", "cancelled", "completed_with_errors"]
+const statusOptions = ["running", "pending", "paused", ...terminal]
+const statusCounts = computed(() => {
+  const counts: Record<string, number> = {}
+  for (const task of orderedTasks.value) counts[task.status] = (counts[task.status] || 0) + 1
+  return counts
+})
+const visibleTasks = computed(() => statusFilter.value
+  ? orderedTasks.value.filter(task => task.status === statusFilter.value)
+  : orderedTasks.value
+)
 const activeCounts = computed(() => {
   const task = activeTask.value
   const progress = task?.progress || {}
   return task && terminal.includes(task.status) ? { ...progress, ...task.result } : progress
+})
+watch(activeTask, task => {
+  if (!task) return
+  const index = tasks.value.findIndex(row => row.id === task.id)
+  if (index !== -1) tasks.value[index] = task
 })
 // Polling only tells us something new while the worker can still move the task.
 const pollable = ["pending", "running"]
@@ -146,7 +162,6 @@ async function loadTasks() {
 async function selectTask(task: any) {
   if (!task) return
   await crawlStore.setTask(task)
-  void loadDiagnosis(task.id)
   await nextTick()
   selectedTaskPanel.value?.scrollIntoView({ block: "start" })
 }
@@ -179,10 +194,10 @@ async function loadDiagnosis(taskId: string) {
   diagnosisNotice.value = ""
   if (!auth.isAdmin || !taskId) return
   try {
-    diagnosis.value = await api.get<any>("/ai/diagnose/" + taskId)
+    const result = await api.get<any>("/ai/diagnose/" + taskId)
+    if (activeTask.value?.id === taskId) diagnosis.value = result
   } catch {
     // 404 simply means "not analysed yet".
-    diagnosis.value = null
   }
 }
 
@@ -293,18 +308,28 @@ async function startCrawl() {
   starting.value = true
   try {
     const created: any[] = []
+    const failures: string[] = []
+    const failedIds: string[] = []
+    const maxPages = Math.max(0, Math.floor(Number(syncMaxPages.value) || 0))
     for (const id of selectedSourceIds.value) {
       if (!syncableSources.value.some((s: any) => s.id === id)) continue
-      const task = await api.post<any>("/crawl/tasks", {
-        source: id,
-        max_pages: Math.max(0, Math.floor(Number(syncMaxPages.value) || 0)),
-      })
-      created.push(task)
+      try {
+        const task = await api.post<any>("/crawl/tasks", { source: id, max_pages: maxPages })
+        created.push(task)
+      } catch (e) {
+        failures.push(sourceName({ source: id }) + " · " + (e instanceof Error ? e.message : i18n.t('sync_failed_start')))
+        failedIds.push(id)
+      }
     }
     if (created.length > 0) {
       await crawlStore.setTask(created[0])
     }
     await loadTasks()
+    if (failures.length) {
+      selectedSourceIds.value = failedIds
+      pageError.value = [i18n.t('sync_batch_result', { created: created.length, failed: failures.length }), ...failures].join("\n")
+      return
+    }
     if (created.length && route.name === "sync" && syncView.value === "start") {
       await selectView("tasks")
     }
@@ -447,15 +472,15 @@ watch(syncView, (view) => {
         >{{ i18n.t('sync_view_' + view) }}</button>
       </nav>
 
-      <p v-if="pageError" role="alert" class="mb-4 break-words rounded-xl border border-red-200 bg-surface p-4 text-sm text-red-700 dark:border-red-900 dark:bg-gray-900 dark:text-red-300">{{ pageError }}</p>
+      <p v-if="pageError" role="alert" class="mb-4 whitespace-pre-line break-words rounded-xl border border-red-200 bg-surface p-4 text-sm text-red-700 dark:border-red-900 dark:bg-gray-900 dark:text-red-300">{{ pageError }}</p>
 
       <section v-if="auth.user && syncView === 'start'" class="rounded-2xl border border-border bg-surface p-4 dark:border-gray-800 dark:bg-gray-900 sm:p-6">
         <h2 class="mb-4 text-lg font-semibold">{{ auth.isAdmin ? i18n.t('sync_start_full') : i18n.t('sync_start_my') }}</h2>
 
         <div class="flex flex-wrap items-center gap-2 mb-3 text-xs">
-          <button @click="selectAllSources" class="px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5">{{ i18n.t('sync_select_all') }}</button>
-          <button @click="invertSources" class="px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5">{{ i18n.t('sync_select_invert') }}</button>
-          <button @click="clearSources" class="px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5">{{ i18n.t('sync_select_none') }}</button>
+          <button :disabled="starting || bookshelfSyncing" @click="selectAllSources" class="px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5">{{ i18n.t('sync_select_all') }}</button>
+          <button :disabled="starting || bookshelfSyncing" @click="invertSources" class="px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5">{{ i18n.t('sync_select_invert') }}</button>
+          <button :disabled="starting || bookshelfSyncing" @click="clearSources" class="px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5">{{ i18n.t('sync_select_none') }}</button>
           <span class="text-muted dark:text-gray-400">{{ i18n.t('sync_selected_count', { n: selectedSourceIds.length }) }} / {{ syncableSources.length }}</span>
         </div>
 
@@ -465,7 +490,7 @@ watch(syncView, (view) => {
             :key="s.id"
             class="flex cursor-pointer items-start gap-2 rounded-lg border border-border bg-paper px-3 py-2.5 hover:border-accent/40 dark:border-gray-700 dark:bg-gray-800"
           >
-            <input type="checkbox" :value="s.id" v-model="selectedSourceIds" class="mt-0.5 rounded" />
+            <input type="checkbox" :value="s.id" v-model="selectedSourceIds" :disabled="starting || bookshelfSyncing" class="mt-0.5 rounded" />
             <span class="min-w-0">
               <span class="block text-sm font-medium truncate">{{ s.name }}</span>
               <span class="block text-xs text-muted dark:text-gray-400 truncate">{{ s.id }}</span>
@@ -488,10 +513,10 @@ watch(syncView, (view) => {
               class="min-h-10 w-24 rounded-lg border border-border bg-paper px-2 py-1.5 text-sm dark:border-gray-700 dark:bg-gray-800"
             />
           </label>
-          <button @click="startCrawl" :disabled="starting || bookshelfSyncing" class="min-h-10 rounded-lg bg-accent px-4 text-sm font-medium text-white hover:opacity-90 disabled:opacity-50">
+          <button @click="startCrawl" :disabled="starting || bookshelfSyncing || !selectedSourceIds.length" class="min-h-10 rounded-lg bg-accent px-4 text-sm font-medium text-white hover:opacity-90 disabled:opacity-50">
             {{ starting ? i18n.t('sync_starting') : i18n.t('sync_import_books') }}
           </button>
-          <button @click="startBookshelfSync" :disabled="bookshelfSyncing || starting" class="min-h-10 rounded-lg border border-accent px-4 text-sm font-medium text-accent hover:bg-accent/10 disabled:opacity-50">
+          <button @click="startBookshelfSync" :disabled="bookshelfSyncing || starting || !selectedSourceIds.length" class="min-h-10 rounded-lg border border-accent px-4 text-sm font-medium text-accent hover:bg-accent/10 disabled:opacity-50">
             {{ bookshelfSyncing ? i18n.t('sync_starting') : i18n.t('sync_import_bookshelf') }}
           </button>
         </div>
@@ -548,192 +573,201 @@ watch(syncView, (view) => {
           <p class="text-xs text-muted dark:text-gray-400 mt-2">{{ i18n.t('sync_auto_hint') }}</p>
       </section>
 
-      <section v-if="syncView === 'tasks' && activeTask" ref="selectedTaskPanel" class="mb-5 scroll-mt-28 rounded-2xl border border-border bg-surface p-4 dark:border-gray-800 dark:bg-gray-900 sm:p-6">
-        <div class="flex flex-wrap items-center justify-between gap-2">
-          <h2 class="text-lg font-semibold">{{ i18n.t('sync_selected_task') }}</h2>
-          <span class="text-xs px-2 py-1 rounded-full" :class="activeTask.status === 'running' ? 'bg-blue-100 text-blue-700' : activeTask.status === 'paused' ? 'bg-amber-100 text-amber-700' : activeTask.status === 'completed_with_errors' ? 'bg-amber-100 text-amber-700' : activeTask.status === 'failed' ? 'bg-red-100 text-red-700' : 'bg-gray-100 text-gray-600'">{{ statusText(activeTask.status) }}</span>
-        </div>
-        <p class="mt-2 break-words text-sm font-medium">{{ sourceName(activeTask) }}</p>
-        <p class="mb-4 mt-1 break-all font-mono text-xs text-muted dark:text-gray-400">{{ activeTask.id }}</p>
-        <div class="h-2 rounded bg-gray-200 dark:bg-gray-700 overflow-hidden mb-2">
-          <div class="h-full bg-accent transition-all" :style="{ width: activeProgress + '%' }"></div>
-        </div>
-        <div class="mb-3 flex flex-wrap items-center gap-x-5 gap-y-1 text-xs text-muted dark:text-gray-400">
-          <span v-if="activeTask.max_pages > 0">{{ i18n.t('sync_pages') }} {{ activeTask.progress?.pages_checked || 0 }} / {{ activeTask.max_pages }}</span>
-          <span v-else>{{ i18n.t('sync_pages') }} {{ activeTask.progress?.pages_checked || 0 }} ({{ i18n.t('sync_unlimited') }})</span>
-          <span>{{ i18n.t('sync_found') }} {{ activeCounts.books_found ?? 0 }}</span>
-          <span v-if="activeTask.priority !== undefined">{{ i18n.t('sync_priority') }} {{ activeTask.priority }}</span>
-        </div>
-        <div v-if="activeTask.progress?.current_book || activeTask.progress?.current_chapter" class="mb-3 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted dark:text-gray-400">
-          <span>{{ activeTask.progress?.current_book }} · {{ activeTask.progress?.current_chapter }}</span>
-          <span v-if="activeTask.progress?.current_content_pages_done">{{ i18n.t('sync_chapter_pages_fetched', { n: activeTask.progress.current_content_pages_done }) }}</span>
-          <span v-if="activeTask.progress?.current_images_total">{{ i18n.t('sync_images_progress', { done: activeTask.progress.current_images_done || 0, total: activeTask.progress.current_images_total }) }}</span>
-        </div>
-        <div class="grid grid-cols-3 gap-2 text-center mb-4">
-          <div class="p-2 rounded bg-green-50 dark:bg-green-950">
-            <div class="text-sm font-semibold text-green-700 dark:text-green-400">{{ activeCounts.books_synced ?? 0 }}</div>
-            <div class="text-xs text-muted">{{ i18n.t('sync_synced') }}</div>
-          </div>
-          <div class="p-2 rounded bg-red-50 dark:bg-red-950">
-            <div class="text-sm font-semibold text-red-700 dark:text-red-400">{{ activeCounts.books_failed ?? 0 }}</div>
-            <div class="text-xs text-muted">{{ i18n.t('sync_failed') }}</div>
-          </div>
-          <div class="p-2 rounded bg-blue-50 dark:bg-blue-950">
-            <div class="text-sm font-semibold text-blue-700 dark:text-blue-400">{{ activeCounts.chapters_created ?? 0 }}</div>
-            <div class="text-xs text-muted">{{ i18n.t('sync_chapters') }}</div>
-          </div>
-        </div>
-        <div class="flex flex-wrap gap-2">
-          <button v-if="activeTask.status === 'running' || activeTask.status === 'pending'" @click="pauseTask" class="px-3 py-1.5 text-xs rounded border border-border dark:border-gray-700 hover:bg-accent/5">{{ i18n.t('sync_pause') }}</button>
-          <button v-if="activeTask.status === 'paused'" @click="resumeTask" class="px-3 py-1.5 text-xs rounded border border-green-600 text-green-700 dark:text-green-400 hover:bg-green-50 dark:hover:bg-green-950">{{ i18n.t('sync_resume') }}</button>
-          <button v-if="activeTask.status === 'pending' || activeTask.status === 'paused'" @click="moveTaskFront(activeTask)" class="px-3 py-1.5 text-xs rounded border border-accent text-accent hover:bg-accent/10">{{ i18n.t('sync_top') }}</button>
-          <button v-if="!terminal.includes(activeTask.status)" @click="cancelTask" class="px-3 py-1.5 text-xs rounded border border-red-500 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950">{{ i18n.t('sync_cancel') }}</button>
-          <button v-if="deletable.includes(activeTask.status)" @click="deleteTask(activeTask)" class="px-3 py-1.5 text-xs rounded border border-red-300 text-red-500 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950">{{ i18n.t('sync_delete') }}</button>
-        </div>
-        <p v-if="activeTask.error" class="mt-3 break-words text-xs text-red-600 dark:text-red-400">{{ activeTask.error }}</p>
-
-        <!-- AI diagnosis: explains the failure, proposes (never applies) changes -->
-        <div v-if="canDiagnose && (diagnosisWorthwhile || diagnosis)" class="mt-4 pt-4 border-t border-border dark:border-gray-700">
-          <div class="flex items-center justify-between gap-2 mb-2">
-            <h3 class="text-sm font-semibold">{{ i18n.t('sync_ai_title') }}</h3>
-            <button
-              @click="runDiagnosis"
-              :disabled="diagnosisLoading"
-              class="px-3 py-1.5 text-xs rounded border border-accent text-accent hover:bg-accent/10 disabled:opacity-50 shrink-0"
-            >{{ diagnosisLoading
-                 ? i18n.t('sync_ai_running')
-                 : (diagnosis ? i18n.t('sync_ai_rerun') : i18n.t('sync_ai_run')) }}</button>
-          </div>
-          <p class="text-[11px] text-muted dark:text-gray-400 mb-2">{{ i18n.t('sync_ai_hint') }}</p>
-
-          <p v-if="diagnosisError" class="text-xs text-red-500 break-words">{{ diagnosisError }}</p>
-          <p v-else-if="diagnosisNotice" class="text-xs text-green-600 dark:text-green-400">{{ diagnosisNotice }}</p>
-
-          <div v-if="diagnosis" class="space-y-3">
+      <div v-if="syncView === 'tasks'" class="grid items-start gap-4" :class="{ 'lg:grid-cols-2': activeTask }">
+        <section class="min-w-0 rounded-2xl border border-border bg-surface p-4 dark:border-gray-800 dark:bg-gray-900 sm:p-6">
+          <div class="mb-4 flex flex-wrap items-center justify-between gap-2">
+            <h2 class="text-lg font-semibold">{{ i18n.t('sync_recent_tasks') }}</h2>
             <div class="flex flex-wrap items-center gap-2">
-              <span class="text-[11px] px-2 py-0.5 rounded-full" :class="classificationClass(diagnosis.classification)">
-                {{ classificationLabel(diagnosis.classification) }}
-              </span>
-              <span class="text-[11px] text-muted dark:text-gray-400">
-                {{ i18n.t('sync_ai_confidence', { level: diagnosis.confidence || '?' }) }}
-                · {{ diagnosis.model }}
-              </span>
+              <select v-if="tasks.length" v-model="statusFilter" :aria-label="i18n.t('sync_status_filter')" class="min-h-10 rounded-lg border border-border bg-paper px-2 text-sm dark:border-gray-700 dark:bg-gray-800">
+                <option value="">{{ i18n.t('sync_all_statuses') }} ({{ tasks.length }})</option>
+                <option v-for="status in statusOptions" :key="status" :value="status">
+                  {{ statusText(status) }} ({{ statusCounts[status] || 0 }})
+                </option>
+              </select>
+              <button
+                v-if="tasks.some((t) => terminal.includes(t.status))"
+                @click="clearHistory"
+                class="text-xs px-2 py-1 rounded border border-red-300 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950"
+              >{{ i18n.t('sync_clear_history') }}</button>
             </div>
-
-            <p class="text-sm text-ink whitespace-pre-wrap break-words">{{ diagnosis.summary }}</p>
-
-            <div v-if="diagnosis.reasoning?.length">
-              <p class="text-[11px] font-medium text-muted dark:text-gray-400 mb-1">{{ i18n.t('sync_ai_reasoning') }}</p>
-              <ul class="list-disc pl-4 space-y-0.5">
-                <li v-for="(line, i) in diagnosis.reasoning" :key="i" class="text-xs text-ink break-words">{{ line }}</li>
-              </ul>
-            </div>
-
-            <div v-if="diagnosis.next_steps?.length">
-              <p class="text-[11px] font-medium text-muted dark:text-gray-400 mb-1">{{ i18n.t('sync_ai_next') }}</p>
-              <ol class="list-decimal pl-4 space-y-0.5">
-                <li v-for="(line, i) in diagnosis.next_steps" :key="i" class="text-xs text-ink break-words">{{ line }}</li>
-              </ol>
-            </div>
-
-            <div v-if="diagnosis.proposed_changes?.length">
-              <p class="text-[11px] font-medium text-muted dark:text-gray-400 mb-1">
-                {{ i18n.t('sync_ai_proposals', { n: diagnosis.proposed_changes.length }) }}
-              </p>
-              <div class="space-y-2">
-                <div
-                  v-for="(change, i) in diagnosis.proposed_changes"
-                  :key="i"
-                  class="p-2 rounded border border-border dark:border-gray-700 text-xs"
-                >
-                  <div class="flex items-center gap-2 mb-1">
-                    <code class="text-accent break-all">{{ change.path }}</code>
-                    <span class="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800">{{ change.risk }}</span>
-                    <span
-                      v-if="change.mismatch"
-                      class="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-300"
-                    >{{ i18n.t('sync_ai_stale') }}</span>
+          </div>
+          <p v-if="historyNotice" class="text-xs text-green-600 dark:text-green-400 mb-3">{{ historyNotice }}</p>
+          <p v-if="loadingTasks" class="text-sm text-muted">{{ i18n.t('sync_loading') }}</p>
+          <p v-else-if="tasks.length === 0" class="text-sm text-muted">{{ i18n.t('sync_no_tasks') }}</p>
+          <p v-else-if="!visibleTasks.length" role="status" class="py-5 text-sm text-muted">{{ i18n.t('sync_no_matching_tasks') }}</p>
+          <div v-else class="max-h-[55vh] divide-y divide-border overflow-y-auto lg:max-h-[65vh]">
+            <div
+              v-for="task in visibleTasks"
+              :key="task.id"
+              class="py-3 cursor-pointer hover:bg-accent/5 transition-colors"
+              @click="selectTask(task)"
+            >
+              <div class="mb-1 flex flex-wrap items-center justify-between gap-2">
+                <button type="button" @click.stop="selectTask(task)" class="min-w-0 break-all text-left text-sm font-medium hover:text-accent">{{ sourceName(task) }}</button>
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="text-xs px-2 py-0.5 rounded-full" :class="task.status === 'completed' ? 'bg-green-100 text-green-700' : task.status === 'completed_with_errors' ? 'bg-amber-100 text-amber-700' : task.status === 'failed' || task.status === 'cancelled' ? 'bg-red-100 text-red-700' : 'bg-blue-100 text-blue-700'">{{ statusText(task.status) }}</span>
+                  <button v-if="task.status === 'running' || task.status === 'pending'" @click.stop="taskAction(task, 'pause')" class="text-xs px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5">{{ i18n.t('sync_pause') }}</button>
+                  <button v-if="task.status === 'paused'" @click.stop="taskAction(task, 'resume')" class="text-xs px-2 py-1 rounded border border-green-600 text-green-700 dark:text-green-400 hover:bg-green-50 dark:hover:bg-green-950">{{ i18n.t('sync_resume') }}</button>
+                  <button v-if="task.status === 'pending' || task.status === 'paused'" @click.stop="moveTaskFront(task)" class="text-xs px-2 py-1 rounded border border-accent text-accent hover:bg-accent/10">{{ i18n.t('sync_top') }}</button>
+                  <button v-if="!terminal.includes(task.status)" @click.stop="cancelTaskById(task)" class="text-xs px-2 py-1 rounded border border-red-500 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950">{{ i18n.t('sync_cancel') }}</button>
+                  <button v-if="deletable.includes(task.status)" @click.stop="deleteTask(task)" class="text-xs px-2 py-1 rounded border border-red-300 text-red-500 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950">{{ i18n.t('sync_delete') }}</button>
+                </div>
+              </div>
+              <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted dark:text-gray-400">
+                <span>{{ task.mode || i18n.t('sync_mode') }}</span>
+                <span v-if="task.max_pages > 0">{{ i18n.t('sync_pages') }} {{ task.progress?.pages_checked || 0 }}/{{ task.max_pages }}</span>
+                <span v-else>{{ i18n.t('sync_pages') }} {{ task.progress?.pages_checked || 0 }} ({{ i18n.t('sync_unlimited') }})</span>
+                <span>{{ i18n.t('sync_books') }} {{ task.progress?.books_found || 0 }}</span>
+                <span v-if="task.priority !== undefined">{{ i18n.t('sync_priority') }} {{ task.priority }}</span>
+                <span v-if="task.finished_at">{{ i18n.t('sync_finished') }} {{ new Date(task.finished_at).toLocaleString() }}</span>
+              </div>
+              <div v-if="task.max_pages > 0" class="h-1 rounded bg-gray-200 dark:bg-gray-700 overflow-hidden mt-2">
+                <div class="h-full bg-accent" :style="{ width: Math.min(100, Math.round(((task.max_pages > 0 ? (task.progress?.pages_checked || 0) / task.max_pages : 0)) * 100)) + '%' }"></div>
+              </div>
+              <div v-if="task.error" class="mt-2 break-words text-xs text-red-600 dark:text-red-400">{{ task.error }}</div>
+              <details v-if="task.result?.details?.length" class="mt-2 text-xs" @click.stop>
+                <summary class="cursor-pointer text-accent">{{ i18n.t('sync_book_details', { n: task.result.details.length }) }}</summary>
+                <div class="mt-2 space-y-1 pl-3 border-l border-border dark:border-gray-700">
+                  <div v-for="detail in task.result.details" :key="detail.url || detail.title" class="flex flex-wrap gap-x-2 gap-y-1">
+                    <span :class="detail.filtered ? 'text-gray-500' : detail.synced === false || detail.failed_chapters?.length ? 'text-red-600 dark:text-red-400' : 'text-green-700 dark:text-green-400'">{{ i18n.t(detail.filtered ? 'sync_filtered' : detail.synced === false ? 'sync_failed' : detail.failed_chapters?.length ? 'sync_completed_with_errors' : 'sync_synced') }}</span>
+                    <span>{{ detail.title || detail.name || detail.url }}</span>
+                    <span v-if="detail.error" class="text-red-600 dark:text-red-400">{{ detail.error }}</span>
+                    <span v-if="detail.filtered" class="text-gray-500">{{ detail.filter_type }}: {{ detail.filter_value }}</span>
+                    <span v-if="detail.failed_chapters?.length" class="text-red-600 dark:text-red-400">{{ i18n.t('sync_chapters_failed') }} {{ detail.failed_chapters.length }}</span>
                   </div>
-                  <p class="text-muted dark:text-gray-400 break-words">{{ i18n.t('sync_ai_current') }}<code class="break-all">{{ change.current || '—' }}</code></p>
-                  <p class="text-muted dark:text-gray-400 break-words">{{ i18n.t('sync_ai_suggest') }}<code class="break-all">{{ change.new_text ?? change.new }}</code></p>
-                  <p v-if="change.reason" class="mt-1 text-muted dark:text-gray-400 break-words">{{ change.reason }}</p>
                 </div>
-              </div>
-              <div class="flex flex-wrap items-center gap-2 mt-2">
-                <button
-                  v-if="!diagnosis.change_id"
-                  @click="proposeSourceChange"
-                  :disabled="diagnosisProposing"
-                  class="px-3 py-1.5 text-xs rounded bg-accent text-white font-medium hover:opacity-90 disabled:opacity-50"
-                >{{ diagnosisProposing ? i18n.t('sync_ai_proposing') : i18n.t('sync_ai_propose') }}</button>
-                <span v-else class="text-xs text-green-600 dark:text-green-400">{{ i18n.t('sync_ai_proposed') }}</span>
-              </div>
+              </details>
             </div>
-            <p v-else class="text-[11px] text-muted dark:text-gray-400">{{ i18n.t('sync_ai_no_change') }}</p>
           </div>
-        </div>
-      </section>
+        </section>
 
-      <section v-if="syncView === 'tasks'" class="rounded-2xl border border-border bg-surface p-4 dark:border-gray-800 dark:bg-gray-900 sm:p-6">
-        <div class="mb-4 flex flex-wrap items-center justify-between gap-2">
-          <h2 class="text-lg font-semibold">{{ i18n.t('sync_recent_tasks') }}</h2>
-          <div class="flex flex-wrap items-center gap-2">
-            <span class="text-xs text-muted dark:text-gray-400">{{ i18n.t('sync_tasks_count', { n: tasks.length }) }}</span>
-            <button
-              v-if="tasks.some((t) => deletable.includes(t.status))"
-              @click="clearHistory"
-              class="text-xs px-2 py-1 rounded border border-red-300 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950"
-            >{{ i18n.t('sync_clear_history') }}</button>
+        <section v-if="activeTask" ref="selectedTaskPanel" class="min-w-0 scroll-mt-28 rounded-2xl border border-border bg-surface p-4 dark:border-gray-800 dark:bg-gray-900 sm:p-6">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <h2 class="text-lg font-semibold">{{ i18n.t('sync_selected_task') }}</h2>
+            <span class="text-xs px-2 py-1 rounded-full" :class="activeTask.status === 'running' ? 'bg-blue-100 text-blue-700' : activeTask.status === 'paused' ? 'bg-amber-100 text-amber-700' : activeTask.status === 'completed_with_errors' ? 'bg-amber-100 text-amber-700' : activeTask.status === 'failed' ? 'bg-red-100 text-red-700' : 'bg-gray-100 text-gray-600'">{{ statusText(activeTask.status) }}</span>
           </div>
-        </div>
-        <p v-if="historyNotice" class="text-xs text-green-600 dark:text-green-400 mb-3">{{ historyNotice }}</p>
-        <p v-if="loadingTasks" class="text-sm text-muted">{{ i18n.t('sync_loading') }}</p>
-        <p v-else-if="tasks.length === 0" class="text-sm text-muted">{{ i18n.t('sync_no_tasks') }}</p>
-        <div v-else class="divide-y divide-border">
-          <div
-            v-for="task in orderedTasks"
-            :key="task.id"
-            class="py-3 cursor-pointer hover:bg-accent/5 transition-colors"
-            @click="selectTask(task)"
-          >
-            <div class="mb-1 flex flex-wrap items-center justify-between gap-2">
-              <button type="button" @click.stop="selectTask(task)" class="min-w-0 break-all text-left text-sm font-medium hover:text-accent">{{ sourceName(task) }}</button>
+          <p class="mt-2 break-words text-sm font-medium">{{ sourceName(activeTask) }}</p>
+          <p class="mb-4 mt-1 break-all font-mono text-xs text-muted dark:text-gray-400">{{ activeTask.id }}</p>
+          <div v-if="activeTask.max_pages > 0" class="h-2 rounded bg-gray-200 dark:bg-gray-700 overflow-hidden mb-2">
+            <div class="h-full bg-accent transition-all" :style="{ width: activeProgress + '%' }"></div>
+          </div>
+          <div class="mb-3 flex flex-wrap items-center gap-x-5 gap-y-1 text-xs text-muted dark:text-gray-400">
+            <span v-if="activeTask.max_pages > 0">{{ i18n.t('sync_pages') }} {{ activeTask.progress?.pages_checked || 0 }} / {{ activeTask.max_pages }}</span>
+            <span v-else>{{ i18n.t('sync_pages') }} {{ activeTask.progress?.pages_checked || 0 }} ({{ i18n.t('sync_unlimited') }})</span>
+            <span>{{ i18n.t('sync_found') }} {{ activeCounts.books_found ?? 0 }}</span>
+            <span v-if="activeTask.priority !== undefined">{{ i18n.t('sync_priority') }} {{ activeTask.priority }}</span>
+          </div>
+          <div v-if="activeTask.progress?.current_book || activeTask.progress?.current_chapter" class="mb-3 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted dark:text-gray-400">
+            <span>{{ [activeTask.progress?.current_book, activeTask.progress?.current_chapter].filter(Boolean).join(" · ") }}</span>
+            <span v-if="activeTask.progress?.current_toc_pages_done">{{ i18n.t('sync_toc_pages_read', { n: activeTask.progress.current_toc_pages_done }) }}</span>
+            <span v-if="activeTask.progress?.current_content_pages_done">{{ i18n.t('sync_chapter_pages_fetched', { n: activeTask.progress.current_content_pages_done }) }}</span>
+            <span v-if="activeTask.progress?.current_images_total">{{ i18n.t('sync_images_progress', { done: activeTask.progress.current_images_done || 0, total: activeTask.progress.current_images_total }) }}</span>
+          </div>
+          <div class="grid grid-cols-3 gap-2 text-center mb-4">
+            <div class="p-2 rounded bg-green-50 dark:bg-green-950">
+              <div class="text-sm font-semibold text-green-700 dark:text-green-400">{{ activeCounts.books_synced ?? 0 }}</div>
+              <div class="text-xs text-muted">{{ i18n.t('sync_synced') }}</div>
+            </div>
+            <div class="p-2 rounded bg-red-50 dark:bg-red-950">
+              <div class="text-sm font-semibold text-red-700 dark:text-red-400">{{ activeCounts.books_failed ?? 0 }}</div>
+              <div class="text-xs text-muted">{{ i18n.t('sync_failed') }}</div>
+            </div>
+            <div class="p-2 rounded bg-blue-50 dark:bg-blue-950">
+              <div class="text-sm font-semibold text-blue-700 dark:text-blue-400">{{ activeCounts.chapters_created ?? 0 }}</div>
+              <div class="text-xs text-muted">{{ i18n.t('sync_chapters') }}</div>
+            </div>
+          </div>
+          <div class="flex flex-wrap gap-2">
+            <button v-if="activeTask.status === 'running' || activeTask.status === 'pending'" @click="pauseTask" class="px-3 py-1.5 text-xs rounded border border-border dark:border-gray-700 hover:bg-accent/5">{{ i18n.t('sync_pause') }}</button>
+            <button v-if="activeTask.status === 'paused'" @click="resumeTask" class="px-3 py-1.5 text-xs rounded border border-green-600 text-green-700 dark:text-green-400 hover:bg-green-50 dark:hover:bg-green-950">{{ i18n.t('sync_resume') }}</button>
+            <button v-if="activeTask.status === 'pending' || activeTask.status === 'paused'" @click="moveTaskFront(activeTask)" class="px-3 py-1.5 text-xs rounded border border-accent text-accent hover:bg-accent/10">{{ i18n.t('sync_top') }}</button>
+            <button v-if="!terminal.includes(activeTask.status)" @click="cancelTask" class="px-3 py-1.5 text-xs rounded border border-red-500 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950">{{ i18n.t('sync_cancel') }}</button>
+            <button v-if="deletable.includes(activeTask.status)" @click="deleteTask(activeTask)" class="px-3 py-1.5 text-xs rounded border border-red-300 text-red-500 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950">{{ i18n.t('sync_delete') }}</button>
+          </div>
+          <p v-if="activeTask.error" class="mt-3 break-words text-xs text-red-600 dark:text-red-400">{{ activeTask.error }}</p>
+
+          <!-- AI diagnosis: explains the failure, proposes (never applies) changes -->
+          <div v-if="canDiagnose && (diagnosisWorthwhile || diagnosis)" class="mt-4 pt-4 border-t border-border dark:border-gray-700">
+            <div class="flex items-center justify-between gap-2 mb-2">
+              <h3 class="text-sm font-semibold">{{ i18n.t('sync_ai_title') }}</h3>
+              <button
+                @click="runDiagnosis"
+                :disabled="diagnosisLoading"
+                class="px-3 py-1.5 text-xs rounded border border-accent text-accent hover:bg-accent/10 disabled:opacity-50 shrink-0"
+              >{{ diagnosisLoading
+                   ? i18n.t('sync_ai_running')
+                   : (diagnosis ? i18n.t('sync_ai_rerun') : i18n.t('sync_ai_run')) }}</button>
+            </div>
+            <p class="text-[11px] text-muted dark:text-gray-400 mb-2">{{ i18n.t('sync_ai_hint') }}</p>
+
+            <p v-if="diagnosisError" class="text-xs text-red-500 break-words">{{ diagnosisError }}</p>
+            <p v-else-if="diagnosisNotice" class="text-xs text-green-600 dark:text-green-400">{{ diagnosisNotice }}</p>
+
+            <div v-if="diagnosis" class="space-y-3">
               <div class="flex flex-wrap items-center gap-2">
-                <span class="text-xs px-2 py-0.5 rounded-full" :class="task.status === 'completed' ? 'bg-green-100 text-green-700' : task.status === 'completed_with_errors' ? 'bg-amber-100 text-amber-700' : task.status === 'failed' || task.status === 'cancelled' ? 'bg-red-100 text-red-700' : 'bg-blue-100 text-blue-700'">{{ statusText(task.status) }}</span>
-                <button v-if="task.status === 'running' || task.status === 'pending'" @click.stop="taskAction(task, 'pause')" class="text-xs px-2 py-1 rounded border border-border dark:border-gray-700 hover:bg-accent/5">{{ i18n.t('sync_pause') }}</button>
-                <button v-if="task.status === 'paused'" @click.stop="taskAction(task, 'resume')" class="text-xs px-2 py-1 rounded border border-green-600 text-green-700 dark:text-green-400 hover:bg-green-50 dark:hover:bg-green-950">{{ i18n.t('sync_resume') }}</button>
-                <button v-if="task.status === 'pending' || task.status === 'paused'" @click.stop="moveTaskFront(task)" class="text-xs px-2 py-1 rounded border border-accent text-accent hover:bg-accent/10">{{ i18n.t('sync_top') }}</button>
-                <button v-if="!terminal.includes(task.status)" @click.stop="cancelTaskById(task)" class="text-xs px-2 py-1 rounded border border-red-500 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950">{{ i18n.t('sync_cancel') }}</button>
-                <button v-if="deletable.includes(task.status)" @click.stop="deleteTask(task)" class="text-xs px-2 py-1 rounded border border-red-300 text-red-500 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950">{{ i18n.t('sync_delete') }}</button>
+                <span class="text-[11px] px-2 py-0.5 rounded-full" :class="classificationClass(diagnosis.classification)">
+                  {{ classificationLabel(diagnosis.classification) }}
+                </span>
+                <span class="text-[11px] text-muted dark:text-gray-400">
+                  {{ i18n.t('sync_ai_confidence', { level: diagnosis.confidence || '?' }) }}
+                  · {{ diagnosis.model }}
+                </span>
               </div>
-            </div>
-            <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted dark:text-gray-400">
-              <span>{{ task.mode || i18n.t('sync_mode') }}</span>
-              <span v-if="task.max_pages > 0">{{ i18n.t('sync_pages') }} {{ task.progress?.pages_checked || 0 }}/{{ task.max_pages }}</span>
-              <span v-else>{{ i18n.t('sync_pages') }} {{ task.progress?.pages_checked || 0 }} ({{ i18n.t('sync_unlimited') }})</span>
-              <span>{{ i18n.t('sync_books') }} {{ task.progress?.books_found || 0 }}</span>
-              <span v-if="task.priority !== undefined">{{ i18n.t('sync_priority') }} {{ task.priority }}</span>
-              <span v-if="task.finished_at">{{ i18n.t('sync_finished') }} {{ new Date(task.finished_at).toLocaleString() }}</span>
-            </div>
-            <div class="h-1 rounded bg-gray-200 dark:bg-gray-700 overflow-hidden mt-2">
-              <div class="h-full bg-accent" :style="{ width: Math.min(100, Math.round(((task.max_pages > 0 ? (task.progress?.pages_checked || 0) / task.max_pages : 0)) * 100)) + '%' }"></div>
-            </div>
-            <div v-if="task.error" class="mt-2 break-words text-xs text-red-600 dark:text-red-400">{{ task.error }}</div>
-            <details v-if="task.result?.details?.length" class="mt-2 text-xs" @click.stop>
-              <summary class="cursor-pointer text-accent">同步书籍明细（{{ task.result.details.length }}）</summary>
-              <div class="mt-2 space-y-1 pl-3 border-l border-border dark:border-gray-700">
-                <div v-for="detail in task.result.details" :key="detail.url || detail.title" class="flex flex-wrap gap-x-2 gap-y-1">
-                  <span :class="detail.filtered ? 'text-gray-500' : detail.synced === false || detail.failed_chapters?.length ? 'text-red-600 dark:text-red-400' : 'text-green-700 dark:text-green-400'">{{ detail.filtered ? '已过滤' : detail.synced === false ? '失败' : detail.failed_chapters?.length ? '部分失败' : '成功' }}</span>
-                  <span>{{ detail.title || detail.name || detail.url }}</span>
-                  <span v-if="detail.error" class="text-red-600 dark:text-red-400">{{ detail.error }}</span>
-                  <span v-if="detail.filtered" class="text-gray-500">{{ detail.filter_type }}: {{ detail.filter_value }}</span>
-                  <span v-if="detail.failed_chapters?.length" class="text-red-600 dark:text-red-400">章节失败 {{ detail.failed_chapters.length }}</span>
+
+              <p class="text-sm text-ink whitespace-pre-wrap break-words">{{ diagnosis.summary }}</p>
+
+              <div v-if="diagnosis.reasoning?.length">
+                <p class="text-[11px] font-medium text-muted dark:text-gray-400 mb-1">{{ i18n.t('sync_ai_reasoning') }}</p>
+                <ul class="list-disc pl-4 space-y-0.5">
+                  <li v-for="(line, i) in diagnosis.reasoning" :key="i" class="text-xs text-ink break-words">{{ line }}</li>
+                </ul>
+              </div>
+
+              <div v-if="diagnosis.next_steps?.length">
+                <p class="text-[11px] font-medium text-muted dark:text-gray-400 mb-1">{{ i18n.t('sync_ai_next') }}</p>
+                <ol class="list-decimal pl-4 space-y-0.5">
+                  <li v-for="(line, i) in diagnosis.next_steps" :key="i" class="text-xs text-ink break-words">{{ line }}</li>
+                </ol>
+              </div>
+
+              <div v-if="diagnosis.proposed_changes?.length">
+                <p class="text-[11px] font-medium text-muted dark:text-gray-400 mb-1">
+                  {{ i18n.t('sync_ai_proposals', { n: diagnosis.proposed_changes.length }) }}
+                </p>
+                <div class="space-y-2">
+                  <div
+                    v-for="(change, i) in diagnosis.proposed_changes"
+                    :key="i"
+                    class="p-2 rounded border border-border dark:border-gray-700 text-xs"
+                  >
+                    <div class="flex items-center gap-2 mb-1">
+                      <code class="text-accent break-all">{{ change.path }}</code>
+                      <span class="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800">{{ change.risk }}</span>
+                      <span
+                        v-if="change.mismatch"
+                        class="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-300"
+                      >{{ i18n.t('sync_ai_stale') }}</span>
+                    </div>
+                    <p class="text-muted dark:text-gray-400 break-words">{{ i18n.t('sync_ai_current') }}<code class="break-all">{{ change.current || '—' }}</code></p>
+                    <p class="text-muted dark:text-gray-400 break-words">{{ i18n.t('sync_ai_suggest') }}<code class="break-all">{{ change.new_text ?? change.new }}</code></p>
+                    <p v-if="change.reason" class="mt-1 text-muted dark:text-gray-400 break-words">{{ change.reason }}</p>
+                  </div>
+                </div>
+                <div class="flex flex-wrap items-center gap-2 mt-2">
+                  <button
+                    v-if="!diagnosis.change_id"
+                    @click="proposeSourceChange"
+                    :disabled="diagnosisProposing"
+                    class="px-3 py-1.5 text-xs rounded bg-accent text-white font-medium hover:opacity-90 disabled:opacity-50"
+                  >{{ diagnosisProposing ? i18n.t('sync_ai_proposing') : i18n.t('sync_ai_propose') }}</button>
+                  <span v-else class="text-xs text-green-600 dark:text-green-400">{{ i18n.t('sync_ai_proposed') }}</span>
                 </div>
               </div>
-            </details>
+              <p v-else class="text-[11px] text-muted dark:text-gray-400">{{ i18n.t('sync_ai_no_change') }}</p>
+            </div>
           </div>
-        </div>
-      </section>
+        </section>
+      </div>
     </main>
   </div>
 </template>

@@ -232,6 +232,94 @@ async def test_fetch_chapter_content_gallery_walk_respects_page_cap(monkeypatch)
     assert YueduPlugin._gallery_page_limit() == 20
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("manifest", [True, False], ids=["album-next-link", "comic-source-rule"])
+async def test_long_album_reaches_last_page_without_entering_next_chapter(monkeypatch, manifest):
+    monkeypatch.delenv("YUEDU_GALLERY_MAX_PAGES", raising=False)
+    config = {"bookSourceUrl": "https://reader.test", "ruleContent": {"content": "#missing@text"}}
+    if not manifest:
+        config["bookSourceType"] = 2
+        config["ruleContent"]["nextContentUrl"] = "a.page@href"
+    plugin = YueduPlugin(config)
+    if manifest:
+        plugin._chapter_image_manifest = [{"imgName": "1"}, {"imgName": "2"}]
+    count = 530
+    requested = []
+    active = peak = 0
+
+    async def get(url):
+        nonlocal active, peak
+        page = int(url.rsplit("/", 1)[-1])
+        assert 1 <= page <= count
+        requested.append(page)
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0)
+        active -= 1
+        html = f'<div id="imgarea"><img src="/images/{page}.jpg"></div>'
+        if page == 1 and not manifest:
+            return html + "".join(f'<a class="page" href="/view/{n}">page</a>'
+                                  for n in range(2, count + 1))
+        if page == count:
+            return html + '<a class="page btnnext" href="/view/531#top">下一话</a>'
+        return html + f'<a class="page btnnext" href="/view/{page + 1}">下一张</a>'
+
+    chapter = SimpleNamespace(url="https://reader.test/view/1",
+                              next_url='https://reader.test/view/531,{"webView":true}')
+    progress = AsyncMock()
+    with patch.object(plugin, "_get", get), patch.object(plugin, "_thread_count", return_value=3):
+        content = await plugin.fetch_chapter_content_with_progress(chapter, progress)
+    assert requested == list(range(1, count + 1))
+    assert peak == (1 if manifest else 3)
+    assert content.splitlines() == [f"![](https://reader.test/images/{n}.jpg)"
+                                    for n in range(1, count + 1)]
+    assert progress.await_args.args == (count,)
+
+
+@pytest.mark.asyncio
+async def test_gallery_rejects_endless_fresh_links_to_the_same_image(monkeypatch):
+    monkeypatch.setenv("YUEDU_GALLERY_MAX_PAGES", "0")
+    plugin = YueduPlugin({"bookSourceUrl": "https://reader.test", "bookSourceType": 2})
+    async def get(url):
+        n = int(url.rsplit("/", 1)[-1])
+        assert n < 10
+        return f'<div id="imgarea"><img src="/a.jpg"></div><a rel="next" href="/{n+1}">下一张</a>'
+
+    with patch.object(plugin, "_get", get), pytest.raises(ValueError, match="相同内容"):
+        await plugin.fetch_chapter_content(SimpleNamespace(url="https://reader.test/1"))
+
+
+@pytest.mark.asyncio
+async def test_untyped_image_gallery_follows_page_labels_and_stops_at_chapter_link():
+    plugin = YueduPlugin({"bookSourceUrl": "https://reader.test"})
+    async def get(url):
+        n = int(url.rsplit("/", 1)[-1])
+        assert n <= 24
+        label = "下一页" if n < 24 else "下一章"
+        return (f'<div id="imgarea"><img src="/{n}.jpg"></div>'
+                f'<a class="btnnext" href="/{n+1}">{label}</a>')
+    with patch.object(plugin, "_get", get):
+        content = await plugin.fetch_chapter_content(SimpleNamespace(url="https://reader.test/1"))
+    assert len(content.splitlines()) == 24
+    assert content.endswith("/24.jpg)")
+
+
+@pytest.mark.asyncio
+async def test_prose_chapter_keeps_its_existing_pagination_limit():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://reader.test",
+        "ruleContent": {"content": "p@text", "nextContentUrl": "a.next@href"},
+    })
+    async def get(url):
+        n = int(url.rsplit("/", 1)[-1])
+        assert n <= 21
+        return f'<p>Page {n}</p><a class="next" href="/{n+1}">Next</a>'
+
+    with patch.object(plugin, "_get", get):
+        content = await plugin.fetch_chapter_content(SimpleNamespace(url="https://reader.test/1"))
+    assert content.splitlines() == [f"Page {n}" for n in range(1, 22)]
+
+
 def test_parse_bookshelf_direct_anchor_fallback():
     plugin = YueduPlugin({"bookSourceUrl": "https://example.com"})
     html = """
@@ -1564,6 +1652,66 @@ async def test_fetch_book_follows_multiple_toc_pages():
         "https://example.com/books/list_2.html",
         "https://example.com/books/list_3.html",
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("all_links", [False, True], ids=["next-link", "page-selector"])
+async def test_long_toc_keeps_every_chapter_in_order(all_links):
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "ruleBookInfo": {"name": "h1@text"},
+        "ruleToc": {
+            "chapterList": "a.ch", "chapterName": "text", "chapterUrl": "href",
+            "nextTocUrl": "a.page@href",
+        },
+    })
+    requested = []
+    active = peak = 0
+
+    async def fetch(url):
+        nonlocal active, peak
+        page = int(url.rsplit("/", 1)[1])
+        requested.append(page)
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0)
+        active -= 1
+        following = range(2, 26) if all_links and page == 1 else [min(page + 1, 25)]
+        links = "".join(f'<a class="page" href="/list/{n}">Next</a>' for n in following)
+        links += '<a class="page" href="/list/1#top">First</a>'
+        chapters = "".join(
+            f'<a class="ch" href="/chapter/{n}.html">Chapter {n}</a>'
+            for n in range((page - 1) * 102 + 1, page * 102 + 1)
+        )
+        return f"<h1>Long book</h1>{chapters}{links}"
+
+    progress = AsyncMock()
+    with patch.object(plugin, "_get", fetch), patch.object(plugin, "_thread_count", return_value=3):
+        book = await plugin.fetch_book_with_progress("https://example.com/list/1", progress)
+    assert requested == list(range(1, 26))
+    assert peak == (3 if all_links else 1)
+    assert [ch.title for ch in book.chapters] == [f"Chapter {n}" for n in range(1, 2551)]
+    assert book.chapters[-1].chapter_number == 2550
+    assert progress.await_args.args == ("Long book", 25)
+
+
+@pytest.mark.asyncio
+async def test_repeating_toc_with_changing_next_url_reports_rule_error():
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "ruleBookInfo": {"name": "h1@text"},
+        "ruleToc": {"chapterList": "a.ch", "chapterName": "text", "chapterUrl": "href",
+                    "nextTocUrl": "a.page@href"},
+    })
+
+    async def fetch(url):
+        page = int(url.rsplit("/", 1)[1])
+        assert page < 10
+        return ('<h1>Loop</h1><a class="ch" href="/chapter/1.html">One</a>'
+                f'<a class="page" href="/list/{page + 1}">Next</a>')
+
+    with patch.object(plugin, "_get", fetch), pytest.raises(ValueError, match="nextTocUrl"):
+        await plugin.fetch_book("https://example.com/list/1")
 
 
 @pytest.mark.asyncio
