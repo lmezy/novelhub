@@ -9,7 +9,7 @@ import re
 import time
 from bs4 import BeautifulSoup
 
-from app.crawler.base import EmptyTocError
+from app.crawler.base import EmptyTocError, RemoteChapter
 from app.crawler.plugins.yuedu import YueduPlugin
 from app.crawler.plugins.yuedu.rule_engine import YueduRuleEngine
 from app.services.proxy_config import ProxyConfig
@@ -1606,6 +1606,39 @@ async def test_fetch_chapter_content_generic_fallback():
 
     assert "Main text" in content
     assert "<" not in content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("previous_image, expected_prior_pages", [
+    ("a.jpg", False),
+    ("unrelated.jpg", True),
+])
+async def test_chapter_gallery_drops_verified_previous_episode(previous_image, expected_prior_pages):
+    plugin = YueduPlugin({
+        "bookSourceUrl": "https://example.com",
+        "ruleContent": {"content": ".gallery@html"},
+    })
+    previous_url = "https://example.com/read/ep1"
+    current_url = "https://example.com/read/ep2"
+    pages = {
+        previous_url: f'<ul class="gallery"><li><img data-original="/pages/1/{previous_image}"></li></ul>',
+        current_url: (
+            '<ul class="gallery"><li><img data-original="/pages/1/a.jpg"></li>'
+            '<li><img data-original="/pages/4/b.jpg"></li>'
+            '<li><img data-original="/pages/4/c.jpg"></li></ul>'
+        ),
+    }
+    chapters = plugin._attach_next_urls([
+        RemoteChapter(previous_url, "Episode 1", previous_url, 1),
+        RemoteChapter(current_url, "Episode 2", current_url, 2),
+    ])
+    with patch.object(plugin, "_get", AsyncMock(side_effect=pages.__getitem__)) as fetch:
+        content = await plugin.fetch_chapter_content(chapters[1])
+
+    assert [call.args[0] for call in fetch.await_args_list] == [current_url, previous_url]
+    assert ("/pages/1/a.jpg" in content) is expected_prior_pages
+    assert "/pages/4/b.jpg" in content
+    assert "/pages/4/c.jpg" in content
 
 
 def test_next_content_url_resolves_relative_against_current_page():

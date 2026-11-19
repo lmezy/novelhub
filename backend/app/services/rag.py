@@ -46,7 +46,6 @@ class RAGService:
     # Approximate token splitting (Chinese chars ~1.5 tokens, English words ~1.3 tokens)
     CHUNK_SIZE = 500     # target tokens per chunk
     CHUNK_OVERLAP = 100  # overlap between chunks
-    MAX_CHUNKS_PER_BOOK = 2000
     EMBED_BATCH_SIZE = 16
     #: Stored chunk text is capped: the vector carries the meaning, the text is
     #: only shown back to the model as a citation snippet.
@@ -92,7 +91,7 @@ class RAGService:
         start = 0
         text_len = len(text)
 
-        while start < text_len and len(chunks) < self.MAX_CHUNKS_PER_BOOK:
+        while start < text_len:
             end = min(start + chars_per_chunk, text_len)
             chunk = text[start:end].strip()
             if chunk:
@@ -178,12 +177,12 @@ class RAGService:
                     "reason": "已索引且章节数一致；需要强制重建时使用 force=true。",
                 }
 
-        limit_chunks = int(max_chunks or self.MAX_CHUNKS_PER_BOOK)
+        limit_chunks = int(max_chunks or 0)
         total_chunks = 0
         indexed_chapters = 0
         batch_texts: list[str] = []
         batch_metas: list[dict[str, Any]] = []
-        skipped = 0
+        truncated = False
 
         async def flush_batch() -> None:
             nonlocal total_chunks, batch_texts, batch_metas
@@ -204,9 +203,6 @@ class RAGService:
             # Reading a chapter file is synchronous; yielding keeps the uvicorn
             # worker answering requests while a 1 000-chapter book is indexed.
             await asyncio.sleep(0)
-            if total_chunks + len(batch_texts) >= limit_chunks:
-                skipped += 1
-                continue
             try:
                 content = self.storage.read_chapter(chapter.content_path)
             except Exception as exc:
@@ -215,9 +211,13 @@ class RAGService:
             chunks = self.chunk_text(indexable_chapter_text(content))
             if not chunks:
                 continue
+            if limit_chunks and total_chunks + len(batch_texts) >= limit_chunks:
+                truncated = True
+                break
             indexed_chapters += 1
             for idx, chunk in enumerate(chunks):
-                if total_chunks + len(batch_texts) >= limit_chunks:
+                if limit_chunks and total_chunks + len(batch_texts) >= limit_chunks:
+                    truncated = True
                     break
                 batch_texts.append(chunk)
                 batch_metas.append({
@@ -226,8 +226,10 @@ class RAGService:
                     "chapter_number": chapter.chapter_number,
                     "title": chapter.title or "",
                 })
-            if len(batch_texts) >= self.EMBED_BATCH_SIZE:
-                await flush_batch()
+                if len(batch_texts) >= self.EMBED_BATCH_SIZE:
+                    await flush_batch()
+            if truncated:
+                break
 
         await flush_batch()
         if not total_chunks:
@@ -248,7 +250,7 @@ class RAGService:
             "chapters": len(chapters),
             "indexed_chapters": indexed_chapters,
             "chunks": total_chunks,
-            "truncated": skipped > 0 or total_chunks >= limit_chunks,
+            "truncated": truncated,
             "model": cfg.effective_embedding_model,
             "skipped": False,
         }

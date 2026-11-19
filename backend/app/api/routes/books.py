@@ -948,12 +948,13 @@ async def list_book_sources(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """List other library books with the same title across sources."""
+    """List other library books with the same title and reading format."""
     book = await db.get(Book, book_id)
     if not ensure_book_visible(user, book):
         raise HTTPException(status_code=404, detail="Book not found")
 
     normalized = _normalize_book_title(book.title)
+    kind = normalize_kind(getattr(book, "kind", None))
     query = select(Book).options(selectinload(Book.author)).where(
         Book.id != book_id,
         # Narrow in the database: normalising titles in Python meant loading
@@ -980,6 +981,7 @@ async def list_book_sources(
         b
         for b in (await db.scalars(query)).unique().all()
         if _normalize_book_title(b.title) == normalized
+        and normalize_kind(getattr(b, "kind", None)) == kind
     ]
     candidates.append(book)
 

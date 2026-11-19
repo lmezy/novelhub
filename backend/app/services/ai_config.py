@@ -57,6 +57,9 @@ AI_AUTO_DIAGNOSE_KEY = "ai_auto_diagnose"
 #: install (and the environment-variable fallbacks) keeps working unchanged.
 AI_PROFILES_KEY = "ai_providers"
 AI_ACTIVE_PROFILE_KEY = "ai_active_profile"
+AI_EMBEDDING_PROFILES_KEY = "ai_embedding_providers"
+AI_ACTIVE_EMBEDDING_PROFILE_KEY = "ai_active_embedding_profile"
+LEGACY_EMBEDDING_PROFILE_ID = "legacy-embedding"
 
 ALL_KEYS = (
     AI_ENABLED_KEY,
@@ -80,6 +83,8 @@ ALL_KEYS = (
     AI_AUTO_DIAGNOSE_KEY,
     AI_PROFILES_KEY,
     AI_ACTIVE_PROFILE_KEY,
+    AI_EMBEDDING_PROFILES_KEY,
+    AI_ACTIVE_EMBEDDING_PROFILE_KEY,
 )
 
 #: Upper bound for the saved provider list: a runaway client must not be able to
@@ -114,6 +119,8 @@ FIELD_TO_KEY = {
     "auto_diagnose": AI_AUTO_DIAGNOSE_KEY,
     "profiles": AI_PROFILES_KEY,
     "active_profile_id": AI_ACTIVE_PROFILE_KEY,
+    "embedding_profiles": AI_EMBEDDING_PROFILES_KEY,
+    "active_embedding_profile_id": AI_ACTIVE_EMBEDDING_PROFILE_KEY,
 }
 
 # -- provider presets --------------------------------------------------------
@@ -355,25 +362,34 @@ class AIProviderProfile:
             return False
         return bool(self.api_key) or not self.needs_key
 
-    def public_dict(self, *, active: bool = False) -> dict[str, Any]:
+    def public_dict(self, *, active: bool = False, embedding: bool = False) -> dict[str, Any]:
+        effective_base_url = self.effective_base_url
+        effective_model = self.effective_model
+        provider_label = self.provider_label
+        if embedding:
+            preset = _embedding_preset(self.provider) if self.provider else {}
+            effective_base_url = (self.base_url or preset.get("base_url", "")).rstrip("/")
+            effective_model = self.model or preset.get("model", "")
+            if not self.provider:
+                provider_label = ""
         return {
             "id": self.id,
             "name": self.name,
-            "label": self.label,
+            "label": self.label if provider_label else self.name.strip(),
             "provider": self.provider,
-            "provider_label": self.provider_label,
+            "provider_label": provider_label,
             "base_url": self.base_url,
-            "effective_base_url": self.effective_base_url,
+            "effective_base_url": effective_base_url,
             "model": self.model,
-            "effective_model": self.effective_model,
+            "effective_model": effective_model,
             "api_key_set": bool(self.api_key),
             "api_key_hint": _key_hint(self.api_key),
-            "configured": self.configured,
+            "configured": bool(effective_base_url and effective_model and (self.api_key or not self.needs_key)),
             "active": active,
         }
 
 
-def parse_profiles(raw: Any) -> list[AIProviderProfile]:
+def parse_profiles(raw: Any, *, embedding: bool = False) -> list[AIProviderProfile]:
     """Read the stored provider list, tolerant of anything unusable.
 
     A row written by a future version, a truncated JSON blob or a hand-edited
@@ -397,7 +413,7 @@ def parse_profiles(raw: Any) -> list[AIProviderProfile]:
     for entry in raw[:MAX_PROFILES]:
         if not isinstance(entry, dict):
             continue
-        profile = profile_from_entry(entry)
+        profile = profile_from_entry(entry, embedding=embedding)
         if profile is None or profile.id in seen:
             continue
         seen.add(profile.id)
@@ -405,16 +421,17 @@ def parse_profiles(raw: Any) -> list[AIProviderProfile]:
     return profiles
 
 
-def profile_from_entry(entry: Mapping[str, Any]) -> AIProviderProfile | None:
+def profile_from_entry(entry: Mapping[str, Any], *, embedding: bool = False) -> AIProviderProfile | None:
     """Build one profile from a stored/submitted entry, or ``None`` if unusable."""
     profile_id = str(entry.get("id") or "").strip()
     if not profile_id:
         return None
     api_key = str(entry.get("api_key") or "")
+    provider = str(entry.get("provider") or "").strip()
     return AIProviderProfile(
         id=profile_id,
         name=str(entry.get("name") or "").strip(),
-        provider=normalize_provider(entry.get("provider")),
+        provider="" if embedding and not provider else normalize_provider(provider),
         base_url=str(entry.get("base_url") or "").strip(),
         model=str(entry.get("model") or "").strip(),
         api_key=decrypt_secret(api_key) if api_key else "",
@@ -471,6 +488,8 @@ class AIConfig:
     #: the single-provider fields above (and the environment) stay authoritative.
     profiles: tuple[AIProviderProfile, ...] = ()
     active_profile_id: str = ""
+    embedding_profiles: tuple[AIProviderProfile, ...] = ()
+    active_embedding_profile_id: str = ""
 
     # -- derived ------------------------------------------------------------
 
@@ -511,7 +530,7 @@ class AIConfig:
     def effective_embedding_base_url(self) -> str:
         if self.embedding_base_url:
             return self.embedding_base_url.rstrip("/")
-        if self.embedding_provider and self.embedding_provider != self.provider:
+        if self.embedding_provider and (self.embedding_profiles or self.embedding_provider != self.provider):
             return str(_embedding_preset(self.embedding_provider).get("base_url") or "").rstrip("/")
         return self.effective_base_url
 
@@ -523,7 +542,21 @@ class AIConfig:
 
     @property
     def effective_embedding_api_key(self) -> str:
+        if self.embedding_profiles and (self.embedding_provider or self.embedding_base_url):
+            return self.embedding_api_key
         return self.embedding_api_key or self.api_key
+
+    def legacy_embedding_profile(self) -> AIProviderProfile:
+        # The legacy single-provider config may already be using the chat key
+        # with a dedicated endpoint. Carry it over only for that same endpoint.
+        dedicated = bool(self.embedding_provider or self.embedding_base_url)
+        return AIProviderProfile(
+            id=LEGACY_EMBEDDING_PROFILE_ID,
+            provider=self.embedding_provider,
+            base_url=self.embedding_base_url or (self.effective_embedding_base_url if dedicated else ""),
+            model=self.embedding_model,
+            api_key=self.effective_embedding_api_key if dedicated else self.embedding_api_key,
+        )
 
     @property
     def embeddings_supported(self) -> bool:
@@ -559,6 +592,8 @@ class AIConfig:
 
     def public_dict(self) -> dict[str, Any]:
         """Configuration for the admin UI: never includes the raw key."""
+        embedding_profiles = self.embedding_profiles or (self.legacy_embedding_profile(),)
+        embedding_profile_id = self.active_embedding_profile_id or embedding_profiles[0].id
         return {
             "enabled": self.enabled,
             "configured": self.configured,
@@ -587,6 +622,12 @@ class AIConfig:
             "effective_embedding_base_url": self.effective_embedding_base_url,
             "embedding_api_key_set": bool(self.embedding_api_key),
             "embeddings_supported": self.embeddings_supported,
+            "embedding_profiles": [
+                profile.public_dict(active=profile.id == embedding_profile_id, embedding=True)
+                for profile in embedding_profiles
+            ],
+            "active_embedding_profile_id": embedding_profile_id,
+            "embedding_profile_source": "profiles" if self.embedding_profiles else "single",
             "auto_diagnose": self.auto_diagnose,
             "profiles": [
                 profile.public_dict(active=profile.id == self.active_profile_id)
@@ -679,6 +720,21 @@ def resolve_ai_config(
     embedding_api_key = pick(AI_EMBEDDING_API_KEY_KEY, "AI_EMBEDDING_API_KEY")
     if embedding_api_key:
         embedding_api_key = decrypt_secret(embedding_api_key)
+    embedding_base_url = pick(AI_EMBEDDING_BASE_URL_KEY, "AI_EMBEDDING_BASE_URL")
+    embedding_model = pick(AI_EMBEDDING_MODEL_KEY, "AI_EMBEDDING_MODEL")
+    embedding_profiles = tuple(parse_profiles(stored.get(AI_EMBEDDING_PROFILES_KEY), embedding=True))
+    active_embedding_id = ""
+    if embedding_profiles:
+        requested_id = str(stored.get(AI_ACTIVE_EMBEDDING_PROFILE_KEY) or "").strip()
+        active_embedding = next(
+            (profile for profile in embedding_profiles if profile.id == requested_id),
+            embedding_profiles[0],
+        )
+        active_embedding_id = active_embedding.id
+        embedding_provider = active_embedding.provider
+        embedding_base_url = active_embedding.base_url
+        embedding_model = active_embedding.model
+        embedding_api_key = active_embedding.api_key
 
     enabled_raw = pick(AI_ENABLED_KEY, "AI_ENABLED")
     if enabled_raw == "":
@@ -704,12 +760,14 @@ def resolve_ai_config(
         rag_top_k=_as_int(pick(AI_RAG_TOP_K_KEY, "AI_RAG_TOP_K", "6"), 6),
         rag_auto_index=_truthy(pick(AI_RAG_AUTO_INDEX_KEY, "AI_RAG_AUTO_INDEX")),
         embedding_provider=embedding_provider,
-        embedding_base_url=pick(AI_EMBEDDING_BASE_URL_KEY, "AI_EMBEDDING_BASE_URL"),
+        embedding_base_url=embedding_base_url,
         embedding_api_key=embedding_api_key,
-        embedding_model=pick(AI_EMBEDDING_MODEL_KEY, "AI_EMBEDDING_MODEL"),
+        embedding_model=embedding_model,
         auto_diagnose=_truthy(pick(AI_AUTO_DIAGNOSE_KEY, "AI_AUTO_DIAGNOSE"), True),
         profiles=profiles,
         active_profile_id=active_profile_id,
+        embedding_profiles=embedding_profiles,
+        active_embedding_profile_id=active_embedding_id,
     )
 
 
@@ -799,6 +857,8 @@ async def set_ai_config(db: AsyncSession, values: Mapping[str, Any]) -> AIConfig
             values = {**values, "active_profile_id": requested_active}
         values = _merge_active_profile_values(values, stored_profiles, active_id)
 
+    values = _apply_embedding_profile_updates(rows, values)
+
     prepared: dict[str, str] = {}
     for field, value in values.items():
         if value is None:
@@ -835,6 +895,7 @@ def _merge_profiles(
     submitted: Any,
     *,
     legacy_api_key: str = "",
+    embedding: bool = False,
 ) -> list[AIProviderProfile]:
     """Apply a submitted provider list over the stored one.
 
@@ -872,7 +933,7 @@ def _merge_profiles(
                 entry["api_key"] = ""
         else:
             entry["api_key"] = str(api_key)
-        profile = profile_from_entry(entry)
+        profile = profile_from_entry(entry, embedding=embedding)
         if profile is not None:
             merged.append(profile)
     return merged
@@ -882,6 +943,8 @@ def _merge_active_profile_values(
     values: Mapping[str, Any],
     stored: list[AIProviderProfile],
     active_id: str,
+    *,
+    embedding: bool = False,
 ) -> dict[str, Any]:
     """Fold single-provider fields into the active provider entry.
 
@@ -889,7 +952,8 @@ def _merge_active_profile_values(
     list (an older cached bundle, a script): without it, its edits would land in
     ``ai_provider``/``ai_api_key`` and be ignored, because the list wins.
     """
-    fields = ("provider", "base_url", "model", "api_key")
+    prefix = "embedding_" if embedding else ""
+    fields = tuple(prefix + field for field in ("provider", "base_url", "model", "api_key"))
     if not any(values.get(field) is not None for field in fields):
         return dict(values)
 
@@ -908,14 +972,14 @@ def _merge_active_profile_values(
         "api_key": current.api_key,
     }
     for field in ("provider", "base_url", "model"):
-        value = values.get(field)
+        value = values.get(prefix + field)
         if value is not None:
             updated[field] = str(value).strip()
-    api_key = values.get("api_key")
+    api_key = values.get(prefix + "api_key")
     if api_key is not None and str(api_key) != MASKED_KEY:
         updated["api_key"] = str(api_key)
 
-    profile = profile_from_entry(updated)
+    profile = profile_from_entry(updated, embedding=embedding)
     if profile is None:
         return dict(values)
     profiles[index] = profile
@@ -923,6 +987,43 @@ def _merge_active_profile_values(
     payload = dict(values)
     for field in fields:
         payload.pop(field, None)
-    payload["profiles"] = serialize_profiles(profiles)
-    payload["active_profile_id"] = profile.id
+    payload[prefix + "profiles"] = serialize_profiles(profiles)
+    payload["active_" + prefix + "profile_id"] = profile.id
     return payload
+
+
+def _apply_embedding_profile_updates(
+    rows: Mapping[str, AppSetting], values: Mapping[str, Any],
+) -> dict[str, Any]:
+    stored = {key: row.value for key, row in rows.items()}
+    profiles = parse_profiles(stored.get(AI_EMBEDDING_PROFILES_KEY), embedding=True)
+    active_id = str(stored.get(AI_ACTIVE_EMBEDDING_PROFILE_KEY) or "").strip()
+    requested_id = values.get("active_embedding_profile_id")
+    submitted = values.get("embedding_profiles")
+    if submitted is None:
+        if requested_id is not None and any(profile.id == requested_id for profile in profiles):
+            active_id = str(requested_id)
+        updated = _merge_active_profile_values(values, profiles, active_id, embedding=True) if profiles else dict(values)
+        if requested_id is not None:
+            updated["active_embedding_profile_id"] = active_id
+        return updated
+
+    if not profiles and isinstance(submitted, list):
+        legacy = resolve_ai_config(stored).legacy_embedding_profile()
+        for entry in submitted[:MAX_PROFILES]:
+            if not isinstance(entry, dict) or entry.get("id") != legacy.id:
+                continue
+            draft = profile_from_entry(entry, embedding=True)
+            if draft and draft.provider == legacy.provider and draft.base_url.rstrip("/") == legacy.base_url.rstrip("/"):
+                profiles = [legacy]
+            break
+    merged = _merge_profiles(profiles, submitted, embedding=True)
+    if not merged:
+        merged = [AIProviderProfile(id=uuid4().hex, provider="")]
+    selected = str(requested_id if requested_id is not None else active_id).strip()
+    if selected not in {profile.id for profile in merged}:
+        selected = merged[0].id
+    updated = {**values, "embedding_profiles": serialize_profiles(merged), "active_embedding_profile_id": selected}
+    for field in ("embedding_provider", "embedding_base_url", "embedding_model", "embedding_api_key"):
+        updated.pop(field, None)
+    return updated

@@ -208,17 +208,11 @@ export const useBooksStore = defineStore("books", () => {
     return loaded
   }
 
-  async function prefetchChapter(chapterId: string): Promise<void> {
-    if (chapterCache.has(chapterId)) return
+  async function prefetchChapter(chapterId: string, limit: number): Promise<void> {
     try {
-      const persistent = await readCachedChapter(`chapter:${chapterId}`) as ChapterContent | null
-      if (persistent) {
-        chapterCache.set(chapterId, persistent)
-        return
-      }
-      const loaded = await api.get<ChapterContent>(`/chapters/${chapterId}`)
-      chapterCache.set(chapterId, loaded)
-      void writeCachedChapter(`chapter:${chapterId}`, loaded)
+      const meta = await fetchChapterContentMeta(chapterId)
+      const version = meta.hash || (meta.total_length ? `len${meta.total_length}` : "")
+      if (version) await fetchChapterChunk(chapterId, 0, limit, version)
     } catch {
       // Prefetch is best effort; the normal navigation request reports errors.
     }

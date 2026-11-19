@@ -269,7 +269,7 @@ async def stats(db: Any) -> dict[str, Any]:
 
 
 def candidate_query(*, force: bool, limit: int):
-    """SQL for books that still need a profile."""
+    """SQL for eligible profiles, with no limit when ``limit`` is 0."""
     from app.models import Book, BookProfile, Chapter
 
     query = (
@@ -283,7 +283,7 @@ def candidate_query(*, force: bool, limit: int):
             )
         )
         .order_by(Book.updated_at.desc())
-        .limit(limit)
+        .limit(limit or None)
     )
     if not force:
         query = query.where(~exists().where(BookProfile.book_id == Book.id))

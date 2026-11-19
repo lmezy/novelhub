@@ -16,6 +16,10 @@ from sqlalchemy import select  # noqa: F401  (kept for the fake db's contract)
 from app.services.ai_config import (
     AI_ACTIVE_PROFILE_KEY,
     AI_API_KEY_KEY,
+    AI_EMBEDDING_API_KEY_KEY,
+    AI_EMBEDDING_BASE_URL_KEY,
+    AI_EMBEDDING_PROFILES_KEY,
+    AI_EMBEDDING_PROVIDER_KEY,
     AI_MODEL_KEY,
     AI_PROFILES_KEY,
     AI_PROVIDER_KEY,
@@ -171,6 +175,57 @@ async def test_set_ai_config_stores_keys_encrypted_and_switches_the_active_entry
     assert switched.provider == "deepseek"
     assert switched.api_key == "sk-deepseek"
     assert switched.effective_model == "deepseek-flash"
+
+
+@pytest.mark.asyncio
+async def test_embedding_profiles_migrate_and_switch_independently_from_chat():
+    db = FakeDB([
+        row(AI_PROVIDER_KEY, "deepseek"),
+        row(AI_API_KEY_KEY, "fake-chat-key"),
+        row(AI_EMBEDDING_PROVIDER_KEY, "siliconflow"),
+        row(AI_EMBEDDING_API_KEY_KEY, "fake-embedding-key"),
+    ])
+    legacy = (await get_ai_config(db)).public_dict()["embedding_profiles"][0]
+    local = {"id": "local", "provider": "ollama", "base_url": "http://computer:11434/v1", "model": "bge-m3"}
+
+    cfg = await set_ai_config(db, {"embedding_profiles": [legacy, local], "active_embedding_profile_id": "local"})
+
+    assert cfg.provider == "deepseek"
+    assert cfg.api_key == "fake-chat-key"
+    assert cfg.effective_embedding_api_key == ""
+    assert cfg.effective_embedding_model == "bge-m3"
+    assert cfg.effective_embedding_base_url == local["base_url"]
+    assert db.value_of(AI_EMBEDDING_PROFILES_KEY).count("enc:") == 1
+    assert "fake-embedding-key" not in json.dumps(cfg.public_dict())
+
+    cloud = await set_ai_config(db, {"active_embedding_profile_id": legacy["id"]})
+    assert cloud.effective_embedding_model == "BAAI/bge-m3"
+    assert cloud.effective_embedding_api_key == "fake-embedding-key"
+
+    # Cached clients still update the effective profile through the legacy field names.
+    updated = await set_ai_config(db, {"embedding_model": "Pro/BAAI/bge-m3", "embedding_api_key": MASKED_KEY})
+    assert updated.effective_embedding_model == "Pro/BAAI/bge-m3"
+    assert updated.effective_embedding_api_key == "fake-embedding-key"
+    assert updated.embedding_profiles[1].model == "bge-m3"
+
+
+@pytest.mark.asyncio
+async def test_editing_the_legacy_embedding_endpoint_does_not_migrate_its_key():
+    db = FakeDB([
+        row(AI_EMBEDDING_PROVIDER_KEY, "custom"),
+        row(AI_EMBEDDING_BASE_URL_KEY, "https://original.test/v1"),
+        row(AI_EMBEDDING_API_KEY_KEY, "fake-original-key"),
+    ])
+    legacy = (await get_ai_config(db)).public_dict()["embedding_profiles"][0]
+    changed = await set_ai_config(db, {"embedding_profiles": [{**legacy, "base_url": "https://other.test/v1"}]})
+
+    assert changed.effective_embedding_api_key == ""
+    assert changed.effective_embedding_base_url == "https://other.test/v1"
+
+    deleted = await set_ai_config(db, {"embedding_profiles": []})
+    assert deleted.embedding_provider == ""
+    assert deleted.embedding_base_url == ""
+    assert deleted.embedding_api_key == ""
 
 
 @pytest.mark.asyncio

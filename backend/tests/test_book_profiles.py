@@ -3,7 +3,9 @@
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy.dialects import postgresql
 
+from app.api.routes.rag import LibraryBuildRequest
 from app.core.config import settings
 from app.services import book_profiles, library_jobs, rag_jobs
 
@@ -113,26 +115,39 @@ def _isolated_state(tmp_path, monkeypatch):
 
 def test_status_exposes_the_run_limits():
     limits = library_jobs.status()["limits"]
-    assert limits["max_books_per_run"] == library_jobs.MAX_BOOKS_PER_RUN
+    assert limits["max_books_per_run"] is None
+    assert limits["default_books_per_run"] == library_jobs.DEFAULT_BOOKS_PER_RUN
     assert limits["books_per_request"] == library_jobs.BOOKS_PER_REQUEST
 
 
 def test_start_refuses_while_the_rag_queue_is_running():
+    assert rag_jobs.acquire_file_lock(rag_jobs._lock_path())
     rag_jobs._write({**rag_jobs.empty_state(), "running": True})
 
     with pytest.raises(ValueError):
         library_jobs.start(limit=10)
 
 
-@pytest.mark.asyncio
-async def test_start_clamps_the_limit_and_writes_running_state(monkeypatch):
+@pytest.mark.parametrize("limit", [0, 50_001])
+def test_start_preserves_the_requested_limit_and_writes_running_state(monkeypatch, limit):
     monkeypatch.setattr(library_jobs, "ensure_worker", lambda: True)
 
-    state = library_jobs.start(limit=999_999)
+    request = LibraryBuildRequest(limit=limit)
+    state = library_jobs.start(limit=request.limit)
 
     assert state["running"] is True
-    assert state["limit"] == library_jobs.MAX_BOOKS_PER_RUN
+    assert state["limit"] == limit
     assert library_jobs.read_state()["phase"] == "running"
+
+
+def test_candidate_query_all_omits_the_sql_limit():
+    dialect = postgresql.dialect()
+    full = book_profiles.candidate_query(force=False, limit=0).compile(dialect=dialect)
+    bounded = book_profiles.candidate_query(force=False, limit=50_001).compile(dialect=dialect)
+
+    assert "LIMIT" not in str(full)
+    assert "LIMIT" in str(bounded)
+    assert 50_001 in bounded.params.values()
 
 
 @pytest.mark.asyncio

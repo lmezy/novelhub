@@ -25,6 +25,11 @@ AI 配置存在数据库里（`app_settings`，键名 `ai_*`），改完立即�
 - 浏览器里缓存着旧前端（还在提交单套字段的那个版本）也不会写坏配置：它提交的
   provider / base_url / model / api_key 会落到**当前生效的那条**上。
 
+「语义检索（RAG）→ 向量模型供应商」也可以保存多套配置。选中一套并保存即可切换，和对话供应商独立。
+原来的向量配置会出现在列表第一条，首次保存时保留其密钥。每条可单独配置、复制或删除，复制时需要重新填写密钥。
+专用向量供应商使用自己的密钥，本地 Ollama 可留空。选择「与对话模型相同」且留空向量地址和密钥时，会复用对话密钥。
+若切换到输出不兼容的向量服务，先停止建索引，再用新配置重建已有章节向量和书库画像。
+
 ### 1.2 其它字段
 
 | 字段 | 说明 |
@@ -36,7 +41,7 @@ AI 配置存在数据库里（`app_settings`，键名 `ai_*`），改完立即�
 | API Key | AES-GCM 加密入库，接口只回掩码；本地 Ollama 这类服务可以留空 |
 | Temperature / 最大输出 token / 超时 / 上下文上限（字符） | 生成参数，对所有供应商生效 |
 | 使用代理 | 走代理发请求。勾选后留空表示**复用爬虫代理**（设置 → 代理里的地址） |
-| 向量提供方 / 向量模型 / 向量接口地址 / 向量 API Key | RAG 用的 embedding 服务，可以与对话模型不同 |
+| 向量模型供应商 | RAG 使用的向量服务，可单独保存多套，每套包含提供方、模型、接口地址和密钥 |
 | 问答时使用语义检索 / 检索片段数 | 是否用 RAG、检索几个片段 |
 
 **测试连接**会分别探测对话接口和向量接口，并显示：解析出的请求地址、是否走代理、耗时、
@@ -54,6 +59,10 @@ AI 配置存在数据库里（`app_settings`，键名 `ai_*`），改完立即�
 | OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` | `text-embedding-3-small` |
 | Claude | `https://api.anthropic.com` | `claude-3-5-haiku-latest` | 无 |
 | Ollama（本地） | `http://localhost:11434/v1` | `qwen2.5:7b` | `nomic-embed-text` |
+
+NovelHub 在 NAS、Ollama 在另一台电脑时，向量接口地址填 `http://<电脑局域网IP>:11434/v1`。
+Ollama 要监听局域网地址，Windows 入站规则可以仅放行 NAS。如果启用了 AI 代理，代理规则要让电脑的局域网 IP 直连。
+使用书库画像时可装 `bge-m3`，保存向量配置后在「测试连接」确认模型返回 1024 维。
 
 ## 2. 阅读器里的用法
 
@@ -74,26 +83,26 @@ AI 配置存在数据库里（`app_settings`，键名 `ai_*`），改完立即�
 
 | 方式 | 入口 | 特点 |
 |---|---|---|
-| 按需逐本 | 设置 → AI → RAG 索引管理 → 输入书籍 ID → 建立索引 | 同步执行，适合"就这一本"；同章节数已建过的书直接跳过，`force=true` 才重建 |
+| 按需逐本 | 设置 → AI → RAG 索引管理 → 输入书籍 ID → 建立索引 | 默认索引本书全部正文；要补齐此前截断的索引，勾选「重建已有索引」 |
 | 打开即建 | 设置 → AI → 语义检索 → 「打开书籍时自动建索引」+ 保存 | 读者打开一本书就排队后台建；**每天最多 20 本**、队列最多 20 本、每本最多 300 片段、已建/漫画/无章节跳过 |
-| 后台批量 | 设置 → AI → RAG 索引管理 → 「后台批量建索引」 | 只挑**还没有向量**的小说按最近更新排序；一次最多 **1000 本**、每本最多 **2000 片段**；页面关掉也会继续跑，可随时取消 |
+| 后台批量 | 设置 → AI → RAG 索引管理 → 「后台批量建索引」 | 只挑**还没有向量**的小说，按最近更新排序。默认 20 本、每本最多 400 片段；书籍和片段上限可分别设为 `0`，表示全部。页面关掉后仍会继续运行，可随时取消 |
 
-**为什么要限制**：每本书的每个片段都是一次向量调用 + 一条 JSONB 记录（1 024 维约 20 KB）。
-你的 4.6 万本书全建一遍约 350~500 万片段 ≈ 70~100 GB、20~30 万次请求——不要一次跑全库，
-按需分批（界面上会按当前设置估算"约多少 MB、多少次请求"再让你点）。
+每个向量请求最多处理 16 个正文片段，每个片段写入一条 JSONB 记录。1 024 维向量约占 20 KB，
+350 万至 500 万片段约占 70 至 100 GB，并需要数十万次请求。填具体上限时，界面会估算空间和请求量。
 
-后台任务的状态写在 `storage/.rag-jobs.json`，页面轮询 `GET /api/rag/jobs/status` 显示进度；
-取消只会在**当前这本书写完后**生效（一本几百章的书可能要一两分钟）。
+后台任务状态保存在 `storage/.rag-jobs.json`，页面通过 `GET /api/rag/jobs/status` 显示进度。
+取消会在当前书处理完后生效。任务取消、连续失败停止或中断后，未处理的书会从本次队列移除。
+下一次批量建索引会重新选取符合条件的书并从零统计，错误详情可在任务卡片里展开。
 
 ```bash
 TOKEN=<你的 JWT>
 # 按需建索引（管理员）
 curl -X POST "http://localhost:8088/api/rag/index/<BOOK_ID>?force=true" \
   -H "Authorization: Bearer $TOKEN"
-# 后台批量（管理员，最多 1000 本）
+# 后台批量（管理员，以下示例选择 20 本并索引它们的全部片段）
 curl -X POST "http://localhost:8088/api/rag/batch" -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"limit":20,"max_chunks":400,"scope":"unindexed"}'
+  -d '{"limit":20,"max_chunks":0,"scope":"unindexed"}'
 # 批量进度 / 取消（管理员）
 curl "http://localhost:8088/api/rag/jobs/status" -H "Authorization: Bearer $TOKEN"
 curl -X POST "http://localhost:8088/api/rag/jobs/cancel" -H "Authorization: Bearer $TOKEN"
@@ -109,9 +118,8 @@ curl -X POST "http://localhost:8088/api/rag/search" -H "Authorization: Bearer $T
 curl "http://localhost:8088/api/rag/index?limit=50" -H "Authorization: Bearer $TOKEN"
 ```
 
-单本同步建索引会反复调用向量接口：一本几百章的书可能要一两分钟（网关已配 3600s 超时），
-手机端容易中途断开——要稳就用后台批量或「打开即建」。片段总数上限 2000（`max_chunks` 可调），
-超出会截断并在结果里标注。
+单本同步建索引会反复调用向量接口，几百章的书可能需要一两分钟。手机端可用后台批量建索引，关闭页面后任务仍会继续。
+单本 API 的 `max_chunks` 参数可以指定正整数上限，有正文片段被截断时，结果中的 `truncated` 为 `true`。
 
 ### 3.1 跨书找相似（书库画像）
 
@@ -119,8 +127,8 @@ curl "http://localhost:8088/api/rag/index?limit=50" -H "Authorization: Bearer $T
 
 - 每本书生成 **4 条画像向量**（均匀抽 4 个章节各截 900 字，前面加书名/作者/标签/简介），
   整库约 18.5 万条、1.3 GB；不需要把 71 万章全部向量化（那是 70~100 GB）。
-- 管理员在 **设置 → AI → RAG 索引管理 → 书库画像** 里构建：每次最多 2000 本（建议 500~1000），
-  后台跑、可取消，页面 4 秒刷新进度与已建总量。
+- 管理员在 **设置 → AI → RAG 索引管理 → 书库画像** 里构建。默认 2000 本，可输入更大的数量，填 `0` 会处理所有待建画像的书籍。
+  任务在后台运行，可取消，页面每 4 秒刷新进度和已建总量。
 - 读者在导航 **「找相似」** 页粘贴一段情节 → 语义检索；书籍详情页也有「找相似」。
 - 要求向量模型输出 **1024 维**（bge-m3 / text-embedding-v3 / embedding-3），
   数据库要跑 **pgvector** 镜像（`pgvector/pgvector:pg17`），迁移 0040 会建
@@ -128,7 +136,7 @@ curl "http://localhost:8088/api/rag/index?limit=50" -H "Authorization: Bearer $T
 
 ```bash
 TOKEN=<管理员 JWT>
-# 构建（每次最多 2000 本）
+# 构建（limit=0 处理所有符合条件的书籍）
 curl -X POST "http://localhost:8088/api/rag/library/build" -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' -d '{"limit":500,"force":false}'
 # 进度 / 取消

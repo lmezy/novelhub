@@ -14,6 +14,7 @@ from app.crawler.plugins.yuedu.selectors import CHAPTER_CHROME_PHRASES
 from bs4 import BeautifulSoup
 from bs4 import Tag
 from collections.abc import Awaitable, Callable
+from itertools import groupby
 from typing import Any
 from urllib.parse import urljoin
 from urllib.parse import urlparse
@@ -21,6 +22,9 @@ import asyncio
 import json
 import os
 import re
+
+
+IMAGE_LINE = re.compile(r"!\[[^\]]*\]\((\S+)\)")
 
 
 class ChapterMixin:
@@ -89,20 +93,7 @@ class ChapterMixin:
             "url": chapter.url,
             "tag": str(getattr(chapter, "tags", "") or ""),
         })
-        generic_content = self._parse_chapter_content_generic(html, fetch_url)
-        if self._uses_android_js_rule("ruleContent", "content"):
-            content = generic_content
-        else:
-            try:
-                content = chapter_engine.parse_content(html)
-            except Exception:
-                content = ""
-            if (
-                not content
-                or self._looks_like_rule_diagnostic(content, html)
-                or self._is_bare_image_url(content)
-            ):
-                content = generic_content
+        content = self._extract_chapter_page(chapter_engine, html, fetch_url)
         parts = [content] if content else []
 
         # Follow nextContentUrl for multi-page chapters.  Manga/photo albums
@@ -218,6 +209,11 @@ class ChapterMixin:
         if not content:
             content = self._parse_chapter_content_generic(html, fetch_url)
         content = content.strip()
+        previous_url = getattr(chapter, "previous_url", None)
+        if previous_url and pages_fetched == 0 and not gallery_mode:
+            content = await self._trim_cumulative_gallery(
+                content, fetch_url, previous_url, _fetch_content_page,
+            )
         if self._content_is_blocked(content):
             raise RuntimeError(
                 "Chapter content looks like an anti-bot/captcha page "
@@ -241,6 +237,85 @@ class ChapterMixin:
                 f"Chapter returned empty content: {chapter.url}"
             )
         return content
+
+    def _extract_chapter_page(self, engine: YueduRuleEngine, html: str, url: str) -> str:
+        if not self._uses_android_js_rule("ruleContent", "content"):
+            try:
+                content = engine.parse_content(html)
+            except Exception:
+                content = ""
+            if content and not (
+                self._looks_like_rule_diagnostic(content, html)
+                or self._is_bare_image_url(content)
+            ):
+                return content
+        return self._parse_chapter_content_generic(html, url)
+
+    @staticmethod
+    def _image_only_lines(content: str, url: str) -> list[tuple[str, str]]:
+        images = []
+        for line in content.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            match = IMAGE_LINE.fullmatch(line)
+            if match is None:
+                return []
+            absolute = urljoin(url, match[1]).split("#", 1)[0]
+            images.append((line, absolute))
+        return images
+
+    async def _trim_cumulative_gallery(
+        self,
+        content: str,
+        url: str,
+        previous_url: str,
+        fetch_page: Callable[[str], Awaitable[str]],
+    ) -> str:
+        """Drop earlier episodes when the source returns a cumulative gallery."""
+        images = self._image_only_lines(content, url)
+        # Ordinary chapters usually use one image directory. Require ordered,
+        # numbered sibling directories before making another source request.
+        directories: list[tuple[str, str, str]] = []
+        for _, image_url in images:
+            parsed = urlparse(image_url)
+            parts = parsed.path.rsplit("/", 2)
+            if (
+                parsed.scheme not in ("http", "https") or not parsed.netloc
+                or len(parts) != 3 or not re.fullmatch(r"[0-9]{1,9}", parts[1])
+            ):
+                return content
+            directories.append((f"{parsed.scheme}://{parsed.netloc}", parts[0], parts[1]))
+        groups = [directory for directory, _ in groupby(directories)]
+        if len(groups) < 2 or len({group[:2] for group in groups}) != 1:
+            return content
+        numbers = [int(group[2]) for group in groups]
+        if any(first >= second for first, second in zip(numbers, numbers[1:])):
+            return content
+
+        previous_page_url, _ = self._split_options_suffix(previous_url)
+        if not previous_page_url or previous_page_url == url:
+            return content
+        try:
+            previous_html = await fetch_page(previous_url)
+            engine = YueduRuleEngine(self.config)
+            engine.set_page_url(previous_page_url)
+            previous_content = self._extract_chapter_page(engine, previous_html, previous_page_url)
+            if "<" in previous_content or ">" in previous_content:
+                previous_content = self._content_text_preserving_images(previous_content)
+            previous_images = self._image_only_lines(previous_content, previous_page_url)
+        except Exception as exc:
+            logger.debug("Could not compare overlapping gallery chapters: %s", type(exc).__name__)
+            return content
+
+        previous_count = len(previous_images)
+        if not 0 < previous_count < len(images):
+            return content
+        if directories[previous_count - 1] == directories[previous_count]:
+            return content
+        if any(old[1] != current[1] for old, current in zip(previous_images, images)):
+            return content
+        return "\n".join(line for line, _ in images[previous_count:])
 
     @staticmethod
     def _content_is_chapter_chrome(content: str) -> bool:

@@ -366,6 +366,11 @@ async def test_admin_ai_route_saves_and_lists_saved_providers():
              "api_key": ""},
         ],
         "active_profile_id": "p2",
+        "embedding_profiles": [
+            {"id": "cloud", "provider": "siliconflow", "api_key": "fake-cloud-key"},
+            {"id": "local", "provider": "ollama", "model": "bge-m3"},
+        ],
+        "active_embedding_profile_id": "cloud",
     }
 
     resp = await call("PUT", "/api/admin/ai", db, json=payload)
@@ -375,13 +380,12 @@ async def test_admin_ai_route_saves_and_lists_saved_providers():
     assert "sk-deepseek" not in stored["ai_providers"]
     assert stored["ai_active_profile"] == "p2"
     assert json.loads(stored["ai_providers"])[1]["base_url"] == "http://192.168.1.5:11434/v1"
+    assert "fake-cloud-key" not in stored["ai_embedding_providers"]
+    assert stored["ai_active_embedding_profile"] == "cloud"
 
     # Reading it back lists both entries, marks the active one and never
     # echoes a key.
-    rows = [
-        SimpleNamespace(key="ai_providers", value=stored["ai_providers"]),
-        SimpleNamespace(key="ai_active_profile", value=stored["ai_active_profile"]),
-    ]
+    rows = [SimpleNamespace(key=key, value=value) for key, value in stored.items()]
     resp = await call("GET", "/api/admin/ai", fake_db(rows=rows))
 
     body = resp.json()
@@ -390,6 +394,9 @@ async def test_admin_ai_route_saves_and_lists_saved_providers():
     assert [profile["active"] for profile in body["profiles"]] == [False, True]
     assert body["provider"] == "ollama"
     assert body["effective_base_url"] == "http://192.168.1.5:11434/v1"
+    assert [profile["active"] for profile in body["embedding_profiles"]] == [True, False]
+    assert body["effective_embedding_model"] == "BAAI/bge-m3"
+    assert "fake-cloud-key" not in resp.text
     assert "sk-deepseek" not in resp.text
 
 

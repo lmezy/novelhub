@@ -103,7 +103,7 @@ async def index_book(
     force: bool = Query(False, description="Rebuild even if already indexed"),
     chapter_start: int | None = Query(None, ge=1),
     chapter_end: int | None = Query(None, ge=1),
-    max_chunks: int | None = Query(None, ge=1, le=20000),
+    max_chunks: int | None = Query(None, ge=0, description="0 or omitted indexes all chunks"),
     db: AsyncSession = Depends(get_db),
 ):
     """Index all chapters of a book for semantic search."""
@@ -147,19 +147,17 @@ async def delete_index(book_id: str, db: AsyncSession = Depends(get_db)):
 # ---------------------------------------------------------------------------
 # Background indexing: the reader's "打开即建" queue and the admin batch run.
 #
-# Both live behind the same runner (app.services.rag_jobs): one book at a time,
-# capped books per run and capped chunks per book, so neither the embedding bill
-# nor the Postgres JSONB table can grow without a human deciding to.
+# Both live behind the same runner (app.services.rag_jobs), one book at a time.
 # ---------------------------------------------------------------------------
 
 
 class RAGBatchRequest(BaseModel):
-    limit: int = Field(default=20, ge=1, le=rag_jobs.MAX_BATCH_BOOKS)
+    limit: int = Field(default=20, ge=0, description="0 selects all eligible books")
     max_chunks: int = Field(
-        default=rag_jobs.DEFAULT_BATCH_CHUNKS, ge=1, le=rag_jobs.MAX_CHUNKS_PER_BOOK
+        default=rag_jobs.DEFAULT_BATCH_CHUNKS, ge=0, description="0 indexes all chunks"
     )
     #: ``unindexed`` = newest novels that have no vectors yet; ``book_ids`` =
-    #: exactly the ids given (still capped by ``limit``).
+    #: exactly the ids given. A positive ``limit`` caps either selection.
     scope: str = Field(default="unindexed", description="unindexed | book_ids")
     book_ids: list[str] = Field(default_factory=list)
 
@@ -179,8 +177,10 @@ async def auto_index_book(book_id: str, user: User = Depends(get_current_user),
 
 
 @router.post("/batch", dependencies=[Depends(require_admin)])
-async def start_batch(payload: RAGBatchRequest, db: AsyncSession = Depends(get_db)):
-    """Queue up to ``MAX_BATCH_BOOKS`` books for background indexing."""
+async def start_batch(
+    payload: RAGBatchRequest, include_queue: bool = True, db: AsyncSession = Depends(get_db),
+):
+    """Queue eligible books for background indexing."""
     if library_jobs.read_state().get("running"):
         raise HTTPException(status_code=409, detail="书库画像正在构建，等它结束再建索引")
     candidates = select(Book.id, Book.title).where(
@@ -189,23 +189,21 @@ async def start_batch(payload: RAGBatchRequest, db: AsyncSession = Depends(get_d
     )
     titles: dict[str, str] = {}
     if payload.scope == "book_ids":
-        requested = list(dict.fromkeys(str(i) for i in payload.book_ids if i))[: payload.limit]
+        requested = list(dict.fromkeys(str(i) for i in payload.book_ids if i))
+        if payload.limit:
+            requested = requested[:payload.limit]
         if not requested:
             raise HTTPException(status_code=400, detail="没有提供书籍 ID")
-        rows = (
-            await db.execute(candidates.where(Book.id.in_(requested)))
-        ).all()
-        titles = {row[0]: row[1] for row in rows}
+        # Keep large explicit selections within the database's bind-parameter limit.
+        for offset in range(0, len(requested), 1000):
+            book_ids = requested[offset:offset + 1000]
+            rows = await db.execute(candidates.where(Book.id.in_(book_ids)))
+            titles.update(rows.all())
         ids = [book_id for book_id in requested if book_id in titles]
     else:
-        rows = (
-            await db.execute(
-                candidates
-                .where(~exists().where(ChapterEmbedding.book_id == Book.id))
-                .order_by(Book.updated_at.desc())
-                .limit(payload.limit)
-            )
-        ).all()
+        query = candidates.where(~exists().where(ChapterEmbedding.book_id == Book.id))
+        query = query.order_by(Book.updated_at.desc()).limit(payload.limit or None)
+        rows = (await db.execute(query)).all()
         titles = {row[0]: row[1] for row in rows}
         ids = list(titles)
 
@@ -215,7 +213,12 @@ async def start_batch(payload: RAGBatchRequest, db: AsyncSession = Depends(get_d
             "candidates": 0,
             "message": "没有符合条件的小说。请检查章节和现有索引。",
         }
-    result = rag_jobs.start_batch(ids, max_chunks=payload.max_chunks, titles=titles)
+    try:
+        result = rag_jobs.start_batch(
+            ids, max_chunks=payload.max_chunks, titles=titles, include_queue=include_queue,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     result["candidates"] = len(ids)
     return result
 
@@ -256,18 +259,21 @@ async def _index_stats(db: AsyncSession, cfg) -> dict[str, Any]:
 
 
 @router.get("/jobs/status", dependencies=[Depends(require_admin)])
-async def jobs_status(db: AsyncSession = Depends(get_db)):
+async def jobs_status(include_queue: bool = True, db: AsyncSession = Depends(get_db)):
     """Progress of the background queue plus what is already indexed."""
-    state = rag_jobs.status()
+    state = rag_jobs.status(include_queue=include_queue)
     cfg = await get_ai_config(db)
     state["stats"] = await _index_stats(db, cfg)
     return state
 
 
 @router.post("/jobs/cancel", dependencies=[Depends(require_admin)])
-async def cancel_jobs():
+async def cancel_jobs(include_queue: bool = True):
     """Stop after the book currently being indexed."""
-    return rag_jobs.cancel()
+    state = rag_jobs.cancel()
+    if not include_queue:
+        state.pop("queue", None)
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -281,8 +287,8 @@ async def cancel_jobs():
 
 class LibraryBuildRequest(BaseModel):
     limit: int = Field(
-        default=library_jobs.DEFAULT_BOOKS_PER_RUN, ge=1,
-        le=library_jobs.MAX_BOOKS_PER_RUN,
+        default=library_jobs.DEFAULT_BOOKS_PER_RUN, ge=0,
+        description="Maximum books to process, or 0 for all eligible books",
     )
     force: bool = Field(default=False, description="Rebuild books that already have a profile")
 
@@ -295,7 +301,7 @@ class LibrarySearchRequest(BaseModel):
 
 @router.post("/library/build", dependencies=[Depends(require_admin)])
 async def build_library_profiles(payload: LibraryBuildRequest):
-    """Queue a whole-library profile build (bounded by ``limit`` books)."""
+    """Queue a library profile build, optionally bounded by ``limit`` books."""
     try:
         return library_jobs.start(limit=payload.limit, force=payload.force)
     except ValueError as exc:

@@ -228,7 +228,7 @@ const prevChapter = computed(() =>
   currentIndex.value > 0 ? chapters.value[currentIndex.value - 1] : null,
 )
 const nextChapter = computed(() =>
-  currentIndex.value < chapters.value.length - 1 ? chapters.value[currentIndex.value + 1] : null,
+  currentIndex.value >= 0 ? chapters.value[currentIndex.value + 1] ?? null : null,
 )
 
 const readerFontStyle = computed(() => {
@@ -294,17 +294,14 @@ function decodeEntities(text: string): string {
  * Lift out validated images first. Convert and escape the remaining text
  * before inserting rendered image elements with their original URLs.
  */
-function renderChapterHtml(content: string, title: string | null, openImageLabel: string): string {
-  const images: string[] = []
+function renderChapterContent(content: string, title: string | null, openImageLabel: string, prioritizeFirst: boolean) {
+  const images: { src: string; alt: string; label: string }[] = []
   function captureImage(url: string, alt: string): string {
     const safe = safeImageUrl(decodeEntities(url))
     if (!safe) return ""
-    const label = alt ? openImageLabel + " · " + decodeEntities(alt) : openImageLabel
-    images.push(
-      '<button type="button" class="chapter-image-trigger" aria-label="' + escapeHtml(label) + '">' +
-      '<img src="' + escapeHtml(safe) + '" alt="' + escapeHtml(decodeEntities(alt)) + '" loading="lazy" decoding="async">' +
-      '</button>',
-    )
+    const decodedAlt = decodeEntities(alt)
+    const label = decodedAlt ? openImageLabel + " · " + decodedAlt : openImageLabel
+    images.push({ src: safe, alt: decodedAlt, label })
     return "\u0000img" + (images.length - 1) + "\u0000"
   }
   const source = String(content || "").replace(/\r\n?/g, "\n")
@@ -326,19 +323,36 @@ function renderChapterHtml(content: string, title: string | null, openImageLabel
       /!\[([^\]]*)\]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)/g,
       (_match, alt: string, url: string) => captureImage(url, alt),
     )
-  return text.split("\n").filter((paragraph) => paragraph.trim()).map((paragraph) => {
+  const orderedImages: typeof images = []
+  let containsText = false
+  const html = text.split("\n").filter((paragraph) => paragraph.trim()).map((paragraph, paragraphIndex) => {
     const parts = paragraph.replace(/^[\t \u00a0\u3000]+/, "").split(/\u0000img(\d+)\u0000/g)
     const hasText = parts.some((part, index) => index % 2 === 0 && part.trim())
-    const html = parts.map((part, index) => index % 2 === 0
-      ? escapeHtml(displayText(part))
-      : images[Number(part)] ?? "").join("")
-    return hasText ? `<p>${html}</p>` : `<p class="reader-illustration">${html}</p>`
+    containsText ||= hasText
+    const paragraphHtml = parts.map((part, index) => {
+      if (index % 2 === 0) return escapeHtml(displayText(part))
+      const image = images[Number(part)]
+      if (!image) return ""
+      const first = prioritizeFirst && paragraphIndex === 0 && !hasText && orderedImages.length === 0
+      orderedImages.push(image)
+      const loading = first ? 'loading="eager" fetchpriority="high"' : 'loading="lazy"'
+      return '<button type="button" class="chapter-image-trigger" aria-label="' + escapeHtml(image.label) + '">' +
+        '<img src="' + escapeHtml(image.src) + '" alt="' + escapeHtml(image.alt) + '" ' + loading + ' decoding="async">' +
+        '</button>'
+    }).join("")
+    return hasText ? `<p>${paragraphHtml}</p>` : `<p class="reader-illustration">${paragraphHtml}</p>`
   }).join("")
+  return { html, comicPages: containsText ? [] : orderedImages }
 }
 
-const chapterBodyHtml = computed(() =>
-  chapter.value ? renderChapterHtml(chapter.value.content, chapter.value.title, i18n.t('image_viewer_open')) : "",
+const chapterBody = computed(() =>
+  chapter.value ? renderChapterContent(
+    chapter.value.content, chapter.value.title, i18n.t('image_viewer_open'), showContentImages.value,
+  ) : null,
 )
+const chapterBodyHtml = computed(() => chapterBody.value?.html ?? "")
+const comicPages = computed(() => showContentImages.value ? chapterBody.value?.comicPages ?? [] : [])
+const pagedComic = computed(() => pageMode.value !== "scroll" && comicPages.value.length > 0)
 
 const pageProgress = computed(() => {
   if (pageCount.value <= 1) return 100
@@ -619,6 +633,7 @@ function onContentLoad() {
   applyRestoredPosition()
 }
 async function onMobileContentLoad() {
+  if (pagedComic.value) return // Comic pages have fixed dimensions before their images load.
   await refreshMobileLayout()
   if (pendingRestorePercent.value !== null) applyRestoredPosition()
 }
@@ -951,9 +966,6 @@ async function loadChapter(id: string) {
     contentTotalLength.value = loaded.total_length || contentTotalLength.value
     readLocation.value = { book_id: bookId.value, chapter_id: id }
     loading.value = false
-    // Warm the next chapter while the reader lays out the current one.
-    const next = chapters.value.find((item) => item.chapter_number > loaded.chapter_number)
-    if (next) void store.prefetchChapter(next.id)
     const hasPendingPage = pendingPage.value !== null
     if (isMobileLayout.value) await refreshMobileLayout()
     await nextTick()
@@ -1087,6 +1099,12 @@ watch(
   },
 )
 
+watch([nextChapter, loading], ([next, pending]) => {
+  if (next && !pending && chapter.value?.id === chapterId.value) {
+    void store.prefetchChapter(next.id, CHUNK_LIMIT)
+  }
+}, { flush: "post" })
+
 // "打开即建": ask the backend to queue this book for background RAG indexing.
 // The server owns every guard (setting off, comic, already indexed, daily cap),
 // and the reader must never wait for this -- so the answer is ignored and a
@@ -1098,39 +1116,34 @@ async function requestAutoRagIndex(id: string | null | undefined) {
   } catch { /* best effort; chat still works in window mode */ }
 }
 
-watch(
-  () => route.params.bookId,
-  async (newId) => {
-    if (!newId) return
-    try {
-      chapters.value = await store.fetchChapters(newId as string)
-    } catch { /* non-fatal */ }
-    // Same reasoning as onMounted: do not block the chapter on these.
-    void loadAlternates()
-    void loadBookmarks()
-    void requestAutoRagIndex(newId as string)
-    if (isMobileLayout.value) nextTick(refreshMobileLayout)
-  },
-)
+async function loadChapterList(id: string) {
+  chapters.value = []
+  try {
+    const loaded = await store.fetchChapters(id)
+    if (bookId.value === id) chapters.value = loaded
+  } catch { /* non-fatal */ }
+}
 
-onMounted(async () => {
+watch(bookId, (id) => {
+  if (!id) return
+  void loadChapterList(id)
+  void loadAlternates()
+  void loadBookmarks()
+  void requestAutoRagIndex(id)
+})
+
+onMounted(() => {
   window.addEventListener("scroll", onScroll, { passive: true })
   window.addEventListener("resize", onResize, { passive: true })
   mediaQuery = window.matchMedia("(max-width: 900px) and (pointer: coarse), (max-width: 700px)")
   mediaListener = () => updateMobileLayout()
   mediaQuery.addEventListener?.("change", mediaListener)
   updateMobileLayout()
-  try {
-    chapters.value = await store.fetchChapters(bookId.value)
-  } catch { /* non-fatal */ }
-  // The chapter body is what the reader is waiting for. The "read on another
-  // source" list and the bookmark list are secondary, so they must not sit in
-  // front of it: awaiting them here used to delay the first paint of a chapter
-  // by as long as /books/{id}/sources took.
+  void loadChapter(chapterId.value)
+  void loadChapterList(bookId.value)
   void loadAlternates()
   void loadBookmarks()
   void requestAutoRagIndex(bookId.value)
-  await loadChapter(chapterId.value)
   window.addEventListener("pagehide", flushPageProgressKeepalive)
 })
 
@@ -1180,8 +1193,16 @@ onUnmounted(() => {
           @load.capture="onMobileContentLoad"
         >
           <div ref="pageViewport" class="page-viewport">
-            <article ref="pageContent" class="page-columns" :style="readerFontStyle" :lang="readingLanguage">
-              <div class="page-inner">
+            <article ref="pageContent" class="page-columns" :class="{ 'page-columns--images': pagedComic }" :style="readerFontStyle" :lang="readingLanguage">
+              <template v-if="pagedComic">
+                <h1 class="sr-only">{{ chapterLabel(chapter) }}</h1>
+                <div v-for="(image, index) in comicPages" :key="index" class="comic-page" :inert="index !== currentPage">
+                  <button v-if="Math.abs(index - currentPage) <= 1" type="button" class="chapter-image-trigger" :aria-label="image.label">
+                    <img :src="image.src" :alt="image.alt" :fetchpriority="index === currentPage ? 'high' : 'low'" decoding="async" />
+                  </button>
+                </div>
+              </template>
+              <div v-else class="page-inner">
                 <h1 class="page-title">
                   {{ chapterLabel(chapter) }}
                 </h1>
@@ -1212,8 +1233,8 @@ onUnmounted(() => {
           @click="handleTap"
           @load.capture="onMobileScrollContentLoad"
         >
-          <article ref="mobileTextRef" class="scroll-page-content" :style="readerFontStyle" :lang="readingLanguage">
-            <h1 class="page-title">
+          <article ref="mobileTextRef" class="scroll-page-content" :class="{ 'scroll-single-image': comicPages.length === 1 && !contentHasMore }" :style="readerFontStyle" :lang="readingLanguage">
+            <h1 :class="comicPages.length === 1 && !contentHasMore ? 'sr-only' : 'page-title'">
               {{ chapterLabel(chapter) }}
             </h1>
             <div
@@ -1739,6 +1760,28 @@ onUnmounted(() => {
   max-height: max(70px, calc(100dvh - var(--quickbar-height) - 145px));
 }
 
+.page-columns--images {
+  display: flex;
+}
+
+.comic-page {
+  flex: 0 0 100%;
+  min-width: 0;
+  display: grid;
+  place-items: center;
+  padding: max(1rem, env(safe-area-inset-bottom)) 0.75rem;
+}
+
+.comic-page .chapter-image-trigger {
+  margin: 0;
+  cursor: zoom-in;
+}
+
+.page-columns--images .comic-page img {
+  max-height: calc(100vh - var(--quickbar-height) - 2rem);
+  max-height: calc(100dvh - var(--quickbar-height) - 2 * max(1rem, env(safe-area-inset-bottom)));
+}
+
 .page-columns :deep(p),
 .page-columns :deep(blockquote),
 .page-columns :deep(li) {
@@ -1840,6 +1883,16 @@ onUnmounted(() => {
   min-height: 100%;
   padding: 24px 22px max(52px, env(safe-area-inset-bottom));
   line-height: var(--reader-line-height);
+}
+
+.scroll-single-image {
+  display: grid;
+  align-items: center;
+  padding-block: max(1rem, env(safe-area-inset-bottom));
+}
+
+.scroll-single-image :deep(.reader-illustration) {
+  margin: 0;
 }
 
 .scroll-page-meta {

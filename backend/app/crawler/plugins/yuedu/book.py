@@ -531,6 +531,7 @@ class BookMixin:
                     if index + 1 < len(chapters)
                     else None
                 ),
+                previous_url=chapters[index - 1].url if index > 0 else None,
             )
             for index, chapter in enumerate(chapters)
         ]

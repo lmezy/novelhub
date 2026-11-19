@@ -7,6 +7,7 @@ import { useI18nStore } from "./i18n"
 // AI provider settings + RAG index maintenance
 // ---------------------------------------------------------------------------
 const EMBEDDING_HINT_RE = /embed|bge|gte|m3|rerank/i
+const DEFAULT_LIBRARY_LIMIT = 2000
 
 // ---------------------------------------------------------------------------
 // Model providers
@@ -41,6 +42,10 @@ function newProfileId(): string {
   return random ? `p_${random}` : `p_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
 }
 
+function normalizeIndexLimit(value: number | "", fallback: number): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : fallback
+}
+
 export const useAdminAIStore = defineStore("adminAI", () => {
   const i18n = useI18nStore()
 
@@ -52,7 +57,6 @@ export const useAdminAIStore = defineStore("adminAI", () => {
   const aiSaved = ref(false)
   const aiTesting = ref(false)
   const aiTestResult = ref<any>(null)
-  const aiEmbeddingKeyInput = ref("")
   const aiModels = ref<string[]>([])
   const aiModelsLoading = ref(false)
   const aiModelsError = ref("")
@@ -67,6 +71,11 @@ export const useAdminAIStore = defineStore("adminAI", () => {
       aiProfiles.value.find((profile) => profile.id === aiActiveProfileId.value) ||
       aiProfiles.value[0] ||
       null,
+  )
+  const embeddingProfiles = ref<AIProviderDraft[]>([])
+  const selectedEmbeddingId = ref("")
+  const selectedEmbeddingProfile = computed(() =>
+    embeddingProfiles.value.find((profile) => profile.id === selectedEmbeddingId.value),
   )
 
   const chatModelOptions = computed(() =>
@@ -84,12 +93,15 @@ export const useAdminAIStore = defineStore("adminAI", () => {
   const aiIndexedBooks = ref<any[]>([])
   const aiIndexedLoading = ref(false)
 
-  // Background RAG queue: the reader's "打开即建" progress and the capped
-  // admin batch run.  Both are one server-side runner, so the UI only polls.
+  // The reader's "打开即建" and admin batch share one server-side runner.
   const ragJobStatus = ref<any>(null)
   const ragJobError = ref("")
-  const ragBatchLimit = ref(20)
-  const ragBatchChunks = ref(400)
+  const ragBatchLimit = ref<number | "">(20)
+  const ragBatchChunks = ref<number | "">(400)
+  const ragBatchOptions = computed(() => ({
+    limit: normalizeIndexLimit(ragBatchLimit.value, 20),
+    max_chunks: normalizeIndexLimit(ragBatchChunks.value, 400),
+  }))
   const ragBatchBusy = ref(false)
   const ragBatchError = ref("")
   const ragBatchResult = ref<any>(null)
@@ -99,13 +111,14 @@ export const useAdminAIStore = defineStore("adminAI", () => {
   const libraryStatus = ref<any>(null)
   const libraryError = ref("")
   const libraryBusy = ref(false)
-  const libraryLimit = ref(2000)
+  const libraryLimit = ref<number | "">(DEFAULT_LIBRARY_LIMIT)
+  const libraryBuildLimit = computed(() => normalizeIndexLimit(libraryLimit.value, DEFAULT_LIBRARY_LIMIT))
 
   function profileDraftFrom(value: any): AIProviderDraft {
     return {
       id: String(value?.id || newProfileId()),
       name: String(value?.name || ""),
-      provider: String(value?.provider || "openai"),
+      provider: String(value?.provider ?? "openai"),
       base_url: String(value?.base_url || ""),
       model: String(value?.model || ""),
       provider_label: value?.provider_label,
@@ -139,9 +152,6 @@ export const useAdminAIStore = defineStore("adminAI", () => {
       rag_enabled: res.rag_enabled,
       rag_top_k: res.rag_top_k,
       rag_auto_index: res.rag_auto_index === true,
-      embedding_provider: res.embedding_provider || "",
-      embedding_base_url: res.embedding_base_url || "",
-      embedding_model: res.embedding_model || "",
       auto_diagnose: res.auto_diagnose !== false,
     }
   }
@@ -180,7 +190,7 @@ export const useAdminAIStore = defineStore("adminAI", () => {
         ]
         aiActiveProfileId.value = aiProfiles.value[0].id
       }
-      aiEmbeddingKeyInput.value = ""
+      loadEmbeddingProfiles(res)
     } catch (e) {
       aiError.value = e instanceof Error ? e.message : i18n.t('admin_failed')
     } finally {
@@ -249,8 +259,57 @@ export const useAdminAIStore = defineStore("adminAI", () => {
     profile.model = preset.model || ""
   }
 
-  function profilePayload() {
-    return aiProfiles.value.map((profile) => {
+  function loadEmbeddingProfiles(res: any) {
+    const profiles = Array.isArray(res.embedding_profiles) ? res.embedding_profiles : []
+    embeddingProfiles.value = profiles.map(profileDraftFrom)
+    selectedEmbeddingId.value = res.active_embedding_profile_id || embeddingProfiles.value[0]?.id || ""
+  }
+
+  function addEmbeddingProfile(sourceId?: string) {
+    const source = embeddingProfiles.value.find((profile) => profile.id === sourceId)
+    const profile = profileDraftFrom(source ? {
+      name: source.name ? `${source.name} (${i18n.t('admin_ai_profile_duplicate')})` : "",
+      provider: source.provider,
+      provider_label: source.provider_label,
+      base_url: source.base_url,
+      model: source.model,
+    } : { provider: "" })
+    profile.draft = true
+    embeddingProfiles.value.push(profile)
+    selectedEmbeddingId.value = profile.id
+  }
+
+  function removeEmbeddingProfile(id: string) {
+    const profile = embeddingProfiles.value.find((entry) => entry.id === id)
+    if (!profile) return
+    const name = profile.name || profile.provider_label || profile.provider || i18n.t('admin_ai_embedding_same')
+    if (!window.confirm(i18n.t('admin_ai_profile_delete_confirm', { name }))) return
+    embeddingProfiles.value = embeddingProfiles.value.filter((entry) => entry.id !== id)
+    if (selectedEmbeddingId.value === id) selectedEmbeddingId.value = embeddingProfiles.value[0]?.id || ""
+  }
+
+  function clearEmbeddingKey() {
+    const profile = selectedEmbeddingProfile.value
+    if (!profile) return
+    profile.api_key_input = ""
+    profile.api_key_clear = true
+    profile.api_key_set = false
+    profile.api_key_hint = ""
+  }
+
+  function applyEmbeddingPreset(name: string) {
+    const profile = selectedEmbeddingProfile.value
+    if (!profile || profile.provider === name) return
+    const preset = (aiConfig.value?.providers || []).find((item: any) => item.value === name)
+    profile.provider = name
+    profile.provider_label = preset?.label
+    profile.base_url = preset?.base_url || ""
+    profile.model = preset?.embedding_model || ""
+    clearEmbeddingKey()
+  }
+
+  function profilePayload(profiles: AIProviderDraft[]) {
+    return profiles.map((profile) => {
       const entry: Record<string, any> = {
         id: profile.id,
         name: profile.name,
@@ -281,11 +340,10 @@ export const useAdminAIStore = defineStore("adminAI", () => {
         if (typeof value === "number" && !Number.isFinite(value)) continue
         body[key] = value
       }
-      body.profiles = profilePayload()
+      body.profiles = profilePayload(aiProfiles.value)
       body.active_profile_id = aiActiveProfileId.value || aiProfiles.value[0]?.id || ""
-      // Every provider key is in the list above; the single-provider field is
-      // only what a profile inherits when it has no key of its own.
-      if (aiEmbeddingKeyInput.value) body.embedding_api_key = aiEmbeddingKeyInput.value
+      body.embedding_profiles = profilePayload(embeddingProfiles.value)
+      body.active_embedding_profile_id = selectedEmbeddingId.value
       const res = await api.put<any>("/admin/ai", body)
       aiConfig.value = { ...aiConfig.value, ...res }
       // Show what the server actually stored, not what was typed: a dropped
@@ -299,7 +357,7 @@ export const useAdminAIStore = defineStore("adminAI", () => {
           saved.find((profile: any) => profile.active || profile.id === res.active_profile_id)?.id ||
           aiProfiles.value[0].id
       }
-      aiEmbeddingKeyInput.value = ""
+      loadEmbeddingProfiles(res)
       aiSaved.value = true
       window.setTimeout(() => (aiSaved.value = false), 2000)
     } catch (e) {
@@ -355,12 +413,8 @@ export const useAdminAIStore = defineStore("adminAI", () => {
   }
 
   function applyModel(target: "model" | "embedding_model", value: string) {
-    const profile = aiActiveProfile.value
-    if (target === "model" && profile) {
-      profile.model = value
-      return
-    }
-    aiForm.value[target] = value
+    const profile = target === "model" ? aiActiveProfile.value : selectedEmbeddingProfile.value
+    if (profile) profile.model = value
   }
 
   async function loadIndexedBooks() {
@@ -404,7 +458,7 @@ export const useAdminAIStore = defineStore("adminAI", () => {
 
   async function loadRagJobStatus() {
     try {
-      ragJobStatus.value = await api.get<any>("/rag/jobs/status")
+      ragJobStatus.value = await api.get<any>("/rag/jobs/status?include_queue=false")
       ragJobError.value = ""
     } catch (e) {
       ragJobError.value = e instanceof Error ? e.message : i18n.t('admin_ai_rag_jobs_failed')
@@ -416,15 +470,11 @@ export const useAdminAIStore = defineStore("adminAI", () => {
     ragBatchError.value = ""
     ragBatchResult.value = null
     try {
-      // The server enforces the same ceilings; clamping here keeps the box from
-      // showing a value that was silently reduced.
-      const limit = Math.max(1, Math.min(1000, Number(ragBatchLimit.value) || 20))
-      const maxChunks = Math.max(1, Math.min(2000, Number(ragBatchChunks.value) || 400))
-      ragBatchLimit.value = limit
-      ragBatchChunks.value = maxChunks
-      ragBatchResult.value = await api.post<any>("/rag/batch", {
-        limit,
-        max_chunks: maxChunks,
+      const options = ragBatchOptions.value
+      ragBatchLimit.value = options.limit
+      ragBatchChunks.value = options.max_chunks
+      ragBatchResult.value = await api.post<any>("/rag/batch?include_queue=false", {
+        ...options,
         scope: "unindexed",
       })
       await loadRagJobStatus()
@@ -438,7 +488,7 @@ export const useAdminAIStore = defineStore("adminAI", () => {
   async function cancelRagBatch() {
     ragBatchError.value = ""
     try {
-      await api.post("/rag/jobs/cancel")
+      await api.post("/rag/jobs/cancel?include_queue=false")
       await loadRagJobStatus()
     } catch (e) {
       ragBatchError.value = e instanceof Error ? e.message : i18n.t('admin_ai_rag_batch_failed')
@@ -455,10 +505,11 @@ export const useAdminAIStore = defineStore("adminAI", () => {
   }
 
   async function startLibraryBuild() {
+    if (libraryBusy.value || libraryStatus.value?.running) return
     libraryBusy.value = true
     libraryError.value = ""
     try {
-      const limit = Math.max(1, Math.min(50000, Number(libraryLimit.value) || 2000))
+      const limit = libraryBuildLimit.value
       libraryLimit.value = limit
       await api.post("/rag/library/build", { limit, force: false })
       await loadLibraryStatus()
@@ -488,7 +539,13 @@ export const useAdminAIStore = defineStore("adminAI", () => {
     aiSaved,
     aiTesting,
     aiTestResult,
-    aiEmbeddingKeyInput,
+    embeddingProfiles,
+    selectedEmbeddingId,
+    selectedEmbeddingProfile,
+    addEmbeddingProfile,
+    removeEmbeddingProfile,
+    clearEmbeddingKey,
+    applyEmbeddingPreset,
     aiModels,
     aiModelsLoading,
     aiModelsError,
@@ -522,6 +579,7 @@ export const useAdminAIStore = defineStore("adminAI", () => {
     ragJobError,
     ragBatchLimit,
     ragBatchChunks,
+    ragBatchOptions,
     ragBatchBusy,
     ragBatchError,
     ragBatchResult,
@@ -532,6 +590,7 @@ export const useAdminAIStore = defineStore("adminAI", () => {
     libraryError,
     libraryBusy,
     libraryLimit,
+    libraryBuildLimit,
     loadLibraryStatus,
     startLibraryBuild,
     cancelLibraryBuild,

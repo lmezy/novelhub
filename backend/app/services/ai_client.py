@@ -182,8 +182,8 @@ def parse_model_ids(data: Any) -> list[str]:
     return sorted({i for i in ids if i})
 
 
-def _headers(cfg: AIConfig, *, api_key: str = "") -> dict[str, str]:
-    key = api_key or cfg.api_key
+def _headers(cfg: AIConfig) -> dict[str, str]:
+    key = cfg.api_key
     if cfg.kind == "anthropic":
         headers = {
             "Content-Type": "application/json",
@@ -588,7 +588,9 @@ class LLMClient:
             )
 
         url = _embeddings_endpoint(self.cfg.effective_embedding_base_url)
-        headers = _headers(self.cfg, api_key=self.cfg.effective_embedding_api_key)
+        headers = {"Content-Type": "application/json"}
+        if key := self.cfg.effective_embedding_api_key:
+            headers["Authorization"] = f"Bearer {key}"
         vectors: list[list[float]] = []
 
         for start in range(0, len(texts), batch_size):

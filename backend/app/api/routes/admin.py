@@ -340,6 +340,8 @@ class AIConfigUpdate(BaseModel):
     auto_diagnose: bool | None = None
     #: Saved provider list (replaces the whole list) and which entry is in use.
     profiles: list[AIProviderProfileUpdate] | None = None
+    embedding_profiles: list[AIProviderProfileUpdate] | None = None
+    active_embedding_profile_id: str | None = None
 
     @field_validator(
         "temperature", "max_tokens", "timeout", "context_chars", "rag_top_k",

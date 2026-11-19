@@ -1,11 +1,8 @@
-"""RAG background jobs: limits, eligibility rules and the queue runner.
-
-The point of these tests is the guard rails: a batch is capped, the reader's
-auto queue is capped per day, comics and already-indexed books are refused, and
-a run stops instead of hammering a broken embedding endpoint.
-"""
+"""Manual RAG batches, reader-triggered limits, and the queue runner."""
 
 import asyncio
+import os
+import time
 from datetime import date
 from types import SimpleNamespace
 
@@ -52,13 +49,13 @@ class FakeDB:
 
 
 def test_append_skips_books_already_queued_or_running():
-    rag_jobs._write({
+    state = {
         **rag_jobs.empty_state(),
         "queue": [{"book_id": "b1", "title": "一", "source": "batch", "max_chunks": 10}],
         "current": {"book_id": "b2", "title": "二"},
-    })
+    }
 
-    added = rag_jobs._append([
+    added = rag_jobs._append(state, [
         {"book_id": "b1"},
         {"book_id": "b2"},
         {"book_id": "b3", "title": "三"},
@@ -66,43 +63,118 @@ def test_append_skips_books_already_queued_or_running():
     ])
 
     assert added == 1
-    state = rag_jobs.read_state()
     assert [entry["book_id"] for entry in state["queue"]] == ["b1", "b3"]
 
 
-def test_batch_refuses_more_than_the_hard_cap():
-    with pytest.raises(ValueError):
-        rag_jobs.start_batch([f"b{i}" for i in range(rag_jobs.MAX_BATCH_BOOKS + 1)])
-
-
-def test_batch_ceiling_allows_a_thousand_books():
-    """「本次最多几本」 has to be big enough to be worth a run on a large library.
-
-    The ceiling went 200 -> 1000 after the admin panel needed dozens of rounds
-    for a 24k-book library; this test pins the decision so a future cleanup does
-    not quietly shrink it back.
-    """
-    assert rag_jobs.MAX_BATCH_BOOKS >= 1000
-
-    rag_jobs.start_batch([f"b{i}" for i in range(1000)], max_chunks=100)
-
-    assert len(rag_jobs.read_state()["queue"]) == 1000
-
-
-def test_batch_caps_chunks_per_book():
-    rag_jobs.start_batch(["b1"], max_chunks=10_000)
-
-    state = rag_jobs.read_state()
-    assert state["queue"][0]["max_chunks"] == rag_jobs.MAX_CHUNKS_PER_BOOK
+@pytest.mark.parametrize("max_chunks", [0, 10_000])
+def test_batch_preserves_limits_above_old_cap(max_chunks, monkeypatch):
+    monkeypatch.setattr(rag_jobs, "ensure_worker", lambda: False)
+    result = rag_jobs.start_batch(
+        [f"b{i}" for i in range(1001)], max_chunks=max_chunks, include_queue=False,
+    )
+    assert result["queued"] == 1001
+    assert result["max_chunks"] == max_chunks
+    assert result["state"]["queued"] == 1001
+    assert "queue" not in result["state"]
+    assert rag_jobs.status()["queue"][-1]["max_chunks"] == max_chunks
 
 
 def test_status_exposes_the_limits_for_the_ui():
     limits = rag_jobs.status()["limits"]
 
-    assert limits["max_batch_books"] == rag_jobs.MAX_BATCH_BOOKS
-    assert limits["max_chunks_per_book"] == rag_jobs.MAX_CHUNKS_PER_BOOK
+    assert limits["default_batch_chunks"] == rag_jobs.DEFAULT_BATCH_CHUNKS
     assert limits["auto_daily_limit"] == rag_jobs.AUTO_DAILY_LIMIT
     assert limits["chunk_bytes_estimate"] > 0
+
+
+def test_long_running_job_keeps_its_worker_lock(monkeypatch):
+    lock_path = rag_jobs._lock_path()
+    assert rag_jobs.acquire_file_lock(lock_path)
+    stale_at = time.time() - rag_jobs.LOCK_STALE_SECONDS - 1
+    os.utime(lock_path, (stale_at, stale_at))
+    monkeypatch.setattr(rag_jobs, "_lock_predates_process", lambda path, pid: False)
+
+    assert not rag_jobs.acquire_file_lock(lock_path)
+
+
+@pytest.mark.parametrize("phase", ["done", "failed", "cancelled", "indexing"])
+def test_next_batch_resets_previous_run_and_preserves_auto_count(phase, monkeypatch):
+    monkeypatch.setattr(rag_jobs, "ensure_worker", lambda: False)
+    rag_jobs._write({
+        **rag_jobs.empty_state(),
+        "phase": phase,
+        "running": phase == "indexing",
+        "started_at": "2026-10-01T07:00:00",
+        "total": 3000,
+        "done": 10,
+        "failed": 3,
+        "chunks": 2000,
+        "recent_errors": [{"error": "previous failure"}],
+        "error": "previous batch stopped",
+        "queue": [{"book_id": "old-pending"}],
+        "auto_date": "2026-10-01",
+        "auto_count": 4,
+    })
+
+    old = rag_jobs.status()
+    assert old["phase"] == ("interrupted" if phase == "indexing" else phase)
+    assert old["queued"] == 0
+    assert old["discarded"] == 1
+    assert old["total"] == 13
+
+    state = rag_jobs.start_batch(["new"])["state"]
+
+    assert [item["book_id"] for item in state["queue"]] == ["new"]
+    assert state["total"] == 1
+    assert state["started_at"] is None
+    assert state["done"] == state["failed"] == state["chunks"] == state["discarded"] == 0
+    assert state["recent_errors"] == []
+    assert state["error"] is None
+    assert state["auto_date"] == "2026-10-01"
+    assert state["auto_count"] == 4
+
+
+def test_live_batch_reconciles_inherited_total_with_actual_queue(monkeypatch):
+    assert rag_jobs.acquire_file_lock(rag_jobs._lock_path())
+    rag_jobs._write({
+        **rag_jobs.empty_state(),
+        "running": True,
+        "phase": "indexing",
+        "total": 15,
+        "done": 3,
+        "failed": 2,
+        "skipped": 1,
+        "current": {"book_id": "current"},
+        "queue": [{"book_id": "old-pending"}],
+    })
+
+    status = rag_jobs.status()
+    assert status["phase"] == "indexing"
+    assert status["total"] == 8
+    assert status["discarded"] == 0
+
+    monkeypatch.setattr(rag_jobs, "ensure_worker", lambda: False)
+    state = rag_jobs.start_batch(["new-pending"])["state"]
+    assert state["total"] == 9
+    assert state["queued"] == 2
+
+
+def test_reused_worker_pid_is_marked_interrupted(monkeypatch):
+    assert rag_jobs.acquire_file_lock(rag_jobs._lock_path())
+    rag_jobs._write({
+        **rag_jobs.empty_state(),
+        "running": True,
+        "phase": "indexing",
+        "total": 1,
+        "current": {"book_id": "in-progress"},
+    })
+    monkeypatch.setattr(rag_jobs, "_lock_predates_process", lambda path, pid: True)
+
+    state = rag_jobs.status()
+    assert state["phase"] == "interrupted"
+    assert state["running"] is False
+    assert state["total"] == 0
+    assert state["discarded"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +356,9 @@ async def test_runner_stops_after_repeated_failures(monkeypatch):
     state = rag_jobs.read_state()
     assert state["phase"] == "failed"
     assert state["failed"] == rag_jobs.MAX_CONSECUTIVE_FAILURES
+    assert state["total"] == state["failed"]
+    assert state["discarded"] == 5 - state["failed"]
+    assert state["queue"] == []
     assert "429" in state["error"]
     # The remaining books stay unsent; they are not retried in a tight loop.
     assert state["done"] == 0
@@ -312,6 +387,8 @@ async def test_cancel_stops_between_books(monkeypatch):
     state = rag_jobs.read_state()
     assert state["phase"] == "cancelled"
     assert state["done"] == 0
+    assert state["total"] == 0
+    assert state["discarded"] == 2
 
 
 def _await(value):

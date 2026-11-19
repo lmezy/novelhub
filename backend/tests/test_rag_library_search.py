@@ -31,8 +31,8 @@ from app.core.database import get_db
 from app.main import app
 from app.models import Book, BookTag, Chapter, ChapterEmbedding, Tag
 from app.models.base import Base
-from app.services import book_profiles
-from app.services.auth import get_current_user
+from app.services import book_profiles, rag_jobs
+from app.services.auth import get_current_user, require_admin
 from app.services.rag import RAGService
 
 
@@ -194,6 +194,44 @@ async def test_list_indexed_books_titles_come_from_a_column_query(session_factor
     assert entries[0]["title"] == "带标签的书"
     assert entries[0]["chunks"] == 2
     assert entries[0]["chapters"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["unindexed", "book_ids"])
+async def test_batch_accepts_zero_limits_via_admin_endpoint(scope, session_factory, monkeypatch, tmp_path):
+    await _seed_books(
+        session_factory,
+        Book(id="first", title="第一本", kind="novel"),
+        Book(id="second", title="第二本", kind="novel"),
+        Book(id="comic", title="漫画", kind="comic"),
+        Chapter(id="c1", book_id="first", chapter_number=1, content_path="/first"),
+        Chapter(id="c2", book_id="second", chapter_number=1, content_path="/second"),
+        Chapter(id="c3", book_id="comic", chapter_number=1, content_path="/comic"),
+    )
+
+    async def override_db():
+        async with session_factory() as session:
+            yield session
+
+    monkeypatch.setattr(rag_jobs.settings, "STORAGE_PATH", str(tmp_path))
+    monkeypatch.setattr(rag_jobs, "ensure_worker", lambda: False)
+    monkeypatch.setitem(app.dependency_overrides, get_db, override_db)
+    monkeypatch.setitem(app.dependency_overrides, require_admin, lambda: None)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/api/rag/batch?include_queue=false",
+            json={"limit": 0, "max_chunks": 0, "scope": scope, "book_ids": ["second", "first", "comic"]},
+        )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["queued"] == payload["candidates"] == 2
+    assert "queue" not in payload["state"]
+    queue = rag_jobs.read_state()["queue"]
+    assert {item["book_id"] for item in queue} == {"first", "second"}
+    assert all(item["max_chunks"] == 0 for item in queue)
+    if scope == "book_ids":
+        assert [item["book_id"] for item in queue] == ["second", "first"]
 
 
 @pytest.mark.asyncio

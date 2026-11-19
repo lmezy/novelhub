@@ -7,8 +7,8 @@ texts), a row per segment.  The whole library is ~185 000 rows (~1.3 GB).
 Like the RAG queue this runs in the background behind a lock file (the state
 endpoint may be served by the other uvicorn worker), is cancellable between
 batches, and stops after :data:`MAX_CONSECUTIVE_FAILURES` failed batches.  A
-single run is capped at :data:`MAX_BOOKS_PER_RUN` books so a mistake costs
-minutes, not a day.
+single run processes up to the requested number of books, or all candidates
+when the administrator selects 0.
 """
 
 from __future__ import annotations
@@ -30,9 +30,6 @@ STATE_FILE = ".library-jobs.json"
 LOCK_FILE = ".library-jobs.lock"
 
 DEFAULT_BOOKS_PER_RUN = 2000
-#: The whole library is ~46k books (about 11.6k embedding requests, 1-2 hours).
-#: The cap is a guard against a typo, not a recommendation to run it all at once.
-MAX_BOOKS_PER_RUN = 50000
 #: Books per embedding request: four segments each fills one 16-text batch.
 BOOKS_PER_REQUEST = 4
 MAX_CONSECUTIVE_FAILURES = 3
@@ -104,7 +101,7 @@ def _write(state: Mapping[str, Any]) -> dict[str, Any]:
 def status() -> dict[str, Any]:
     state = read_state()
     state["limits"] = {
-        "max_books_per_run": MAX_BOOKS_PER_RUN,
+        "max_books_per_run": None,
         "default_books_per_run": DEFAULT_BOOKS_PER_RUN,
         "books_per_request": BOOKS_PER_REQUEST,
     }
@@ -129,10 +126,9 @@ def start(*, limit: int = DEFAULT_BOOKS_PER_RUN, force: bool = False) -> dict[st
 
     if read_state().get("running"):
         return status()
-    if rag_jobs.read_state().get("running"):
+    if rag_jobs.status(include_queue=False).get("running"):
         # Both jobs hammer the embedding API and the same disk; keep them serial.
         raise ValueError("批量建索引正在运行，等它结束再开始书库画像")
-    limit = max(1, min(int(limit or DEFAULT_BOOKS_PER_RUN), MAX_BOOKS_PER_RUN))
     _write({
         **empty_state(),
         "running": True,
@@ -202,7 +198,7 @@ async def _run() -> None:
                     await db.scalars(
                         candidate_query(
                             force=bool(state.get("force")),
-                            limit=int(state.get("limit") or DEFAULT_BOOKS_PER_RUN),
+                            limit=int(state["limit"]),
                         ).options(selectinload(Book.tags), selectinload(Book.categories))
                     )
                 ).unique().all()

@@ -42,11 +42,16 @@ class _UniqueAwareScalarResult:
 
 
 @pytest.mark.asyncio
-async def test_list_book_sources_calls_unique_before_all():
+@pytest.mark.parametrize("current_kind, alternate_kind, unrelated_kind", [
+    ("novel", None, "comic"),
+    ("comic", "comic", "novel"),
+])
+async def test_list_book_sources_calls_unique_before_all(current_kind, alternate_kind, unrelated_kind):
     db = AsyncMock()
     current = SimpleNamespace(
         id="current",
         title="剑来",
+        kind=current_kind,
         is_r18=False,
         owner_id=None,
         is_public=False,
@@ -59,6 +64,7 @@ async def test_list_book_sources_calls_unique_before_all():
     other = SimpleNamespace(
         id="other",
         title="剑来",
+        kind=alternate_kind,
         is_r18=False,
         owner_id=None,
         is_public=False,
@@ -68,8 +74,9 @@ async def test_list_book_sources_calls_unique_before_all():
         status=None,
         updated_at=None,
     )
+    unrelated = SimpleNamespace(**{**vars(other), "id": "unrelated", "kind": unrelated_kind})
     db.get.return_value = current
-    db.scalars.return_value = _UniqueAwareScalarResult([other])
+    db.scalars.return_value = _UniqueAwareScalarResult([other, unrelated])
     db.execute.return_value = MagicMock()
     db.execute.return_value.all.return_value = []
 

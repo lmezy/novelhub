@@ -957,7 +957,7 @@ async def test_stream_transform_emits_start_deltas_and_done():
 # ---------------------------------------------------------------------------
 
 
-def test_chunk_text_overlaps_and_respects_the_cap():
+def test_chunk_text_splits_with_overlap():
     service = RAGService(FakeDB(), config=configured_config())
     text = "字" * 3000
 
@@ -966,6 +966,30 @@ def test_chunk_text_overlaps_and_respects_the_cap():
     assert len(chunks) > 1
     assert all(chunk for chunk in chunks)
     assert len(service.chunk_text("   ")) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("max_chunks", "expected", "truncated"), [
+    (None, 2003, False),
+    (0, 2003, False),
+    (2003, 2003, False),
+    (2001, 2001, True),
+])
+async def test_rag_indexes_beyond_old_chunk_limit(max_chunks, expected, truncated):
+    chapters = make_chapters(1)
+    db = FakeDB(book=SimpleNamespace(kind="novel", title="故事"), chapters=chapters)
+    service = RAGService(db, config=configured_config())
+    step = (service.CHUNK_SIZE - service.CHUNK_OVERLAP) * 2
+    service.storage = FakeStorage({"p1": "字" * (step * 2002 + 1)})
+    embed = AsyncMock(side_effect=lambda texts, **kwargs: [[1.0, 0.0] for _ in texts])
+    service._client = AsyncMock(return_value=SimpleNamespace(embed=embed))
+
+    result = await service.index_book("b1", max_chunks=max_chunks, force=True)
+
+    assert result["chunks"] == len(db.added) == expected
+    assert result["truncated"] is truncated
+    assert db.added[-1].chunk_index == expected - 1
+    assert all(len(call.args[0]) <= service.EMBED_BATCH_SIZE for call in embed.await_args_list)
 
 
 def test_rank_orders_by_cosine_similarity():

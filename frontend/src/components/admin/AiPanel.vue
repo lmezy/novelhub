@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from "vue"
 import { useI18nStore } from "../../stores/i18n"
 import { useAdminAIStore } from "../../stores/adminAI"
+import AiProviderList from "./AiProviderList.vue"
 
 const i18n = useI18nStore()
 const aiStore = useAdminAIStore()
@@ -19,6 +20,7 @@ const job = computed(() => aiStore.ragJobStatus)
 const jobRunning = computed(() => !!job.value?.running)
 const jobCancelling = computed(() => !!job.value?.cancel_requested)
 const jobTotal = computed(() => Number(job.value?.total || 0))
+const jobShowsProgress = computed(() => jobRunning.value || job.value?.phase === "done")
 const jobProcessed = computed(
   () =>
     Number(job.value?.done || 0) +
@@ -34,25 +36,25 @@ const jobPhaseLabel = computed(() => {
   if (phase === "done") return i18n.t("admin_ai_rag_job_done")
   if (phase === "cancelled") return i18n.t("admin_ai_rag_job_cancelled")
   if (phase === "failed") return i18n.t("admin_ai_rag_job_failed")
+  if (phase === "interrupted") return i18n.t("admin_ai_rag_job_interrupted")
   if (jobRunning.value) return i18n.t("admin_ai_rag_job_running")
   return i18n.t("admin_ai_rag_job_idle")
 })
 const jobCurrent = computed(() => String(job.value?.current?.title || ""))
 const jobLastError = computed(() => {
+  if (job.value?.error) return String(job.value.error)
   const errors = Array.isArray(job.value?.recent_errors) ? job.value.recent_errors : []
   if (!errors.length) return ""
   return String(errors[errors.length - 1]?.error || "")
 })
-const estimateMb = computed(() => {
-  const books = Math.max(1, Number(aiStore.ragBatchLimit) || 20)
-  const chunks = Math.max(1, Number(aiStore.ragBatchChunks) || 400)
+const batchEstimate = computed(() => {
+  const { limit: books, max_chunks: chunks } = aiStore.ragBatchOptions
+  if (!books || !chunks) return null
   const perChunk = Number(job.value?.limits?.chunk_bytes_estimate) || 20480
-  return Math.max(1, Math.round((books * chunks * perChunk) / (1024 * 1024)))
-})
-const estimateCalls = computed(() => {
-  const books = Math.max(1, Number(aiStore.ragBatchLimit) || 20)
-  const chunks = Math.max(1, Number(aiStore.ragBatchChunks) || 400)
-  return Math.ceil((books * chunks) / 16)
+  return {
+    size: Math.max(1, Math.round((books * chunks * perChunk) / (1024 * 1024))),
+    calls: books * Math.ceil(chunks / 16),
+  }
 })
 const indexedStats = computed(() => {
   const stats = job.value?.stats || {}
@@ -95,15 +97,13 @@ const libraryStats = computed(() => {
     mb: Math.round(Number(stats.db_bytes || 0) / (1024 * 1024)),
   }
 })
-// One embedding request carries four books (4 segments each = 16 texts).
-const libraryRequests = computed(() => {
-  const books = Math.max(1, Number(aiStore.libraryLimit) || 2000)
-  return Math.ceil(books / 4)
-})
-const libraryMb = computed(() => {
-  const books = Math.max(1, Number(aiStore.libraryLimit) || 2000)
-  // 4 segments × (4 KB vector + ~3 KB excerpt)
-  return Math.max(1, Math.round((books * 4 * 7 * 1024) / (1024 * 1024)))
+const libraryEstimate = computed(() => {
+  const books = aiStore.libraryBuildLimit
+  if (!books) return null
+  return {
+    calls: Math.ceil(books / 4), // four books of four segments per request
+    size: Math.max(1, Math.round((books * 4 * 7) / 1024)), // 7 KB per segment
+  }
 })
 
 let pollTimer: number | undefined
@@ -145,62 +145,17 @@ onUnmounted(() => {
         </button>
       </div>
 
-      <!-- saved model providers -->
-      <div class="mb-4 p-3 rounded border border-border dark:border-gray-700">
-        <div class="flex items-center justify-between mb-2">
-          <span class="text-xs font-medium">{{ i18n.t('admin_ai_profiles_title') }}</span>
-          <button
-            type="button"
-            @click="aiStore.addAIProfile"
-            class="text-[11px] px-2 py-0.5 rounded border border-border dark:border-gray-700 hover:bg-accent/10"
-          >{{ i18n.t('admin_ai_profile_add') }}</button>
-        </div>
-        <p class="text-[11px] text-muted dark:text-gray-400 mb-2">
-          {{ aiStore.aiProfileSource === 'profiles'
-            ? i18n.t('admin_ai_profiles_hint')
-            : i18n.t('admin_ai_profiles_single_hint') }}
-        </p>
-
-        <div v-if="!aiStore.aiProfiles.length" class="text-[11px] text-muted dark:text-gray-400">
-          {{ i18n.t('admin_ai_profile_empty') }}
-        </div>
-        <div v-else class="space-y-1.5">
-          <div
-            v-for="profile in aiStore.aiProfiles"
-            :key="profile.id"
-            class="flex items-center gap-2 text-xs p-2 rounded border transition-colors cursor-pointer"
-            :class="profile.id === aiStore.aiActiveProfileId
-              ? 'border-accent bg-accent/5'
-              : 'border-border dark:border-gray-700 hover:border-accent/60'"
-            @click="aiStore.selectAIProfile(profile.id)"
-          >
-            <span class="flex-1 min-w-0 truncate">
-              {{ profile.name || profile.provider_label || profile.provider }}
-              <span class="text-muted dark:text-gray-400">
-                · {{ profile.provider_label || profile.provider }}
-                <template v-if="profile.model">· {{ profile.model }}</template>
-              </span>
-            </span>
-            <span
-              v-if="profile.id === aiStore.aiActiveProfileId"
-              class="text-[10px] px-1.5 py-0.5 rounded bg-accent/15 text-accent shrink-0"
-            >{{ i18n.t('admin_ai_profile_in_use') }}</span>
-            <span v-if="profile.api_key_set" class="text-[10px] text-green-600 dark:text-green-400 shrink-0">
-              {{ i18n.t('admin_ai_profile_key_saved') }}
-            </span>
-            <button
-              type="button"
-              class="text-[11px] text-accent hover:opacity-70 shrink-0"
-              @click.stop="aiStore.duplicateAIProfile(profile.id)"
-            >{{ i18n.t('admin_ai_profile_duplicate') }}</button>
-            <button
-              type="button"
-              class="text-[11px] text-red-400 hover:text-red-600 shrink-0"
-              @click.stop="aiStore.removeAIProfile(profile.id)"
-            >{{ i18n.t('admin_ai_profile_delete') }}</button>
-          </div>
-        </div>
-      </div>
+      <AiProviderList
+        :title="i18n.t('admin_ai_profiles_title')"
+        :hint="i18n.t(aiStore.aiProfileSource === 'profiles' ? 'admin_ai_profiles_hint' : 'admin_ai_profiles_single_hint')"
+        :profiles="aiStore.aiProfiles"
+        :selected-id="aiStore.aiActiveProfileId"
+        :active-id="aiStore.aiConfig.active_profile_id || aiStore.aiProfiles[0]?.id || ''"
+        @add="aiStore.addAIProfile()"
+        @select="aiStore.selectAIProfile"
+        @duplicate="aiStore.duplicateAIProfile"
+        @remove="aiStore.removeAIProfile"
+      />
 
       <template v-if="aiStore.aiActiveProfile">
         <div class="mb-3">
@@ -385,20 +340,37 @@ onUnmounted(() => {
     <h2 class="text-sm font-semibold mb-1">{{ i18n.t('admin_ai_embedding_title') }}</h2>
     <p class="text-xs text-muted dark:text-gray-400 mb-4">{{ i18n.t('admin_ai_embedding_hint') }}</p>
 
+    <AiProviderList
+      :title="i18n.t('admin_ai_embedding_profiles_title')"
+      :hint="i18n.t('admin_ai_embedding_profiles_hint')"
+      :profiles="aiStore.embeddingProfiles"
+      :selected-id="aiStore.selectedEmbeddingId"
+      :active-id="aiStore.aiConfig?.active_embedding_profile_id || ''"
+      :inherited-label="i18n.t('admin_ai_embedding_same')"
+      @add="aiStore.addEmbeddingProfile()"
+      @select="aiStore.selectedEmbeddingId = $event"
+      @duplicate="aiStore.addEmbeddingProfile"
+      @remove="aiStore.removeEmbeddingProfile"
+    />
+    <template v-if="aiStore.selectedEmbeddingProfile">
+    <label class="mb-3 block">
+      <span class="mb-1 block text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_ai_profile_name') }}</span>
+      <input v-model="aiStore.selectedEmbeddingProfile.name" class="w-full rounded border border-border bg-paper px-3 py-2 text-sm dark:border-gray-700 dark:bg-gray-800" />
+    </label>
     <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
       <label class="block">
         <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_embedding_provider') }}</span>
-        <select v-model="aiStore.aiForm.embedding_provider" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800">
+        <select :value="aiStore.selectedEmbeddingProfile.provider" @change="aiStore.applyEmbeddingPreset(($event.target as HTMLSelectElement).value)" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800">
           <option value="">{{ i18n.t('admin_ai_embedding_same') }}</option>
           <option v-for="p in (aiStore.aiConfig?.providers || []).filter((p: any) => p.embeddings)" :key="p.value" :value="p.value">{{ p.label }}</option>
         </select>
       </label>
       <label class="block">
         <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_embedding_model') }}</span>
-        <input v-model="aiStore.aiForm.embedding_model" :placeholder="aiStore.aiConfig?.effective_embedding_model" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+        <input v-model="aiStore.selectedEmbeddingProfile.model" :placeholder="aiStore.selectedEmbeddingProfile.effective_model" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
       </label>
     </div>
-    <div v-if="aiStore.aiModels.length" class="mb-3">
+    <div v-if="!aiStore.selectedEmbeddingProfile.provider && !aiStore.selectedEmbeddingProfile.base_url && aiStore.aiModels.length" class="mb-3">
       <span class="block text-[11px] text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_models_embedding') }}</span>
       <div class="flex flex-wrap gap-1.5">
         <button
@@ -407,20 +379,24 @@ onUnmounted(() => {
           type="button"
           @click="aiStore.applyModel('embedding_model', model)"
           class="text-[11px] px-2 py-0.5 rounded border transition-colors"
-          :class="aiStore.aiForm.embedding_model === model
+          :class="aiStore.selectedEmbeddingProfile.model === model
             ? 'border-accent text-accent bg-accent/10'
             : 'border-border dark:border-gray-700 text-muted dark:text-gray-400 hover:text-accent'"
         >{{ model }}</button>
       </div>
     </div>
+    <label class="mb-3 block">
+      <span class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_embedding_base_url') }}</span>
+      <input v-model="aiStore.selectedEmbeddingProfile.base_url" :placeholder="aiStore.selectedEmbeddingProfile.effective_base_url" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+    </label>
     <div class="mb-3">
-      <label class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_embedding_base_url') }}</label>
-      <input v-model="aiStore.aiForm.embedding_base_url" :placeholder="aiStore.aiConfig?.effective_embedding_base_url" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+      <label class="block">
+        <span class="mb-1 block text-xs text-muted dark:text-gray-400">{{ i18n.t('admin_ai_embedding_key') }}</span>
+        <input v-model="aiStore.selectedEmbeddingProfile.api_key_input" type="password" autocomplete="new-password" :placeholder="aiStore.selectedEmbeddingProfile.api_key_set ? i18n.t('admin_ai_key_keep') : !aiStore.selectedEmbeddingProfile.provider && !aiStore.selectedEmbeddingProfile.base_url ? i18n.t('admin_ai_embedding_key_same') : ''" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
+      </label>
+      <button v-if="aiStore.selectedEmbeddingProfile.api_key_set" type="button" @click="aiStore.clearEmbeddingKey" class="mt-1 py-1 text-[11px] text-red-500 hover:text-red-700">{{ i18n.t('admin_ai_profile_clear_key') }}</button>
     </div>
-    <div class="mb-3">
-      <label class="block text-xs text-muted dark:text-gray-400 mb-1">{{ i18n.t('admin_ai_embedding_key') }}</label>
-      <input v-model="aiStore.aiEmbeddingKeyInput" type="password" autocomplete="new-password" :placeholder="aiStore.aiConfig?.embedding_api_key_set ? i18n.t('admin_ai_key_keep') : i18n.t('admin_ai_embedding_key_same')" class="w-full px-3 py-2 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800" />
-    </div>
+    </template>
 
     <div class="flex items-center justify-between mb-3">
       <div>
@@ -494,16 +470,18 @@ onUnmounted(() => {
       <div class="grid grid-cols-2 gap-2 max-w-sm mb-3">
         <label class="text-[11px] text-muted">
           {{ i18n.t('admin_ai_rag_batch_limit') }}
-          <input v-model.number="aiStore.ragBatchLimit" type="number" min="1" max="1000" :disabled="jobRunning" class="mt-1 w-full px-2 py-1 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 disabled:opacity-60" />
+          <input v-model.number="aiStore.ragBatchLimit" type="number" min="0" :disabled="jobRunning" class="mt-1 w-full px-2 py-1 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 disabled:opacity-60" />
         </label>
         <label class="text-[11px] text-muted">
           {{ i18n.t('admin_ai_rag_batch_chunks') }}
-          <input v-model.number="aiStore.ragBatchChunks" type="number" min="1" max="2000" :disabled="jobRunning" class="mt-1 w-full px-2 py-1 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 disabled:opacity-60" />
+          <input v-model.number="aiStore.ragBatchChunks" type="number" min="0" :disabled="jobRunning" class="mt-1 w-full px-2 py-1 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 disabled:opacity-60" />
         </label>
       </div>
 
       <p class="text-[11px] text-amber-600 dark:text-amber-400 mb-3 break-words">
-        {{ i18n.t('admin_ai_rag_batch_warn', { size: estimateMb, calls: estimateCalls }) }}
+        {{ batchEstimate
+          ? i18n.t('admin_ai_rag_batch_warn', batchEstimate)
+          : i18n.t('admin_ai_rag_batch_warn_all') }}
       </p>
 
       <div class="flex flex-wrap gap-2 mb-3">
@@ -516,7 +494,7 @@ onUnmounted(() => {
       </div>
 
       <p v-if="aiStore.ragBatchError" class="text-xs text-red-500 mb-2 break-words">{{ aiStore.ragBatchError }}</p>
-      <p v-if="aiStore.ragBatchResult" class="text-xs text-muted dark:text-gray-400 mb-2 break-words">
+      <p v-if="aiStore.ragBatchResult && (!aiStore.ragBatchResult.queued || jobRunning)" class="text-xs text-muted dark:text-gray-400 mb-2 break-words">
         <template v-if="aiStore.ragBatchResult.queued">
           {{ i18n.t('admin_ai_rag_batch_queued', {
             queued: aiStore.ragBatchResult.queued,
@@ -530,9 +508,9 @@ onUnmounted(() => {
       <div v-if="job" class="mb-3 p-2 rounded border border-border dark:border-gray-700">
         <div class="flex items-center justify-between text-[11px] text-muted dark:text-gray-400 mb-1">
           <span>{{ jobPhaseLabel }}</span>
-          <span>{{ jobProcessed }} / {{ jobTotal }}</span>
+          <span v-if="jobShowsProgress">{{ jobProcessed }} / {{ jobTotal }}</span>
         </div>
-        <div class="h-1.5 rounded bg-gray-200 dark:bg-gray-700 overflow-hidden mb-1">
+        <div v-if="jobShowsProgress" class="h-1.5 rounded bg-gray-200 dark:bg-gray-700 overflow-hidden mb-1">
           <div class="h-full bg-accent transition-all" :style="{ width: jobPercent + '%' }"></div>
         </div>
         <p v-if="jobCurrent" class="text-[11px] text-muted truncate">{{ i18n.t('admin_ai_rag_job_current', { title: jobCurrent }) }}</p>
@@ -542,8 +520,13 @@ onUnmounted(() => {
             failed: job.failed || 0, chunks: job.chunks || 0,
           }) }}
         </p>
-        <p v-if="jobLastError" class="text-[11px] text-red-500 break-words">{{ jobLastError }}</p>
-        <p v-if="job.error" class="text-[11px] text-red-500 break-words">{{ job.error }}</p>
+        <p v-if="job.discarded" class="text-[11px] text-muted dark:text-gray-400">
+          {{ i18n.t('admin_ai_rag_job_discarded', { count: job.discarded }) }}
+        </p>
+        <details v-if="jobLastError" :key="job.started_at" class="text-[11px] text-red-500">
+          <summary class="cursor-pointer">{{ i18n.t('admin_ai_rag_job_error_details') }}</summary>
+          <p class="break-words">{{ jobLastError }}</p>
+        </details>
         <p class="text-[11px] text-muted dark:text-gray-400 mt-1">
           {{ i18n.t('admin_ai_rag_indexed_stats', {
             books: indexedStats.books, chunks: indexedStats.chunks, size: indexedStats.mb,
@@ -559,12 +542,14 @@ onUnmounted(() => {
       <div class="max-w-[12rem] mb-3">
         <label class="text-[11px] text-muted">
           {{ i18n.t('admin_ai_library_limit') }}
-          <input v-model.number="aiStore.libraryLimit" type="number" min="1" max="50000" :disabled="libraryRunning" class="mt-1 w-full px-2 py-1 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 disabled:opacity-60" />
+          <input v-model.number="aiStore.libraryLimit" type="number" min="0" :disabled="libraryRunning" class="mt-1 w-full px-2 py-1 rounded border border-border dark:border-gray-700 text-sm bg-paper dark:bg-gray-800 disabled:opacity-60" />
         </label>
       </div>
 
       <p class="text-[11px] text-amber-600 dark:text-amber-400 mb-3 break-words">
-        {{ i18n.t('admin_ai_library_warn', { size: libraryMb, calls: libraryRequests }) }}
+        {{ libraryEstimate
+          ? i18n.t('admin_ai_library_warn', libraryEstimate)
+          : i18n.t('admin_ai_library_warn_all') }}
       </p>
 
       <div class="flex flex-wrap gap-2 mb-3">

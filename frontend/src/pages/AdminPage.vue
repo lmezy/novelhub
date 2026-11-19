@@ -457,6 +457,7 @@ async function revokeToken(id: string) {
 
 const indexStats = ref<any>(null)
 const indexRebuilding = ref(false)
+const indexRebuildSubmitting = ref(false)
 const indexError = ref("")
 //: Progress of the current/last search-index rebuild (see
 //: ``GET /search/index/rebuild/status``).  The rebuild runs in the backend in
@@ -508,6 +509,10 @@ async function loadIndexProgress(initial = false) {
 }
 
 async function rebuildIndex() {
+  if (indexRebuilding.value || indexRebuildSubmitting.value) return
+  if (!window.confirm(i18n.t('admin_index_rebuild_confirm'))) return
+
+  indexRebuildSubmitting.value = true
   indexError.value = ""
   try {
     const res = await api.post<any>("/search/index/rebuild")
@@ -517,6 +522,8 @@ async function rebuildIndex() {
     else await loadIndexStats()
   } catch (e) {
     indexError.value = e instanceof Error ? e.message : i18n.t('admin_rebuild_failed')
+  } finally {
+    indexRebuildSubmitting.value = false
   }
 }
 
@@ -998,9 +1005,9 @@ onUnmounted(() => {
           </div>
           <button
             @click="rebuildIndex"
-            :disabled="indexRebuilding"
+            :disabled="indexRebuilding || indexRebuildSubmitting"
             class="px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:opacity-90 disabled:opacity-50"
-          >{{ indexRebuilding ? i18n.t('admin_index_rebuilding') : i18n.t('admin_index_rebuild') }}</button>
+          >{{ indexRebuilding || indexRebuildSubmitting ? i18n.t('admin_index_rebuilding') : i18n.t('admin_index_rebuild') }}</button>
         </div>
 
         <div class="p-5 rounded-lg border border-border dark:border-gray-700 bg-surface dark:bg-gray-900">

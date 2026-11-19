@@ -250,6 +250,26 @@ async def test_wrong_model_name_is_explained_and_the_names_are_offered(llm_serve
     assert result["current_model"] == "wrong-model"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("embedding_key", ["", "fake-embedding-key"])
+async def test_dedicated_embedding_profiles_use_only_their_own_bearer_key(llm_server, embedding_key):
+    from app.services.ai_config import resolve_ai_config
+
+    cfg = resolve_ai_config({
+        "ai_provider": "claude",
+        "ai_api_key": "fake-chat-key",
+        "ai_embedding_providers": json.dumps([{
+            "id": "local", "provider": "ollama", "base_url": llm_server,
+            "model": "bge-m3", "api_key": embedding_key,
+        }]),
+    }, env={})
+
+    assert await LLMClient(cfg).embed(["hi"], retries=0) == [[0.0, 0.5]]
+    assert RECEIVED[-1]["path"] == "/v1/embeddings"
+    assert RECEIVED[-1]["auth"] == (f"Bearer {embedding_key}" if embedding_key else None)
+    assert RECEIVED[-1]["api_key"] is None
+
+
 # ---------------------------------------------------------------------------
 # service -> client -> wire
 # ---------------------------------------------------------------------------
