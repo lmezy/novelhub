@@ -2,9 +2,94 @@ from dataclasses import dataclass
 from pathlib import Path
 import hashlib
 import json
+import os
+import shutil
 import re
+from uuid import uuid4
+from loguru import logger
 
 from app.core.config import settings
+
+
+def looks_like_text_response(data: bytes) -> bool:
+    header = data[:256].lstrip().lower()
+    return header.startswith((b"<!doctype html", b"<html", b"<head", b"<body", b"<script", b"{", b"["))
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    """Publish the complete file with one same-directory rename."""
+    temporary = path.with_name(f".novelhub-{uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as output:
+            output.write(data)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+class TruncatedChapterError(ValueError):
+    """A refresh returned only the opening of the stored chapter."""
+
+
+class ChapterFileBatch:
+    """Undo published chapter files if their database transaction rolls back."""
+
+    def __init__(self):
+        self._originals: dict[Path, Path | None] = {}
+
+    def write(self, numbered: Path, data: bytes, chapter_id: str, previous: str | None) -> Path:
+        # A TOC insertion can reuse a number still owned by a different
+        # chapter. Retain our own filename or reserve an unused one.
+        path = numbered
+        old = Path(previous) if previous else None
+        if old and old.parent == numbered.parent and old.suffix == ".md":
+            path = old
+        if path != old:
+            try:
+                path.touch(exist_ok=False)
+            except FileExistsError:
+                path = numbered.with_stem(f"{numbered.stem}~{safe_segment(chapter_id)}")
+                path.touch(exist_ok=False)
+            self._originals[path] = None
+        elif path not in self._originals:
+            backup = path.with_name(f".novelhub-{uuid4().hex}.bak")
+            try:
+                os.link(path, backup)
+            except FileNotFoundError:
+                backup = None
+            except OSError:
+                # Some NAS volumes do not support hard links.
+                try:
+                    shutil.copy2(path, backup)
+                except BaseException:
+                    backup.unlink(missing_ok=True)
+                    raise
+            self._originals[path] = backup
+        _atomic_write(path, data)
+        return path
+
+    def finish(self, *, committed: bool) -> None:
+        restore_error = None
+        for path, original in self._originals.items():
+            if committed:
+                if original is not None:
+                    try:
+                        original.unlink(missing_ok=True)
+                    except OSError as exc:
+                        logger.warning("Could not remove committed chapter backup {}: {}", original, exc)
+            else:
+                try:
+                    if original is None:
+                        path.unlink(missing_ok=True)
+                    else:
+                        original.replace(path)
+                        original.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.error("Could not restore {} from {}: {}", path, original, exc)
+                    restore_error = exc
+        self._originals.clear()
+        if restore_error is not None:
+            raise restore_error
 
 
 def chapter_markdown(chapter_title: str, content: str) -> str:
@@ -158,15 +243,38 @@ class BookStorage:
     def chapter_images_dir(self, book_id: str) -> Path:
         return self.root / safe_segment(book_id) / "images"
 
+    def previous_chapter_path(self, book_id: str, chapter_id: str) -> Path:
+        return self.root / safe_segment(book_id) / ".previous" / (safe_segment(chapter_id) + ".txt")
+
+    @staticmethod
+    def _valid_cached_image(path: Path) -> bool:
+        try:
+            with path.open("rb") as stream:
+                header = stream.read(256)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        return bool(header) and not looks_like_text_response(header)
+
+    def find_chapter_image(self, book_id: str, url: str) -> str | None:
+        directory = self.chapter_images_dir(book_id)
+        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+        for extension in ("jpg", "png", "webp", "gif", "svg"):
+            path = directory / f"{digest}.{extension}"
+            if self._valid_cached_image(path):
+                return path.relative_to(self.root).as_posix()
+        return None
+
     def save_chapter_image(self, book_id: str, url: str, data: bytes) -> str:
         """Save one in-content image and return a storage-relative path."""
+        if not data or looks_like_text_response(data):
+            raise ValueError("图片地址返回了空内容或文本页面")
         directory = self.chapter_images_dir(book_id)
         directory.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha256(str(url).encode("utf-8")).hexdigest()[:16]
         extension = self._image_extension(data)
         path = directory / f"{digest}.{extension}"
-        if not path.exists():
-            path.write_bytes(data)
+        if not self._valid_cached_image(path):
+            _atomic_write(path, data)
         return path.relative_to(self.root).as_posix()
 
     def chapter_image_path(self, book_id: str, filename: str) -> Path:
@@ -197,7 +305,7 @@ class BookStorage:
         directory.mkdir(parents=True, exist_ok=True)
         extension = self._image_extension(data)
         path = directory / f"{safe_segment(book_id)}.{extension}"
-        path.write_bytes(data)
+        _atomic_write(path, data)
         return path.relative_to(self.root.parent).as_posix()
 
     def save_display_cover(self, book_id: str, data: bytes) -> str:
@@ -206,10 +314,11 @@ class BookStorage:
         directory.mkdir(parents=True, exist_ok=True)
         extension = self._image_extension(data)
         safe_id = safe_segment(book_id)
-        for old in directory.glob(f"{safe_id}_display.*"):
-            old.unlink(missing_ok=True)
         path = directory / f"{safe_id}_display.{extension}"
-        path.write_bytes(data)
+        _atomic_write(path, data)
+        for old in directory.glob(f"{safe_id}_display.*"):
+            if old != path:
+                old.unlink(missing_ok=True)
         return path.relative_to(self.root.parent).as_posix()
 
     def write_metadata(
@@ -222,10 +331,7 @@ class BookStorage:
         path = self.book_dir(author, title, ref)
         path.mkdir(parents=True, exist_ok=True)
         metadata_path = path / "metadata.json"
-        metadata_path.write_text(
-            json.dumps(metadata, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        _atomic_write(metadata_path, json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8"))
         return metadata_path
 
     def write_chapter(
@@ -236,13 +342,39 @@ class BookStorage:
         chapter_title: str,
         content: str,
         ref: BookRef | None = None,
+        *,
+        chapter_id: str = "",
+        previous_path: str | None = None,
+        previous_hash: str | None = None,
+        batch: ChapterFileBatch | None = None,
     ) -> tuple[str, str]:
         path = self.book_dir(author, title, ref)
         path.mkdir(parents=True, exist_ok=True)
         file_path = path / f"{number:06d}.md"
         markdown = chapter_markdown(chapter_title, content)
-        file_path.write_text(markdown, encoding="utf-8")
+        data = markdown.encode("utf-8")
         content_hash = text_digest(markdown)
+        if batch is None:
+            _atomic_write(file_path, data)
+        else:
+            if chapter_id and previous_path and previous_hash and previous_hash != content_hash:
+                try:
+                    old_text = self.read_chapter(previous_path)
+                except (FileNotFoundError, UnicodeDecodeError):
+                    old_text = None
+                # Legacy books can share a file. Only archive text that actually
+                # matches this chapter's database row.
+                if old_text is not None and text_digest(old_text) == previous_hash:
+                    old_body = old_text.partition("\n")[2] if old_text.startswith("#") else old_text
+                    old_body = "".join(old_body.split())
+                    new_body = "".join(content.split())
+                    if len(old_body) >= 800 and 40 <= len(new_body) <= len(old_body) // 4 and old_body.startswith(new_body):
+                        raise TruncatedChapterError("新正文只有已存正文的一段开头，已保留原文")
+                    history = (self.previous_chapter_path(ref.book_id, chapter_id) if ref
+                               else path / ".previous" / (safe_segment(chapter_id) + ".txt"))
+                    history.parent.mkdir(parents=True, exist_ok=True)
+                    batch.write(history, old_text.encode("utf-8"), chapter_id, str(history))
+            file_path = batch.write(file_path, data, chapter_id, previous_path)
         return str(file_path), content_hash
 
     def read_chapter(self, content_path: str) -> str:

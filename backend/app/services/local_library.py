@@ -144,6 +144,8 @@ def scan_local_library(
     added_paths: set[str] = set()
 
     for dirpath, dirnames, filenames in os.walk(root_path):
+        if ".previous" in dirnames:
+            dirnames.remove(".previous")
         current = Path(dirpath)
         rel = current.relative_to(root_path)
         depth = 0 if rel == Path(".") else len(rel.parts)

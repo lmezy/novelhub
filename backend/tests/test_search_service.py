@@ -30,6 +30,18 @@ def test_ensure_index_is_cached():
     assert client.index.call_count == 1
 
 
+def test_reconcile_chapter_labels_only_updates_stale_documents():
+    from types import SimpleNamespace
+    service, _, index = _service_with_indexes()
+    index.get_documents.return_value.results = [
+        SimpleNamespace(id="old", tags=["书名"], category_names=["漫画"]),
+        SimpleNamespace(id="ok", tags=["都市"], category_names=["都市"]),
+    ]
+    with patch.object(service, "_ensure_index"):
+        service.reconcile_chapter_labels("book", ["都市"], ["都市"])
+    index.update_documents.assert_called_once_with([{"id": "old", "tags": ["都市"], "category_names": ["都市"]}])
+
+
 def test_ensure_index_updates_settings():
     service, client = _make_service()
     index = client.index.return_value

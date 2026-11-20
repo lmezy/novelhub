@@ -58,12 +58,15 @@ class SyncErrorMixin:
         """
         if SyncErrorMixin._is_infrastructure_error(exc):
             return False
+        status = core_transient.http_status(exc)
+        if status is not None:
+            return status == 403
+        # Empty-directory diagnostics can mention a *possible* rate limit.
+        # Such a suggestion is not evidence that the server refused access.
+        if SyncErrorMixin._is_empty_book_error(exc):
+            return False
         message = str(exc).lower()
-        if any(marker in message for marker in ("anti-bot", "captcha", "验证码", "rate-limit", "限流")):
-            return True
-        response = getattr(exc, "response", None)
-        status = getattr(response, "status_code", None)
-        return status in {403, 408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524}
+        return any(marker in message for marker in ("anti-bot", "captcha", "验证码", "rate-limit", "限流"))
 
     #: Failures of our own stack, not of the site.  They carry a message rather
     #: than a recognisable class name, so they are matched on text -- the one
@@ -110,17 +113,16 @@ class SyncErrorMixin:
         """Whether a failed book fetch is a transient error worth retrying
         (Cloudflare 5xx / upstream error, browser load timeout, or a dropped
         connection) rather than a deterministic rule/Cookie problem."""
+        status = core_transient.http_status(exc)
+        if status is not None:
+            return core_transient.retryable_http_status(status)
         if core_transient.is_transient_transport_error(exc):
             # Covers the socket/stream class names *and* the "pop from an empty
             # deque" concurrency artefact: ten of these in a row used to abort
             # the whole task with a misleading "被反爬" message.
             return True
         message = str(exc).lower()
-        if any(marker in message for marker in TRANSIENT_BOOK_MARKERS):
-            return True
-        response = getattr(exc, "response", None)
-        status = getattr(response, "status_code", None)
-        return status in {408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524}
+        return any(marker in message for marker in TRANSIENT_BOOK_MARKERS)
 
     @staticmethod
     def _is_transient_chapter_error(exc: BaseException) -> bool:
@@ -131,6 +133,9 @@ class SyncErrorMixin:
         stopping the current book early for: continuing only sends dozens of
         doomed requests while the origin is down.
         """
+        status = core_transient.http_status(exc)
+        if status is not None:
+            return core_transient.retryable_http_status(status)
         if core_transient.is_transient_transport_error(exc):
             return True
         return any(marker in str(exc).lower()
@@ -149,3 +154,99 @@ class SyncErrorMixin:
         """
         return "no usable metadata" in str(exc).lower()
 
+
+# Failures that are worth retrying on their own: the proxy/upstream was
+# momentarily unreachable, not the source rules or a captcha gate.  A short
+# outage used to mark the whole task failed (and the UI then showed a
+# misleading "书源未返回可同步的书籍").
+_TRANSIENT_TASK_MARKERS = (
+    "timeout",
+    "timed out",
+    "connecttimeout",
+    "readtimeout",
+    "pooltimeout",
+    "connecterror",
+    "readerror",
+    "writeerror",
+    "remoteprotocolerror",
+    "proxyerror",
+    "connection reset",
+    "connection closed",
+    "connection is closed",
+    "connection was closed",
+    "connection is already closed",
+    "server closed the connection",
+    "connection refused",
+    "connection aborted",
+    "temporarily unavailable",
+    "temporary failure",
+    "network is unreachable",
+    "name or service not known",
+    "getaddrinfo failed",
+    "upstream server returned",
+    "server returned a transient",
+    "error code 5",
+    "empty content",
+    "网络",
+    "暂时无法访问",
+)
+
+# These need a Cookie / a different exit node, so retrying immediately only
+# hammers the site.
+_NON_TRANSIENT_TASK_MARKERS = (
+    "anti-bot",
+    "captcha",
+    "验证码",
+    "人机验证",
+    "身份验证",
+    "反爬",
+    "cookie",
+    "legado js",
+    "书源规则",
+)
+
+
+def is_transient_task_error(exc: BaseException) -> bool:
+    """Whether a failed crawl task should be retried automatically.
+
+    A dropped database connection surfaces two layers up: the asyncpg
+    ``InterfaceError`` ("the underlying connection is closed") is the real cause,
+    and SQLAlchemy wraps it in a ``PendingRollbackError`` whose own name and
+    message only *embed* the original as text.  Reading just the wrapper missed
+    exactly that case on 2026-10-13: a three-day task was marked ``failed``
+    (its counters read "成功 1147 / 找到 1168") because the final progress write
+    hit a connection the server had closed.  Walk the explicit cause chain
+    (``__cause__`` / ``.orig``, deliberately not the implicit ``__context__``)
+    so the actual failure is what gets classified.
+    """
+
+    def _nodes():
+        seen: set[int] = set()
+        node: BaseException | None = exc
+        while node is not None and id(node) not in seen:
+            seen.add(id(node))
+            yield node
+            node = getattr(node, "orig", None) or node.__cause__
+
+    for node in _nodes():
+        status = core_transient.http_status(node)
+        if status is not None:
+            return core_transient.retryable_http_status(status)
+        name = type(node).__name__.lower()
+        message = str(node).lower()
+        if any(marker in message for marker in _NON_TRANSIENT_TASK_MARKERS):
+            return False
+        if any(marker in message for marker in _TRANSIENT_TASK_MARKERS):
+            return True
+        if core_transient.is_transient_transport_error(node):
+            return True
+        # asyncpg ``InterfaceError`` / SQLAlchemy ``DBAPIError`` normally already
+        # carry "connection is closed" in the message (matched above); this name
+        # gate is the fallback for a future wording that still means "the
+        # connection died", while excluding the *other* ``InterfaceError``
+        # ("another operation is in progress"), which is not a dropped link.
+        if name in {"interfaceerror", "dbapierror"} and (
+            "connection" in message or "closed" in message
+        ):
+            return True
+    return False

@@ -7,6 +7,7 @@ URL.  A CDN failure must not be recorded against the *source* host's
 transport health, which is a mistake this module exists to avoid.
 """
 
+from app.core.transient import UpstreamBackoff
 from app.crawler.plugins.yuedu.common import logger
 from app.crawler.plugins.yuedu.errors import is_transient_transport_error
 import random
@@ -45,7 +46,6 @@ class ImagesMixin:
         url = clean_url or url
         if self._image_known_missing(url):
             return None
-        await self._sleep_rate_limit()
         headers = self._build_headers({
             "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
         })
@@ -65,9 +65,9 @@ class ImagesMixin:
             """Fetch over one transport; ``None`` means "gone for good"."""
             nonlocal headers
             last_error: Exception | None = None
-            last_status: int | None = None
             for attempt in range(3):
                 try:
+                    await self._wait_for_request(url)
                     client = await self._get_http_client(proxy)
                     resp = await client.get(url, headers=headers)
                     if resp.status_code == 403 and attempt == 0:
@@ -85,15 +85,8 @@ class ImagesMixin:
                             url,
                         )
                         return None
-                    if resp.status_code in (429, 500, 502, 503, 504):
-                        retry_after = resp.headers.get("Retry-After", "")
-                        wait = (
-                            float(retry_after)
-                            if retry_after and retry_after.replace(".", "", 1).isdigit()
-                            else 2 ** attempt
-                        )
-                        last_status = resp.status_code
-                        await asyncio.sleep(wait + random.uniform(0.5, 1.5))
+                    if self._is_transient_upstream_status(resp.status_code):
+                        await self._retry_status(url, resp, attempt)
                         continue
                     resp.raise_for_status()
                     self._capture_cookie_jar(resp)
@@ -110,15 +103,15 @@ class ImagesMixin:
                         await asyncio.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
             if last_error is not None:
                 raise last_error
-            raise RuntimeError(
-                f"Request failed after retries: {url}"
-                + (f" (HTTP {last_status})" if last_status else "")
-            )
+            raise RuntimeError(f"Request failed after retries: {url}")
 
         last_error: Exception | None = None
-        for proxy in self._ordered_transports(proxy_url):
+        transports = self._ordered_transports(proxy_url)
+        for index, proxy in enumerate(transports):
             try:
                 result = await _request(proxy)
+            except UpstreamBackoff:
+                raise
             except Exception as exc:
                 if not is_transient_transport_error(exc):
                     last_error = exc
@@ -127,14 +120,13 @@ class ImagesMixin:
                 # An image CDN failing says nothing about the book site, so it
                 # must not push the *source's* transport into cooldown; that
                 # made the next page request try the dead direct path first.
-                if proxy is None:
+                if index + 1 == len(transports):
                     break
                 logger.warning(
-                    "Configured proxy %s request failed for content image (%s%s); "
-                    "retrying direct",
-                    proxy_url,
+                    "%s request failed for content image (%s); retrying %s",
+                    self._transport_label(proxy),
                     type(exc).__name__,
-                    f": {exc}" if str(exc) else "",
+                    self._retry_transport_label(transports[index + 1]),
                 )
                 continue
             if result is None:

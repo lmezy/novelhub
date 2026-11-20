@@ -10,6 +10,7 @@ title overflowing a filesystem component limit.
 """
 
 from app.crawler.base import RemoteChapter
+from app.services.book_title import is_identity_tag
 from app.crawler.plugins.yuedu.common import logger
 from app.crawler.plugins.yuedu.rule_engine import YueduRuleEngine
 from app.crawler.plugins.yuedu.selectors import GENERIC_BOOK_AUTHOR_SELECTORS
@@ -631,12 +632,7 @@ class ParsingMixin:
                 value,
             ).lower()
 
-        title_norm = _normalize(title) if title and title.lower() != "unknown" else ""
-        author_norm = (
-            _normalize(author) if author and author.lower() != "unknown" else ""
-        )
         markers = self._site_markers()
-        protected_tags = {"漫画", "漫畫", "写真", "寫真", "图集", "圖集"}
         noise = {
             "tags", "tag", "标签", "分类", "类别", "类型",
             "论坛", "论坛帖子", "帖子", "书源", "书籍",
@@ -656,7 +652,6 @@ class ParsingMixin:
             value = str(value or "").strip().lower()
             if value:
                 noise.add(value)
-        title_noise = {"最新章节", "全文", "全文阅读", "免费阅读", "小说", "最新更新"}
         result: list[str] = []
         for tag in tags:
             tag = str(tag or "").strip().strip("#").strip()
@@ -668,26 +663,8 @@ class ParsingMixin:
             # Internal ids sometimes leak in as "tags" (e.g. a 19 digit book id).
             if normalized.isdigit() and len(normalized) >= 4:
                 continue
-            if title_norm:
-                if normalized == title_norm:
-                    continue
-                if title_norm in normalized:
-                    remainder = _normalize(normalized.replace(title_norm, ""))
-                    if not remainder:
-                        continue
-                    if author_norm and author_norm in remainder:
-                        continue
-                    if remainder in noise or any(
-                        token in remainder for token in title_noise
-                    ):
-                        continue
-            if author_norm:
-                if normalized == author_norm:
-                    continue
-                if normalized in author_norm and len(normalized) >= 2:
-                    continue
-                if author_norm in normalized:
-                    continue
+            if is_identity_tag(tag, title, author):
+                continue
             if tag.lower() in noise:
                 continue
             if any(marker and marker.lower() in tag.lower() for marker in markers):
@@ -765,18 +742,6 @@ class ParsingMixin:
         return any(marker in value for marker in (
             "org.jsoup", "Packages.", "java.lang.", "ReferenceError:",
         ))
-    @staticmethod
-    def _content_type_tags(*values: Any) -> list[str]:
-        """Keep non-novel forum posts discoverable in the existing library."""
-        text = " ".join(str(value or "") for value in values).lower()
-        tags: list[str] = []
-        if "漫画" in text or "漫畫" in text:
-            tags.append("漫画")
-        if "写真" in text or "寫真" in text:
-            tags.append("写真")
-        if any(marker in text for marker in ("图集", "圖集", "图包", "圖包", "套图", "套圖")):
-            tags.append("图集")
-        return tags
     def _uses_android_js_rule(self, section: str, field: str) -> bool:
         """Identify Legado rules that need Android/JVM-only APIs.
 

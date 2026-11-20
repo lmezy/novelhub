@@ -1061,10 +1061,9 @@ async def resync_book(
 ):
     """Re-sync one book.
 
-    ``refetch_content=true`` drops the stored chapters first, so the whole book
-    is downloaded again -- the repair for text that was saved wrong but looks
-    fine (content written by an older build, or by another book that shared the
-    same storage directory before the per-book directory fix).
+    With ``refetch_content=true`` each chapter in the current TOC is fetched
+    again. A successful refresh updates the existing chapter in place so its
+    bookmarks and reading progress continue to work.
     """
     try:
         return await SyncService(db).resync_book(

@@ -36,7 +36,7 @@ A manual override takes precedence over evidence during sync and reclassificatio
 
 import asyncio
 import re
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 
 KIND_NOVEL = "novel"
@@ -347,6 +347,7 @@ async def scan_book_votes(
     storage,
     paths: Sequence[str],
     limit: int = KIND_SCAN_CHAPTERS,
+    ignore_content: Callable[[str], bool] | None = None,
 ) -> tuple[list[bool], int]:
     """Read sampled chapters; return ``(votes, chapters_read)``.
 
@@ -369,6 +370,8 @@ async def scan_book_votes(
         except Exception:
             continue
         reads += 1
+        if ignore_content and ignore_content(content):
+            continue
         vote = chapter_comic_vote(content)
         if vote is not None:
             votes.append(vote)
@@ -377,7 +380,8 @@ async def scan_book_votes(
     return votes, reads
 
 
-async def classify_stored_book(db, storage, book_id: str, *, source=None, labels=(), current=None) -> str:
+async def classify_stored_book(db, storage, book_id: str, *, source=None, labels=(), current=None,
+                               ignore_content: Callable[[str], bool] | None = None) -> str:
     """Apply the same sampled chapter evidence to an individual book."""
     from sqlalchemy import select
 
@@ -388,7 +392,7 @@ async def classify_stored_book(db, storage, book_id: str, *, source=None, labels
         .where(Chapter.book_id == book_id, Chapter.content_path.is_not(None))
         .order_by(Chapter.chapter_number, Chapter.id)
     )
-    votes, _ = await scan_book_votes(storage, [path for path in paths.all() if path])
+    votes, _ = await scan_book_votes(storage, [path for path in paths.all() if path], ignore_content=ignore_content)
     return resolve_kind(source=source, labels=labels, content_votes=votes, current=current)
 
 

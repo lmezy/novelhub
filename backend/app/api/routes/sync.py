@@ -144,9 +144,10 @@ async def import_local_books(
         raise HTTPException(status_code=400, detail="Local path is required")
 
     results = []
+    service = SyncService(db)
     for path in paths:
         try:
-            result = await SyncService(db).sync_book(
+            result = await service.sync_book(
                 source_id,
                 _to_file_url(path),
                 is_r18_override=payload.is_r18,

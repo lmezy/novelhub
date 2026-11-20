@@ -39,6 +39,11 @@ def test_one_matched_title_is_not_enough():
     assert cover_wall_matches(body, OTHER_TITLES, "隐形的主人") == []
 
 
+def test_cover_variants_count_once_and_the_works_own_title_is_excluded():
+    body = '<img alt="世上只有妈妈好 封面"><img alt="世上只有妈妈好（新版）"><img alt="隐形的主人 第一卷">'
+    assert cover_wall_matches(body, [*OTHER_TITLES, "隐形的主人"], "隐形的主人") == []
+
+
 def test_the_books_own_cover_is_not_a_wall():
     body = '<img alt="隐形的主人"><img alt="隐形的主人">'
     assert cover_wall_matches(body, OTHER_TITLES, "隐形的主人") == []

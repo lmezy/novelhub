@@ -14,6 +14,7 @@ from datetime import timedelta
 from loguru import logger
 from sqlalchemy import select, update
 
+from app.core import transient
 from app.core.clock import naive_now
 from app.core.config import (
     db_pool_capacity,
@@ -27,6 +28,7 @@ from app.core.config import (
 from app.core.database import SessionLocal
 from app.core.heartbeat import mark_alive
 from app.models import CrawlTask
+from app.services.sync_errors import is_transient_task_error as _is_transient_task_error
 
 
 # ``crawl_tasks.result`` is one JSONB row rewritten on every batch.  Letting
@@ -49,113 +51,6 @@ def _cap_task_details(details: list[dict], limit: int = _TASK_DETAILS_LIMIT) -> 
         "truncated": True,
     })
     return capped
-
-
-# Failures that are worth retrying on their own: the proxy/upstream was
-# momentarily unreachable, not the source rules or a captcha gate.  A short
-# outage used to mark the whole task failed (and the UI then showed a
-# misleading "书源未返回可同步的书籍").
-_TRANSIENT_TASK_MARKERS = (
-    "timeout",
-    "timed out",
-    "connecttimeout",
-    "readtimeout",
-    "pooltimeout",
-    "connecterror",
-    "readerror",
-    "writeerror",
-    "remoteprotocolerror",
-    "proxyerror",
-    "connection reset",
-    "connection closed",
-    "connection is closed",
-    "connection was closed",
-    "connection is already closed",
-    "server closed the connection",
-    "connection refused",
-    "connection aborted",
-    "temporarily unavailable",
-    "temporary failure",
-    "network is unreachable",
-    "name or service not known",
-    "getaddrinfo failed",
-    "upstream server returned",
-    "server returned a transient",
-    "error code 5",
-    "empty content",
-    "网络",
-    "暂时无法访问",
-)
-
-# These need a Cookie / a different exit node, so retrying immediately only
-# hammers the site.
-_NON_TRANSIENT_TASK_MARKERS = (
-    "anti-bot",
-    "captcha",
-    "验证码",
-    "人机验证",
-    "身份验证",
-    "反爬",
-    "cookie",
-    "legado js",
-    "书源规则",
-)
-
-
-def _is_transient_task_error(exc: BaseException) -> bool:
-    """Whether a failed crawl task should be retried automatically.
-
-    A dropped database connection surfaces two layers up: the asyncpg
-    ``InterfaceError`` ("the underlying connection is closed") is the real cause,
-    and SQLAlchemy wraps it in a ``PendingRollbackError`` whose own name and
-    message only *embed* the original as text.  Reading just the wrapper missed
-    exactly that case on 2026-10-13: a three-day task was marked ``failed``
-    (its counters read "成功 1147 / 找到 1168") because the final progress write
-    hit a connection the server had closed.  Walk the explicit cause chain
-    (``__cause__`` / ``.orig``, deliberately not the implicit ``__context__``)
-    so the actual failure is what gets classified.
-    """
-
-    def _nodes():
-        seen: set[int] = set()
-        node: BaseException | None = exc
-        while node is not None and id(node) not in seen:
-            seen.add(id(node))
-            yield node
-            node = getattr(node, "orig", None) or node.__cause__
-
-    for node in _nodes():
-        name = type(node).__name__.lower()
-        message = str(node).lower()
-        if any(marker in message for marker in _NON_TRANSIENT_TASK_MARKERS):
-            return False
-        if any(marker in message for marker in _TRANSIENT_TASK_MARKERS):
-            return True
-        # httpx.RequestError and asyncio.TimeoutError often stringify to "".
-        if name in {
-            "connecttimeout",
-            "readtimeout",
-            "writetimeout",
-            "pooltimeout",
-            "connecterror",
-            "connectionerror",
-            "readerror",
-            "writeerror",
-            "proxyerror",
-            "remoteprotocolerror",
-            "timeouterror",
-        }:
-            return True
-        # asyncpg ``InterfaceError`` / SQLAlchemy ``DBAPIError`` normally already
-        # carry "connection is closed" in the message (matched above); this name
-        # gate is the fallback for a future wording that still means "the
-        # connection died", while excluding the *other* ``InterfaceError``
-        # ("another operation is in progress"), which is not a dropped link.
-        if name in {"interfaceerror", "dbapierror"} and (
-            "connection" in message or "closed" in message
-        ):
-            return True
-    return False
 
 
 def _task_retry_delay_seconds(retries: int) -> int:
@@ -399,6 +294,9 @@ async def run_crawl_task_async(task_id: str, *, book_concurrency: int | None = N
         ) -> None:
             nonlocal progress_state
             async with db_lock:
+                if page != progress_state.get("next_page"):
+                    progress_state.pop("completed_page_urls", None)
+                    progress_state.pop("retry_checkpoint", None)
                 progress_state.update({
                     "pages_checked": page,
                     "books_found": found,
@@ -449,6 +347,22 @@ async def run_crawl_task_async(task_id: str, *, book_concurrency: int | None = N
                     chapter_progress_committed_at = now
                     await db.commit()
 
+        checkpoint_saved = False
+
+        def _save_backoff_checkpoint(snapshot: dict, completed_urls: list[str]) -> None:
+            nonlocal checkpoint_saved
+            checkpoint_saved = True
+            progress_state.update({key: snapshot[key] for key in _RESULT_COUNTER_KEYS})
+            progress_state.update({
+                "next_page": snapshot["next_page"],
+                "pages_checked": snapshot["pages_checked"],
+                "completed_page_urls": completed_urls,
+                "retry_checkpoint": True,
+            })
+            previous_result["details"] = _cap_task_details(
+                [*(previous_result.get("details") or []), *snapshot["details"]]
+            )
+
         try:
             result = await SyncService(db).discover_and_sync_all(
                 task_obj.source,
@@ -462,6 +376,8 @@ async def run_crawl_task_async(task_id: str, *, book_concurrency: int | None = N
                 before_step=_wait_if_paused,
                 checkpoint_cb=_wait_if_paused,
                 start_page=start_page,
+                completed_page_urls=progress_state.get("completed_page_urls"),
+                backoff_cb=_save_backoff_checkpoint,
                 book_concurrency=book_concurrency,
                 page_batch_size=int(getattr(settings, "SYNC_PAGE_BATCH_SIZE", 0) or 0),
                 exclude_tags=list(getattr(task_obj, "exclude_tags", None) or []),
@@ -469,11 +385,8 @@ async def run_crawl_task_async(task_id: str, *, book_concurrency: int | None = N
             )
             await db.refresh(task_obj)
             if task_obj.status == "paused":
-                await _apply_task_state(
-                    task_obj, db, task_id,
-                    {"status": "paused", "resume_at": None},
-                )
-                return {"status": "paused", "task_id": task_id}
+                _save_backoff_checkpoint(result, [])
+                raise SyncPaused("Task paused")
             if task_obj.status == "cancelled":
                 await _apply_task_state(
                     task_obj, db, task_id,
@@ -545,9 +458,11 @@ async def run_crawl_task_async(task_id: str, *, book_concurrency: int | None = N
             })
             return result
         except SyncPaused:
-            await _apply_task_state(
-                task_obj, db, task_id, {"status": "paused", "resume_at": None}
-            )
+            values = {"status": "paused", "resume_at": None}
+            if checkpoint_saved:
+                values.update(progress=dict(progress_state),
+                              result=_carry_result_counters(previous_result, progress_state))
+            await _apply_task_state(task_obj, db, task_id, values)
             return {"status": "paused", "task_id": task_id}
         except TaskCancelled as exc:
             await _apply_task_state(task_obj, db, task_id, {
@@ -568,15 +483,20 @@ async def run_crawl_task_async(task_id: str, *, book_concurrency: int | None = N
                 max_retries = 2
             if _is_transient_task_error(exc) and retries < max(0, max_retries):
                 delay = _task_retry_delay_seconds(retries)
+                if isinstance(exc, transient.UpstreamBackoff):
+                    delay = max(delay, exc.remaining_seconds)
+                    reason = f"{exc.origin} 要求暂缓请求（HTTP {exc.status_code}）"
+                else:
+                    reason = f"网络/代理暂时不可用（{type(exc).__name__}: {_describe_error(exc)}）"
+                resume_at = naive_now() + timedelta(seconds=delay)
                 message = (
-                    "网络/代理暂时不可用（"
-                    f"{type(exc).__name__}: {_describe_error(exc)}），"
-                    f"{delay} 秒后自动重试（第 {retries + 1}/{max_retries} 次）"
+                    f"{reason}，预计 {resume_at:%Y-%m-%d %H:%M:%S} 自动重试"
+                    f"（第 {retries + 1}/{max_retries} 次）"
                 )
                 await _apply_task_state(task_obj, db, task_id, {
                     "status": "pending",
                     "finished_at": None,
-                    "resume_at": naive_now() + timedelta(seconds=delay),
+                    "resume_at": resume_at,
                     "progress": {**progress_state, "auto_retries": retries + 1},
                     "result": _carry_result_counters(previous_result, progress_state),
                     "error": message,

@@ -4,7 +4,7 @@ function token(): string | null {
   return localStorage.getItem("novelhub_token")
 }
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+async function fetchResponse(path: string, options: RequestInit = {}): Promise<Response> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...(options.headers as Record<string, string> | undefined),
@@ -31,11 +31,18 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     }
     throw new Error(msg)
   }
-  if (res.status === 204) return undefined as T
-  return res.json()
+  return res
+}
+
+async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const res = await fetchResponse(path, options)
+  return res.status === 204 ? undefined as T : res.json()
 }
 
 export const api = {
+  async getBlob(path: string): Promise<Blob> {
+    return (await fetchResponse(path)).blob()
+  },
   get<T>(path: string): Promise<T> {
     return request<T>(path)
   },

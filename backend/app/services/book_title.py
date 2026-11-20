@@ -78,3 +78,23 @@ def normalized_title_sql(column: Any) -> Any:
     from sqlalchemy import func
 
     return func.regexp_replace(func.lower(column), TITLE_NOISE_PATTERN, "", "g")
+
+
+def is_identity_tag(tag: str, title: str, author: str) -> bool:
+    """Recognise copied title/author metadata without removing genuine genres."""
+    label = normalize_title(tag.strip("#＃ "))
+    name = normalize_title(title)
+    writer = normalize_title(author)
+    if name == "unknown":
+        name = ""
+    if writer == "unknown":
+        writer = ""
+    if not label or label in {name, writer}:
+        return True
+    if re.match(r"^(?:书名|書名|作者|笔名|筆名|著者)[:：]", label):
+        return True
+    if name and name in label:
+        rest = label.replace(name, "", 1).strip("()-_：:|/·")
+        return rest in {"最新章节", "最新章節", "全文", "全文阅读", "全文閱讀",
+                        "免费阅读", "免費閱讀", "小说", "小說", "最新更新", writer}
+    return bool(writer and label in {writer + "著", "作者" + writer})

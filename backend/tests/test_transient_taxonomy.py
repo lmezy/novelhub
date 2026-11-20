@@ -163,3 +163,18 @@ def test_the_concurrency_artefact_is_still_matched_by_its_message():
     # The other IndexError must not be swept in by a loose match.
     assert core_transient.is_transient_transport_error(
         IndexError("list index out of range")) is False
+
+
+@pytest.mark.parametrize("status", [408, 425, 429, 500, 503, 520, 523])
+def test_retryable_http_status_is_not_a_verification_page(status):
+    from app.services.crawl_runner import _is_transient_task_error
+    error = _status_error(status)
+    assert not SyncService._is_upstream_blocked(error)
+    assert SyncService._is_transient_chapter_error(error)
+    assert SyncService._is_transient_book_fetch(error)
+    assert _is_transient_task_error(error)
+
+
+def test_empty_toc_diagnosis_mentioning_a_possible_rate_limit_is_not_a_gate():
+    error = ValueError("Book page returned no usable metadata/chapters: 站点可能对该出口 IP 限流")
+    assert not SyncService._is_upstream_blocked(error)

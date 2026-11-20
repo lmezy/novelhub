@@ -224,12 +224,10 @@ async def test_fetch_chapter_content_gallery_walk_respects_page_cap(monkeypatch)
         tags="",
     )
 
-    with patch.object(plugin, "_get", AsyncMock(side_effect=fake_get)):
-        content = await plugin.fetch_chapter_content(chapter)
-
-    images = [line for line in content.splitlines() if line.startswith("![")]
-    assert len(images) == 21  # the entry page plus the 20 capped pages
-    assert YueduPlugin._gallery_page_limit() == 20
+    with patch.object(plugin, "_get", AsyncMock(side_effect=fake_get)) as fetch:
+        with pytest.raises(ValueError, match="YUEDU_GALLERY_MAX_PAGES=20"):
+            await plugin.fetch_chapter_content(chapter)
+    assert fetch.await_count == 21
 
 
 @pytest.mark.asyncio
@@ -283,7 +281,7 @@ async def test_gallery_rejects_endless_fresh_links_to_the_same_image(monkeypatch
     async def get(url):
         n = int(url.rsplit("/", 1)[-1])
         assert n < 10
-        return f'<div id="imgarea"><img src="/a.jpg"></div><a rel="next" href="/{n+1}">下一张</a>'
+        return f'<div id="imgarea"><img src="/{n % 2}.jpg"></div><a rel="next" href="/{n+1}">下一张</a>'
 
     with patch.object(plugin, "_get", get), pytest.raises(ValueError, match="相同内容"):
         await plugin.fetch_chapter_content(SimpleNamespace(url="https://reader.test/1"))
@@ -305,19 +303,35 @@ async def test_untyped_image_gallery_follows_page_labels_and_stops_at_chapter_li
 
 
 @pytest.mark.asyncio
-async def test_prose_chapter_keeps_its_existing_pagination_limit():
+async def test_prose_chapter_reads_past_twenty_pages_to_its_end():
     plugin = YueduPlugin({
         "bookSourceUrl": "https://reader.test",
         "ruleContent": {"content": "p@text", "nextContentUrl": "a.next@href"},
     })
     async def get(url):
         n = int(url.rsplit("/", 1)[-1])
-        assert n <= 21
-        return f'<p>Page {n}</p><a class="next" href="/{n+1}">Next</a>'
+        assert n <= 29
+        link = f'<a class="next" href="/{n+1}">Next</a>' if n < 29 else ""
+        return f'<p>Page {n}</p>{link}'
 
     with patch.object(plugin, "_get", get):
         content = await plugin.fetch_chapter_content(SimpleNamespace(url="https://reader.test/1"))
-    assert content.splitlines() == [f"Page {n}" for n in range(1, 22)]
+    assert content.splitlines() == [f"Page {n}" for n in range(1, 30)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("last_html", "message"), [
+    ("", "未解析出正文"),
+    ("<html><p>该作品已下架</p></html>", "已被删除"),
+    ("<p>输入验证码后可继续访问</p>", "验证"),
+])
+async def test_bad_followup_page_fails_the_whole_chapter(last_html, message):
+    plugin = YueduPlugin({"bookSourceUrl": "https://reader.test",
+                          "ruleContent": {"content": "p@text", "nextContentUrl": "a.next@href"}})
+    first = '<p>完整章节的第一页</p><a class="next" href="/2">下一页</a>'
+    with patch.object(plugin, "_get", AsyncMock(side_effect=[first, last_html])):
+        with pytest.raises((RuntimeError, ValueError), match=message):
+            await plugin.fetch_chapter_content(SimpleNamespace(url="https://reader.test/1"))
 
 
 def test_parse_bookshelf_direct_anchor_fallback():
@@ -3251,7 +3265,7 @@ async def test_empty_array_rules_from_yuedu_export_use_forum_fallback():
         "ruleContent": [],
         "ruleToc": [],
     })
-    html = '<h1>漫画图集</h1><div id="content-section"><pre>body</pre></div>'
+    html = '<h1>漫画图集</h1><div class="tags"><a>漫画</a><a>图集</a></div><div id="content-section"><pre>body</pre></div>'
     url = "https://forum.example/index.php?app=forum&act=threadview&tid=1"
 
     with patch.object(plugin, "_get", AsyncMock(return_value=html)):
@@ -5542,9 +5556,9 @@ def test_describe_book_page_says_which_knob_to_turn():
     from app.crawler.plugins.yuedu.book import describe_book_page, toc_container_hint
 
     stub = '<html><script>window.location.href="/book/1"</script></html>'
-    assert "跳转/挑战页" in describe_book_page(stub, "ul#ul_all_chapters > li")
+    assert "跳转脚本" in describe_book_page(stub, "ul#ul_all_chapters > li")
 
-    captcha = "<html>" + "x" * 3000 + " Just a moment... </html>"
+    captcha = "<html><title>Just a moment...</title></html>"
     assert "人机验证" in describe_book_page(captcha, "ul#ul_all_chapters > li")
 
     missing = "<html>" + "x" * 3000 + "</html>"
@@ -5553,7 +5567,10 @@ def test_describe_book_page_says_which_knob_to_turn():
 
     empty = '<html>' + "x" * 3000 + ' id="ul_all_chapters" ' + "y" * 100 + "</html>"
     verdict = describe_book_page(empty, "ul#ul_all_chapters > li")
-    assert "是空的" in verdict and "限流" in verdict
+    assert "没有解析出章节" in verdict and "限流" not in verdict
+
+    small = '<html><script src="captcha.js"></script><article>第一章</article></html>'
+    assert "没有目录容器" in describe_book_page(small, "ul#ul_all_chapters > li")
 
     # No usable selector hint -> a generic verdict, never a crash.
     assert "没有解析出任何章节链接" in describe_book_page(missing, "")
@@ -5561,3 +5578,100 @@ def test_describe_book_page_says_which_knob_to_turn():
     assert toc_container_hint("ul#ul_all_chapters > li") == 'id="ul_all_chapters"'
     assert toc_container_hint("div.chapter-list a") == 'class="chapter-list"'
     assert toc_container_hint("ul > li") == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["_get", "_post", "fetch_cover", "fetch_content_image"])
+async def test_every_http_attempt_observes_the_source_interval(method, monkeypatch):
+    plugin = YueduPlugin({"bookSourceUrl": "https://interval.test"})
+    reserve = AsyncMock()
+    monkeypatch.setattr(plugin, "_sleep_rate_limit", reserve)
+    monkeypatch.setattr(plugin, "_ordered_transports", lambda proxy: [None])
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    starts = []
+
+    def respond(request):
+        starts.append(reserve.await_count)
+        if len(starts) == 1:
+            return httpx.Response(502)
+        return httpx.Response(200, content=b"some content " * 30)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        monkeypatch.setattr(plugin, "_get_http_client", AsyncMock(return_value=client))
+        assert await getattr(plugin, method)("https://interval.test/chapter")
+    assert starts == [1, 2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["_get", "_post"])
+async def test_definitive_http_error_sends_only_one_request(method, monkeypatch):
+    plugin = YueduPlugin({"bookSourceUrl": "https://gone.test"})
+    reserve = AsyncMock()
+    monkeypatch.setattr(plugin, "_sleep_rate_limit", reserve)
+    monkeypatch.setattr(plugin, "_ordered_transports", lambda proxy: ["proxy", None])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda req: httpx.Response(404))) as client:
+        monkeypatch.setattr(plugin, "_get_http_client", AsyncMock(return_value=client))
+        with pytest.raises(httpx.HTTPStatusError):
+            await getattr(plugin, method)("https://gone.test/book/1")
+    reserve.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_origin_holds_other_books_but_releases_after_deadline(monkeypatch):
+    from app.core.transient import UpstreamBackoff
+
+    first = YueduPlugin({"bookSourceUrl": "https://cooldown.test"})
+    second = YueduPlugin({"bookSourceUrl": "https://cooldown.test/other"})
+    monkeypatch.setattr(YueduPlugin, "_origin_cooldowns", {})
+    monkeypatch.setattr(YueduPlugin, "_sleep_rate_limit", AsyncMock())
+    monkeypatch.setattr(YueduPlugin, "_ordered_transports", lambda self, proxy: ["proxy", None])
+    calls = []
+
+    def respond(request):
+        calls.append(request.url.host)
+        if len(calls) == 1:
+            return httpx.Response(429, headers={"Retry-After": "120"})
+        return httpx.Response(200, text="ok")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        monkeypatch.setattr(YueduPlugin, "_get_http_client", AsyncMock(return_value=client))
+        with pytest.raises(UpstreamBackoff) as caught:
+            await first._get("https://cooldown.test:443/book/1?q=1#top")
+        assert caught.value.remaining_seconds == 120
+        with pytest.raises(UpstreamBackoff):
+            await second._post("https://cooldown.test/book/2")
+        assert await second._get("https://other.test/x") == "ok"
+        # Simulate expiry without sleeping through the cooldown.
+        first._origin_cooldowns["https://cooldown.test"] = (429, time.monotonic() - 1)
+        assert await second._get("https://cooldown.test/book/2") == "ok"
+    assert calls == ["cooldown.test", "other.test", "cooldown.test"]
+
+
+def test_retry_after_http_dates_and_invalid_headers():
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    future = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=300), usegmt=True)
+    parse = YueduPlugin._retry_after_seconds
+    assert 298 < parse(future) <= 300
+    assert parse("not a date") is None
+    assert parse("Thu, 01 Jan 1970 00:00:00 GMT") == 0
+    assert parse("1.5") == 1.5
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["fetch_cover", "fetch_content_image"])
+async def test_image_fetch_uses_configured_proxy_if_direct_first_fails(monkeypatch, method):
+    plugin = YueduPlugin({"bookSourceUrl": "https://image.test"})
+    direct = AsyncMock()
+    direct.get.side_effect = httpx.ConnectTimeout("offline")
+    image = b"image" * 50
+    via_proxy = _fake_http_client([httpx.Response(200, content=image, headers={"content-type": "image/png"})])
+    route = AsyncMock(side_effect=lambda proxy: via_proxy if proxy else direct)
+    monkeypatch.setattr(plugin, "_get_http_client", route)
+    monkeypatch.setattr(plugin, "_reset_http_client", AsyncMock())
+    monkeypatch.setattr(plugin, "_sleep_rate_limit", AsyncMock())
+    monkeypatch.setattr(plugin, "_ordered_transports", lambda proxy: [None, "proxy"])
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    assert await getattr(plugin, method)("https://cdn.test/1.png") == (image, "image/png")
+    assert route.await_args.args == ("proxy",)
+    assert via_proxy.calls == 1

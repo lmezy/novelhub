@@ -20,46 +20,16 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import JSON, select
-from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy import select
 
 from app.api.routes import rag as rag_routes
 from app.core.database import get_db
 from app.main import app
 from app.models import Book, BookTag, Chapter, ChapterEmbedding, Tag
-from app.models.base import Base
 from app.services import book_profiles, rag_jobs
 from app.services.auth import get_current_user, require_admin
 from app.services.rag import RAGService
-
-
-@pytest_asyncio.fixture
-async def session_factory():
-    """SQLite session factory over the real metadata.
-
-    SQLite cannot compile ``JSONB``, and several tables (``users``,
-    ``sources``, ``chapter_embeddings`` ...) carry it.  The columns are swapped
-    to the generic ``JSON`` type for the duration of the test and restored
-    afterwards, so nothing leaks into the rest of the suite.
-    """
-    swapped = []
-    for table in Base.metadata.tables.values():
-        for column in table.columns:
-            if isinstance(column.type, JSONB):
-                swapped.append((column, column.type))
-                column.type = JSON()
-    engine = create_async_engine("sqlite+aiosqlite://")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    try:
-        yield async_sessionmaker(engine, expire_on_commit=False)
-    finally:
-        await engine.dispose()
-        for column, original in swapped:
-            column.type = original
 
 
 async def _seed_books(Session, *books) -> None:

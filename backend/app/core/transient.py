@@ -23,15 +23,53 @@ arguments, which is how "Failed to sync book X: " with no cause used to appear).
 
 ``RequestError`` is excluded on purpose
 ---------------------------------------
-``httpx.HTTPStatusError`` derives from ``httpx.RequestError``, so listing
-``RequestError`` makes **every** HTTP status error look like a network blip --
-including a 404.  Callers must decide those on the status code (see
-``SyncService._is_transient_book_fetch``), not on the exception's ancestry.
+HTTPX distinguishes request failures from HTTP status errors. Classify an
+HTTP response by its status code, and reserve transport retries for failures
+with evidence of a socket or stream problem.
 """
 
 from __future__ import annotations
 
+import math
+import time
+
+
+class UpstreamStatusError(RuntimeError):
+    """A retryable HTTP response that needs no further immediate attempts."""
+
+    def __init__(self, status: int, detail: str):
+        self.status_code = status
+        super().__init__(f"HTTP {status}：{detail}")
+
+
+class UpstreamBackoff(UpstreamStatusError):
+    """The server requested a cooldown. A queued sync can release its slot."""
+
+    def __init__(self, status: int, origin: str, deadline: float):
+        self.deadline = deadline
+        self.origin = origin
+        super().__init__(status, f"{origin} 要求暂缓请求，请在 {self.remaining_seconds} 秒后重试")
+
+    @property
+    def remaining_seconds(self) -> int:
+        return max(0, math.ceil(self.deadline - time.monotonic()))
+
+
+def http_status(exc: BaseException) -> int | None:
+    if isinstance(exc, UpstreamStatusError):
+        return exc.status_code
+    return getattr(getattr(exc, "response", None), "status_code", None)
+
+
+def retryable_http_status(status: int) -> bool:
+    return status in (408, 425, 429) or 500 <= status < 600
+
+
 __all__ = [
+    "UpstreamStatusError",
+    "UpstreamBackoff",
+    "http_status",
+    "retryable_http_status",
     "TRANSIENT_EXCEPTION_NAMES",
     "TRANSIENT_MESSAGE_MARKERS",
     "exception_names",

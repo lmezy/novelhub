@@ -13,6 +13,9 @@ It is a mixin: it only ever touches shared state through ``self`` /
 
 from app.crawler.plugins.yuedu.common import logger
 from app.crawler.plugins.yuedu.errors import is_transient_transport_error
+from app.core.transient import UpstreamBackoff, UpstreamStatusError
+from datetime import date, datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import urlparse
 import asyncio
@@ -578,6 +581,70 @@ class TransportMixin:
                 await asyncio.sleep(
                     cooldown_seconds + random.uniform(0, 1)
                 )
+
+    @staticmethod
+    def _retry_after_seconds(value: str) -> float | None:
+        """Read a delta or HTTP date. Bound anomalous values to a representable delay."""
+        value = value.strip()
+        if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value):
+            seconds = float(value)
+        else:
+            try:
+                when = parsedate_to_datetime(value)
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=timezone.utc)
+                seconds = (when - datetime.now(timezone.utc)).total_seconds()
+            except (ValueError, OverflowError, TypeError):
+                return None
+        # The queue stores a local datetime and rounds waits up to whole seconds.
+        max_seconds = (date.max - date.today()).days * 86400
+        return min(max(0, seconds), max_seconds)
+
+    @staticmethod
+    def _origin(url: str) -> str:
+        # HTTPX normalizes default ports and IPv6 literals. Exclude userinfo,
+        # query and path from both the shared key and the task message.
+        return str(httpx.URL(url).copy_with(userinfo=b"", raw_path=b"/", fragment=None)).rstrip("/")
+
+    def _check_cooldown(self, origin: str) -> None:
+        entry = self._origin_cooldowns.get(origin)
+        if entry is not None:
+            status, deadline = entry
+            if deadline > time.monotonic():
+                raise UpstreamBackoff(status, origin, deadline)
+            del self._origin_cooldowns[origin]
+
+    async def _wait_for_request(self, url: str) -> None:
+        origin = self._origin(url)
+        self._check_cooldown(origin)
+        await self._sleep_rate_limit()
+        # Another in-flight request may have seen a 429 while we waited.
+        self._check_cooldown(origin)
+
+    def _observe_backoff(self, url: str, status: int, retry_after: str) -> None:
+        delay = self._retry_after_seconds(retry_after) if retry_after else None
+        if status != 429 and not delay:
+            return
+        origin = self._origin(url)
+        now = time.monotonic()
+        deadline = now + (delay if delay is not None else 60)
+        if len(self._origin_cooldowns) >= 256:
+            for key, (_, expiry) in list(self._origin_cooldowns.items()):
+                if expiry <= now:
+                    del self._origin_cooldowns[key]
+        previous = self._origin_cooldowns.get(origin)
+        if previous is None or previous[1] < deadline:
+            self._origin_cooldowns[origin] = (status, deadline)
+        status, deadline = self._origin_cooldowns[origin]
+        raise UpstreamBackoff(status, origin, deadline)
+
+    async def _retry_status(self, url: str, response, attempt: int) -> None:
+        status = response.status_code
+        self._observe_backoff(url, status, response.headers.get("Retry-After", ""))
+        if attempt == 2:
+            raise UpstreamStatusError(status, url)
+        await asyncio.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
+
     def _capture_cookie_jar(self, resp) -> None:
         """Collect Set-Cookie headers when the source enables its cookie jar."""
         if not self.config.get("enabledCookieJar", False):
@@ -687,7 +754,6 @@ class TransportMixin:
                 # helper (GET / webView) rather than being force-POSTed.
                 return await self._get(clean_url, charset=charset)
             url = clean_url
-        await self._sleep_rate_limit()
         headers = self._build_headers(headers)
 
         proxy_url = None
@@ -701,10 +767,10 @@ class TransportMixin:
 
         async def _request(proxy: str | None) -> str:
             nonlocal headers
-            last_error: httpx.HTTPError | None = None
-            last_status: int | None = None
+            last_error: Exception | None = None
             for attempt in range(3):
                 try:
+                    await self._wait_for_request(url)
                     client = await self._get_http_client(proxy)
                     if isinstance(body, str):
                         content_type = headers.get("Content-Type", "").lower()
@@ -734,6 +800,8 @@ class TransportMixin:
                                 request_headers=headers,
                                 fallback_http=False,
                             )
+                        except UpstreamStatusError:
+                            raise
                         except RuntimeError as exc:
                             if "anti-bot/captcha" in str(exc):
                                 raise
@@ -754,18 +822,7 @@ class TransportMixin:
                             return browser_html
                         raise self._blocked_page_error(url)
                     if self._is_transient_upstream_status(resp.status_code):
-                        retry_after = resp.headers.get("Retry-After", "")
-                        wait = (
-                            float(retry_after)
-                            if retry_after and retry_after.replace(".", "", 1).isdigit()
-                            else 2 ** attempt
-                        )
-                        # Remember why the last attempt failed: this branch
-                        # never sets ``last_error``, so without it the final
-                        # error was a bare "Request failed after retries" that
-                        # hid a repeated upstream 5xx.
-                        last_status = resp.status_code
-                        await asyncio.sleep(wait + random.uniform(0.5, 1.5))
+                        await self._retry_status(url, resp, attempt)
                         continue
                     resp.raise_for_status()
                     self._capture_cookie_jar(resp)
@@ -781,6 +838,8 @@ class TransportMixin:
                                 request_headers=headers,
                                 fallback_http=False,
                             )
+                        except UpstreamStatusError:
+                            raise
                         except RuntimeError as exc:
                             if "anti-bot/captcha" in str(exc):
                                 raise
@@ -801,7 +860,7 @@ class TransportMixin:
                             return browser_html
                         raise self._blocked_page_error(url)
                     return text
-                except httpx.HTTPError as exc:
+                except httpx.RequestError as exc:
                     last_error = exc
                     if attempt < 2:
                         await asyncio.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
@@ -817,13 +876,10 @@ class TransportMixin:
 
             if last_error is not None:
                 raise last_error
-            raise RuntimeError(
-                f"Request failed after retries: {url}"
-                + (f" (HTTP {last_status})" if last_status else "")
-            )
+            raise RuntimeError(f"Request failed after retries: {url}")
 
         transports = self._ordered_transports(proxy_url)
-        last_error: httpx.HTTPError | None = None
+        last_error: Exception | None = None
         for index, proxy in enumerate(transports):
             # Only give up once *every* candidate failed.  ``_ordered_transports``
             # ranks direct first while the proxy is in cooldown (or after a direct
@@ -844,29 +900,6 @@ class TransportMixin:
                     url,
                     type(exc).__name__,
                     f": {exc}" if str(exc) else "",
-                    self._retry_transport_label(transports[index + 1]),
-                )
-                continue
-            except httpx.HTTPStatusError as exc:
-                last_error = exc
-                status = (
-                    exc.response.status_code
-                    if exc.response is not None
-                    else None
-                )
-                # Only retry the other transport for statuses that may be
-                # specific to this exit node / IP.  A 404 from the proxy is a
-                # definitive answer; falling back to direct just burned the
-                # 3x connect timeout before failing anyway.
-                if is_last or status not in (
-                    403, 408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524,
-                ):
-                    raise
-                logger.warning(
-                    "%s returned HTTP %s for %s; retrying %s",
-                    self._transport_label(proxy),
-                    status if status is not None else "error",
-                    url,
                     self._retry_transport_label(transports[index + 1]),
                 )
                 continue
@@ -913,7 +946,6 @@ class TransportMixin:
             url = clean_url
             if url_options.get("charset"):
                 charset = url_options.get("charset")
-        await self._sleep_rate_limit()
         headers = self._build_headers()
 
         proxy_url = None
@@ -927,12 +959,12 @@ class TransportMixin:
 
         async def _request(proxy: str | None) -> str:
             nonlocal headers
-            last_error: httpx.HTTPError | None = None
-            last_status: int | None = None
+            last_error: Exception | None = None
             # Set when a polluted system DNS forced a DoH-resolved IP rewrite.
             doh_target: tuple[str, str] | None = None
             for attempt in range(3):
                 try:
+                    await self._wait_for_request(url)
                     client = await self._get_http_client(proxy)
                     req_url = url
                     req_headers = headers
@@ -955,6 +987,8 @@ class TransportMixin:
                                 request_headers=headers,
                                 fallback_http=False,
                             )
+                        except UpstreamStatusError:
+                            raise
                         except RuntimeError as exc:
                             if "anti-bot/captcha" in str(exc):
                                 raise
@@ -978,18 +1012,7 @@ class TransportMixin:
                         # bare httpx 403 that hides the real cause.
                         raise self._blocked_page_error(url)
                     if self._is_transient_upstream_status(resp.status_code):
-                        retry_after = resp.headers.get("Retry-After", "")
-                        wait = (
-                            float(retry_after)
-                            if retry_after and retry_after.replace(".", "", 1).isdigit()
-                            else 2 ** attempt
-                        )
-                        # Remember the status: this branch never sets
-                        # ``last_error``, so the final error would otherwise be
-                        # a bare "Request failed after retries" that hides a
-                        # repeatedly failing upstream 5xx.
-                        last_status = resp.status_code
-                        await asyncio.sleep(wait + random.uniform(0.5, 1.5))
+                        await self._retry_status(url, resp, attempt)
                         continue
                     resp.raise_for_status()
                     self._capture_cookie_jar(resp)
@@ -1005,6 +1028,8 @@ class TransportMixin:
                                 request_headers=headers,
                                 fallback_http=False,
                             )
+                        except UpstreamStatusError:
+                            raise
                         except RuntimeError as exc:
                             if "anti-bot/captcha" in str(exc):
                                 raise
@@ -1059,7 +1084,7 @@ class TransportMixin:
                     last_error = exc
                     if attempt < 2:
                         await asyncio.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
-                except httpx.HTTPError as exc:
+                except httpx.RequestError as exc:
                     if isinstance(exc, httpx.TransportError):
                         # The pooled connection hung (proxy restarted, upstream
                         # node vanished). Drop it so the retry dials fresh
@@ -1083,13 +1108,10 @@ class TransportMixin:
 
             if last_error is not None:
                 raise last_error
-            raise RuntimeError(
-                f"Request failed after retries: {url}"
-                + (f" (HTTP {last_status})" if last_status else "")
-            )
+            raise RuntimeError(f"Request failed after retries: {url}")
 
         transports = self._ordered_transports(proxy_url)
-        last_error: httpx.HTTPError | None = None
+        last_error: Exception | None = None
         for index, proxy in enumerate(transports):
             # See ``_get``: a direct-first ordering must not skip the proxy.
             is_last = index == len(transports) - 1
@@ -1106,25 +1128,6 @@ class TransportMixin:
                     url,
                     type(exc).__name__,
                     f": {exc}" if str(exc) else "",
-                    self._retry_transport_label(transports[index + 1]),
-                )
-                continue
-            except httpx.HTTPStatusError as exc:
-                last_error = exc
-                status = (
-                    exc.response.status_code
-                    if exc.response is not None
-                    else None
-                )
-                if is_last or status not in (
-                    403, 408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524,
-                ):
-                    raise
-                logger.warning(
-                    "%s returned HTTP %s for %s; retrying %s",
-                    self._transport_label(proxy),
-                    status if status is not None else "error",
-                    url,
                     self._retry_transport_label(transports[index + 1]),
                 )
                 continue

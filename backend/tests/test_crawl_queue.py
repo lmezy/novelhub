@@ -1270,3 +1270,61 @@ async def test_clear_history_only_ever_touches_finished_tasks():
     assert "crawl_tasks.user_id" in str(compiled)
 
 
+@pytest.mark.asyncio
+async def test_cooldown_requeues_at_server_deadline_with_page_checkpoint(monkeypatch):
+    import time
+    from app.core.clock import naive_now
+    from app.core.transient import UpstreamBackoff
+    from app.services.crawl_runner import _RESULT_COUNTER_KEYS
+
+    task = _task()
+    db = AsyncMock()
+    db.get.return_value = task
+    before = naive_now()
+    error = UpstreamBackoff(503, "https://books.test", time.monotonic() + 300)
+    snapshot = dict.fromkeys(_RESULT_COUNTER_KEYS, 0)
+    snapshot.update(books_found=2, books_synced=2, chapters_created=4, pages_checked=3,
+                    next_page=3, details=[{"url": "https://books.test/1", "synced": True}])
+    completed = ["https://books.test/1"]
+
+    async def deferred(self, source, **kwargs):
+        kwargs["backoff_cb"](snapshot, completed)
+        raise error
+
+    monkeypatch.setenv("SYNC_TASK_RETRY_BASE_SECONDS", "5")
+    with (
+        patch("app.services.crawl_runner.SessionLocal", return_value=_session_for(db)),
+        patch("app.services.sync.SyncService.discover_and_sync_all", deferred),
+    ):
+        result = await run_crawl_task_async("task-1")
+
+    assert result["status"] == "retrying"
+    assert result["retry_in_seconds"] == 300
+    assert task.status == "pending" and (task.resume_at - before).total_seconds() >= 300
+    assert task.progress["next_page"] == 3
+    assert task.progress["completed_page_urls"] == completed
+    assert task.result["chapters_created"] == 4
+    assert task.result["details"] == snapshot["details"]
+
+
+@pytest.mark.asyncio
+async def test_retry_reuses_saved_page_and_queued_priority_respects_cooldown():
+    from datetime import timedelta
+    from app.api.routes.crawl import move_task_front, retry_task
+    from app.core.clock import naive_now
+
+    deadline = naive_now() + timedelta(minutes=5)
+    task = _task(progress={"retry_checkpoint": True, "next_page": 3, "auto_retries": 2,
+                           "completed_page_urls": ["https://books.test/book/1"]},
+                 result={"books_synced": 4}, resume_at=deadline)
+    db = AsyncMock()
+    db.get.return_value = task
+    db.scalar.return_value = 7
+    user = SimpleNamespace(id="admin", role="admin")
+    await move_task_front(task.id, user=user, db=db)
+    assert task.priority == 8 and task.resume_at == deadline
+    task.status = "failed"
+    await retry_task(task.id, user=user, db=db)
+    assert task.progress == {"retry_checkpoint": True, "next_page": 3, "auto_retries": 0,
+                             "completed_page_urls": ["https://books.test/book/1"]}
+    assert task.status == "pending" and task.result == {"books_synced": 4}

@@ -14,6 +14,7 @@ runs the render under ``ensure_future`` + ``asyncio.shield`` and, on
 timeout, closes the browser so the navigation can finish on its own.
 """
 
+from app.core.transient import UpstreamBackoff, UpstreamStatusError
 from app.crawler.plugins.yuedu.common import logger
 from typing import Any
 import asyncio
@@ -84,12 +85,6 @@ class RenderMixin:
                 raise RuntimeError(f"Playwright is not installed: {url}")
             return await self._get(url)
 
-        # The source's own rate limit applies to the browser path too; it used
-        # to bypass it, which hammered WAF-protected sites with parallel
-        # browsers and produced captcha pages mid-sync.
-        async with self._browser_semaphore():
-            await self._sleep_rate_limit()
-
         # A single transient browser failure (empty page, navigation timeout)
         # is common right after the proxy reconnects, so retry once when the
         # caller requires a real browser.
@@ -98,6 +93,7 @@ class RenderMixin:
         for attempt in range(attempts):
             try:
                 async with self._browser_semaphore():
+                    await self._wait_for_request(url)
                     html = await self._fetch_with_playwright(
                         async_playwright,
                         url,
@@ -105,6 +101,8 @@ class RenderMixin:
                         request_headers,
                     )
                 return html
+            except UpstreamBackoff:
+                raise
             except Exception as exc:
                 last_error = exc
                 message = str(exc)
@@ -129,6 +127,8 @@ class RenderMixin:
 
         # Fallback: try evaluating webJs on plain HTTP response
         if not fallback_http:
+            if isinstance(last_error, UpstreamStatusError):
+                raise last_error
             detail = f" ({type(last_error).__name__}: {last_error})" if last_error else ""
             raise RuntimeError(f"Browser request failed: {url}{detail}") from last_error
 
@@ -253,7 +253,10 @@ class RenderMixin:
 
             # WAF-protected sites often keep analytics sockets open forever;
             # waiting for networkidle turns a usable page into a timeout.
-            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            if response is not None and self._is_transient_upstream_status(response.status):
+                self._observe_backoff(url, response.status, response.headers.get("retry-after", ""))
+                raise UpstreamStatusError(response.status, url)
             # Cloudflare / WAF challenge pages ("Just a moment…") return
             # before the JS challenge has solved itself.  Wait for the
             # real page (and the resolved session cookies) before running

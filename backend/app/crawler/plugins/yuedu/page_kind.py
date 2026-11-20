@@ -11,6 +11,7 @@ pages, a novel title can contain 限流, and a chapter's own prose can say
 distinctions, so change them only with a real page in hand.
 """
 
+from app.core.transient import retryable_http_status
 from app.crawler.plugins.yuedu.markers import CF_CHALLENGE_MARKERS
 from app.crawler.plugins.yuedu.markers import CLOUDFLARE_ERROR_IDS
 from app.crawler.plugins.yuedu.markers import CLOUDFLARE_ERROR_PHRASES
@@ -21,6 +22,7 @@ from app.crawler.plugins.yuedu.markers import UPSTREAM_ERROR_CODE_RE
 from app.crawler.plugins.yuedu.markers import UPSTREAM_ERROR_PAGE_MAX_CHARS
 from app.crawler.plugins.yuedu.markers import has_contextual_block_marker
 from app.crawler.plugins.yuedu.markers import has_weak_block_marker
+from app.crawler.plugins.yuedu.markers import chapter_text_is_blocked
 from urllib.parse import urlparse
 import re
 
@@ -122,18 +124,8 @@ class PageKindMixin:
         ):
             return True
         return bool(UPSTREAM_ERROR_BODY_RE.search(lowered))
-    @staticmethod
-    def _is_transient_upstream_status(status: int) -> bool:
-        """Whether an HTTP status is an upstream hiccup worth retrying.
+    _is_transient_upstream_status = staticmethod(retryable_http_status)
 
-        Cloudflare answers 520-527 when its edge cannot talk to the origin and
-        origins answer 500-504 of their own; both come and go within minutes.
-        Treating them as retryable (instead of a WAF gate) also means
-        ``sync.py`` sees the "(HTTP 52x)" signature and classifies the failure as
-        transient, so a burst of them no longer counts towards
-        ``SYNC_MAX_CONSECUTIVE_FAILURES`` and aborts the whole task.
-        """
-        return status == 429 or 500 <= status < 600
     @staticmethod
     def _looks_like_removed_page(html: str) -> bool:
         """Detect a "this novel/chapter no longer exists" notice page.
@@ -173,29 +165,5 @@ class PageKindMixin:
         if "browser check" in lowered:
             return True
         return False
-    @classmethod
-    def _content_is_blocked(cls, text: str) -> bool:
-        """Reject extracted chapter text that is really an anti-bot page."""
-        if not text:
-            return False
-        lowered = text.lower()
-        strong = (
-            "输入验证码后可继续访问",
-            "请完成验证",
-            "人机验证",
-            "滑动验证",
-            "验证码后可继续访问",
-            "limit_box",
-            "访问过于频繁",
-            "请求过于频繁",
-            "操作过于频繁",
-        )
-        if any(marker in lowered for marker in strong):
-            return True
-        if has_contextual_block_marker(lowered):
-            return True
-        if "访问异常" in lowered:
-            return any(confirm in lowered for confirm in (
-                "验证码", "继续访问", "稍后", "频繁", "限流",
-            ))
-        return False
+
+    _content_is_blocked = staticmethod(chapter_text_is_blocked)

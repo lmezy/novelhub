@@ -1,17 +1,20 @@
 import asyncio
 import re
+from collections import Counter
+from types import SimpleNamespace
 from uuid import uuid4
 from collections.abc import Awaitable, Callable
 from html import escape, unescape
 from urllib.parse import urljoin, urlparse
 
 from sqlalchemy import delete, select, update
-from sqlalchemy.exc import MissingGreenlet, SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from loguru import logger
 
 from app.crawler.base import EmptyTocError
+from app.crawler.plugins.yuedu.markers import chapter_text_is_blocked
 from app.crawler.registry import get_plugin
 from app.core import transient as core_transient
 from app.core.config import settings, sync_book_concurrency, sync_thread_count
@@ -26,6 +29,7 @@ from app.models import (
     BookVersion,
     Category,
     Chapter,
+    ChapterEmbedding,
     Cookie,
     Bookmark,
     CustomTag,
@@ -36,20 +40,18 @@ from app.models import (
     User,
 )
 from app.repositories.tag import TagRepository
-from app.services.content_quality import cover_wall_matches
-from app.services.storage import BookRef, BookStorage, text_digest
+from app.services.content_quality import SynopsisCatalog, cover_wall_labels, foreign_synopsis, match_cover_titles, normalize_title
+from app.services.storage import BookRef, BookStorage, ChapterFileBatch, TruncatedChapterError, text_digest
 from app.services.search import search_service
 from app.services.cookie_crypto import safe_decrypt_cookie
 from app.services.r18 import detect_r18
 from app.services.auto_categorize import classify_category_names
-from app.services.book_title import normalized_title_sql
+from app.services.book_title import is_identity_tag, normalized_title_sql
 from app.services.source_interval import apply_source_interval, source_sync_interval
 from app.services.book_kind import (
     KIND_COMIC,
-    chapter_comic_vote,
     classify_stored_book,
     is_comic_content,
-    is_comic_labels,
     is_comic_source,
     normalize_kind,
     refresh_search_kinds,
@@ -248,13 +250,14 @@ async def load_source_cookie(source_id: str) -> str | None:
 
 
 from app.services.sync_book_meta import SyncBookMetaMixin
-from app.services.sync_errors import SyncErrorMixin
+from app.services.sync_errors import SyncErrorMixin, is_transient_task_error
 
 
 class SyncService(SyncBookMetaMixin, SyncErrorMixin):
-    def __init__(self, db: AsyncSession, storage: BookStorage | None = None):
+    def __init__(self, db: AsyncSession, storage: BookStorage | None = None, *, synopses: SynopsisCatalog | None = None):
         self.db = db
         self.storage = storage or BookStorage()
+        self._synopses = synopses or SynopsisCatalog()
         #: Every book title in the library, loaded once per sync run; the
         #: cover-wall detector compares image alt texts against it.
         self._other_book_titles: set[str] | None = None
@@ -326,9 +329,12 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                 return await plugin.fetch_chapter_content(remote_chapter)
             except Exception as exc:
                 last_error = exc
-                if SyncService._is_upstream_blocked(exc):
-                    raise
-                if SyncService._is_permanent_chapter_error(exc):
+                if (
+                    isinstance(exc, core_transient.UpstreamStatusError)
+                    or not SyncService._is_transient_chapter_error(exc)
+                    or SyncService._is_upstream_blocked(exc)
+                    or SyncService._is_permanent_chapter_error(exc)
+                ):
                     raise
                 if attempt < attempts - 1:
                     await asyncio.sleep((2 ** attempt) + 0.5)
@@ -387,37 +393,8 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         author: str,
     ) -> list[str]:
         """Drop title/author fragments that old imports stored as tags."""
-        def _normalize(value: str) -> str:
-            return re.sub(
-                r"[\s《》「」『』〈〉（）【】\[\]\"'“”‘’]+",
-                "",
-                value or "",
-            ).lower()
-
-        title_norm = _normalize(title) if title and title.lower() != "unknown" else ""
-        author_norm = (
-            _normalize(author) if author and author.lower() != "unknown" else ""
-        )
-        cleaned: list[str] = []
-        for tag in tags:
-            tag = str(tag or "").strip().lower()
-            normalized = _normalize(tag)
-            if not normalized:
-                continue
-            if title_norm and (
-                normalized == title_norm
-                or normalized in title_norm
-                or title_norm in normalized
-            ):
-                continue
-            if author_norm and (
-                normalized == author_norm
-                or normalized in author_norm
-                or author_norm in normalized
-            ):
-                continue
-            cleaned.append(tag)
-        return cleaned
+        cleaned = [str(tag or "").strip().strip("#＃").strip().lower() for tag in tags]
+        return list(dict.fromkeys(tag for tag in cleaned if tag and not is_identity_tag(tag, title, author)))
 
     @staticmethod
     def _is_book_r18(source: Source, remote_book) -> bool:
@@ -511,12 +488,17 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                 if image_progress_cb is not None:
                     await image_progress_cb(index, len(urls))
                 try:
-                    result = await fetcher(url, referer=base_url or None)
-                    if result is not None:
+                    path = await asyncio.to_thread(self.storage.find_chapter_image, book.id, url)
+                    if not isinstance(path, str):
+                        result = await fetcher(url, referer=base_url or None)
+                        if result is None:
+                            continue
                         data, _content_type = result
-                        path = self.storage.save_chapter_image(book.id, url, data)
-                        filename = path.rsplit("/", 1)[-1]
-                        local_urls[url] = f"/api/chapters/{chapter_id}/images/{filename}"
+                        path = await asyncio.to_thread(self.storage.save_chapter_image, book.id, url, data)
+                    filename = path.rsplit("/", 1)[-1]
+                    local_urls[url] = f"/api/chapters/{chapter_id}/images/{filename}"
+                except core_transient.UpstreamBackoff:
+                    raise
                 except Exception:
                     # Keep the original remote image available to the reader.
                     continue
@@ -589,7 +571,7 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                 break
             except Exception as exc:
                 last_book_exc = exc
-                if not self._is_transient_book_fetch(exc):
+                if isinstance(exc, core_transient.UpstreamStatusError) or not self._is_transient_book_fetch(exc):
                     raise
                 if book_attempt < 2:
                     await asyncio.sleep(2.0 + book_attempt * 2.0)
@@ -658,6 +640,16 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             is_r18=is_r18,
             owner_id=source.owner_id,
         )
+        previous_title = book.title
+        previous_author = author_name
+        if not is_new:
+            if book.author_id and book.author_id != author_id:
+                previous_author = await self._book_author_name(book.author_id)
+                if author_name == "Unknown":
+                    author_name = previous_author
+                    author_id = book.author_id
+            book.title = book_title
+            book.author_id = author_id
         remote_cover_url = await self._persist_cover(book, plugin, remote_book)
 
         # Tags are re-derived on every sync: the source is the authority, so a
@@ -667,20 +659,9 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         # failure cannot wipe a book's tags.  Manual tags live in
         # ``book_custom_tags`` and are untouched by this.
         classification_tag = "r18" if is_r18 else "all-ages"
-        derived_tags: set[str] = set()
-        for tag in remote_book.tags:
-            tag = str(tag).strip().lower()
-            if tag:
-                derived_tags.add(tag)
-        for tag in discovery_tags or []:
-            tag = str(tag).strip().lower()
-            if tag:
-                derived_tags.add(tag)
-        source_tags = self._clean_sync_tags(
-            derived_tags,
-            book_title,
-            author_name,
-        )
+        source_tags = candidate_tags
+        if not is_new:
+            source_tags = self._clean_sync_tags(source_tags, previous_title, previous_author)
         if not source_tags:
             stored_tags = {
                 str(tag).strip().lower()
@@ -692,6 +673,8 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                 book_title,
                 author_name,
             )
+            if not is_new:
+                source_tags = self._clean_sync_tags(source_tags, previous_title, previous_author)
         await self._save_tags(
             book.id,
             sorted([*source_tags, classification_tag]),
@@ -701,6 +684,7 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             book.kind = resolve_kind(source=source, labels=source_tags)
         book_kind = normalize_kind(book.kind)
         source_config = source.config
+        request_interval = source_sync_interval(source)
         # Persist the book before chapter downloads so a later chapter failure
         # cannot leave chapters pointing at an uncommitted book row.
         await self.db.commit()
@@ -722,8 +706,8 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                 "source_book_id": remote_book.source_book_id,
                 "title": book_title,
                 "author": author_name,
-                "description": remote_book.description,
-                "status": remote_book.status,
+                "description": book.description,
+                "status": book.status,
                 "is_r18": is_r18,
                 "tags": sorted(source_tags),
                 "cover": book.cover,
@@ -741,37 +725,17 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         # names explicitly like ``_book_tag_names`` does.
         book_custom_tags = await self._book_custom_tag_names(self.db, book.id)
         index_tags = list(dict.fromkeys([*book_tags, *book_custom_tags]))
-        try:
-            from app.services.auto_categorize import AutoCategorizationService
-            book_category_names = await AutoCategorizationService.categorize_book(
-                self.db,
-                book.id,
-            )
-        except Exception:
-            await self.db.rollback()
-            # The rollback above expired every ORM instance in this session,
-            # including ``book`` and ``source``.  Snapshot the plain columns
-            # now: every later read in this method must come from these
-            # snapshots, never from the expired instances (a synchronous
-            # attribute read raises ``MissingGreenlet`` which would mask the
-            # real error).
-            book_category_names = []
-        # Snapshot every plain column ``book``/``source`` contributes below.
-        # ``categorize_book`` (and its ``ensure_default_categories`` commit)
-        # may have expired them already; a later chapter ``rollback()`` would
-        # expire them again.  Either way, reading the instances after this
-        # point risks ``MissingGreenlet``.
         book_id = book.id
         book_title = book.title
         book_is_r18 = book.is_r18
         book_author = author_name
-        book_description = (book.description or "")[:2000]
         book_cover = book.cover
         book_source_book_id = book.source_book_id
         book_status = book.status
         source_id_value = source.id
         source_owner_id = source.owner_id
         book_description_full = book.description
+        book_hidden = book.hidden
         book_values = {
             "source_id": source_id_value,
             "author_id": author_id,
@@ -784,6 +748,13 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             "owner_id": source_owner_id,
             "kind": book_kind,
         }
+        try:
+            from app.services.auto_categorize import AutoCategorizationService
+            book_category_names = await AutoCategorizationService.categorize_book(self.db, book_id)
+        except Exception as exc:
+            await self.db.rollback()
+            logger.warning("Could not recategorize book {}: {}", book_id, describe_error(exc))
+            book_category_names = await self._book_category_names(book_id)
         # ``is_public`` is a user action, never synced from the source, so it
         # has to be read back from the stored row -- writing the doc without it
         # would silently un-share a book the owner made public.
@@ -806,6 +777,7 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             "kind": book_kind,
         })
 
+        image_book = SimpleNamespace(id=book_id, kind=book_kind)
         created = 0
         skipped = 0
         total = len(remote_book.chapters)
@@ -839,22 +811,22 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                     "content_pages_done": content_pages_done,
                 })
 
-        repair_stats: dict = {}
+        refresh_rows: dict[str, str] = {}
+        repair_ids: set[str] = set()
+        synopsis_catalog = await self._synopses.for_owner(self.db, source_owner_id)
+        if not book_hidden:
+            self._synopses.remember(synopsis_catalog, book_title, book_description_full)
         existing_source_ids = await self._reconcile_chapter_ids(
             book_id,
             remote_book.chapters,
             gallery_size=len(getattr(plugin, "_chapter_image_manifest", []) or []),
             refetch_content=refetch_content,
-            stats=repair_stats,
+            refresh_rows=refresh_rows,
+            repair_ids=repair_ids,
+            synopsis_catalog=synopsis_catalog,
+            book_title=book_title,
         )
-        replaced_foreign_chapters = int(repair_stats.get("repaired_chapters", 0))
-        if replaced_foreign_chapters:
-            logger.info(
-                "Book {} had {} chapter(s) whose stored text was unusable "
-                "(another book's text, or a page with no body); refetching",
-                book_id,
-                replaced_foreign_chapters,
-            )
+        repaired = 0
 
         missing_chapters = [
             remote_chapter
@@ -870,12 +842,12 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
 
         concurrency = self._chapter_concurrency(
             config,
-            source_sync_interval(source),
+            request_interval,
         )
-        semaphore = asyncio.Semaphore(concurrency)
+        chapters_to_fetch = iter(missing_chapters)
         results_queue = asyncio.Queue(maxsize=concurrency * 2)
 
-        async def _producer(remote_chapter) -> None:
+        async def _fetch_chapter(remote_chapter):
             async def _report_content_pages(pages_done: int) -> None:
                 await _report_progress(
                     remote_chapter,
@@ -889,32 +861,30 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                     images_total=images_total,
                 )
 
-            async with semaphore:
-                chapter_db_id = str(uuid4())
-                try:
-                    content = await self._fetch_chapter_with_retry(
-                        plugin,
-                        remote_chapter,
-                        progress_cb=_report_content_pages,
-                    )
-                    content = await self._process_content_images(
-                        book,
-                        chapter_db_id,
-                        content,
-                        remote_chapter.url,
-                        plugin,
-                        image_progress_cb=_report_images,
-                    )
-                    result = (remote_chapter, content, None, chapter_db_id)
-                except Exception as exc:
-                    result = (remote_chapter, None, exc, chapter_db_id)
-            await results_queue.put(result)
+            chapter_db_id = refresh_rows.get(remote_chapter.source_chapter_id) or str(uuid4())
+            try:
+                content = await self._fetch_chapter_with_retry(
+                    plugin,
+                    remote_chapter,
+                    progress_cb=_report_content_pages,
+                )
+                content = await self._process_content_images(
+                    image_book,
+                    chapter_db_id,
+                    content,
+                    remote_chapter.url,
+                    plugin,
+                    image_progress_cb=_report_images,
+                )
+                return (remote_chapter, content, None, chapter_db_id)
+            except Exception as exc:
+                return (remote_chapter, None, exc, chapter_db_id)
 
-        producers = [
-            asyncio.create_task(_producer(remote_chapter))
-            for remote_chapter in missing_chapters
-        ]
-        remaining = len(producers)
+        async def _producer() -> None:
+            for remote_chapter in chapters_to_fetch:
+                await results_queue.put(await _fetch_chapter(remote_chapter))
+
+        remaining = len(missing_chapters)
         # Make sure the book row really exists before chapter inserts begin.
         book_row_verified = await self._ensure_book_row(book_id, book_values)
         consecutive_blocked = 0
@@ -927,9 +897,9 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         commit_batch = max(
             1, int(getattr(settings, "SYNC_CHAPTER_COMMIT_BATCH", 25) or 25)
         )
-        pending_chapter_writes = 0
+        file_batch = ChapterFileBatch()
+        pending_chapters = []
         pending_index_docs: list[dict] = []
-        check_kind = book_kind == KIND_COMIC or is_comic_source(source_config) or is_comic_labels(source_tags)
         max_consecutive_transient = max(
             1,
             int(
@@ -940,12 +910,43 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                 )
             ),
         )
+        async def commit_chapters() -> None:
+            nonlocal created, repaired
+            await self._flush_chapter_writes(pending_index_docs, file_batch)
+            created += len(pending_chapters)
+            repaired += sum(ch.source_chapter_id in repair_ids for ch in pending_chapters)
+            pending_chapters.clear()
+
+        async def rollback_chapters(exc: BaseException) -> None:
+            nonlocal book_row_verified
+            affected = list(pending_chapters)
+            pending_chapters.clear()
+            pending_index_docs.clear()
+            try:
+                file_batch.finish(committed=False)
+            finally:
+                await self.db.rollback()
+            book_row_verified = False
+            for ch in affected:
+                failed_chapters.append({
+                    "chapter_number": ch.chapter_number, "title": ch.title,
+                    "url": ch.url, "error": describe_error(exc)[:300],
+                })
+            logger.warning("Could not persist {} chapters of book {}: {}",
+                           len(affected), book_id, describe_error(exc))
+
+        producers = [
+            asyncio.create_task(_producer())
+            for _ in range(min(concurrency, remaining))
+        ]
         try:
             while remaining > 0:
                 remote_chapter, content, error, chapter_db_id = await results_queue.get()
                 remaining -= 1
                 await _checkpoint()
                 if error is not None:
+                    if isinstance(error, core_transient.UpstreamBackoff):
+                        raise error
                     if self._is_infrastructure_error(error):
                         # Same rule as the book-level counters below: our own
                         # stack failing (pool exhaustion, rolled-back session)
@@ -967,6 +968,7 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                         await _report_progress(remote_chapter)
                         continue
                     if self._is_upstream_blocked(error):
+                        consecutive_transient = 0
                         consecutive_blocked += 1
                         failed_chapters.append({
                             "chapter_number": remote_chapter.chapter_number,
@@ -1014,51 +1016,50 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                         ) from error
                     continue
 
+                consecutive_blocked = 0
+                consecutive_transient = 0
                 # Some sources put the site's "related works" grid inside the
                 # chapter container: the body is then nothing but other books'
                 # covers.  Writing it would make a junk book that looks read-
                 # able; skip the chapter instead and say so.
-                wall_hits = cover_wall_matches(
-                    content, await self._library_titles(), book_title
-                )
-                if wall_hits:
-                    logger.warning(
-                        "第 {} 章《{}》的正文实际是其他书的封面（命中书名：{}），已跳过写入",
-                        remote_chapter.chapter_number,
-                        remote_chapter.title,
-                        "、".join(wall_hits[:3]),
-                    )
+                rejection = await self._replacement_error(content, book_title, remote_chapter.title, synopsis_catalog)
+                if rejection:
+                    logger.warning("第 {} 章《{}》未写入：{}", remote_chapter.chapter_number, remote_chapter.title, rejection)
+                    failed_chapters.append({
+                        "chapter_number": remote_chapter.chapter_number,
+                        "title": remote_chapter.title,
+                        "url": remote_chapter.url,
+                        "error": rejection,
+                    })
                     await _report_progress(remote_chapter)
                     continue
 
+                pending_chapters.append(remote_chapter)
                 try:
-                    content_path, content_hash = self.storage.write_chapter(
-                        author_name,
-                        book_title,
-                        remote_chapter.chapter_number,
-                        remote_chapter.title,
-                        content,
-                        ref=storage_ref,
-                    )
-                    chapter = Chapter(
-                        id=chapter_db_id,
-                        book_id=book_id,
-                        chapter_number=remote_chapter.chapter_number,
-                        source_chapter_id=remote_chapter.source_chapter_id,
-                        title=remote_chapter.title,
-                        content_path=content_path,
-                        hash=content_hash,
-                    )
                     if not book_row_verified:
                         if not await self._ensure_book_row(book_id, book_values):
-                            raise SQLAlchemyError(
-                                "Book row is missing and could not be restored"
-                            )
+                            raise SQLAlchemyError("Book row is missing and could not be restored")
                         book_row_verified = True
-                    self.db.add(chapter)
-                    pending_chapter_writes += 1
-                    if not check_kind and chapter_comic_vote(content):
-                        check_kind = True
+                    if remote_chapter.source_chapter_id in refresh_rows:
+                        chapter = await self.db.get(Chapter, chapter_db_id, with_for_update=True, populate_existing=True)
+                        if chapter is None:
+                            raise SQLAlchemyError("Chapter was removed during refresh")
+                    else:
+                        chapter = Chapter(id=chapter_db_id, book_id=book_id)
+                        self.db.add(chapter)
+                    content_path, content_hash = self.storage.write_chapter(
+                        author_name, book_title, remote_chapter.chapter_number,
+                        remote_chapter.title, content, ref=storage_ref,
+                        chapter_id=chapter_db_id, previous_path=chapter.content_path,
+                        previous_hash=chapter.hash, batch=file_batch,
+                    )
+                    if remote_chapter.source_chapter_id in refresh_rows and chapter.hash != content_hash:
+                        await self._invalidate_chapter_analysis(chapter_db_id)
+                    chapter.chapter_number = remote_chapter.chapter_number
+                    chapter.source_chapter_id = remote_chapter.source_chapter_id
+                    chapter.title = remote_chapter.title
+                    chapter.content_path = content_path
+                    chapter.hash = content_hash
                     await self.db.flush()
                     pending_index_docs.append({
                         "id": chapter.id,
@@ -1077,78 +1078,49 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                         "is_public": book_is_public,
                         "kind": book_kind,
                     })
-                    if pending_chapter_writes >= commit_batch:
-                        await self._flush_chapter_writes(pending_index_docs)
-                        pending_chapter_writes = 0
-
-                    consecutive_transient = 0
-                    created += 1
-                except SQLAlchemyError as exc:
-                    # A database failure while persisting a chapter (pool
-                    # exhaustion included) is our own stack, not the site: it
-                    # is recorded but counts toward nothing.
-                    await self.db.rollback()
-                    # The rows added since the last commit went with the
-                    # rollback: keep the counters honest and never index them.
-                    created = max(0, created - pending_chapter_writes)
-                    pending_chapter_writes = 0
-                    pending_index_docs.clear()
-                    book_row_verified = False
+                    if len(pending_chapters) >= commit_batch:
+                        await commit_chapters()
+                except TruncatedChapterError as exc:
+                    # The storage check runs before either revision is written.
+                    pending_chapters.pop()
                     failed_chapters.append({
-                        "chapter_number": remote_chapter.chapter_number,
-                        "title": remote_chapter.title,
-                        "url": remote_chapter.url,
-                        "error": describe_error(exc)[:300],
+                        "chapter_number": remote_chapter.chapter_number, "title": remote_chapter.title,
+                        "url": remote_chapter.url, "error": str(exc),
                     })
-                    logger.warning(
-                        "Failed to sync chapter {} ({}): {}",
-                        remote_chapter.title,
-                        remote_chapter.url,
-                        describe_error(exc),
-                    )
-                    await _report_progress(remote_chapter)
-                    continue
+                except asyncio.CancelledError as exc:
+                    await rollback_chapters(exc)
+                    raise
                 except Exception as exc:
-                    await self.db.rollback()
-                    created = max(0, created - pending_chapter_writes)
-                    pending_chapter_writes = 0
-                    pending_index_docs.clear()
-                    failed_chapters.append({
-                        "chapter_number": remote_chapter.chapter_number,
-                        "title": remote_chapter.title,
-                        "url": remote_chapter.url,
-                        "error": describe_error(exc)[:300],
-                    })
-                    logger.warning(
-                        "Failed to sync chapter {} ({}): {}",
-                        remote_chapter.title,
-                        remote_chapter.url,
-                        describe_error(exc),
-                    )
+                    await rollback_chapters(exc)
                 await _report_progress(remote_chapter)
         finally:
             for producer in producers:
                 producer.cancel()
             await asyncio.gather(*producers, return_exceptions=True)
-            if pending_chapter_writes or pending_index_docs:
-                # Whatever the loop left uncommitted (a short book, or a pause
-                # between batches) is written now, in the same commit-then-index
-                # order.
+            tail_chapter = pending_chapters[-1] if pending_chapters else None
+            if pending_chapters:
                 try:
-                    await self._flush_chapter_writes(pending_index_docs)
-                except SQLAlchemyError:
-                    await self.db.rollback()
-                    created = max(0, created - pending_chapter_writes)
-                    pending_index_docs.clear()
-                pending_chapter_writes = 0
+                    await commit_chapters()
+                except asyncio.CancelledError as exc:
+                    await rollback_chapters(exc)
+                    raise
+                except Exception as exc:
+                    await rollback_chapters(exc)
             await asyncio.to_thread(search_service.flush_chapters)
 
-        final_kind = await self._resolve_synced_kind(book_id, source_config, source_tags, book_kind, check_kind)
+        if tail_chapter is not None:
+            await _report_progress(tail_chapter)
+        final_kind = await self._resolve_synced_kind(book_id, source_config, source_tags, book_kind, book_title, synopsis_catalog)
         if final_kind != book_kind:
             await self.db.commit()
             await refresh_search_kinds([book_id])
         if source_owner_id is None:
             await self._handle_global_r18_conflicts(book_id)
+        if not is_new:
+            try:
+                await asyncio.to_thread(search_service.reconcile_chapter_labels, book_id, index_tags, book_category_names)
+            except Exception as exc:
+                logger.warning("Could not refresh indexed chapter labels for {}: {}", book_id, describe_error(exc))
         logger.info(
             "Sync complete book={} created={} skipped={} failed={}",
             book_id,
@@ -1166,17 +1138,33 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             # book that shared the same storage directory, or the page came
             # back with only images/ads (see codex-handoff 56/58).  A repair
             # the admin did not ask for, so it is reported, not silent.
-            "repaired_chapters": replaced_foreign_chapters,
+            "repaired_chapters": repaired,
         }
+
+    async def _replacement_error(self, content: str, book_title: str, chapter_title: str, catalog: dict) -> str:
+        if not content.strip():
+            return "抓取正文为空，已跳过写入"
+        if chapter_text_is_blocked(content):
+            return "抓取结果包含站点验证提示，已跳过写入"
+        if foreign_synopsis(content, book_title, chapter_title, catalog):
+            return "抓取内容匹配其他书籍的简介，已跳过写入"
+        wall_hits = await self._cover_wall_hits(content, book_title)
+        return "正文仅包含其他书籍的封面：" + "、".join(wall_hits[:3]) if wall_hits else ""
+
+    async def _cover_wall_hits(self, content: str, book_title: str) -> list[str]:
+        labels = cover_wall_labels(content)
+        if not labels:
+            return []
+        return match_cover_titles(labels, await self._library_titles(), book_title)
 
     async def _library_titles(self) -> set[str]:
         """Every book title in the library (loaded once per sync run)."""
         if self._other_book_titles is None:
             rows = await self.db.scalars(select(Book.title))
-            self._other_book_titles = {str(title) for title in rows.all() if title}
+            self._other_book_titles = {normalize_title(title) for title in rows.all() if title}
         return self._other_book_titles
 
-    async def _flush_chapter_writes(self, pending_index_docs: list[dict]) -> None:
+    async def _flush_chapter_writes(self, pending_index_docs: list[dict], file_batch: ChapterFileBatch | None = None) -> None:
         """Commit the chapter rows written since the last batch, then index them.
 
         Order matters: a search document must never describe a chapter the
@@ -1191,6 +1179,8 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         already on disk and whose rows the next sync simply refetches).
         """
         await self.db.commit()
+        if file_batch is not None:
+            file_batch.finish(committed=True)
         docts = list(pending_index_docs)
         pending_index_docs.clear()
         for doc in docts:
@@ -1274,13 +1264,11 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             )
         )
         if book:
-            book.title = self._safe_title(remote_book)
-            book.author_id = author_id
-            book.description = remote_book.description
-            book.status = self._clamp(
-                str(remote_book.status or ""),
-                32,
-            ) or None
+            # The caller also needs the earlier identity to clean legacy tags.
+            if remote_book.description and remote_book.description.strip():
+                book.description = remote_book.description
+            if remote_book.status:
+                book.status = self._clamp(remote_book.status, 32)
             book.is_r18 = is_r18
             book.owner_id = owner_id
             await self.db.flush()
@@ -1313,7 +1301,10 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         remote_chapters: list,
         gallery_size: int = 0,
         refetch_content: bool = False,
-        stats: dict | None = None,
+        refresh_rows: dict[str, str] | None = None,
+        repair_ids: set[str] | None = None,
+        synopsis_catalog: dict[bytes, str] | None = None,
+        book_title: str = "",
     ) -> set[str]:
         """Return existing source chapter ids, upgrading legacy numeric ids to URLs.
 
@@ -1321,23 +1312,10 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         stored the positional chapter number. Upgrading in place prevents a
         full re-download when the TOC order is stable.
 
-        Blank chapters (from anti-bot/error pages) and obvious TOC junk (nav,
-        ads, "查看所有章节") are dropped so a re-sync can fetch real content.
-
-        ``gallery_size`` is the source's declared ``imgInfoList`` length; any
-        stored image-only chapter that stops exactly there is the old
-        12-image truncation (see ``_is_truncated_gallery``) and is dropped so
-        the album can be fetched again.
-
-        ``refetch_content`` drops *every* stored chapter instead, which is what
-        an explicit "refetch this book's text" repair asks for: content that
-        was written by an older build (or by another book before the storage
-        fix) can look perfectly healthy to the checks above and would otherwise
-        never be fetched again.
-
-        ``stats`` collects what was repaired and why (``foreign_chapters``:
-        stored text that another book's sync had overwritten), so a caller can
-        report a repair the admin never asked for.
+        Chapters still in the TOC keep their database identity while their
+        replacement is being fetched. Return only IDs safe to skip. Record
+        the IDs of rows needing an update in refresh_rows. Drop obsolete
+        navigation/duplicate rows separately.
         """
         rows = await self.db.scalars(
             select(Chapter).where(Chapter.book_id == book_id)
@@ -1354,6 +1332,8 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             if ch.chapter_number is not None
         }
 
+        remote_ids = {str(remote.source_chapter_id or "") for remote in remote_chapters}
+        upgraded = False
         for remote_chapter in remote_chapters:
             source_id = str(remote_chapter.source_chapter_id or "")
             if not source_id or source_id in by_id:
@@ -1362,22 +1342,34 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             if legacy is None:
                 continue
             legacy_id = str(legacy.source_chapter_id or "")
-            if legacy_id.startswith(("http://", "https://")):
+            if legacy_id in remote_ids or (legacy_id and legacy_id != str(legacy.chapter_number)):
                 continue
-            if legacy_id == source_id:
+            if legacy.title and remote_chapter.title and (
+                self._normalize_title_for_match(legacy.title) != self._normalize_title_for_match(remote_chapter.title)
+            ):
                 continue
             by_id.pop(legacy_id, None)
+            upgraded = True
             legacy.source_chapter_id = source_id
             by_id[source_id] = legacy
 
-        remote_ids = {
-            str(remote_chapter.source_chapter_id or "")
-            for remote_chapter in remote_chapters
-        }
-        remote_titles = {
-            self._normalize_title_for_match(remote_chapter.title)
-            for remote_chapter in remote_chapters
-        }
+        remote_titles = Counter(self._normalize_title_for_match(remote.title) for remote in remote_chapters)
+        stored_titles = Counter(self._normalize_title_for_match(ch.title) for ch in chapters)
+        # Sources sometimes change the entire chapter URL scheme. Reuse an
+        # unambiguous reader ID, but change its source URL only after a good fetch.
+        changed_urls: set[str] = set()
+        if refresh_rows is not None:
+            old_by_title = {
+                self._normalize_title_for_match(ch.title): old_id
+                for old_id, ch in by_id.items() if old_id not in remote_ids
+            }
+            for remote in remote_chapters:
+                new_id = str(remote.source_chapter_id or "")
+                title = self._normalize_title_for_match(remote.title)
+                if (new_id and new_id not in by_id and title and title in old_by_title
+                        and stored_titles[title] == remote_titles[title] == 1):
+                    by_id[new_id] = by_id.pop(old_by_title[title])
+                    changed_urls.add(new_id)
         remote_hosts = {
             urlparse(remote_chapter.url).netloc.lower()
             for remote_chapter in remote_chapters
@@ -1394,60 +1386,60 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         def book_has_prose() -> bool:
             if not prose_verdict:
                 prose_verdict.append(any(
-                    self._chapter_body_has_prose(chapter)
+                    self._chapter_body_has_prose(chapter, synopsis_catalog=synopsis_catalog, book_title=book_title)
                     for chapter in by_id.values()
                     if chapter.content_path
                 ))
             return prose_verdict[0]
+        ready_ids = set(by_id)
         stale_ids: list[str] = []
-        for source_id, chapter in list(by_id.items()):
+        for source_id, chapter in by_id.items():
             if source_id in remote_ids:
-                if refetch_content:
-                    # Explicit repair: the stored text is suspect however
-                    # healthy it looks, so drop the row and fetch it again.
-                    stale_ids.append(source_id)
-                    continue
-                # Rows created by older migrations/tests may not have a
-                # content path yet; keep those identities so URL migration
-                # and normal incremental sync can still reconcile them.
-                # A persisted path, on the other hand, means we can safely
-                # remove a known empty/anti-bot artifact.
-                reason = (
-                    self._stale_chapter_reason(
-                        chapter,
-                        book_has_prose=book_has_prose,
-                    )
-                    if chapter.content_path
-                    else ""
-                )
-                if reason:
-                    stale_ids.append(source_id)
-                    if reason in ("foreign", "image-only") and stats is not None:
-                        # Repaired silently otherwise: text another book
-                        # overwrote (the shared-directory era, codex-handoff
-                        # 56) or a page whose body never arrived (image-only
-                        # ad/cover block).  A caller reports both.
-                        stats["repaired_chapters"] = (
-                            stats.get("repaired_chapters", 0) + 1
-                        )
-                elif self._is_truncated_gallery(chapter, gallery_size):
-                    stale_ids.append(source_id)
-            elif self._looks_like_junk_chapter(chapter, remote_hosts):
-                stale_ids.append(source_id)
+                reason = ""
+                if not refetch_content:
+                    reason = self._stale_chapter_reason(chapter, book_has_prose=book_has_prose,
+                                                        synopsis_catalog=synopsis_catalog, book_title=book_title)
+                if refetch_content or reason or source_id in changed_urls or self._is_truncated_gallery(chapter, gallery_size):
+                    ready_ids.discard(source_id)
+                    if refresh_rows is not None:
+                        refresh_rows[source_id] = chapter.id
+                    if reason in ("foreign", "image-only", "synopsis") and repair_ids is not None:
+                        repair_ids.add(source_id)
             elif (
-                self._normalize_title_for_match(chapter.title)
-                and self._normalize_title_for_match(chapter.title) in remote_titles
+                self._looks_like_junk_chapter(chapter, remote_hosts)
+                or self._normalize_title_for_match(chapter.title) in remote_titles
             ):
-                # A duplicate/old URL for a chapter that still exists in the
-                # current TOC under a canonical URL.
-                stale_ids.append(source_id)
+                # A changed domain or repeated title alone cannot prove a
+                # readable chapter is obsolete.
+                if self._stale_chapter_reason(chapter):
+                    stale_ids.append(source_id)
         for source_id in stale_ids:
             chapter = by_id.pop(source_id)
             await self._release_chapter_references(chapter.id)
             await self.db.delete(chapter)
 
+        ready_ids.difference_update(stale_ids)
+        moved = []
+        for remote in remote_chapters:
+            key = str(remote.source_chapter_id)
+            if key in ready_ids and by_id[key].chapter_number != remote.chapter_number:
+                by_id[key].chapter_number = remote.chapter_number
+                moved.append({"id": by_id[key].id, "chapter_number": remote.chapter_number})
         await self.db.flush()
-        return set(by_id)
+        if moved or upgraded or stale_ids:
+            await self.db.commit()
+        if moved:
+            try:
+                await asyncio.to_thread(search_service.update_chapter_numbers, moved)
+            except Exception as exc:
+                logger.warning("Could not update indexed chapter numbers for {}: {}", book_id, exc)
+        return ready_ids
+
+    async def _invalidate_chapter_analysis(self, chapter_id: str) -> None:
+        from app.services.ai_insights import mark_chapter_insights_stale
+
+        await self.db.execute(delete(ChapterEmbedding).where(ChapterEmbedding.chapter_id == chapter_id))
+        await mark_chapter_insights_stale(self.db, chapter_id)
 
     async def _release_chapter_references(self, chapter_id: str) -> None:
         """Detach rows that point at a chapter about to be replaced.
@@ -1477,22 +1469,6 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
 
         await mark_chapter_insights_stale(self.db, chapter_id)
 
-    # Content markers that indicate an anti-bot / captcha page was saved
-    # instead of real chapter text.  Chapters matching these are dropped on
-    # re-sync so a later attempt can refetch real content.
-    BLOCK_CONTENT_MARKERS = (
-        "输入验证码后可继续访问",
-        "系统检测到您访问异常",
-        "访问异常",
-        "limit_box",
-        "请完成验证",
-        "人机验证",
-        "滑动验证",
-        "安全验证",
-        "访问过于频繁",
-        "请求过于频繁",
-    )
-
     def _chapter_has_real_content(self, chapter: Chapter) -> bool:
         """Return False for empty, anti-bot or foreign junk chapters so a
         re-sync refetches them."""
@@ -1503,6 +1479,8 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         chapter: Chapter,
         *,
         book_has_prose: bool | Callable[[], bool] = False,
+        synopsis_catalog: dict[bytes, str] | None = None,
+        book_title: str = "",
     ) -> str:
         """Why a stored chapter must be fetched again (``""`` when it is fine).
 
@@ -1534,6 +1512,8 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             # directory per author+title), so what is on disk is not this
             # chapter's text.  Refetch instead of serving the wrong book.
             return "foreign"
+        if synopsis_catalog is not None and foreign_synopsis(content, book_title, chapter.title, synopsis_catalog):
+            return "synopsis"
         has_image_refs = bool(
             re.search(
                 r"!\[[^\]]*\]\([^)]*\)|<img\b[^>]*\bsrc=",
@@ -1546,10 +1526,7 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         body = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", body)
         body = re.sub(r"<[^>]+>", " ", body)
         body = re.sub(r"\s+", " ", body).strip()
-        lowered = body.lower()
-        if any(
-            marker in lowered for marker in self.BLOCK_CONTENT_MARKERS
-        ):
+        if chapter_text_is_blocked(body):
             return "blocked"
         # A chapter stored as one bare image URL is the old broken manga
         # fallback, not readable content.  Let a re-sync replace it with the
@@ -1583,6 +1560,9 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         self,
         chapter: Chapter,
         content: str | None = None,
+        *,
+        synopsis_catalog: dict[bytes, str] | None = None,
+        book_title: str = "",
     ) -> bool:
         """Whether a stored chapter holds readable text rather than only images.
 
@@ -1602,7 +1582,10 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         body = re.sub(r"^#.*(?:\r?\n|$)", "", content, flags=re.M)
         body = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", body)
         body = re.sub(r"<[^>]+>", " ", body)
-        return len(re.sub(r"\s+", " ", body).strip()) >= 20
+        if len(re.sub(r"\s+", " ", body).strip()) < 20 or chapter_text_is_blocked(body):
+            return False
+        return (self._chapter_file_is_ours(chapter, content) and
+                (synopsis_catalog is None or not foreign_synopsis(content, book_title, chapter.title, synopsis_catalog)))
 
     def _chapter_file_is_ours(
         self,
@@ -1784,8 +1767,8 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
     async def resync_book(self, book_id: str, refetch_content: bool = False) -> dict:
         """Re-sync a book already in the library from its source.
 
-        ``refetch_content`` also drops every stored chapter, so the whole book
-        is downloaded again.  That is the repair for chapters whose stored text
+        ``refetch_content`` refreshes every chapter still in the source TOC
+        and keeps each chapter's reader-facing identity.  That is the repair for chapters whose stored text
         is wrong but looks healthy -- content saved by an older build, or by
         another book that shared its directory before the storage fix.
         """
@@ -1839,7 +1822,6 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         # concurrent ``rollback()`` on the same session expires these anyway,
         # so read everything through explicit queries up front.
         book_author = await self._book_author_name(book.author_id)
-        book_description = (book.description or "")[:2000]
         book_tags = await self._book_tag_names(book.id)
         book_custom_tags = await self._book_custom_tag_names(self.db, book.id)
         index_tags = list(dict.fromkeys([*book_tags, *book_custom_tags]))
@@ -1847,28 +1829,46 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         author_name = book_author
         book_title = book.title
         book_kind_value = book.kind
-        content_path, content_hash = self.storage.write_chapter(
-            author_name,
-            book_title,
-            remote_chapter.chapter_number,
-            remote_chapter.title,
-            content,
-            ref=BookRef(
-                book_id=book_id,
-                source_id=book_source_id,
-                source_book_id=book_source_book_id,
-            ),
-        )
+        catalog = await self._synopses.for_owner(self.db, book.owner_id)
+        rejection = await self._replacement_error(content, book_title, remote_chapter.title, catalog)
+        if rejection:
+            raise ValueError(rejection)
+        # Re-read the current revision under the same lock used by book-wide
+        # refreshes, after the potentially slow network requests are finished.
+        await self.db.refresh(chapter, with_for_update=True)
+        file_batch = ChapterFileBatch()
+        try:
+            content_path, content_hash = self.storage.write_chapter(
+                author_name,
+                book_title,
+                remote_chapter.chapter_number,
+                remote_chapter.title,
+                content,
+                batch=file_batch, chapter_id=chapter_id, previous_path=chapter.content_path, previous_hash=chapter.hash,
+                ref=BookRef(
+                    book_id=book_id,
+                    source_id=book_source_id,
+                    source_book_id=book_source_book_id,
+                ),
+            )
 
-        chapter.title = remote_chapter.title
-        chapter.chapter_number = remote_chapter.chapter_number
-        chapter.source_chapter_id = remote_chapter.source_chapter_id
-        chapter.content_path = content_path
-        chapter.hash = content_hash
-        current_kind = normalize_kind(book_kind_value)
-        check_kind = current_kind == KIND_COMIC or bool(chapter_comic_vote(content))
-        final_kind = await self._resolve_synced_kind(book_id, source.config, book_tags, current_kind, check_kind)
-        await self.db.commit()
+            if chapter.hash != content_hash:
+                await self._invalidate_chapter_analysis(chapter.id)
+            chapter.title = remote_chapter.title
+            chapter.chapter_number = remote_chapter.chapter_number
+            chapter.source_chapter_id = remote_chapter.source_chapter_id
+            chapter.content_path = content_path
+            chapter.hash = content_hash
+            current_kind = normalize_kind(book_kind_value)
+            final_kind = await self._resolve_synced_kind(book_id, source.config, book_tags, current_kind, book_title, catalog)
+            await self.db.commit()
+        except BaseException:
+            try:
+                file_batch.finish(committed=False)
+            finally:
+                await self.db.rollback()
+            raise
+        file_batch.finish(committed=True)
 
         await asyncio.to_thread(search_service.index_chapter, {
             "id": chapter.id,
@@ -1900,20 +1900,26 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             "content_length": len(content),
         }
 
-    async def _resolve_synced_kind(self, book_id: str, source_config, labels, current: str, scan_content: bool) -> str:
-        if scan_content:
-            override = await self._book_column(book_id, Book.kind_override)
-            if override:
-                return normalize_kind(override)
-            kind = await classify_stored_book(
-                self.db, self.storage, book_id, source=source_config, labels=labels, current=current,
+    async def _resolve_synced_kind(self, book_id: str, source_config, labels, current: str,
+                                   book_title: str, catalog: dict[bytes, str]) -> str:
+        override = await self._book_column(book_id, Book.kind_override)
+        if override:
+            return normalize_kind(override)
+
+        def unusable(text: str) -> bool:
+            heading, _, body = text.partition("\n")
+            title = heading[1:].strip() if heading.startswith("#") else ""
+            return chapter_text_is_blocked(body if title else text) or foreign_synopsis(text, book_title, title, catalog)
+
+        kind = await classify_stored_book(
+            self.db, self.storage, book_id, source=source_config, labels=labels, current=current, ignore_content=unusable,
+        )
+        if kind != current:
+            await self.db.execute(
+                update(Book)
+                .where(Book.id == book_id, Book.kind_override.is_(None), Book.kind != kind)
+                .values(kind=kind)
             )
-            if kind != current:
-                await self.db.execute(
-                    update(Book)
-                    .where(Book.id == book_id, Book.kind_override.is_(None), Book.kind != kind)
-                    .values(kind=kind)
-                )
         return normalize_kind(await self._book_column(book_id, Book.kind) or current)
 
     async def _book_plugin(self, book: Book) -> tuple[Source, object]:
@@ -1944,26 +1950,23 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
 
     @staticmethod
     def _match_remote_chapter(chapter: Chapter, remote_chapters: list):
-        """Find the remote chapter by URL, position, or normalized title."""
+        """Match a URL or a unique title. Position is a fallback for legacy IDs."""
         for remote_chapter in remote_chapters:
             if (
                 chapter.source_chapter_id
                 and remote_chapter.source_chapter_id == chapter.source_chapter_id
             ):
                 return remote_chapter
-        for remote_chapter in remote_chapters:
-            if (
-                chapter.chapter_number is not None
-                and remote_chapter.chapter_number == chapter.chapter_number
-            ):
-                return remote_chapter
         normalized = SyncService._normalize_title_for_match(chapter.title)
-        for remote_chapter in remote_chapters:
-            if (
-                normalized
-                and SyncService._normalize_title_for_match(remote_chapter.title) == normalized
-            ):
-                return remote_chapter
+        same_title = [remote for remote in remote_chapters if normalized
+                      and SyncService._normalize_title_for_match(remote.title) == normalized]
+        if len(same_title) == 1:
+            return same_title[0]
+        if (not chapter.source_chapter_id or str(chapter.source_chapter_id) == str(chapter.chapter_number)) and (
+            not normalized or same_title
+        ):
+            return next((remote for remote in (same_title or remote_chapters)
+                         if remote.chapter_number == chapter.chapter_number), None)
         return None
 
     async def discover_and_sync(
@@ -2067,6 +2070,8 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         exclude_tags: list[str] | None = None,
         exclude_categories: list[str] | None = None,
         book_concurrency: int | None = None,
+        completed_page_urls: list[str] | None = None,
+        backoff_cb: Callable[[dict, list[str]], None] | None = None,
     ) -> dict:
         """Discover every book across catalog pages and optionally sync them."""
         source = await self.db.get(Source, source_id)
@@ -2148,15 +2153,20 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
         page = start_page
         while max_pages <= 0 or page <= max_pages:
             pages_in_run += 1
-            if before_step is not None:
-                await before_step()
             try:
+                if before_step is not None:
+                    await before_step()
                 page_books = await plugin.discover_books(url=url, page=page)
-            except SyncPaused:
-                # Pause/cancel is handled by ``before_step`` and must reach the
-                # runner untouched (``TaskCancelled`` never crosses this layer).
-                raise
             except Exception as exc:
+                if isinstance(exc, (SyncPaused, core_transient.UpstreamBackoff)) or (
+                    backoff_cb is not None and is_transient_task_error(exc)
+                ):
+                    if backoff_cb is not None:
+                        backoff_cb(
+                            _result_so_far(done_state=False, next_page=page),
+                            list(completed_page_urls or ()) if page == start_page else [],
+                        )
+                    raise
                 # A catalog page that stops answering must not discard the work
                 # already done in this run.  Icu (hq555) synced 244 books over
                 # nine hours, then its JS explore rule returned nothing on the
@@ -2193,6 +2203,13 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                 done = True
                 break
 
+            # A rate-limited page is fetched again. Only revisit books without
+            # a recorded outcome, even if the catalog order has changed.
+            already_recorded = set(completed_page_urls or ()) if page == start_page else set()
+            new_books = [sb for sb in new_books if sb.url not in already_recorded]
+            page_detail_start = len(details)
+            found_before_page = books_found
+
             continuous_books = bool(
                 getattr(settings, "SYNC_BOOK_CONTINUOUS", False)
             )
@@ -2206,7 +2223,7 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
 
             async def _sync_one(sb):
                 async with SessionLocal() as session:
-                    return await SyncService(session).sync_book(
+                    return await SyncService(session, synopses=self._synopses).sync_book(
                         source_id,
                         sb.url,
                         progress_cb=_guarded_chapter_progress,
@@ -2224,7 +2241,7 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                 if isinstance(outcome, SyncPaused):
                     raise outcome
                 if isinstance(outcome, BaseException):
-                    if self._is_upstream_blocked(outcome):
+                    if isinstance(outcome, core_transient.UpstreamBackoff) or self._is_upstream_blocked(outcome):
                         raise outcome
                     if isinstance(outcome, EmptyTocError) or self._is_empty_book_error(outcome):
                         # The source's own TOC rule no longer matches the site
@@ -2296,6 +2313,7 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                         consecutive_failures = 0
                         consecutive_transient_failures += 1
                         if consecutive_transient_failures >= max_consecutive_failures:
+                            books_failed -= 1
                             raise RuntimeError(
                                 "上游/代理暂时不可用（网络错误，例如 Cloudflare "
                                 f"520/5xx），已连续 {consecutive_transient_failures} "
@@ -2307,9 +2325,8 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                         consecutive_failures += 1
                         if consecutive_failures >= max_consecutive_failures:
                             raise ValueError(
-                                "同步连续失败超过 {} 本，已中止任务以避免持续请求被"
-                                "反爬的站点。请检查书源规则、Cookie 或站点验证状态后"
-                                "再同步。".format(max_consecutive_failures)
+                                f"同步连续失败超过 {max_consecutive_failures} 本，已中止任务。"
+                                f"最近一次失败：{describe_error(outcome)}"
                             )
                     if not self._is_infrastructure_error(outcome):
                         logger.warning(
@@ -2379,13 +2396,20 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                 )
 
             async def _record_finished(finished_tasks) -> None:
+                backoff = None
                 for finished in finished_tasks:
                     sb_snapshot = active_tasks.pop(finished)
                     if finished.cancelled():
                         continue
                     exc = finished.exception()
                     outcome = exc if exc is not None else finished.result()
-                    await _record_outcome(sb_snapshot, outcome)
+                    if isinstance(outcome, core_transient.UpstreamBackoff):
+                        if backoff is None or outcome.deadline > backoff.deadline:
+                            backoff = outcome
+                    else:
+                        await _record_outcome(sb_snapshot, outcome)
+                if backoff is not None:
+                    raise backoff
 
             try:
                 for sb in new_books:
@@ -2449,11 +2473,16 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
                     await _record_finished(finished_tasks)
                     if before_step is not None:
                         await before_step()
-            except BaseException:
+            except BaseException as exc:
                 for task in active_tasks:
                     task.cancel()
                 if active_tasks:
                     await asyncio.gather(*active_tasks, return_exceptions=True)
+                if backoff_cb is not None and (isinstance(exc, SyncPaused) or is_transient_task_error(exc)):
+                    finished_urls = [item["url"] for item in details[page_detail_start:]]
+                    snapshot = _result_so_far(done_state=False, next_page=page)
+                    snapshot["books_found"] = found_before_page + len(finished_urls)
+                    backoff_cb(snapshot, sorted(already_recorded.union(finished_urls)))
                 raise
             if max_pages > 0 and page >= max_pages:
                 done = True
@@ -2463,38 +2492,21 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             page += 1
 
         if before_step is not None:
-            await before_step()
+            try:
+                await before_step()
+            except SyncPaused:
+                if backoff_cb is not None:
+                    resume_page = pages_checked + 1 if pages_checked else start_page
+                    backoff_cb(_result_so_far(done_state=False, next_page=resume_page),
+                               list(completed_page_urls or ()) if not pages_checked else [])
+                raise
 
         # Every page came back empty.  Why that is decides what the user sees:
         # a finished task, a transient hiccup worth retrying, or a broken rule.
         if pages_checked == 0 and books_found == 0 and done:
-            if max_pages > 0 and start_page > max_pages:
-                # A task resumed past its own page budget has nothing left to
-                # crawl.  Reporting that as "no books found" turned a task that
-                # had drained its whole catalog into a failed one.
-                return {
-                    "source_id": source_id,
-                    "pages_checked": 0,
-                    "books_found": 0,
-                    "books_synced": 0,
-                    "books_failed": 0,
-                    "books_filtered": 0,
-                    "chapters_created": 0,
-                    "chapters_skipped": 0,
-                    "chapters_failed": 0,
-                    "details": [],
-                    "next_page": start_page,
-                    "done": True,
-                }
-            config = None
-            try:
-                config = source.config
-            except MissingGreenlet:
-                # Every book outcome calls ``rollback()``, which expired the
-                # ``source`` instance loaded at the top of this method.  The
-                # tail only needs the config dict, so fall back to empty rather
-                # than masking the run's real result with greenlet_spawn.
-                config = None
+            if (max_pages > 0 and start_page > max_pages) or (start_page > 1 and not completed_page_urls):
+                # The first page of a resumed batch can itself be the end.
+                return _result_so_far(done_state=True, next_page=start_page)
             if not isinstance(config, dict):
                 config = {}
             js_discovery = any(
@@ -2504,7 +2516,7 @@ class SyncService(SyncBookMetaMixin, SyncErrorMixin):
             known_book = await self.db.scalar(
                 select(Book.id).where(Book.source_id == source_id).limit(1)
             )
-            if known_book is not None:
+            if known_book is not None or completed_page_urls:
                 # The source already has books in the library, so an empty
                 # catalog is a network/proxy/site hiccup rather than a rule
                 # problem: a retried 要撸小说 task answered every category page

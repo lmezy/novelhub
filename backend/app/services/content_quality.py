@@ -12,6 +12,9 @@ a cover page of the work itself is kept.
 from __future__ import annotations
 
 import re
+import asyncio
+import hashlib
+from html import unescape
 from typing import Iterable
 
 IMAGE_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
@@ -39,39 +42,126 @@ def visible_text(content: str) -> str:
     return re.sub(r"\s+", "", text)
 
 
-def cover_wall_matches(
-    content: str,
-    other_titles: Iterable[str],
-    book_title: str = "",
-) -> list[str]:
-    """Titles of *other* books whose covers this "chapter" is made of."""
-    body = str(content or "")
-    images = IMAGE_RE.findall(body)
+def cover_wall_labels(content: str) -> list[str]:
+    """Extract candidate titles before paying for a library-wide lookup."""
+    images = IMAGE_RE.findall(content)
     if len(images) < MIN_IMAGES:
         return []
-    if len(visible_text(body)) >= MIN_TEXT_CHARS:
+    labels = []
+    for image in images:
+        match = ALT_RE.search(image)
+        if match and match.group(1).strip():
+            labels.append(match.group(1).strip())
+    if len(set(labels)) < MIN_MATCHED_TITLES or len(visible_text(content)) >= MIN_TEXT_CHARS:
         return []
+    return labels
 
-    known = {normalize_title(title) for title in other_titles if title}
+
+def match_cover_titles(labels: list[str], known: set[str], book_title: str) -> list[str]:
     own = normalize_title(book_title)
-    matched: list[str] = []
-    seen: set[str] = set()
-    for tag in images:
-        found = ALT_RE.search(tag)
-        if not found:
+    matched: dict[str, str] = {}
+    for label in labels:
+        alt = normalize_title(label)
+        if not alt:
             continue
-        raw = found.group(1).strip()
-        alt = normalize_title(raw)
-        if not alt or alt == own or alt in seen:
+        if alt in known:
+            hit = alt
+        elif own and own in alt:
             continue
-        # Exact match, or the alt carries the title plus decorations
-        # ("【完】世上只有妈妈好 1-7"), which the sources do a lot.
-        hit = alt if alt in known else next(
-            (title for title in known if len(title) >= 4 and title in alt),
-            "",
-        )
-        if not hit:
-            continue
-        seen.add(alt)
-        matched.append(raw)
-    return matched if len(matched) >= MIN_MATCHED_TITLES else []
+        else:
+            hit = max((title for title in known if len(title) >= 4 and title in alt),
+                      key=lambda title: (len(title), title), default="")
+        if hit and hit != own:
+            matched.setdefault(hit, label)
+    return list(matched.values()) if len(matched) >= MIN_MATCHED_TITLES else []
+
+
+def cover_wall_matches(content: str, other_titles: Iterable[str], book_title: str = "") -> list[str]:
+    labels = cover_wall_labels(content)
+    if not labels:
+        return []
+    return match_cover_titles(labels, {normalize_title(title) for title in other_titles if title}, book_title)
+
+
+_SYNOPSIS_LABEL = r"(?:作品|内容|內容|故事|小说|小說|书籍|書籍)?(?:简介|簡介)"
+_CARD = re.compile(
+    r"^(?:(?:书名|書名|作品名)\s*[:：]\s*([^\n]{1,160})|《([^》\n]{1,120})》)"
+    r"\s*\n\s*(?:作者|著者)\s*[:：]\s*[^\n]{1,80}\s*\n\s*"
+    + _SYNOPSIS_LABEL + r"\s*[:：]\s*(.+)$", re.S,
+)
+_INTRO_CHAPTER = re.compile(r"(?:简介|簡介|文案|书单|書單|推书|推書|新书推荐|新書推薦|作品推荐|作品推薦)")
+
+
+def _synopsis_text(value: str) -> str:
+    value = unescape(TAG_RE.sub(" ", value))
+    value = re.sub(r"^\s*" + _SYNOPSIS_LABEL + r"\s*[:：]", "", value)
+    return re.sub(r"\s+", "", value).casefold()
+
+
+def _synopsis_digest(value: str) -> bytes | None:
+    text = _synopsis_text(value)
+    if len(text) < 48:
+        return None
+    return hashlib.sha256(text.encode("utf-8")).digest()
+
+
+class SynopsisCatalog:
+    """A task-local snapshot shared by books from the same discovery task."""
+
+    def __init__(self):
+        self._scopes: dict[str | None, dict[bytes, str]] = {}
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    def remember(entries: dict[bytes, str], title: str, description: str | None) -> None:
+        if not description:
+            return
+        key = _synopsis_digest(description)
+        if key is not None:
+            title_key = normalize_title(title)
+            if entries.setdefault(key, title_key) != title_key:
+                entries[key] = ""  # boilerplate shared by unrelated works
+
+    async def for_owner(self, db, owner_id: str | None) -> dict[bytes, str]:
+        from sqlalchemy import or_, select
+        from app.models import Book
+
+        async with self._lock:
+            if owner_id not in self._scopes:
+                query = select(Book.title, Book.description).where(
+                    Book.hidden.is_(False), Book.description.is_not(None),
+                    or_(Book.owner_id.is_(None), Book.owner_id == owner_id),
+                )
+                entries: dict[bytes, str] = {}
+                rows = await db.stream(query.execution_options(yield_per=512))
+                try:
+                    async for title, description in rows:
+                        self.remember(entries, title, description)
+                finally:
+                    await rows.close()
+                self._scopes[owner_id] = entries
+            return self._scopes[owner_id]
+
+
+def foreign_synopsis(content: str, book_title: str, chapter_title: str,
+                     catalog: dict[bytes, str]) -> bool:
+    """Require a complete foreign synopsis or an explicitly labelled book card."""
+    if _INTRO_CHAPTER.search(chapter_title or ""):
+        return False
+    text = content.strip()
+    if text.startswith("#"):
+        heading, sep, rest = text.partition("\n")
+        if sep and heading.lstrip("# ").strip() == (chapter_title or "").strip():
+            text = rest.strip()
+    title = normalize_title(book_title)
+    card = _CARD.fullmatch(text)
+    if card and title:
+        foreign = normalize_title(card[1] or card[2])
+        blurb = card[3].strip()
+        if foreign and foreign != title and "\n" not in blurb and len(_synopsis_text(blurb)) >= 48:
+            return True
+    if not catalog:
+        return False
+    key = _synopsis_digest(text)
+    matched_title = catalog.get(key) if key else None
+    return bool(matched_title and title and matched_title != title)

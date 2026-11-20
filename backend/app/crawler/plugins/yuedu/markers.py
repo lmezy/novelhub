@@ -200,6 +200,20 @@ UPSTREAM_ERROR_BODY_RE = re.compile(
 UPSTREAM_ERROR_PAGE_MAX_CHARS = 30000
 
 
+def chapter_text_is_blocked(text: str) -> bool:
+    """Classify extracted body text consistently on fetch and on disk."""
+    lowered = (text or "").lower()
+    strong = (
+        "验证码后可继续访问", "请完成验证", "人机验证", "滑动验证", "limit_box",
+        "访问过于频繁", "请求过于频繁", "操作过于频繁",
+    )
+    return (
+        any(marker in lowered for marker in strong)
+        or has_contextual_block_marker(lowered)
+        or has_weak_block_marker(lowered)
+    )
+
+
 def has_contextual_block_marker(text: str) -> bool:
     """Whether an ambiguous block phrase appears in a blocking context.
 

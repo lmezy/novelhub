@@ -81,6 +81,7 @@ function openAISettings() {
   router.push({ path: "/admin", query: { tab: "ai" } })
 }
 const chapterSyncing = ref(false)
+const hasPrevious = ref(false)
 const alternates = ref<any[]>([])
 const showSourceMenu = ref(false)
 
@@ -927,6 +928,7 @@ async function loadRemainingContent() {
 
 async function loadChapter(id: string) {
   const seq = ++chapterLoadSeq
+  hasPrevious.value = false
   flushPageProgress()
   loading.value = true
   error.value = ""
@@ -946,6 +948,8 @@ async function loadChapter(id: string) {
     let version = ""
     try {
       const meta = await store.fetchChapterContentMeta(id)
+      if (seq !== chapterLoadSeq) return
+      hasPrevious.value = Boolean(meta.has_previous)
       version = meta.hash || (meta.total_length ? `len${meta.total_length}` : "")
       contentTotalLength.value = meta.total_length
     } catch {
@@ -987,13 +991,31 @@ async function loadChapter(id: string) {
   }
 }
 
+async function downloadPreviousChapter() {
+  if (!chapter.value) return
+  const id = chapter.value.id
+  try {
+    const file = await api.getBlob('/chapters/' + id + '/previous')
+    const url = URL.createObjectURL(file)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = id + '.txt'
+    link.click()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+  } catch (e) {
+    alert(e instanceof Error ? e.message : i18n.t('reader_failed_load_chapter'))
+  }
+}
+
 async function resyncChapter() {
   if (!chapter.value) return
+  const id = chapter.value.id
   chapterSyncing.value = true
   try {
-    await api.post('/chapters/' + chapter.value.id + '/sync')
-    store.invalidateChapter(chapter.value.id)
-    await loadChapter(chapter.value.id)
+    await api.post('/chapters/' + id + '/sync')
+    store.invalidateChapter(id)
+    if (id !== String(route.params.chapterId)) return
+    await loadChapter(id)
     alert(i18n.t('reader_chapter_synced'))
   } catch (e) {
     alert(e instanceof Error ? e.message : i18n.t('reader_chapter_sync_failed'))
@@ -1294,6 +1316,9 @@ onUnmounted(() => {
           </header>
 
           <footer class="reader-bottombar" @click.stop>
+            <button v-if="auth.isAdmin && hasPrevious" @click="downloadPreviousChapter" class="reader-top-action text-xs">
+              {{ i18n.t('reader_download_previous') }}
+            </button>
             <div v-if="showSourceMenu" class="reader-bottom-panel">
               <button
                 v-for="alt in alternates"
@@ -1415,6 +1440,9 @@ onUnmounted(() => {
             class="text-xs px-2 py-1 rounded border transition-colors disabled:opacity-50"
             :class="isDark ? 'border-gray-700 hover:bg-gray-800' : 'border-border hover:bg-black/5'"
           >{{ chapterSyncing ? i18n.t('reader_chapter_syncing') : i18n.t('reader_chapter_resync') }}</button>
+          <button v-if="auth.isAdmin && hasPrevious" @click="downloadPreviousChapter" class="text-xs px-2 py-1 rounded border">
+            {{ i18n.t('reader_download_previous') }}
+          </button>
           <div v-if="alternates.length > 1" class="relative">
             <button
               @click="showSourceMenu = !showSourceMenu; showAppearance = false"

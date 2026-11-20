@@ -10,6 +10,7 @@ category URL returns the same page for every page number; de-duplicating
 then looks like 'the TOC ended after one page'.
 """
 
+from app.core.transient import UpstreamBackoff, http_status
 from app.crawler.base import RemoteShelfBook
 from app.crawler.plugins.yuedu.common import logger
 from app.crawler.plugins.yuedu.js_runtime import JsEvaluationError
@@ -160,8 +161,9 @@ class ExploreMixin:
 
         kinds = await self._get_catalog_kinds()
         if kinds:
+            backoffs: list[UpstreamBackoff] = []
             blocked_errors: list[str] = []
-            unavailable_errors: list[str] = []
+            unavailable_errors: list[Exception] = []
             transport_errors: list[str] = []
 
             async def _fetch_kind(kind: dict[str, Any]) -> list[dict[str, Any]]:
@@ -201,6 +203,9 @@ class ExploreMixin:
                             ),
                         )
                     return items
+                except UpstreamBackoff as exc:
+                    backoffs.append(exc)
+                    return []
                 except Exception as exc:
                     if page > 1 and self._is_missing_page_error(exc):
                         # A paginated category reported a definite end. Other
@@ -213,24 +218,11 @@ class ExploreMixin:
                         if message
                         else type(exc).__name__
                     )
-                    if (
-                        "anti-bot" in message.lower()
-                        or "captcha" in message.lower()
-                        or "验证码" in message
-                        or "身份验证" in message
-                    ):
+                    if http_status(exc) is not None:
+                        unavailable_errors.append(exc)
+                    elif any(marker in message.lower() for marker in ("anti-bot", "captcha", "验证码", "身份验证")):
                         blocked_errors.append(described)
-                    response = getattr(exc, "response", None)
-                    status_code = getattr(response, "status_code", None)
-                    if status_code is not None or any(
-                        marker in message.lower()
-                        for marker in ("403", "404", "408", "429", "500", "502", "503", "504", "520")
-                    ):
-                        unavailable_errors.append(described)
-                    elif not any(
-                        marker in message.lower()
-                        for marker in ("anti-bot", "captcha", "验证码", "身份验证")
-                    ):
+                    else:
                         # Timeouts / dropped connections / empty httpx errors.
                         transport_errors.append(described)
                     logger.warning(
@@ -259,6 +251,9 @@ class ExploreMixin:
                     return await _fetch_kind(kind)
 
             grouped = await asyncio.gather(*(_bounded(kind) for kind in kinds))
+            if backoffs:
+                # Retry this page before advancing past an unread category.
+                raise max(backoffs, key=lambda exc: exc.deadline)
             results = [item for items in grouped for item in items]
             if not results and blocked_errors:
                 # Every discover category was gated by an anti-bot / captcha
@@ -266,9 +261,8 @@ class ExploreMixin:
                 # error instead of a misleading "0 books found".
                 raise RuntimeError(blocked_errors[0])
             if not results and unavailable_errors:
-                raise RuntimeError(
-                    "书源目录暂时不可访问：" + unavailable_errors[0]
-                )
+                cause = unavailable_errors[0]
+                raise RuntimeError(f"书源目录暂时不可访问：{cause}") from cause
             if not results and transport_errors:
                 # A short network/proxy outage used to surface as the
                 # misleading "书源未返回可同步的书籍"; say what actually
@@ -305,6 +299,8 @@ class ExploreMixin:
                     if items:
                         logger.info(f"Discovered books via fallback: {candidate}")
                         return items
+                except UpstreamBackoff:
+                    raise
                 except Exception:
                     continue
             logger.warning(f"No explore URL for {self.display_name}")
@@ -468,6 +464,8 @@ class ExploreMixin:
                     explore_kind=explore_kind,
                     options=self._options_for_url(options, candidate),
                 )
+            except UpstreamBackoff:
+                raise
             except Exception as exc:
                 if not self._is_missing_page_error(exc):
                     last_error = last_error or exc

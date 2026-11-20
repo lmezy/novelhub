@@ -17,9 +17,11 @@ from app.services.security import hash_password
 from app.api.router import router as api_router
 from app.core.config import settings
 from app.core.logging import setup_logging
+from app.core.transient import UpstreamStatusError
 from app.core.error_handlers import (
     generic_exception_handler,
     request_validation_handler,
+    upstream_status_handler,
     value_error_handler,
 )
 
@@ -41,6 +43,7 @@ from fastapi.exceptions import RequestValidationError
 app.add_exception_handler(RequestValidationError, request_validation_handler)
 app.add_exception_handler(Exception, generic_exception_handler)
 app.add_exception_handler(ValueError, value_error_handler)
+app.add_exception_handler(UpstreamStatusError, upstream_status_handler)
 app.add_exception_handler(
     RequestValidationError,
     lambda req, exc: JSONResponse(

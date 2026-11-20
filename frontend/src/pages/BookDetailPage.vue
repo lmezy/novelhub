@@ -372,10 +372,11 @@ async function deleteThisBook() {
 
 async function resyncBook() {
   if (!book.value) return
+  const id = book.value.id
   syncing.value = true
   try {
-    const result = await api.post<any>('/books/' + book.value.id + '/sync')
-    reportSyncResult(result)
+    const result = await api.post<any>('/books/' + id + '/sync')
+    await reportSyncResult(id, result)
   } catch (e) {
     alert(e instanceof Error ? e.message : i18n.t('book_sync_failed'))
   } finally {
@@ -383,22 +384,16 @@ async function resyncBook() {
   }
 }
 
-/**
- * Download the whole book again, replacing the stored text.
- *
- * Incremental sync skips chapters that already exist, so text that was stored
- * wrong (fetched from an ad/substitution page, or written by another book that
- * shared the same storage folder) would never be repaired on its own.
- */
 async function refetchBookContent() {
   if (!book.value) return
   if (!window.confirm(i18n.t('book_refetch_confirm'))) return
+  const id = book.value.id
   syncing.value = true
   try {
     const result = await api.post<any>(
-      '/books/' + book.value.id + '/sync?refetch_content=true',
+      '/books/' + id + '/sync?refetch_content=true',
     )
-    reportSyncResult(result)
+    await reportSyncResult(id, result)
   } catch (e) {
     alert(e instanceof Error ? e.message : i18n.t('book_sync_failed'))
   } finally {
@@ -406,22 +401,36 @@ async function refetchBookContent() {
   }
 }
 
-function reportSyncResult(result: any) {
-  const failed = result.failed_chapters?.length || 0
+async function reportSyncResult(id: string, result: {
+  created_chapters: number
+  skipped_chapters: number
+  repaired_chapters?: number
+  failed_chapters?: { title: string; chapter_number: number; error: string }[]
+}) {
+  if (route.params.id !== id) return
+  const failures = result.failed_chapters ?? []
+  const failed = failures.length
   const failedSuffix = failed ? i18n.t('book_failed_suffix', { n: failed }) : ''
   const repaired = result.repaired_chapters || 0
   // Text another book had overwritten is repaired silently otherwise.
   const repairedSuffix = repaired
     ? i18n.t('book_sync_repaired_suffix', { n: repaired })
     : ''
-  alert(i18n.t('book_sync_result', {
+  const summary = i18n.t('book_sync_result', {
     created: result.created_chapters,
     skipped: result.skipped_chapters,
     failed: failedSuffix,
-  }) + repairedSuffix)
-  if (book.value) {
-    store.fetchChapters(book.value.id).then((rows) => (chapters.value = rows))
-  }
+  }) + repairedSuffix
+  const examples = failures.slice(0, 3).map(ch => i18n.t('book_sync_failure_detail', {
+    number: ch.chapter_number, title: ch.title, reason: ch.error,
+  }))
+  alert([summary, ...examples].join('\n'))
+  const [updated, rows] = await Promise.all([store.fetchBook(id), store.fetchChapters(id)])
+  if (route.params.id !== id) return
+  book.value = updated
+  chapters.value = rows
+  kindOverride.value = updated.kind_override ?? ""
+  initCategorySelection()
 }
 
 async function loadAlternates(bookId?: string) {

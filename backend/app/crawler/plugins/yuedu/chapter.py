@@ -112,7 +112,8 @@ class ChapterMixin:
         use_gallery_link = has_manifest or (
             gallery_mode and not (self.config.get("ruleContent") or {}).get("nextContentUrl")
         )
-        max_pages = self._gallery_page_limit() if gallery_mode else 20
+        limit_setting = "YUEDU_GALLERY_MAX_PAGES" if gallery_mode else "YUEDU_CONTENT_MAX_PAGES"
+        max_pages = self._page_limit(limit_setting, 0 if gallery_mode else 200)
         parallelism = self._thread_count()
         page_progress_lock = asyncio.Lock()
 
@@ -172,7 +173,7 @@ class ChapterMixin:
 
         enqueue(html, fetch_url)
         pages_fetched = 0
-        seen_gallery_parts = {content} if gallery_mode else set()
+        seen_parts = {content}
         repeats = 0
         while pending and (not max_pages or pages_fetched < max_pages):
             batch_size = min(parallelism, len(pending))
@@ -190,26 +191,31 @@ class ChapterMixin:
             for next_url, next_html in zip(batch, htmls):
                 if self._looks_like_upstream_error(next_html):
                     raise RuntimeError(f"Upstream server returned a transient 5xx error page: {next_url}")
+                if self._looks_like_removed_page(next_html):
+                    raise ValueError(f"章节分页在源站已被删除：{next_url}")
                 chapter_engine.set_page_url(next_url)
                 next_part = self._extract_chapter_page(chapter_engine, next_html, next_url)
-                if next_part and next_part != next_html:
-                    parts.append(next_part)
+                if (not next_part.strip() or self._content_is_chapter_chrome(next_part)
+                        or (next_part == next_html and re.search(r"<(?:html|!doctype)\b", next_html, re.I))):
+                    raise ValueError(f"章节分页未解析出正文：{next_url}")
+                if self._content_is_blocked(next_part):
+                    raise self._blocked_page_error(next_url)
+                parts.append(next_part)
                 pages_fetched += 1
                 enqueue(next_html, next_url)
                 # A broken next rule can mint a fresh URL forever for the
                 # same viewer page. Report the loop instead of saving a
                 # partial album as a successful chapter.
-                if gallery_mode and len(batch) == 1 and len(pending) == 1 and next_part in seen_gallery_parts:
+                if len(batch) == 1 and len(pending) == 1 and next_part in seen_parts:
                     repeats += 1
                     if repeats >= 4:
-                        raise ValueError("图集分页连续返回相同内容，请检查书源的下一页规则")
+                        raise ValueError("章节分页连续返回相同内容，请检查书源的下一页规则")
                 else:
                     repeats = 0
-                if gallery_mode:
-                    seen_gallery_parts.add(next_part)
+                seen_parts.add(next_part)
 
-        if gallery_mode and pending:
-            logger.warning("Gallery reached YUEDU_GALLERY_MAX_PAGES=%s at %s", max_pages, chapter.url)
+        if pending:
+            raise ValueError(f"章节还有未读取的分页，已达到 {limit_setting}={max_pages}：{chapter.url}")
 
         content = self._dedupe_content_images("\n".join(parts))
 
@@ -388,12 +394,12 @@ class ChapterMixin:
             manifest.append({"imgName": name, "imgExtension": extension})
         return manifest
     @staticmethod
-    def _gallery_page_limit() -> int:
+    def _page_limit(setting: str, default: int) -> int:
         """Optional maximum number of follow-up pages, zero reads to the end."""
         try:
-            return max(0, int(os.getenv("YUEDU_GALLERY_MAX_PAGES", "0") or 0))
+            return max(0, int(os.getenv(setting, str(default)) or 0))
         except ValueError:
-            return 0
+            return default
 
     @staticmethod
     def _gallery_next_url(html: str, current_url: str, *, require_page_label: bool = False) -> str:

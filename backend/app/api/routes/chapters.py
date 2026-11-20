@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -81,7 +82,21 @@ async def get_chapter_content_meta(
         raise HTTPException(status_code=404, detail="Chapter content not found")
     except OSError:
         total = 0
-    return {"id": chapter.id, "hash": chapter.hash, "total_length": total}
+    meta = {"id": chapter.id, "hash": chapter.hash, "total_length": total}
+    if user.role in ("admin", "super_admin") and BookStorage().previous_chapter_path(book.id, chapter.id).is_file():
+        meta["has_previous"] = True
+    return meta
+
+
+@router.get("/chapters/{chapter_id}/previous")
+async def download_previous_chapter(chapter_id: str, user: User = Depends(require_admin), db: AsyncSession = Depends(get_db)):
+    chapter = await db.get(Chapter, chapter_id)
+    if chapter is None or not ensure_book_visible(user, await db.get(Book, chapter.book_id)):
+        raise HTTPException(status_code=404, detail="Chapter not found")
+    path = BookStorage().previous_chapter_path(chapter.book_id, chapter.id)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Previous chapter content not found")
+    return FileResponse(path, media_type="text/plain", filename=path.name, headers={"Cache-Control": "private, no-store"})
 
 
 @router.get("/chapters/{chapter_id}/content")

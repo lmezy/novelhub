@@ -118,6 +118,7 @@ class YueduPlugin(UrlsMixin, ParsingMixin, ExploreMixin, BookMixin, ChapterMixin
     _missing_image_urls: dict[str, float] = {}
     _missing_image_ttl = 1800.0
     _missing_image_limit = 2048
+    _origin_cooldowns: dict[str, tuple[int, float]] = {}
     _rate_locks: dict[str, asyncio.Lock] = {}
     _rate_state: dict[str, dict[str, float | int]] = {}
     # DoH (DNS over HTTPS) cache for bypassing polluted system DNS.

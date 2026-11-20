@@ -18,7 +18,7 @@ import pytest
 
 from app.crawler.base import RemoteChapter
 from app.models import Chapter
-from app.services.storage import BookRef, BookStorage
+from app.services.storage import BookRef, BookStorage, ChapterFileBatch
 from app.services.sync import SyncService
 
 BOOK_A = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
@@ -109,6 +109,26 @@ def test_book_dir_without_ref_keeps_the_legacy_layout(tmp_path):
     assert storage.book_dir("作者", "书名") == tmp_path / "作者" / "书名"
 
 
+def test_toc_insertion_preserves_existing_file_on_commit_and_rollback(tmp_path):
+    storage = BookStorage(str(tmp_path))
+    original, digest = storage.write_chapter("作者", "书", 1, "旧章", "原文")
+    for commit in (False, True):
+        batch = ChapterFileBatch()
+        inserted, _ = storage.write_chapter("作者", "书", 1, "插章", "新文",
+                                            chapter_id="new-id", batch=batch)
+        updated, _ = storage.write_chapter("作者", "书", 2, "旧章", "修订",
+                                           chapter_id="old-id", previous_path=original, batch=batch)
+        assert updated == original and inserted != original
+        batch.finish(committed=commit)
+        assert Path(inserted).exists() == commit
+        assert not list(tmp_path.rglob(".novelhub-*"))
+        if commit:
+            assert "新文" in storage.read_chapter(inserted)
+            assert "修订" in storage.read_chapter(original)
+        else:
+            assert storage.chapter_digest(original) == digest
+
+
 def test_chapter_overwritten_by_another_book_is_refetched(tmp_path):
     storage = BookStorage(str(tmp_path))
     ref = _ref(BOOK_A, "yuedu_alice", "https://www.alicesw.com/novel/1")
@@ -172,12 +192,12 @@ async def test_foreign_repair_is_counted_so_it_is_not_silent(tmp_path):
     service = SyncService(db)
     service.storage = storage
 
-    stats: dict = {}
-    kept = await service._reconcile_chapter_ids(BOOK_A, remote, stats=stats)
+    repair_ids = set()
+    kept = await service._reconcile_chapter_ids(BOOK_A, remote, repair_ids=repair_ids)
 
     assert kept == set()
-    assert stats["repaired_chapters"] == 1
-    assert db.delete.await_count == 1
+    assert repair_ids == {chapter.source_chapter_id}
+    db.delete.assert_not_awaited()
 
 
 def test_the_live_four_copies_of_one_title_no_longer_share_a_directory(tmp_path):

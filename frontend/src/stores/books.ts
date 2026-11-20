@@ -50,6 +50,7 @@ export interface ChapterContentChunk extends ChapterContent {
 }
 
 export interface ChapterContentMeta {
+  has_previous?: boolean
   id: string
   hash: string | null
   total_length: number

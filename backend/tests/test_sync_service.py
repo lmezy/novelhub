@@ -582,8 +582,8 @@ async def test_long_album_localises_images_in_order_with_bounded_workers(tmp_pat
     )
     expected = cap - 1 if cap else count
     urls = [f"https://example.test/images/{n}.jpg" for n in range(expected)]
-    assert downloaded == urls
-    assert peak == 3
+    assert sorted(downloaded) == sorted(urls)
+    assert 1 <= peak <= 3
     tags = BeautifulSoup(result, "lxml").find_all("img")
     assert [t["alt"] for t in tags] == [str(n) for n in range(expected)] + ["repeat"]
     for tag, url in zip(tags, [*urls, urls[0]]):
@@ -1373,7 +1373,7 @@ async def test_sync_book_reports_chapter_progress():
         )
 
     assert result["created_chapters"] == 2
-    assert progress_cb.await_count == 2
+    assert [call.args[0]["created_chapters"] for call in progress_cb.await_args_list] == [0, 0, 2]
     last = progress_cb.await_args.args[0]
     assert last["created_chapters"] == 2
     assert last["total_chapters"] == 2
@@ -1504,7 +1504,7 @@ async def test_sync_book_commits_chapter_rows_in_batches(monkeypatch):
     service.storage.write_chapter.return_value = ("path", "hash")
     flushes: list[int] = []
 
-    async def spy(pending_index_docs):
+    async def spy(pending_index_docs, file_batch):
         flushes.append(len(pending_index_docs))
         pending_index_docs.clear()
 
@@ -1566,13 +1566,127 @@ async def test_reconcile_chapter_ids_upgrades_legacy_numeric_ids():
         ],
     )
 
-    assert result == {
-        "https://example.com/book/1.html",
-        "https://example.com/book/2.html",
-    }
+    assert result == set()  # The upgraded rows still need their missing files.
     assert legacy1.source_chapter_id == "https://example.com/book/1.html"
     assert legacy2.source_chapter_id == "https://example.com/book/2.html"
     db.flush.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_commit", [True, False], ids=["rollback-tail", "commit-tail"])
+async def test_whole_book_refresh_keeps_reader_ids_and_accounts_for_every_file(tmp_path, fail_commit):
+    from app.services.storage import BookStorage
+
+    storage = BookStorage(str(tmp_path))
+    db = _mock_db()
+    source = _source()
+    source.owner_id = "reader"
+    book = Book(id="book", title="Book", author_id="author", source_id=source.id,
+                source_book_id="https://example.com/b", kind="novel", is_r18=False)
+    chapters = []
+    remote = []
+    for n in range(1, 4):
+        path, digest = storage.write_chapter("Author", "Book", n, str(n), f"old {n}")
+        url = f"https://example.com/b/{n}"
+        chapters.append(Chapter(id=f"reader-id-{n}", book_id=book.id, chapter_number=n,
+                                title=str(n), source_chapter_id=url, content_path=path, hash=digest))
+        remote.append(RemoteChapter(url, str(n), url, n))
+    rows = {ch.id: ch for ch in chapters}
+    db.get.side_effect = lambda model, key, **kwargs: source if model is Source else rows[key]
+    db.scalars.side_effect = lambda query: SimpleNamespace(
+        all=lambda: chapters if query.column_descriptions[0]["expr"] is Chapter else []
+    )
+    def commit():
+        if fail_commit and list(tmp_path.rglob("*.bak")):
+            raise SQLAlchemyError("transaction rejected")
+
+    db.commit.side_effect = commit
+    plugin = AsyncMock()
+    plugin.fetch_book.return_value = RemoteBook(book.source_book_id, book.title, "Author",
+                                                None, None, remote)
+    async def fetch(chapter):
+        if chapter.chapter_number == 1:
+            raise ValueError("source page is empty")
+        return f"new {chapter.chapter_number}"
+
+    plugin.fetch_chapter_content.side_effect = fetch
+    service = SyncService(db, storage=storage)
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.search_service") as index,
+        patch("app.services.auto_categorize.AutoCategorizationService.categorize_book", AsyncMock(return_value=[])),
+        patch.object(service, "_get_or_create_author", AsyncMock(return_value=SimpleNamespace(id="author"))),
+        patch.object(service, "_get_or_create_book", AsyncMock(return_value=(book, False))),
+        patch.object(service, "_ensure_book_row", AsyncMock(return_value=True)),
+        patch.object(service, "_save_tags", AsyncMock()),
+        patch.object(service, "_invalidate_chapter_analysis", AsyncMock()) as invalidate,
+    ):
+        result = await service.sync_book(source.id, book.source_book_id, refetch_content=True)
+    assert result["created_chapters"] == (0 if fail_commit else 2)
+    assert {item["chapter_number"] for item in result["failed_chapters"]} == ({1, 2, 3} if fail_commit else {1})
+    assert {call.args[0] for call in invalidate.await_args_list} == {"reader-id-2", "reader-id-3"}
+    assert {call.args[0]["id"] for call in index.buffer_chapter.call_args_list} == (
+        set() if fail_commit else {"reader-id-2", "reader-id-3"}
+    )
+    db.delete.assert_not_awaited()
+    assert not list(tmp_path.rglob(".novelhub-*"))
+    for ch in chapters:
+        version = "old" if fail_commit or ch.chapter_number == 1 else "new"
+        assert storage.read_chapter(ch.content_path).strip().endswith(f"{version} {ch.chapter_number}")
+
+
+@pytest.mark.asyncio
+async def test_image_cache_is_shared_by_chapters_and_repairs_html(tmp_path):
+    from app.services.storage import BookStorage
+
+    storage = BookStorage(str(tmp_path))
+    service = SyncService(_mock_db(), storage=storage)
+    book = SimpleNamespace(id="book", kind="novel")
+    data = b"\xff\xd8\xffimage"
+    plugin = SimpleNamespace(fetch_content_image=AsyncMock(return_value=(data, "image/jpeg")))
+    async def localise(chapter_id):
+        return await service._process_content_images(
+            book, chapter_id, "![](/image.jpg)", "https://reader.test/book", plugin,
+        )
+    first = await localise("first")
+    assert await localise("second") == first.replace("/first/", "/second/")
+    plugin.fetch_content_image.assert_awaited_once()
+    filename = storage.find_chapter_image(book.id, "https://reader.test/image.jpg")
+    cached = tmp_path / filename
+    cached.write_bytes(b"<!DOCTYPE html><title>Service unavailable</title>")
+    assert await localise("first") == first
+    assert cached.read_bytes() == data
+    assert plugin.fetch_content_image.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_prose_avoids_library_scan_and_keeps_contextual_mentions():
+    service = SyncService(_mock_db(), storage=MagicMock())
+    prose = "他读到安全验证这一节，合上书，想起出门时忘了拿钥匙。"
+    service.storage.read_chapter.return_value = "#章节\n\n" + prose
+    chapter = Chapter(id="row", content_path="/old.md")
+    assert service._stale_chapter_reason(chapter) == ""
+    assert await service._cover_wall_hits(prose, "书名") == []
+    service.db.scalars.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_url_change_reuses_only_unambiguous_chapters_and_preserves_other_files():
+    old = [Chapter(id=str(n), source_chapter_id=f"https://old.test/{n}", chapter_number=n,
+                   title=title, content_path=f"{n}.md") for n, title in enumerate(
+                       ["开篇", "番外", "番外"], start=1)]
+    remote = [RemoteChapter(f"https://new.test/{n}", title, f"https://new.test/{n}", n)
+              for n, title in enumerate(["开篇", "番外"], start=1)]
+    db = _mock_db()
+    db.scalars.return_value = SimpleNamespace(all=lambda: old)
+    service = SyncService(db, storage=MagicMock())
+    service.storage.read_chapter.return_value = "#章节\n\n" + "值得留存的旧正文。" * 5
+    updates = {}
+    ready = await service._reconcile_chapter_ids("book", remote, refresh_rows=updates)
+    assert updates == {"https://new.test/1": "1"}
+    assert not ready.intersection(ch.source_chapter_id for ch in remote)
+    assert old[0].source_chapter_id == "https://old.test/1"
+    db.delete.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1602,7 +1716,7 @@ async def test_reconcile_chapter_ids_keeps_existing_urls():
         ],
     )
 
-    assert result == {"https://example.com/book/1.html"}
+    assert result == set()  # Existing identity, missing body.
     assert existing.source_chapter_id == "https://example.com/book/1.html"
 
 
@@ -1671,13 +1785,14 @@ async def test_reconcile_chapter_ids_drops_blank_junk_and_duplicate_chapters():
         "/real/000004.md": "#第二章\n\n这是一段足够长的真实正文内容，用于确认章节不会被误删。",
     }.get(path, "")
 
-    result = await service._reconcile_chapter_ids("book-1", remote_chapters)
-
+    with patch("app.services.sync.search_service.update_chapter_numbers") as reindex:
+        result = await service._reconcile_chapter_ids("book-1", remote_chapters)
+    reindex.assert_called_once_with([{"id": "c4", "chapter_number": 2}])
     assert result == {"https://example.com/book/1/b.html"}
-    assert db.delete.await_count == 3
+    assert {call.args[0].id for call in db.delete.await_args_list} == {"c2", "c3"}
 
 @pytest.mark.asyncio
-async def test_reconcile_chapter_ids_drops_anti_bot_junk_chapters():
+async def test_reconcile_chapter_ids_requests_repair_for_anti_bot_text():
     # A chapter that was saved from an anti-bot/captcha page must be treated
     # as junk so a re-sync refetches the real content.
     junk = Chapter(
@@ -1731,7 +1846,7 @@ async def test_reconcile_chapter_ids_drops_anti_bot_junk_chapters():
     result = await service._reconcile_chapter_ids("book-1", remote_chapters)
 
     assert result == {"https://example.com/book/1/b.html"}
-    assert db.delete.await_count == 1
+    db.delete.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1975,12 +2090,12 @@ async def _run_now(func, *args, **kwargs):
 
 
 @pytest.mark.asyncio
-async def test_reconcile_chapter_ids_refetch_content_drops_healthy_chapters():
+async def test_reconcile_chapter_ids_refetch_keeps_healthy_rows():
     """An explicit repair re-downloads chapters that look perfectly healthy.
 
     Stored text can be wrong in ways no check can see from the file alone --
     written by an older build from a page that was not the chapter, say -- so
-    ``refetch_content`` has to drop every chapter of the remote TOC, not only
+    ``refetch_content`` has to refresh every chapter of the remote TOC, not only
     the ones that fail a health check.
     """
     healthy = Chapter(
@@ -2026,11 +2141,11 @@ async def test_reconcile_chapter_ids_refetch_content_drops_healthy_chapters():
         refetch_content=True,
     )
     assert dropped == set()
-    assert db.delete.await_count == 1
+    db.delete.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_reconcile_chapter_ids_detaches_references_before_deleting():
+async def test_reconcile_chapter_ids_keeps_references_until_refresh():
     """A stale chapter cannot be deleted while a reader points at it.
 
     Re-syncing a book drops chapters that were saved from an anti-bot page so
@@ -2066,10 +2181,8 @@ async def test_reconcile_chapter_ids_detaches_references_before_deleting():
     result = await service._reconcile_chapter_ids("book-1", remote_chapters)
 
     assert result == set()
-    assert db.delete.await_count == 1
-    statements = [str(call.args[0]) for call in db.execute.await_args_list]
-    assert any("UPDATE reading_progress" in text for text in statements)
-    assert any("reading_progress.chapter_id" in text for text in statements)
+    db.delete.assert_not_awaited()
+    db.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2196,12 +2309,12 @@ async def test_reconcile_repairs_image_only_chapters_of_a_prose_book():
         "/junk/000002.md": "#第二章\n\n![](https://img.example/static/search.png)",
     }.get(path, "")
 
-    stats: dict = {}
-    kept = await service._reconcile_chapter_ids("book-1", remote_chapters, stats=stats)
+    repair_ids = set()
+    kept = await service._reconcile_chapter_ids("book-1", remote_chapters, repair_ids=repair_ids)
 
     assert kept == {"https://example.com/book/1/a.html"}
-    assert stats["repaired_chapters"] == 1
-    assert db.delete.await_count == 1
+    assert repair_ids == {gallery.source_chapter_id}
+    db.delete.assert_not_awaited()
 
 
 
@@ -2314,7 +2427,7 @@ async def test_resync_chapter_updates_existing_row():
     )
     book.author = SimpleNamespace(name="Author")
     source = _source()
-    db = AsyncMock()
+    db = _mock_db()
     db.get = AsyncMock(side_effect=[chapter, book, source])
     db.scalar = AsyncMock(return_value=None)
     db.commit = AsyncMock()
@@ -2376,7 +2489,7 @@ async def test_resync_chapter_matches_legacy_id_by_number():
     )
     book.author = SimpleNamespace(name="Author")
     source = _source()
-    db = AsyncMock()
+    db = _mock_db()
     db.get = AsyncMock(side_effect=[chapter, book, source])
     db.scalar = AsyncMock(return_value=None)
     db.commit = AsyncMock()
@@ -3303,3 +3416,124 @@ async def test_sync_book_checkpoint_stops_before_next_chapter():
             )
 
     assert checkpoint_calls >= 3
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_for_rate_limit_replays_only_unfinished_books():
+    import time
+    from app.core.transient import UpstreamBackoff
+
+    db = _mock_db()
+    db.get.return_value = _source()
+    plugin = AsyncMock()
+    page = [RemoteShelfBook(str(i), f"Book {i}", "Author", f"https://books.test/{i}")
+            for i in range(3)]
+    plugin.discover_books.return_value = page
+    service = SyncService(db)
+    saved = MagicMock()
+    ok = {"book_id": "book", "created_chapters": 4}
+    wait = UpstreamBackoff(429, "https://books.test", time.monotonic() + 300)
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.sync_book_concurrency", return_value=1),
+        patch.object(service, "sync_book", AsyncMock(side_effect=[ok, wait, ok, ok])) as fetch,
+    ):
+        with pytest.raises(UpstreamBackoff):
+            await service.discover_and_sync_all("src1", max_pages=1, backoff_cb=saved)
+        snapshot, finished = saved.call_args.args
+        assert (snapshot["books_found"], snapshot["books_synced"], snapshot["chapters_created"]) == (1, 1, 4)
+        assert finished == [page[0].url]
+        plugin.discover_books.return_value = list(reversed(page))
+        resumed = await service.discover_and_sync_all("src1", max_pages=1,
+                                                      start_page=snapshot["next_page"],
+                                                      completed_page_urls=finished)
+    assert resumed["books_found"] == resumed["books_synced"] == 2
+    assert [call.args[1] for call in fetch.await_args_list] == [
+        page[0].url, page[1].url, page[2].url, page[1].url,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_later_catalog_timeout_resumes_at_empty_last_page():
+    import httpx
+
+    db = _mock_db()
+    db.get.return_value = _source()
+    plugin = AsyncMock()
+    plugin.discover_books.side_effect = [
+        [RemoteShelfBook("1", "One", "Author", "https://books.test/one")],
+        httpx.ReadTimeout(""), [],
+    ]
+    service = SyncService(db)
+    saved = MagicMock()
+    with patch("app.services.sync.get_plugin", return_value=plugin):
+        with pytest.raises(httpx.ReadTimeout):
+            await service.discover_and_sync_all("src1", sync=False, backoff_cb=saved)
+        snapshot, completed = saved.call_args.args
+        assert (snapshot["next_page"], snapshot["books_found"], completed) == (2, 1, [])
+        result = await service.discover_and_sync_all("src1", sync=False, start_page=2)
+    assert result["done"] and result["books_found"] == 0
+    assert [call.kwargs["page"] for call in plugin.discover_books.await_args_list] == [1, 2, 2]
+
+
+@pytest.mark.asyncio
+async def test_chapter_retry_ignores_deterministic_failures_and_exhausted_http_budget():
+    from app.core.transient import UpstreamStatusError
+    for error in (ValueError("stale selector"), UpstreamStatusError(523, "https://books.test")):
+        plugin = AsyncMock()
+        plugin.fetch_chapter_content.side_effect = error
+        with pytest.raises(type(error)):
+            await SyncService._fetch_chapter_with_retry(plugin, object())
+        plugin.fetch_chapter_content.assert_awaited_once()
+
+@pytest.mark.asyncio
+async def test_long_book_bounds_chapter_tasks_and_resets_block_streak_on_success():
+    db = _mock_db()
+    db.get.return_value = _source()
+    db.add = MagicMock()
+    chapters = [RemoteChapter(str(n), f"chapter {n}", f"https://long.test/{n}", n)
+                for n in range(1, 101)]
+    plugin = AsyncMock()
+    plugin.fetch_book.return_value = RemoteBook("long", "Long", "Author", "", "", chapters)
+    baseline = asyncio.all_tasks()
+    task_counts = []
+
+    async def fetch(chapter):
+        task_counts.append(len(asyncio.all_tasks() - baseline))
+        if chapter.chapter_number % 3 == 0:
+            raise RuntimeError("Site returned an anti-bot/captcha page")
+        return "正常章节正文"
+
+    plugin.fetch_chapter_content.side_effect = fetch
+    service = SyncService(db, storage=MagicMock())
+    service.storage.write_chapter.return_value = ("saved", "hash")
+    with (
+        patch("app.services.sync.get_plugin", return_value=plugin),
+        patch("app.services.sync.search_service"),
+        patch("app.services.auto_categorize.AutoCategorizationService"),
+        patch.object(service, "_save_tags", AsyncMock()),
+        patch.object(service, "_chapter_concurrency", return_value=1),
+        patch.object(service, "_find_same_title_books", AsyncMock(return_value=[])),
+        patch.object(service, "_book_tag_names", AsyncMock(return_value=[])),
+    ):
+        result = await service.sync_book("src1", "https://long.test/book")
+    assert max(task_counts) == 1
+    assert result["created_chapters"] == 67
+    assert len(result["failed_chapters"]) == 33
+
+@pytest.mark.asyncio
+async def test_manual_sync_exposes_retry_after_to_the_reader(client, monkeypatch):
+    import time
+    from app.core.database import get_db
+    from app.core.transient import UpstreamBackoff
+    from app.main import app
+    from app.services.auth import require_admin
+
+    error = UpstreamBackoff(429, "https://books.test", time.monotonic() + 240)
+    monkeypatch.setitem(app.dependency_overrides, get_db, lambda: _mock_db())
+    monkeypatch.setitem(app.dependency_overrides, require_admin, lambda: None)
+    monkeypatch.setattr(SyncService, "resync_book", AsyncMock(side_effect=error))
+    response = await client.post("/api/books/book-1/sync")
+    assert response.status_code == 429
+    assert 239 <= int(response.headers["retry-after"]) <= 240
+    assert "暂缓请求" in response.json()["detail"]

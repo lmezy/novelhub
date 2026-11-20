@@ -4,6 +4,21 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 from loguru import logger
 
+from app.core.transient import UpstreamBackoff, UpstreamStatusError
+
+
+async def upstream_status_handler(request: Request, exc: UpstreamStatusError) -> JSONResponse:
+    if isinstance(exc, UpstreamBackoff):
+        return JSONResponse(
+            status_code=429 if exc.status_code == 429 else 503,
+            headers={"Retry-After": str(exc.remaining_seconds)},
+            content={"detail": str(exc)},
+        )
+    return JSONResponse(
+        status_code=502,
+        content={"detail": f"书源返回 HTTP {exc.status_code}，请稍后重试"},
+    )
+
 
 async def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     logger.opt(exception=exc).error("Unhandled exception on {} {}", request.method, request.url.path)

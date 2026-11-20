@@ -13,6 +13,7 @@ from app.crawler.base import RemoteBook
 from app.crawler.base import RemoteChapter
 from app.crawler.plugins.yuedu.common import logger
 from app.crawler.plugins.yuedu.errors import is_transient_transport_error
+from app.crawler.plugins.yuedu.page_kind import PageKindMixin
 from app.crawler.plugins.yuedu.selectors import TOC_LINK_PATH_RE
 from app.crawler.plugins.yuedu.selectors import TOC_LINK_TEXTS
 from bs4 import BeautifulSoup
@@ -36,23 +37,15 @@ def describe_book_page(html: str, toc_selector: str = "") -> str:
     metadata/chapters" error.  The verdict says which knob to turn.
     """
     text = str(html or "")
-    lowered = text.lower()
-    if len(text) < 2048 or "window.location.href" in lowered:
-        return (
-            f"站点只返回了 {len(text)} 字节的跳转/挑战页，不是目录页；"
-            "换一个代理节点或更新书源 Cookie 后重试"
-        )
-    for marker in ("just a moment", "cf-chl", "cf_chl", "captcha", "人机验证", "安全验证"):
-        if marker in lowered:
-            return "站点返回了人机验证页面；换代理节点或更新书源 Cookie 后重试"
+    if PageKindMixin._is_blocked_page(text) or PageKindMixin._is_challenge_page(text):
+        return "站点返回了人机验证页面，请在浏览器中检查书源的验证状态"
+    if len(text) < 2048 and re.search(r"window\.location\.href\s*=", text, re.I):
+        return "站点返回了跳转脚本，请检查书源的书籍地址和跳转目标"
     container = toc_container_hint(toc_selector)
     if container and container not in text:
         return f"页面已加载，但里面没有目录容器 {container}（书源规则可能已过期）"
     if container:
-        return (
-            f"页面已加载，目录容器 {container} 是空的"
-            "（站点可能对该出口 IP 限流，换节点或更新 Cookie 后重试）"
-        )
+        return f"页面已加载，目录容器 {container} 中没有解析出章节，请检查目录规则"
     return "页面已加载，但没有解析出任何章节链接（书源规则可能已过期）"
 
 
@@ -172,6 +165,10 @@ class BookMixin:
             toc_html = html
         else:
             toc_html = await self._get(toc_url)
+            if self._looks_like_upstream_error(toc_html):
+                raise RuntimeError(f"Upstream server returned a transient 5xx TOC page: {toc_url}")
+            if self._looks_like_removed_page(toc_html):
+                raise ValueError(f"源站提示目录已删除：{toc_url}")
 
         self.engine.set_page_url(toc_url)
         # Legado exposes the parsed book as the ``book`` JS variable; TOC
@@ -283,11 +280,6 @@ class BookMixin:
         tags = list(dict.fromkeys([
             *kind_tags,
             *generic_tags,
-            *self._content_type_tags(
-                book_title,
-                info.get("intro"),
-                generic.get("description"),
-            ),
         ]))
         tags = self._clean_tags(
             tags,
@@ -468,7 +460,7 @@ class BookMixin:
         pages_read = 1
         if pending and progress_cb:
             await progress_cb(progress_title, pages_read)
-        previous_chapters: tuple | None = None
+        seen_chapters = {(entry.get("chapterUrl"), entry.get("chapterName")) for entry in toc}
         repeated_pages = 0
         while pending:
             batch = [pending.popleft() for _ in range(min(parallelism, len(pending)))]
@@ -483,20 +475,22 @@ class BookMixin:
             for page_url, page_html in zip(batch, htmls):
                 if self._looks_like_upstream_error(page_html):
                     raise RuntimeError(f"Upstream server returned a transient 5xx TOC page: {page_url}")
+                if not page_html.strip() or self._looks_like_removed_page(page_html):
+                    raise ValueError(f"目录分页为空或已从源站删除：{page_url}")
                 self.engine.set_page_url(page_url)
                 entries = self._resolve_toc_entries(self.engine.parse_toc(page_html), page_url)
+                page_chapters = {(entry.get("chapterUrl"), entry.get("chapterName")) for entry in entries}
+                new_entries = page_chapters.difference(seen_chapters)
+                seen_chapters.update(page_chapters)
                 toc.extend(entries)
                 enqueue_links(page_html, page_url)
             # Some sites keep generating fresh "next" URLs for the same last
             # page. Only flag a repeating single chain, never a page dropdown.
             if len(batch) == 1 and len(pending) == 1:
-                chapters = tuple((e.get("chapterUrl"), e.get("chapterName")) for e in entries)
-                repeated_pages = repeated_pages + 1 if chapters == previous_chapters else 0
+                repeated_pages = 0 if new_entries else repeated_pages + 1
                 if repeated_pages >= 3:
                     raise ValueError("目录分页连续返回相同章节，请检查书源的 nextTocUrl 规则")
-                previous_chapters = chapters
             else:
-                previous_chapters = None
                 repeated_pages = 0
             pages_read += len(batch)
             if progress_cb:
@@ -582,7 +576,6 @@ class BookMixin:
         url = clean_url or url
         if self._image_known_missing(url):
             return None
-        await self._sleep_rate_limit()
         headers = self._build_headers({
             "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
         })
@@ -603,9 +596,9 @@ class BookMixin:
             """Fetch over one transport; ``None`` means "gone for good"."""
             nonlocal headers
             last_error: Exception | None = None
-            last_status: int | None = None
             for attempt in range(3):
                 try:
+                    await self._wait_for_request(url)
                     client = await self._get_http_client(proxy)
                     resp = await client.get(url, headers=headers)
                     if resp.status_code == 403 and attempt == 0:
@@ -620,15 +613,8 @@ class BookMixin:
                             url,
                         )
                         return None
-                    if resp.status_code in (429, 500, 502, 503, 504):
-                        retry_after = resp.headers.get("Retry-After", "")
-                        wait = (
-                            float(retry_after)
-                            if retry_after and retry_after.replace(".", "", 1).isdigit()
-                            else 2 ** attempt
-                        )
-                        last_status = resp.status_code
-                        await asyncio.sleep(wait + random.uniform(0.5, 1.5))
+                    if self._is_transient_upstream_status(resp.status_code):
+                        await self._retry_status(url, resp, attempt)
                         continue
                     resp.raise_for_status()
                     self._capture_cookie_jar(resp)
@@ -642,13 +628,11 @@ class BookMixin:
                         await asyncio.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
             if last_error is not None:
                 raise last_error
-            raise RuntimeError(
-                f"Request failed after retries: {url}"
-                + (f" (HTTP {last_status})" if last_status else "")
-            )
+            raise RuntimeError(f"Request failed after retries: {url}")
 
         last_error: Exception | None = None
-        for proxy in self._ordered_transports(proxy_url):
+        transports = self._ordered_transports(proxy_url)
+        for index, proxy in enumerate(transports):
             try:
                 result = await _request(proxy)
             except Exception as exc:
@@ -656,14 +640,13 @@ class BookMixin:
                     last_error = exc
                     break
                 last_error = exc
-                if proxy is None:
+                if index + 1 == len(transports):
                     break
                 logger.warning(
-                    "Configured proxy %s request failed for cover (%s%s); "
-                    "retrying direct",
-                    proxy_url,
+                    "%s request failed for cover (%s); retrying %s",
+                    self._transport_label(proxy),
                     type(exc).__name__,
-                    f": {exc}" if str(exc) else "",
+                    self._retry_transport_label(transports[index + 1]),
                 )
                 continue
             if result is None:

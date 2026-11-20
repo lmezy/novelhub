@@ -372,6 +372,35 @@ class SearchIndexMixin:
         self._ensure_index(self.INDEX_BOOKS)
         self.client.index(self.INDEX_BOOKS).update_documents([{"id": book_id, "tags": tags}])
 
+    def update_chapter_numbers(self, moved: list[dict]) -> None:
+        self._ensure_index(self.INDEX_CHAPTERS)
+        index = self.client.index(self.INDEX_CHAPTERS)
+        for start in range(0, len(moved), self.KIND_BACKFILL_BATCH):
+            self._update_existing_documents(index, moved[start:start + self.KIND_BACKFILL_BATCH])
+
+    def reconcile_chapter_labels(self, book_id: str, tags: list[str], categories: list[str]) -> None:
+        """Correct metadata on already indexed chapters without re-indexing their bodies."""
+        self._ensure_index(self.INDEX_CHAPTERS)
+        index = self.client.index(self.INDEX_CHAPTERS)
+        offset = 0
+        tag_set, category_set = set(tags), set(categories)
+        while True:
+            docs = index.get_documents({
+                "filter": f"book_id = {json.dumps(book_id)}",
+                "fields": ["id", "tags", "category_names"],
+                "offset": offset, "limit": self.KIND_BACKFILL_BATCH,
+            }).results
+            changes = [
+                {"id": doc.id, "tags": tags, "category_names": categories}
+                for doc in docs if set(getattr(doc, "tags", []) or []) != tag_set
+                or set(getattr(doc, "category_names", []) or []) != category_set
+            ]
+            if changes:
+                index.update_documents(changes)
+            if len(docs) < self.KIND_BACKFILL_BATCH:
+                break
+            offset += len(docs)
+
     def update_chapter_tags(self, chapter_id: str, tags: list[str]) -> None:
         """Merge new tags into an indexed chapter (see ``update_book_tags``)."""
         self._ensure_index(self.INDEX_CHAPTERS)
@@ -1075,7 +1104,7 @@ class SearchIndexMixin:
         return bool(result.get("hits"))
 
     @staticmethod
-    def _update_indexed_categories(index, docs: list[dict]) -> None:
+    def _update_existing_documents(index, docs: list[dict]) -> None:
         # PUT also inserts missing IDs, which would expose incomplete documents.
         ids = [doc["id"] for doc in docs]
         existing = index.get_documents({
@@ -1115,7 +1144,7 @@ class SearchIndexMixin:
             )
             for book_id, name in rows:
                 names_by_book[book_id].append(name)
-            await asyncio.to_thread(self._update_indexed_categories, books_index, [
+            await asyncio.to_thread(self._update_existing_documents, books_index, [
                 {"id": book_id, "category_names": names} for book_id, names in names_by_book.items()
             ])
             last_id = ""
@@ -1128,7 +1157,7 @@ class SearchIndexMixin:
                 )).all()
                 if not rows:
                     break
-                await asyncio.to_thread(self._update_indexed_categories, chapters_index, [
+                await asyncio.to_thread(self._update_existing_documents, chapters_index, [
                     {"id": chapter_id, "category_names": names_by_book[book_id]}
                     for chapter_id, book_id in rows
                 ])

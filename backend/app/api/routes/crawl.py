@@ -219,7 +219,8 @@ async def move_task_front(
         )
     )
     task.priority = (top_priority or 0) + 1
-    task.resume_at = None
+    if not (task.progress or {}).get("auto_retries"):
+        task.resume_at = None
     await db.commit()
     return {"task_id": task.id, "status": task.status, "priority": task.priority}
 
@@ -264,8 +265,12 @@ async def retry_task(
     if getattr(task, "mode", "bookshelf") == "discover_all":
         task.status = "pending"
         task.error = None
-        task.result = None
-        task.progress = None
+        progress = task.progress or {}
+        if progress.get("retry_checkpoint"):
+            task.progress = {**progress, "auto_retries": 0}
+        else:
+            task.result = None
+            task.progress = None
         task.resume_at = None
         task.started_at = None
         task.finished_at = None
